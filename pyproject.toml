@@ -107,6 +107,7 @@ dependencies = [ # Optional
     "transformers>=4.26.0",
     "torchvision>=0.13.0",
     "deepspeed>=0.8.1",
+    "pippy @ git+https://github.com/pytorch/tau",
     "datasets",
     "etcd3",
     "rpyc",
