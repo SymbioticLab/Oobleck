@@ -2,16 +2,16 @@ import torch
 from deepspeed import comm as dist
 from pippy import Pipe, create_default_args
 from pippy.IR import MultiUseParameterConfig
-from pippy.hf import PiPPyHFTracer
+from pippy.hf import PiPPyHFTracer, bert, gpt2, t5
 
 from typing import Optional, Dict, Any, List
 from transformers import (
     AutoConfig,
     AutoModelForPreTraining,
-    AutoModelForMaskedLM,
     AutoModelForCausalLM,
     AutoModelForImageClassification,
 )
+from oobleck.execution.sharding import vit_add_split_points, resnet_add_split_points
 
 # Oobleck has been tested only with the following models.
 lang_models = ["gpt2", "t5", "bert", "bloom"]
@@ -53,7 +53,6 @@ class OobleckModel:
         if config_args is None:
             config_args = {}
         config_args["use_cache"] = False
-        # config_args["return_dict"] = False
         config_args["remove_unused_columns"] = False
 
         model_config = AutoConfig.from_pretrained(model_name, **config_args)
@@ -65,18 +64,23 @@ class OobleckModel:
 
         assert model, f"Given model {model_name} is not supported yet."
 
+        if "gpt" in model_name:
+            gpt2.add_split_points(model, 1)
+        elif "t5" in model_name:
+            t5.add_split_points(model, 1)
+        elif "bert" in model_name:
+            bert.add_split_points(model, 1)
+        elif "vit" in model_name:
+            vit_add_split_points(model)
+        elif "resnet" in model_name:
+            resnet_add_split_points(model)
+
         concrete_args = create_default_args(model, except_keys=trace_input_names)
-
-        from transformers.utils.fx import symbolic_trace
-
-        # model = symbolic_trace(model, input_names=trace_input_names)
         model = Pipe.from_tracing(
             model,
             MultiUseParameterConfig.REPLICATE,
             tracer=PiPPyHFTracer(),
             concrete_args=concrete_args,
         )
-
-        # TODO: split model!
 
         self.model = model
