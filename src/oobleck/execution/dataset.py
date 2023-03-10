@@ -31,7 +31,7 @@ class OobleckDataset:
         self,
         model_name: str,
         dataset_path: str,
-        dataset_name: Optional[str],
+        dataset_name: Optional[str] = None,
     ):
         # TODO: replace it with evaluate.load("accuracy")
         metric = load_metric("accuracy")
