@@ -3,12 +3,14 @@ import math
 from typing import List, Tuple
 from deepspeed.utils.logging import logger
 
+from oobleck.execution.model import OobleckModel
+
 
 class StageExecutionSpec:
-    def __init__(self, layer_start_index: int, layer_end_indx: int, num_gpus: int):
+    def __init__(self, layer_start_index: int, layer_end_index: int, ranks: List[int]):
         self.layer_start_index = layer_start_index
-        self.layer_end_index = layer_end_indx
-        self.num_gpus = num_gpus
+        self.layer_end_index = layer_end_index
+        self.ranks = ranks
 
     def get_layer_indices(self) -> Tuple[int, int]:
         return self.layer_start_index, self.layer_end_index
@@ -32,11 +34,42 @@ class PipelineSpec:
         self.num_nodes = num_nodes
         self.num_gpus_per_node = num_gpus_per_node
 
-    def create_optimal_plan(self) -> List[StageExecutionSpec]:
+    # TODO: move to planner part
+    def create_optimal_plan(
+        self, target_model: OobleckModel
+    ) -> List[StageExecutionSpec]:
         """Create an optimal execution plan with the given number of GPUs
         using profiled execution information.
+
+        Current Alpha-level implementation: divide layers individually.
+        Number of stages is equal to the number of nodes.
         """
-        pass
+        num_layer_per_node = target_model.model.num_stages // self.num_nodes
+        num_layers = [num_layer_per_node] * self.num_nodes
+        if num_layer_per_node * self.num_nodes < target_model.model.num_stages:
+            num_layers[-1] += (
+                target_model.model.num_stages - num_layer_per_node * self.num_nodes
+            )
+
+        stage_specs = []
+        sum = 0
+        for i, num_layer in enumerate(num_layers):
+            for local_rank in range(self.num_gpus_per_node):
+                end_index = (
+                    target_model.model.num_stages
+                    if num_layer == num_layers[-1]
+                    else sum + num_layer
+                )
+
+                stage_specs.append(
+                    StageExecutionSpec(
+                        sum, end_index, [(i * self.num_gpus_per_node + local_rank)]
+                    )
+                )
+
+            sum += num_layer
+
+        return stage_specs
 
 
 class PipelineSpecs:
@@ -95,7 +128,7 @@ class PipelineSpecs:
         """Return required number of heterogeneous pipelines that
         a linear of combination of the pipelines fills num_nodes.
 
-        Current Alpa-level implementation: always prefer smaller pipelines.
+        Current Alpha-level implementation: always prefer smaller pipelines.
         TODO: analyze the best optimal combination that has the highest throughput.
 
         Args:
