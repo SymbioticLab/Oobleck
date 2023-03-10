@@ -12,17 +12,19 @@ from transformers import TrainingArguments
 class OobleckSampler(Sampler[T_co]):
     def __init__(
         self,
-        num_samples: int,
+        dataset: Dataset,
         microbatch_size: int,
         consumed_samples: int = 0,
         epoch: int = 0,
         shuffle: bool = True,
         seed: int = 0,
     ):
-        self.num_samples = num_samples
+        self.num_samples = len(dataset)
         self.microbatch_size = microbatch_size
         self.num_microbatches = 4  # TODO: modify it
-        self.total_bucket_size = self.microbatch_size * self.num_microbatches
+        self.total_bucket_size = (
+            self.microbatch_size * self.num_microbatches
+        )  # TODO: modify it
         self.consumed_samples = consumed_samples
         self.epoch = epoch
 
@@ -53,6 +55,9 @@ class OobleckDataLoader(DataLoader):
     def __init__(
         self, dataset: Dataset, collate_fn: _collate_fn_t, args: TrainingArguments
     ):
+        assert isinstance(
+            dataset, Dataset
+        ), f"dataset type must be datasets.Dataset. Given: {type(dataset)}"
         sampler = OobleckSampler(dataset, args.per_device_train_batch_size)
 
         super().__init__(

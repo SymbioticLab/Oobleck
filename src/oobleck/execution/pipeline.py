@@ -5,7 +5,7 @@ from types import MethodType
 
 from torch.distributed import ProcessGroup
 from deepspeed import comm as dist
-from deepspeed.utils import logger, instrument_w_nvtx
+from deepspeed.utils import logger, instrument_w_nvtx, RepeatingLoader
 from deepspeed.runtime.pipe import schedule, p2p
 from deepspeed.monitor.monitor import MonitorMaster
 from deepspeed.monitor.config import get_monitor_config
@@ -226,6 +226,22 @@ class PipelineCommunicationMixin(object):
         pass
 
 
+# A map of PipeInstruction types to methods. Each method will be executed with the
+# kwargs provided to the PipeInstruction from the scheduler.
+INSTRUCTION_MAP = {
+    schedule.OptimizerStep: PipelineExecutionMixin.optimizer_step,
+    schedule.ReduceGrads: PipelineCommunicationMixin.reduce_gradients,
+    schedule.ReduceTiedGrads: PipelineCommunicationMixin.reduce_tied_gradients,
+    schedule.LoadMicroBatch: PipelineExecutionMixin.load_microbatch,
+    schedule.ForwardPass: PipelineExecutionMixin.forward_pass,
+    schedule.BackwardPass: PipelineExecutionMixin.backward_pass,
+    schedule.SendActivation: PipelineCommunicationMixin.send_activation,
+    schedule.RecvActivation: PipelineCommunicationMixin.recv_activation,
+    schedule.SendGrad: PipelineCommunicationMixin.send_gradients,
+    schedule.RecvGrad: PipelineCommunicationMixin.recv_gradients,
+}
+
+
 class Pipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
     """
     A realization of :class:`oobleck.planning.pipeline_spec.PipelineSpec`.
@@ -242,7 +258,7 @@ class Pipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         training_args: TrainingArguments,
     ):
         assert spec.num_nodes == dist.get_world_size(process_group), (
-            f"PipelineSpec (# nodes: {len(spec.num_nodes)}) does not match with "
+            f"PipelineSpec (# nodes: {spec.num_nodes}) does not match with "
             f"the given ProcessGroup size ({dist.get_world_size(process_group)})"
         )
 
@@ -265,6 +281,7 @@ class Pipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
 
         self.model = model
         self.dataloader = dataloader
+        self.data_iterator = iter(self.dataloader)
 
         self.training_args = training_args
         if dist.get_rank() == 0:
@@ -274,7 +291,7 @@ class Pipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
                         "tensorboard": {
                             "enabled": True,
                             "output_path": "/tmp/oobleck/tensorboard/",
-                            "job_name": f"{self.model_name}-{datetime.now().strftime('%m-%d-%Y,%H:%M:%S')}",
+                            "job_name": f"{self.model.model_name}-{datetime.now().strftime('%m-%d-%Y,%H:%M:%S')}",
                         }
                     }
                 )
@@ -297,21 +314,6 @@ class Pipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
     def is_last_stage(self):
         return self.layer_end_index == self.total_num_layers - 1
 
-    # A map of PipeInstruction types to methods. Each method will be executed with the
-    # kwargs provided to the PipeInstruction from the scheduler.
-    _INSTRUCTION_MAP = {
-        schedule.OptimizerStep: PipelineExecutionMixin.optimizer_step,
-        schedule.ReduceGrads: PipelineCommunicationMixin.reduce_gradients,
-        schedule.ReduceTiedGrads: PipelineCommunicationMixin.reduce_tied_gradients,
-        schedule.LoadMicroBatch: PipelineExecutionMixin.load_microbatch,
-        schedule.ForwardPass: PipelineExecutionMixin.forward_pass,
-        schedule.BackwardPass: PipelineExecutionMixin.backward_pass,
-        schedule.SendActivation: PipelineCommunicationMixin.send_activation,
-        schedule.RecvActivation: PipelineCommunicationMixin.recv_activation,
-        schedule.SendGrad: PipelineCommunicationMixin.send_gradients,
-        schedule.RecvGrad: PipelineCommunicationMixin.recv_gradients,
-    }
-
     def _exec_schedule(self, pipe_schedule: schedule.PipeSchedule):
         # Reserve and reset buffers.
         self._reserve_pipe_buffers(pipe_schedule.num_pipe_buffers())
@@ -321,14 +323,14 @@ class Pipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         for step_cmds in pipe_schedule:
             # For each instruction in the step
             for cmd in step_cmds:
-                if type(cmd) not in self._INSTRUCTION_MAP:
+                if type(cmd) not in INSTRUCTION_MAP:
                     raise RuntimeError(
                         f"{self.__class__.__name__} does not understand instruction {repr(cmd)}"
                     )
 
                 # Equivalent to: self._exec_forward_pass(buffer_id=0)
-                _exec_instr = MethodType(self._INSTRUCTION_MAP[type(cmd)], self)
-                _exec_instr(self, **cmd.kwargs)
+                _exec_instr = MethodType(INSTRUCTION_MAP[type(cmd)], self)
+                _exec_instr(**cmd.kwargs)
 
 
 if __name__ == "__main__":
@@ -342,7 +344,9 @@ if __name__ == "__main__":
     from transformers import TrainingArguments
 
     args = TrainingArguments(output_dir="/tmp/output")
-    dataloader = OobleckDataLoader(dataset, dataset.data_collator, args)
+    train_dataloader = RepeatingLoader(
+        OobleckDataLoader(dataset.dataset["train"], dataset.data_collator, args)
+    )
 
     from oobleck.planning.pipeline_spec import PipelineSpec
 
@@ -366,5 +370,5 @@ if __name__ == "__main__":
 
     from oobleck.execution.pipeline import Pipeline
 
-    pipeline = Pipeline(pipe_spec, model, dataloader, pg, args)
+    pipeline = Pipeline(pipe_spec, model, train_dataloader, pg, args)
     pipeline.train()

@@ -112,6 +112,7 @@ dependencies = [ # Optional
     "etcd3",
     "rpyc",
     "psutil",
+    "tensorboard",
 ]
 
 # List additional groups of dependencies here (e.g. development

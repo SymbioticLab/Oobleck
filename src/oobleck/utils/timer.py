@@ -38,10 +38,10 @@ class OobleckTimer(SynchronizedWallClockTimer):
 
 def measure_time(func: Callable):
     def wrapper(s, *args, **kwargs):
-        if s.wall_clock_breakdown and s.timers:
+        if s.training_args.should_log and s.timers:
             s.timers(func.__name__).start()
         result = func(self=s, *args, **kwargs)
-        if s.wall_clock_breakdown and s.timers:
+        if s.training_args.should_log and s.timers:
             s.timers(func.__name__).stop()
         return result
 
