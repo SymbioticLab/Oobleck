@@ -16,6 +16,8 @@ from oobleck.utils.timer import OobleckTimer, measure_time
 
 class PipelineExecutionMixin(object):
     def __init__(self):
+        super().__init__()
+
         # stores the loss for the current microbatch being processed
         self.loss = torch.tensor(0.0).to(self.device)
 
@@ -35,6 +37,7 @@ class PipelineExecutionMixin(object):
     @instrument_w_nvtx
     @measure_time
     def load_microbatch(self, buffer_id: int):
+        logger.info(__name__)
         batch = next(self.data_iterator)
 
         if self.is_first_stage():
@@ -72,6 +75,7 @@ class PipelineExecutionMixin(object):
     @instrument_w_nvtx
     @measure_time
     def forward_pass(self, buffer_id: int):
+        logger.info(__name__)
         # Prepare inputs
         if isinstance(self.pipe_buffers["inputs"][buffer_id], tuple):
             inputs = tuple(t.clone() for t in self.pipe_buffers["inputs"][buffer_id])
@@ -110,6 +114,7 @@ class PipelineExecutionMixin(object):
     @instrument_w_nvtx
     @measure_time
     def backward_pass(self, buffer_id: int):
+        logger.info(__name__)
         loss = self.loss
 
         if self.is_last_stage():
@@ -145,6 +150,7 @@ class PipelineExecutionMixin(object):
     @instrument_w_nvtx
     @measure_time
     def optimizer_step(self, lr_kwargs=None):
+        logger.info(__name__)
         # amp enable check: gradient clipping
         self.optimizer_step()
 
@@ -157,6 +163,8 @@ class PipelineExecutionMixin(object):
 
 class PipelineCommunicationMixin(object):
     def __init__(self):
+        super().__init__()
+        
         self.num_pipe_buffers = 0
         self.pipe_buffers = {
             "inputs": [],  # batch input and received activations
@@ -170,26 +178,46 @@ class PipelineCommunicationMixin(object):
         self.first_output_send = True
         self.first_gradient_send = True
 
+    def _reserve_pipe_buffers(self, num_buffers):
+        """Ensure that each pipeline buffer has at least ``num_buffers`` slots.
+        This method only reserves slots and does not allocate tensors.
+        Args:
+            num_buffers (int): The number of buffers to reserve.
+        """
+        if self.num_pipe_buffers >= num_buffers:
+            return
+
+        num_added = num_buffers - self.num_pipe_buffers
+        for key in self.pipe_buffers:
+            self.pipe_buffers[key].extend([None] * num_added)
+        self.num_pipe_buffers = num_buffers
+
     @instrument_w_nvtx
     @measure_time
     def reduce_gradients(self):
+        logger.info(__name__)
         pass
 
     @instrument_w_nvtx
     @measure_time
     def reduce_tied_gradients(self):
+        logger.info(__name__)
         pass
 
     def send_activation(self, buffer_id: int):
+        logger.info(__name__)
         pass
 
     def recv_activation(self, buffer_id: int):
+        logger.info(__name__)
         pass
 
     def send_gradients(self, buffer_id: int):
+        logger.info(__name__)
         pass
 
     def recv_gradients(self, buffer_id: int):
+        logger.info(__name__)
         pass
 
 
@@ -222,9 +250,10 @@ class Pipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         stage_spec = next(filter(lambda s: self.local_rank in s.ranks, self.plan))
         self.layer_start_index, self.layer_end_index = stage_spec.get_layer_indices()
         self.model_layers = [self.model.model.split_gm.children()][
-            self.layer_start_index:self.layer_end_index
+            self.layer_start_index : self.layer_end_index
         ]
         self.total_num_layers = len([self.model.model.split_gm.children()])
+        self.total_num_stages = len(self.plan)
 
         super().__init__()
 
@@ -269,3 +298,48 @@ class Pipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
                 # Equivalent to: self._exec_forward_pass(buffer_id=0)
                 _exec_instr = MethodType(self._INSTRUCTION_MAP[type(cmd)], self)
                 _exec_instr(self, **cmd.kwargs)
+
+
+if __name__ == "__main__":
+    from oobleck.execution.dataset import OobleckDataset
+    from oobleck.execution.model import OobleckModel
+
+    dataset = OobleckDataset("gpt2", "wikitext", "wikitext-2-raw-v1")
+    model = OobleckModel("gpt2", dataset.trace_input_names)
+
+    from oobleck.execution.dataloader import OobleckDataLoader
+    from transformers import TrainingArguments
+
+    args = TrainingArguments(output_dir="/tmp/output")
+    dataloader = OobleckDataLoader(dataset, dataset.data_collator, args)
+
+    from oobleck.planning.pipeline_spec import PipelineSpec
+
+    pipe_spec = PipelineSpec(2, 1)
+
+    import os
+    from deepspeed import comm as dist
+
+    os.environ["RANK"] = "1"
+    os.environ["LOCAL_RANK"] = "1"
+    os.environ["WORLD_SIZE"] = "2"
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "6900"
+
+    # if dist is already initialized, destroy it.
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+    dist.init_distributed("nccl")
+    pg = dist.new_group([0, 1])
+
+    from oobleck.execution.pipeline import Pipeline
+
+    pipeline = Pipeline(pipe_spec, model, dataloader, pg)
+
+    from deepspeed.runtime.pipe import schedule
+
+    schd = schedule.TrainSchedule(
+        args.per_device_train_batch_size, pipeline.total_num_stages, 0
+    )
+    pipeline._exec_schedule(schd)
