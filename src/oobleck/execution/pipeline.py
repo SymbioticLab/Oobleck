@@ -1,17 +1,22 @@
 import torch
 
+from datetime import datetime
 from types import MethodType
 
 from torch.distributed import ProcessGroup
 from deepspeed import comm as dist
 from deepspeed.utils import logger, instrument_w_nvtx
 from deepspeed.runtime.pipe import schedule, p2p
+from deepspeed.monitor.monitor import MonitorMaster
+from deepspeed.monitor.config import get_monitor_config
 
 from oobleck.execution.dataloader import OobleckDataLoader
 from oobleck.execution.model import OobleckModel
 from oobleck.execution.utils import zero_grads
 from oobleck.planning.pipeline_spec import PipelineSpec
 from oobleck.utils.timer import OobleckTimer, measure_time
+
+from transformers import TrainingArguments
 
 
 class PipelineExecutionMixin(object):
@@ -164,7 +169,7 @@ class PipelineExecutionMixin(object):
 class PipelineCommunicationMixin(object):
     def __init__(self):
         super().__init__()
-        
+
         self.num_pipe_buffers = 0
         self.pipe_buffers = {
             "inputs": [],  # batch input and received activations
@@ -234,6 +239,7 @@ class Pipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         model: OobleckModel,
         dataloader: OobleckDataLoader,
         process_group: ProcessGroup,
+        training_args: TrainingArguments,
     ):
         assert spec.num_nodes == dist.get_world_size(process_group), (
             f"PipelineSpec (# nodes: {len(spec.num_nodes)}) does not match with "
@@ -259,6 +265,23 @@ class Pipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
 
         self.model = model
         self.dataloader = dataloader
+
+        self.training_args = training_args
+        if dist.get_global_rank() == 0:
+            self.monitor = MonitorMaster(
+                get_monitor_config(
+                    {
+                        "tensorboard": {
+                            "enabled": True,
+                            "output_path": "/tmp/oobleck/tensorboard/",
+                            "job_name": f"{self.model_name}-{datetime.now().strftime('%m-%d-%Y,%H:%M:%S')}",
+                        }
+                    }
+                )
+            )
+            self.timers = OobleckTimer(self.monitor)
+        else:
+            self.timers = None
 
     def is_first_stage(self):
         return self.layer_start_index == 0
