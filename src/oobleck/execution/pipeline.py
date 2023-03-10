@@ -267,7 +267,7 @@ class Pipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         self.dataloader = dataloader
 
         self.training_args = training_args
-        if dist.get_global_rank() == 0:
+        if dist.get_rank() == 0:
             self.monitor = MonitorMaster(
                 get_monitor_config(
                     {
@@ -282,6 +282,14 @@ class Pipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
             self.timers = OobleckTimer(self.monitor)
         else:
             self.timers = None
+
+    def train(self):
+        train_schedule = schedule.TrainSchedule(
+            self.training_args.per_device_train_batch_size,
+            self.total_num_stages,
+            self.local_rank,
+        )
+        self._exec_schedule(train_schedule)
 
     def is_first_stage(self):
         return self.layer_start_index == 0
@@ -358,11 +366,5 @@ if __name__ == "__main__":
 
     from oobleck.execution.pipeline import Pipeline
 
-    pipeline = Pipeline(pipe_spec, model, dataloader, pg)
-
-    from deepspeed.runtime.pipe import schedule
-
-    schd = schedule.TrainSchedule(
-        args.per_device_train_batch_size, pipeline.total_num_stages, 0
-    )
-    pipeline._exec_schedule(schd)
+    pipeline = Pipeline(pipe_spec, model, dataloader, pg, args)
+    pipeline.train()
