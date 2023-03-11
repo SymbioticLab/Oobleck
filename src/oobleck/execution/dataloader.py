@@ -1,15 +1,14 @@
 import torch
 
-from torch.utils.data import Sampler, DataLoader
-from torch.utils.data.dataset import T_co
+from torch.utils.data import BatchSampler, DataLoader
 from torch.utils.data.dataloader import _collate_fn_t
 from datasets import Dataset
-from typing import Iterator
+from typing import Iterator, List
 
 from transformers import TrainingArguments
 
 
-class OobleckSampler(Sampler[T_co]):
+class OobleckSampler(BatchSampler):
     def __init__(
         self,
         dataset: Dataset,
@@ -31,7 +30,7 @@ class OobleckSampler(Sampler[T_co]):
         self.shuffle = shuffle
         self.seed = seed
 
-    def __iter__(self) -> Iterator[T_co]:
+    def __iter__(self) -> Iterator[List[int]]:
         if self.shuffle:
             # deterministically shuffle based on epoch and seed
             g = torch.Generator()
@@ -50,15 +49,22 @@ class OobleckSampler(Sampler[T_co]):
 
             self.consumed_samples += self.total_bucket_size
 
+    def __len__(self) -> int:
+        return self.num_samples // self.total_bucket_size
+
 
 class OobleckDataLoader(DataLoader):
     def __init__(
-        self, dataset: Dataset, collate_fn: _collate_fn_t, args: TrainingArguments
+        self,
+        dataset: Dataset,
+        batch_size: int,
+        collate_fn: _collate_fn_t,
+        args: TrainingArguments,
     ):
         assert isinstance(
             dataset, Dataset
         ), f"dataset type must be datasets.Dataset. Given: {type(dataset)}"
-        sampler = OobleckSampler(dataset, args.per_device_train_batch_size)
+        sampler = OobleckSampler(dataset, batch_size)
 
         super().__init__(
             dataset,
