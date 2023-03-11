@@ -1,4 +1,3 @@
-import torch
 from deepspeed import comm as dist
 
 from typing import Optional, Dict, Any, List
@@ -8,7 +7,7 @@ from transformers import (
     AutoModelForCausalLM,
     AutoModelForImageClassification,
 )
-from oobleck.planning.sharding import get_split_points, shard_model
+from oobleck.module.sharding import get_split_points, shard_model
 
 # Oobleck has been tested only with the following models.
 lang_models = ["gpt2", "t5", "bert", "bloom"]
