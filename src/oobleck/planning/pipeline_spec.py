@@ -3,7 +3,7 @@ import math
 from typing import List, Tuple
 from deepspeed.utils.logging import logger
 
-from oobleck.execution.model import OobleckModel
+from oobleck.module.model import OobleckModel
 
 
 class StageExecutionSpec:
@@ -44,28 +44,27 @@ class PipelineSpec:
         Current Alpha-level implementation: divide layers individually.
         Number of stages is equal to the number of nodes.
         """
-        num_layer_per_node = target_model.model.num_stages // self.num_nodes
+        num_layer_per_node = len(target_model.model) // self.num_nodes
+        # num_layers: number of layers that are assigned to each stage.
         num_layers = [num_layer_per_node] * self.num_nodes
-        if num_layer_per_node * self.num_nodes < target_model.model.num_stages:
+        if num_layer_per_node * self.num_nodes < len(target_model.model):
             num_layers[-1] += (
-                target_model.model.num_stages - num_layer_per_node * self.num_nodes
+                len(target_model.model) - num_layer_per_node * self.num_nodes
             )
 
         stage_specs = []
         sum = 0
-        for i, num_layer in enumerate(num_layers):
-            for local_rank in range(self.num_gpus_per_node):
-                end_index = (
-                    target_model.model.num_stages
-                    if num_layer == num_layers[-1]
-                    else sum + num_layer
+        for i, (node_id, num_layer) in enumerate(
+            zip(range(self.num_nodes), num_layers)
+        ):
+            end_index = sum + num_layer
+            stage_specs.append(
+                StageExecutionSpec(
+                    sum,
+                    end_index,
+                    list(range(i * node_id, i * node_id + self.num_gpus_per_node)),
                 )
-
-                stage_specs.append(
-                    StageExecutionSpec(
-                        sum, end_index, [(i * self.num_gpus_per_node + local_rank)]
-                    )
-                )
+            )
 
             sum += num_layer
 
