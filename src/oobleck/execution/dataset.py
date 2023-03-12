@@ -2,7 +2,7 @@ import numpy as np
 
 import torch
 from itertools import chain
-from typing import Optional, Tuple, Dict, List, Iterator, Any, Type
+from typing import Optional, Tuple, Dict, List, Any, Type
 from transformers import AutoTokenizer, AutoImageProcessor
 from transformers.data.data_collator import default_data_collator
 from transformers.tokenization_utils import PreTrainedTokenizer
@@ -18,7 +18,7 @@ from torchvision.transforms import (
 )
 from datasets import Dataset, load_dataset, load_metric
 
-from oobleck.execution.model import lang_models, image_models
+from oobleck.module.model import lang_models, image_models
 
 
 class OobleckDataset:
