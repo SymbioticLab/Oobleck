@@ -1,5 +1,4 @@
 import torch
-import pippy
 
 from datetime import datetime
 from types import MethodType
@@ -90,11 +89,7 @@ class PipelineExecutionMixin(object):
     @measure_time
     def forward_pass(self, buffer_id: int):
         logger.info(__name__)
-        # # Prepare inputs
-        # if isinstance(self.pipe_buffers["inputs"][buffer_id], tuple):
-        #     inputs = tuple(t.clone() for t in self.pipe_buffers["inputs"][buffer_id])
-        # else:
-        #     inputs = self.pipe_buffers["inputs"][buffer_id].clone()
+
         inputs = self.pipe_buffers["inputs"][buffer_id]
         zero_grads(inputs)
 
@@ -242,7 +237,7 @@ class PipelineCommunicationMixin(object):
         @run_once
         def send_activation_meta(buffer: Tuple[torch.Tensor], recv_stage: int):
             """Send activation dimension first to the next stage
-            so that it can initialize buffer.
+            so that it can initialize buffers.
 
             Metadata is communicated in this order:
                 * num_tensors in tensor tuple
