@@ -40,7 +40,7 @@ class PipelineExecutionMixin(object):
 
         self.optimizer = None
 
-    def bfloa16_enabled(self):
+    def bfloat16_enabled(self):
         # TODO: modify this
         return False
 
@@ -56,9 +56,9 @@ class PipelineExecutionMixin(object):
         elif isinstance(data, (tuple, list)):
             return type(data)(self._prepare_input(v) for v in data)
         elif isinstance(data, torch.Tensor):
-            kwargs = {"device": self.device}
+            data = data.clone().detach().to(self.device)
             data.requires_grad = data.is_floating_point()
-            return data.to(**kwargs)
+            return data
         return data
 
     # https://github.com/huggingface/transformers/blob/v4.26.1/src/transformers/trainer.py#L2472
@@ -75,6 +75,10 @@ class PipelineExecutionMixin(object):
     @measure_time
     def load_microbatch(self, buffer_id: int):
         logger.info(__name__)
+        assert (
+            self.is_first_stage() or self.is_last_stage()
+        ), "load_microatch can only be called at either the first stage or the last stage."
+
         batch = next(self.data_iterator)
         labels = {"labels": batch.pop("labels")}
 
@@ -95,9 +99,12 @@ class PipelineExecutionMixin(object):
         # XXX Hack
         # Some tensor might be converted from torch.Size().
         # Convert it to torch.Size so that forward can be executed
-        inputs = tuple(
+        inputs: tuple[Union[torch.Size, torch.Tensor]] = tuple(
             [
-                torch.Size(input.tolist()) if input.dim() == 1 else input
+                torch.Size(input.tolist())
+                if input.dim() == 1
+                and input.data[0] == self.training_args.per_device_train_batch_size
+                else input
                 for input in inputs
             ]
         )
@@ -117,7 +124,7 @@ class PipelineExecutionMixin(object):
             # XXX Hack
             # It might includes torch.Size() in outputs.
             # Convert it to torch.Tensor so that it can be transferred
-            outputs = tuple(
+            outputs: tuple[torch.Tensor] = tuple(
                 [
                     output
                     if torch.is_tensor(output)
@@ -153,17 +160,14 @@ class PipelineExecutionMixin(object):
             loss.backward()
         else:
             output_tensors = self.pipe_buffers["outputs"][buffer_id]
+            output_tensors = tuple([t for t in output_tensors if t.requires_grad])
             grad_tensors = self.grad_recv_buf
 
-            if self.bfloa16_enabled() and not self.is_last_stage():
+            if self.bfloat16_enabled() and not self.is_last_stage():
                 # manually call because we don't call optimizer.backward()
                 self.optimizer.clear_lp_grads()
 
             # Oobleck sharded model always returns tuple with tensors and torch.Size.
-            assert (
-                output_tensors,
-                tuple,
-            ), f"Oobleck should return tuple as an output, but received type: {type(output_tensors)}"
             assert len(output_tensors) == len(grad_tensors)
             torch.autograd.backward(tensors=output_tensors, grad_tensors=grad_tensors)
 
@@ -172,7 +176,6 @@ class PipelineExecutionMixin(object):
                 self.optimizer.update_hp_grads(clear_lp_grads=False)
 
         # Free up memory from the output of forward()
-        self.pipe_buffers["output_tensors"][buffer_id] = None
         self.pipe_buffers["outputs"][buffer_id] = None
         grad_tensors = None
 
@@ -199,7 +202,6 @@ class PipelineCommunicationMixin(object):
             "inputs": [],  # batch input and received activations
             "labels": [],  # labels from batch input
             "outputs": [],  # activations
-            "output_tensors": [],  # tensor object to preserve backward graph
         }
 
         # initialized in :func:`oobleck.execution.PipelineCommunicationMixin.recv_activations`.
@@ -251,82 +253,82 @@ class PipelineCommunicationMixin(object):
         logger.info(__name__)
         pass
 
+    @run_once
+    def _send_activation_meta(self, buffer: Tuple[torch.Tensor], receiver_rank: int):
+        """Send activation dimension first to the next stage
+        so that it can initialize buffers.
+
+        Metadata is communicated in this order:
+            * num_tensors in tensor tuple
+            foreeach tensor in buffer:
+                * ndims
+                * dtype
+                * shape
+        """
+        assert isinstance(buffer, tuple), f"Could not send meta type {type(buffer)}."
+        count_tensor = torch.LongTensor(data=[len(buffer)]).to(self.device)
+        self._send(count_tensor, receiver_rank)
+        for tensor in buffer:
+            assert isinstance(tensor, torch.Tensor)
+            send_ndims = torch.LongTensor(data=[len(tensor.size())]).to(self.device)
+            send_dtype = torch.LongTensor(data=[DTYPE_TO_ID[tensor.dtype]]).to(
+                self.device
+            )
+            send_shape = torch.LongTensor(data=tensor.size()).to(self.device)
+            self._send(send_ndims, receiver_rank)
+            self._send(send_dtype, receiver_rank)
+            self._send(send_shape, receiver_rank)
+
     @measure_time
     def send_activations(self, buffer_id: int):
         logger.info(__name__)
 
-        @run_once
-        def send_activation_meta(buffer: Tuple[torch.Tensor], recv_stage: int):
-            """Send activation dimension first to the next stage
-            so that it can initialize buffers.
-
-            Metadata is communicated in this order:
-                * num_tensors in tensor tuple
-                foreeach tensor in buffer:
-                    * ndims
-                    * dtype
-                    * shape
-            """
-            assert isinstance(
-                buffer, tuple
-            ), f"Could not send meta type {type(buffer)}."
-            count_tensor = torch.LongTensor(data=[len(buffer)]).to(self.device)
-            self._send(count_tensor, recv_stage)
-            for tensor in buffer:
-                assert isinstance(tensor, torch.Tensor)
-                send_ndims = torch.LongTensor(data=[len(tensor.size())]).to(self.device)
-                send_dtype = torch.LongTensor(data=[DTYPE_TO_ID[tensor.dtype]]).to(
-                    self.device
-                )
-                send_shape = torch.LongTensor(data=tensor.size()).to(self.device)
-                self._send(send_ndims, recv_stage)
-                self._send(send_dtype, recv_stage)
-                self._send(send_shape, recv_stage)
-
         outputs: Tuple[torch.Tensor] = self.pipe_buffers["outputs"][buffer_id]
-        send_activation_meta(outputs, self.next_rank)
+        self._send_activation_meta(outputs, self.next_rank)
+
+        logger.info("all activation meta sent")
 
         assert isinstance(outputs, tuple)
         for buffer in outputs:
             assert isinstance(buffer, torch.Tensor)
             self._send(buffer, self.next_rank)
 
+    def _create_receive_buffer(self, sender_rank: int) -> Tuple[torch.Tensor]:
+        """Receive metadata about upcoming p2p transfers and return allocated buffer.
+
+        Metadata is communicated in this order:
+            * num_tensors in tensor tuple
+            foreeach tensor in buffer:
+                * ndims
+                * shape
+                * dtype
+        """
+        if self.activation_recv_buf:
+            return self.activation_recv_buf
+
+        count_tensor = torch.LongTensor(data=[0]).to(self.device)
+        self._recv(count_tensor, sender_rank)
+        num_tensors = count_tensor.item()
+        buffers: List[torch.Tensor] = []
+        for _ in range(num_tensors):
+            recv_ndims = torch.LongTensor(data=[0]).to(self.device)
+            recv_dtype = torch.LongTensor(data=[0]).to(self.device)
+            self._recv(recv_ndims, sender_rank)
+            self._recv(recv_dtype, sender_rank)
+            recv_dtype = ID_TO_DTYPE[recv_dtype.item()]
+            recv_shape = torch.LongTensor([1] * recv_ndims).to(self.device)
+            self._recv(recv_shape, sender_rank)
+            recv_ndims = recv_ndims.item()
+            buffers.append(
+                torch.zeros(recv_shape.tolist(), device=self.device, dtype=recv_dtype)
+            )
+        return tuple(buffers)
+
     @measure_time
     def recv_activations(self, buffer_id: int):
         logger.info(__name__)
 
-        def create_receive_buffer(send_stage: int) -> Tuple[torch.Tensor]:
-            """Receive metadata about upcoming p2p transfers and return allocated buffer.
-
-            Metadata is communicated in this order:
-                * num_tensors in tensor tuple
-                foreeach tensor in buffer:
-                    * ndims
-                    * shape
-                    * dtype
-            """
-            count_tensor = torch.LongTensor(data=[0]).to(self.device)
-            self._recv(count_tensor, send_stage)
-            num_tensors = count_tensor.item()
-            buffers: List[torch.Tensor] = []
-            for _ in range(num_tensors):
-                recv_ndims = torch.LongTensor(data=[0]).to(self.device)
-                recv_dtype = torch.LongTensor(data=[0]).to(self.device)
-                self._recv(recv_ndims, send_stage)
-                self._recv(recv_dtype, send_stage)
-                recv_dtype = ID_TO_DTYPE[recv_dtype.item()]
-                recv_shape = torch.LongTensor([1] * recv_ndims).to(self.device)
-                self._recv(recv_shape, send_stage)
-                recv_ndims = recv_ndims.item()
-                buffers.append(
-                    torch.zeros(
-                        recv_shape.tolist(), device=self.device, dtype=recv_dtype
-                    )
-                )
-            return tuple(buffers)
-
-        if self.activation_recv_buf is None:
-            self.activation_recv_buf = create_receive_buffer(self.prev_rank)
+        self.activation_recv_buf = self._create_receive_buffer(self.prev_rank)
 
         assert isinstance(self.activation_recv_buf, tuple)
         recvd: List[Optional[torch.Tensor]] = [None] * len(self.activation_recv_buf)
@@ -347,7 +349,7 @@ class PipelineCommunicationMixin(object):
 
         for buffer in inputs:
             # Skip tensors that will not produce a gradient
-            if not buffer.is_floating_point():
+            if not buffer.requires_grad:
                 assert buffer.grad is None
                 continue
             assert buffer.grad is not None
@@ -367,7 +369,7 @@ class PipelineCommunicationMixin(object):
             buffers: List[torch.Tensor] = []
             for tensor in tensors:
                 assert isinstance(tensor, torch.Tensor)
-                if tensor.is_floating_point():
+                if tensor.requires_grad:
                     buffers.append(torch.zeros_like(tensor))
 
             return buffers
