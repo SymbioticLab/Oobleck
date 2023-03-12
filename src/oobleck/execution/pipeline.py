@@ -7,7 +7,7 @@ from typing import Union, Any, Dict, Mapping, Tuple, List, Optional
 
 from torch.distributed import ProcessGroup, Work
 from deepspeed import comm as dist
-from deepspeed.utils import logger, instrument_w_nvtx, RepeatingLoader
+from deepspeed.utils import logger, instrument_w_nvtx
 from deepspeed.runtime.pipe import schedule
 from deepspeed.monitor.monitor import MonitorMaster
 from deepspeed.monitor.config import get_monitor_config
@@ -610,50 +610,3 @@ class Pipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
                 # Equivalent to: self._exec_forward_pass(buffer_id=0)
                 _exec_instr = MethodType(INSTRUCTION_MAP[type(cmd)], self)
                 _exec_instr(**cmd.kwargs)
-
-
-if __name__ == "__main__":
-    from oobleck.execution.dataset import OobleckDataset
-    from oobleck.module.model import OobleckModel
-
-    dataset = OobleckDataset("gpt2", "wikitext", "wikitext-2-raw-v1")
-    model = OobleckModel("gpt2", dataset.trace_input_names)
-
-    from oobleck.execution.dataloader import OobleckDataLoader
-    from transformers import TrainingArguments
-
-    args = TrainingArguments(output_dir="/tmp/output")
-    train_dataloader = RepeatingLoader(
-        OobleckDataLoader(
-            dataset.dataset["train"],
-            args.per_device_train_batch_size,
-            dataset.data_collator,
-            args,
-        )
-    )
-
-    from oobleck.planning.pipeline_spec import PipelineSpec
-
-    pipe_spec = PipelineSpec(2, 1)
-
-    import os
-    from deepspeed import comm as dist
-
-    os.environ["RANK"] = "1"
-    os.environ["LOCAL_RANK"] = "1"
-    os.environ["WORLD_SIZE"] = "2"
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "25400"
-
-    # if dist is already initialized, destroy it.
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-    dist.init_distributed("nccl")
-    pg = dist.new_group([0, 1])
-
-    from oobleck.execution.pipeline import Pipeline
-
-    pipeline = Pipeline(pipe_spec, model, train_dataloader, pg, args)
-    for i in range(30):
-        pipeline.train()
