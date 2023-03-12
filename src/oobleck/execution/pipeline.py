@@ -5,6 +5,8 @@ from datetime import datetime
 from types import MethodType
 from typing import Union, Any, Dict, Mapping, Tuple, List, Optional
 
+from torch.utils.checkpoint import checkpoint as checkpoint_fn
+
 from torch.distributed import ProcessGroup, Work
 from deepspeed import comm as dist
 from deepspeed.utils import logger, instrument_w_nvtx, RepeatingLoader
@@ -29,8 +31,23 @@ from transformers import TrainingArguments
 
 
 class PipelineExecutionMixin(object):
+    @staticmethod
+    def is_checkpointable(layer: torch.fx.GraphModule) -> bool:
+        if any(isinstance(m, torch.nn.Embedding) for _, m in layer.named_modules()):
+            return False
+        if next(layer.parameters(), None) is None:
+            return False
+        return True
+
     def __init__(self):
         super().__init__()
+
+        # store checkpointability for each layer
+        for layer in self.model_layers:
+            layer.checkpointable = (
+                not self.is_last_stage()
+                and PipelineExecutionMixin.is_checkpointable(layer)
+            )
 
         # stores the loss for the current microbatch being processed
         self.loss = torch.tensor(0.0).to(self.device)
@@ -127,11 +144,15 @@ class PipelineExecutionMixin(object):
 
         # Execute forward
         for layer in self.model_layers:
-            # add labels in input if it is the last layer:
             if self.is_last_stage() and layer == self.model_layers[-1]:
+                # add labels in input if it is the last layer:
                 inputs = inputs + self.pipe_buffers["labels"][buffer_id]
-            inputs = layer(*inputs)
 
+            if layer.checkpointable:
+                inputs = checkpoint_fn(layer, *inputs)
+            else:
+                inputs = layer(*inputs)
+        
         outputs = inputs
 
         # Optionally compute loss on the last stage
@@ -583,8 +604,8 @@ if __name__ == "__main__":
     import os
     from deepspeed import comm as dist
 
-    os.environ["RANK"] = "0"
-    os.environ["LOCAL_RANK"] = "0"
+    os.environ["RANK"] = "1"
+    os.environ["LOCAL_RANK"] = "1"
     os.environ["WORLD_SIZE"] = "2"
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "25400"

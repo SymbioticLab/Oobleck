@@ -36,13 +36,15 @@ class OobleckTimer(SynchronizedWallClockTimer):
         self.monitor.write_events(strings)
 
 
-def measure_time(func: Callable):
-    def wrapper(s, *args, **kwargs):
-        if s.training_args.should_log and s.timers:
-            s.timers(func.__name__).start()
-        result = func(self=s, *args, **kwargs)
-        if s.training_args.should_log and s.timers:
-            s.timers(func.__name__).stop()
-        return result
+def measure_time(timer_name: str):
+    def inner(func: Callable):
+        def wrapper(s, *args, **kwargs):
+            if s.training_args.should_log and s.timers:
+                s.timers(timer_name).start()
+            result = func(self=s, *args, **kwargs)
+            if s.training_args.should_log and s.timers:
+                s.timers(timer_name).stop()
+            return result
 
-    return wrapper
+        return wrapper
+    return inner
