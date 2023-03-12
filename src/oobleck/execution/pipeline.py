@@ -30,6 +30,68 @@ from oobleck.utils.timer import OobleckTimer, measure_time
 from transformers import TrainingArguments
 
 
+class OobleckPipelineSchedule(schedule.TrainSchedule):
+    """A schedule for training a batch using pipeline parallelism.
+
+    Unlike existing :class:`deepspeed.runtime.pipe.schedule.TrainSchedule`,
+    :class:`OobleckPipelineSchedule` decouples allreduce synchronization and optimizer step
+    from pipeline execution and only schedules computation part and intermediate p2p operations.
+
+    reducing (tied) gradients and optimizer step must be done separately.
+    """
+
+    def steps(self):
+        prev_micro_batch_id = -1
+        total_steps = 2 * (self.micro_batches + self.stages - 1)
+        for step_id in range(total_steps):
+            micro_batch_id, is_forward = self._step_to_micro_batch(step_id)
+
+            if self._valid_micro_batch(prev_micro_batch_id):
+                prev_buffer = self._buffer_idx(prev_micro_batch_id)
+            if self._valid_micro_batch(micro_batch_id):
+                curr_buffer = self._buffer_idx(micro_batch_id)
+
+            cmds = []
+
+            # Exchange activations
+            if is_forward:
+                if self._valid_micro_batch(micro_batch_id) and self._valid_stage(
+                    self.prev_stage
+                ):
+                    cmds.append(schedule.RecvActivation(curr_buffer))
+                if self._valid_micro_batch(prev_micro_batch_id) and self._valid_stage(
+                    self.prev_stage
+                ):
+                    cmds.append(schedule.SendGrad(prev_buffer))
+            else:
+                if self._valid_micro_batch(prev_micro_batch_id) and self._valid_stage(
+                    self.next_stage
+                ):
+                    cmds.append(schedule.SendActivation(prev_buffer))
+                if self._valid_micro_batch(micro_batch_id) and self._valid_stage(
+                    self.next_stage
+                ):
+                    cmds.append(schedule.RecvGrad(curr_buffer))
+
+            # First/last stage loads
+            if self.stage_id == 0 or self.stage_id == self.stages - 1:
+                if is_forward and self._valid_micro_batch(micro_batch_id):
+                    cmds.append(schedule.LoadMicroBatch(curr_buffer))
+
+            # Computation
+            if self._valid_micro_batch(micro_batch_id):
+                if is_forward:
+                    cmds.append(schedule.ForwardPass(curr_buffer))
+                else:
+                    cmds.append(schedule.BackwardPass(curr_buffer))
+
+            # No reduce and optimizer step here at the end of the batch
+
+            # Prepare state for next time
+            prev_micro_batch_id = micro_batch_id
+            yield cmds
+
+
 class PipelineExecutionMixin(object):
     @staticmethod
     def is_checkpointable(layer: torch.fx.GraphModule) -> bool:
@@ -152,7 +214,7 @@ class PipelineExecutionMixin(object):
                 inputs = checkpoint_fn(layer, *inputs)
             else:
                 inputs = layer(*inputs)
-        
+
         outputs = inputs
 
         # Optionally compute loss on the last stage
@@ -521,7 +583,7 @@ class Pipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
             self.timers = None
 
     def train(self):
-        train_schedule = schedule.TrainSchedule(
+        train_schedule = OobleckPipelineSchedule(
             self.training_args.per_device_train_batch_size,
             self.total_num_stages,
             self.local_rank,
@@ -621,5 +683,4 @@ if __name__ == "__main__":
 
     pipeline = Pipeline(pipe_spec, model, train_dataloader, pg, args)
     for i in range(30):
-        logger.info(i)
         pipeline.train()
