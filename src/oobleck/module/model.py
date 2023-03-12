@@ -10,6 +10,8 @@ from transformers import (
 from oobleck.module.sharding import get_split_points, shard_model
 from oobleck.module.layer import Layer
 
+from transformers import TrainingArguments
+
 # Oobleck has been tested only with the following models.
 lang_models = ["gpt2", "t5", "bert", "bloom"]
 image_models = ["vit", "resnet", "clip", "swin"]
@@ -41,6 +43,7 @@ class OobleckModel:
         self,
         model_name: str,
         trace_input_names: List[str],
+        training_args: TrainingArguments,
         config_args: Optional[Dict[str, Any]] = None,
     ):
         assert (
@@ -52,6 +55,7 @@ class OobleckModel:
         config_args["use_cache"] = False
         config_args["remove_unused_columns"] = False
 
+        # Use training_args for fp16/bf16
         model_config = AutoConfig.from_pretrained(model_name, **config_args)
         model = None
         for key, automodel in automodel_dict.items():
@@ -64,4 +68,5 @@ class OobleckModel:
         split_points = get_split_points(model_config)
         sharded_model = shard_model(model, trace_input_names, split_points)
         self.model_name = model_name
-        self.model = [Layer(layer) for layer in sharded_model]
+        self.model = [Layer(layer, training_args) for layer in sharded_model]
+        self.training_args = training_args
