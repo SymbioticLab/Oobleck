@@ -38,7 +38,6 @@ class PipelineExecutionMixin(object):
         self.total_loss = None
         self.agg_loss = torch.tensor(0.0, requires_grad=False).to(self.device)
 
-        self.loss_model = None if self.is_last_stage() else torch.nn.CrossEntropyLoss()
         self.optimizer = None
 
     def bfloa16_enabled(self):
@@ -77,7 +76,7 @@ class PipelineExecutionMixin(object):
     def load_microbatch(self, buffer_id: int):
         logger.info(__name__)
         batch = next(self.data_iterator)
-        labels = batch.pop("labels")
+        labels = {"labels": batch.pop("labels")}
 
         if self.is_first_stage():
             self.pipe_buffers["inputs"][buffer_id] = self._prepare_inputs(batch)
@@ -90,22 +89,44 @@ class PipelineExecutionMixin(object):
     def forward_pass(self, buffer_id: int):
         logger.info(__name__)
 
-        inputs = self.pipe_buffers["inputs"][buffer_id]
+        inputs: tuple[torch.Tensor] = self.pipe_buffers["inputs"][buffer_id]
         zero_grads(inputs)
+
+        # XXX Hack
+        # Some tensor might be converted from torch.Size().
+        # Convert it to torch.Size so that forward can be executed
+        inputs = tuple(
+            [
+                torch.Size(input.tolist()) if input.dim() == 1 else input
+                for input in inputs
+            ]
+        )
 
         # Execute forward
         for layer in self.model_layers:
+            # add labels in input if it is the last layer:
+            if self.is_last_stage() and layer == self.model_layers[-1]:
+                inputs = inputs + self.pipe_buffers["labels"][buffer_id]
             inputs = layer(*inputs)
 
         outputs = inputs
-        self.pipe_buffers["outputs"][buffer_id] = outputs
 
-        # Optionally compute loss on the last device
         if self.is_last_stage():
-            assert self.loss_model
-            # "labels" buffer is filled in `.load_microbatch()` function
-            labels = self.pipe_buffers["labels"][buffer_id]
-            self.loss = self.loss_model(outputs, labels)
+            self.loss = outputs["loss"]
+        else:
+            # XXX Hack
+            # It might includes torch.Size() in outputs.
+            # Convert it to torch.Tensor so that it can be transferred
+            outputs = tuple(
+                [
+                    output
+                    if torch.is_tensor(output)
+                    else torch.LongTensor(data=output).to(self.device)
+                    for output in outputs
+                ]
+            )
+
+            self.pipe_buffers["outputs"][buffer_id] = outputs
 
         if isinstance(self.loss, torch.Tensor):
             self.fwd_outputs.append(self.loss.detach())
@@ -125,14 +146,14 @@ class PipelineExecutionMixin(object):
     @measure_time
     def backward_pass(self, buffer_id: int):
         logger.info(__name__)
-        loss = self.loss
 
         if self.is_last_stage():
+            loss = self.loss
             # TODO: gradient accumulation step scale loss
             loss.backward()
         else:
             output_tensors = self.pipe_buffers["outputs"][buffer_id]
-            grad_tensors = self.grad_layer
+            grad_tensors = self.grad_recv_buf
 
             if self.bfloa16_enabled() and not self.is_last_stage():
                 # manually call because we don't call optimizer.backward()
