@@ -94,7 +94,8 @@ def shard_model(
                 for user, _ in existing_nodes[added_node.name].users.items():
                     if user.op != "output" and user.name not in env:
                         returns.append(added_node)
-            returns = set(returns)
+            # remove duplicate but maintain order
+            returns = list(dict.fromkeys(returns).keys())
 
             with new_graph.inserting_after(prev_node):
                 new_graph.output(tuple(returns))
