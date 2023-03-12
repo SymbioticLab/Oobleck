@@ -49,7 +49,7 @@ class Layer(torch.nn.Module):
         else:
             return self.layer(*args)
 
-    def do_allreduce(
+    def _do_allreduce(
         self, bucket: List[torch.Tensor], process_group: Type[ProcessGroup]
     ):
         tensor: torch.Tensor = self.flatten(bucket)
@@ -87,10 +87,10 @@ class Layer(torch.nn.Module):
                 small_bucket.append(tensor)
                 numel += tensor.numel()
                 if numel > elements_per_buffer:
-                    self.do_allreduce(small_bucket, process_group)
+                    self._do_allreduce(small_bucket, process_group)
                     small_bucket = []
                     numel = 0
 
             # Finish reduce operation if small bucket remains.
             if len(small_bucket) > 0:
-                self.do_allreduce(small_bucket, process_group)
+                self._do_allreduce(small_bucket, process_group)
