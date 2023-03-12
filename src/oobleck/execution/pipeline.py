@@ -1,4 +1,5 @@
 import torch
+import itertools
 
 from datetime import datetime
 from types import MethodType
@@ -10,6 +11,8 @@ from deepspeed.utils import logger, instrument_w_nvtx, RepeatingLoader
 from deepspeed.runtime.pipe import schedule
 from deepspeed.monitor.monitor import MonitorMaster
 from deepspeed.monitor.config import get_monitor_config
+from deepspeed.ops.adam import FusedAdam
+from deepspeed.runtime.lr_schedules import WarmupLR
 
 from oobleck.execution.dataloader import OobleckDataLoader
 from oobleck.module.model import OobleckModel
@@ -32,13 +35,25 @@ class PipelineExecutionMixin(object):
         # stores the loss for the current microbatch being processed
         self.loss = torch.tensor(0.0).to(self.device)
 
-        self.forward_outputs = []
-
         # stores the loss for the entire batch
         self.total_loss = None
         self.agg_loss = torch.tensor(0.0, requires_grad=False).to(self.device)
 
-        self.optimizer = None
+        # TODO: use HF arguments to initialize properly
+        parameters = list(
+            itertools.chain(*[list(layer.parameters()) for layer in self.model_layers])
+        )
+        self.optimizer = FusedAdam(
+            parameters,
+            self.training_args.learning_rate,
+            betas=(self.training_args.adam_beta1, self.training_args.adam_beta2),
+            eps=self.training_args.adam_epsilon,
+            adam_w_mode=True,
+        )
+        num_training_steps = 2000  # TODO: fix this
+        self.lr_scheduler = WarmupLR(
+            self.optimizer, self.training_args.get_warmup_steps(num_training_steps)
+        )
 
     def bfloat16_enabled(self):
         # TODO: modify this
@@ -184,7 +199,7 @@ class PipelineExecutionMixin(object):
     def optimizer_step(self, lr_kwargs=None):
         logger.info(__name__)
         # amp enable check: gradient clipping
-        self.optimizer_step()
+        self.optimizer.step()
 
         overflow = (
             self.optimizer.overflow if hasattr(self.optimizer, "overflow") else False
@@ -450,13 +465,13 @@ class Pipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
             else -1
         )
 
+        self.training_args = training_args
         super().__init__()
 
         self.model = model
         self.dataloader = dataloader
         self.data_iterator = iter(self.dataloader)
 
-        self.training_args = training_args
         if dist.get_rank() == 0:
             self.monitor = MonitorMaster(
                 get_monitor_config(
