@@ -39,6 +39,10 @@ class PipelineExecutionMixin(object):
         self.total_loss = None
         self.agg_loss = torch.tensor(0.0, requires_grad=False).to(self.device)
 
+        self.micro_steps = 0
+        self.global_steps = 0
+        self.global_samples = 0
+
         # TODO: use HF arguments to initialize properly
         parameters = list(
             itertools.chain(*[list(layer.parameters()) for layer in self.model_layers])
@@ -87,9 +91,8 @@ class PipelineExecutionMixin(object):
         return tuple(self._prepare_input(t) for _, t in inputs.items())
 
     @instrument_w_nvtx
-    @measure_time
+    @measure_time("execution_load_microbatch")
     def load_microbatch(self, buffer_id: int):
-        logger.info(__name__)
         assert (
             self.is_first_stage() or self.is_last_stage()
         ), "load_microatch can only be called at either the first stage or the last stage."
@@ -104,10 +107,8 @@ class PipelineExecutionMixin(object):
             self.pipe_buffers["labels"][buffer_id] = self._prepare_inputs(labels)
 
     @instrument_w_nvtx
-    @measure_time
+    @measure_time("execution/forward")
     def forward_pass(self, buffer_id: int):
-        logger.info(__name__)
-
         inputs: tuple[torch.Tensor] = self.pipe_buffers["inputs"][buffer_id]
         zero_grads(inputs)
 
@@ -133,8 +134,19 @@ class PipelineExecutionMixin(object):
 
         outputs = inputs
 
+        # Optionally compute loss on the last stage
         if self.is_last_stage():
             self.loss = outputs["loss"]
+
+            if isinstance(self.loss, torch.Tensor):
+                if self.total_loss is None:
+                    self.total_loss = torch.zeros_like(self.loss)
+                self.total_loss += self.loss.detach()
+            else:
+                if self.total_loss is None:
+                    self.total_loss = [torch.zeros_like(l) for l in self.loss]
+                for idx, l in enumerate(self.loss):
+                    self.total_loss[idx] += l.detach()
         else:
             # XXX Hack
             # It might includes torch.Size() in outputs.
@@ -150,33 +162,19 @@ class PipelineExecutionMixin(object):
 
             self.pipe_buffers["outputs"][buffer_id] = outputs
 
-        if isinstance(self.loss, torch.Tensor):
-            self.fwd_outputs.append(self.loss.detach())
-
-            if self.total_loss is None:
-                self.total_loss = torch.zeros_like(self.loss)
-            self.total_loss += self.loss.detach()
-        else:
-            self.fwd_outputs.append([l.detach() for l in self.loss])
-
-            if self.total_loss is None:
-                self.total_loss = [torch.zeros_like(l) for l in self.loss]
-            for idx, l in enumerate(self.loss):
-                self.total_loss[idx] += l.detach()
-
     @instrument_w_nvtx
-    @measure_time
+    @measure_time("execution/backward")
     def backward_pass(self, buffer_id: int):
-        logger.info(__name__)
-
         if self.is_last_stage():
             loss = self.loss
             # TODO: gradient accumulation step scale loss
             loss.backward()
         else:
-            output_tensors = self.pipe_buffers["outputs"][buffer_id]
+            output_tensors: Tuple[torch.Tensor] = self.pipe_buffers["outputs"][
+                buffer_id
+            ]
             output_tensors = tuple([t for t in output_tensors if t.requires_grad])
-            grad_tensors = self.grad_recv_buf
+            grad_tensors: Tuple[torch.Tensor] = self.grad_recv_buf
 
             if self.bfloat16_enabled() and not self.is_last_stage():
                 # manually call because we don't call optimizer.backward()
@@ -195,9 +193,8 @@ class PipelineExecutionMixin(object):
         grad_tensors = None
 
     @instrument_w_nvtx
-    @measure_time
+    @measure_time("execution/step")
     def optimizer_step(self, lr_kwargs=None):
-        logger.info(__name__)
         # amp enable check: gradient clipping
         self.optimizer.step()
 
@@ -206,6 +203,14 @@ class PipelineExecutionMixin(object):
         )
         if not overflow:
             self.lr_scheduler.step(**(lr_kwargs or {}))
+
+        self.global_steps += 1
+        self.global_samples += 0  # TODO: fix this
+
+        if self.monitor:
+            # TODO :log lr
+            # TODO: log train loss
+            pass
 
 
 class PipelineCommunicationMixin(object):
@@ -257,15 +262,13 @@ class PipelineCommunicationMixin(object):
         )
 
     @instrument_w_nvtx
-    @measure_time
+    @measure_time("comm/reduce_gradients")
     def reduce_gradients(self):
-        logger.info(__name__)
         pass
 
     @instrument_w_nvtx
-    @measure_time
+    @measure_time("cpmm/reduced_tied_gradients")
     def reduce_tied_gradients(self):
-        logger.info(__name__)
         pass
 
     @run_once
@@ -279,6 +282,7 @@ class PipelineCommunicationMixin(object):
                 * ndims
                 * dtype
                 * shape
+                * requires_grad
         """
         assert isinstance(buffer, tuple), f"Could not send meta type {type(buffer)}."
         count_tensor = torch.LongTensor(data=[len(buffer)]).to(self.device)
@@ -290,60 +294,70 @@ class PipelineCommunicationMixin(object):
                 self.device
             )
             send_shape = torch.LongTensor(data=tensor.size()).to(self.device)
+            send_req_grad = torch.LongTensor(
+                data=[1 if tensor.requires_grad else 0]
+            ).to(self.device)
             self._send(send_ndims, receiver_rank)
             self._send(send_dtype, receiver_rank)
             self._send(send_shape, receiver_rank)
+            self._send(send_req_grad, receiver_rank)
 
-    @measure_time
+    @measure_time("comm/send_activations")
     def send_activations(self, buffer_id: int):
-        logger.info(__name__)
-
         outputs: Tuple[torch.Tensor] = self.pipe_buffers["outputs"][buffer_id]
         self._send_activation_meta(outputs, self.next_rank)
-
-        logger.info("all activation meta sent")
 
         assert isinstance(outputs, tuple)
         for buffer in outputs:
             assert isinstance(buffer, torch.Tensor)
             self._send(buffer, self.next_rank)
 
-    def _create_receive_buffer(self, sender_rank: int) -> Tuple[torch.Tensor]:
-        """Receive metadata about upcoming p2p transfers and return allocated buffer.
-
-        Metadata is communicated in this order:
-            * num_tensors in tensor tuple
-            foreeach tensor in buffer:
-                * ndims
-                * shape
-                * dtype
-        """
-        if self.activation_recv_buf:
-            return self.activation_recv_buf
-
-        count_tensor = torch.LongTensor(data=[0]).to(self.device)
-        self._recv(count_tensor, sender_rank)
-        num_tensors = count_tensor.item()
-        buffers: List[torch.Tensor] = []
-        for _ in range(num_tensors):
-            recv_ndims = torch.LongTensor(data=[0]).to(self.device)
-            recv_dtype = torch.LongTensor(data=[0]).to(self.device)
-            self._recv(recv_ndims, sender_rank)
-            self._recv(recv_dtype, sender_rank)
-            recv_dtype = ID_TO_DTYPE[recv_dtype.item()]
-            recv_shape = torch.LongTensor([1] * recv_ndims).to(self.device)
-            self._recv(recv_shape, sender_rank)
-            recv_ndims = recv_ndims.item()
-            buffers.append(
-                torch.zeros(recv_shape.tolist(), device=self.device, dtype=recv_dtype)
-            )
-        return tuple(buffers)
-
-    @measure_time
+    @measure_time("comm/recv_activations")
     def recv_activations(self, buffer_id: int):
-        logger.info(__name__)
+        def create_receive_buffer(sender_rank: int) -> Tuple[torch.Tensor]:
+            """Receive metadata about upcoming p2p transfers and return allocated buffer.
 
-        self.activation_recv_buf = self._create_receive_buffer(self.prev_rank)
+            Metadata is communicated in this order:
+                * num_tensors in tensor tuple
+                foreeach tensor in buffer:
+                    * ndims
+                    * dtype
+                    * shape
+                    * requires_grad
+            """
+            count_tensor = torch.LongTensor(data=[0]).to(self.device)
+            self._recv(count_tensor, sender_rank)
+            num_tensors = count_tensor.item()
+            buffers: List[torch.Tensor] = []
+            for _ in range(num_tensors):
+                recv_ndims = torch.LongTensor(data=[0]).to(self.device)
+                self._recv(recv_ndims, sender_rank)
+                recv_ndims = recv_ndims.item()
+
+                recv_dtype = torch.LongTensor(data=[0]).to(self.device)
+                self._recv(recv_dtype, sender_rank)
+                recv_dtype = ID_TO_DTYPE[recv_dtype.item()]
+
+                recv_shape = torch.LongTensor([1] * recv_ndims).to(self.device)
+                self._recv(recv_shape, sender_rank)
+                recv_shape = recv_shape.tolist()
+
+                recv_req_grad = torch.LongTensor(data=[0]).to(self.device)
+                self._recv(recv_req_grad, sender_rank)
+                recv_req_grad = True if recv_req_grad.item() == 1 else False
+
+                buffers.append(
+                    torch.zeros(
+                        recv_shape,
+                        device=self.device,
+                        dtype=recv_dtype,
+                        requires_grad=recv_req_grad,
+                    )
+                )
+            return tuple(buffers)
+
+        if self.activation_recv_buf is None:
+            self.activation_recv_buf = create_receive_buffer(self.prev_rank)
 
         assert isinstance(self.activation_recv_buf, tuple)
         recvd: List[Optional[torch.Tensor]] = [None] * len(self.activation_recv_buf)
@@ -351,14 +365,12 @@ class PipelineCommunicationMixin(object):
             assert torch.is_tensor(buffer)
             self._recv(buffer, self.prev_rank)
             recvd[idx] = buffer.clone().detach()
-            recvd[idx].requires_grad = recvd[idx].is_floating_point()
+            recvd[idx].requires_grad = buffer.requires_grad
 
         self.pipe_buffers["inputs"][buffer_id] = tuple(recvd)
 
-    @measure_time
+    @measure_time("comm/send_gradients")
     def send_gradients(self, buffer_id: int):
-        logger.info(__name__)
-
         inputs = self.pipe_buffers["inputs"][buffer_id]
         assert isinstance(inputs, tuple)
 
@@ -370,13 +382,11 @@ class PipelineCommunicationMixin(object):
             assert buffer.grad is not None
             self._send(buffer.grad, self.prev_rank)
 
-        # We can free up the input buffer noe
+        # We can free up the input buffer now
         self.pipe_buffers["inputs"][buffer_id] = None
 
-    @measure_time
+    @measure_time("comm/recv_gradients")
     def recv_gradients(self, buffer_id: int):
-        logger.info(__name__)
-
         def create_gradients_buffer(
             tensors: Tuple[torch.Tensor],
         ) -> Tuple[torch.Tensor]:
@@ -486,6 +496,7 @@ class Pipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
             )
             self.timers = OobleckTimer(self.monitor)
         else:
+            self.monitor = None
             self.timers = None
 
     def train(self):
@@ -495,6 +506,30 @@ class Pipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
             self.local_rank,
         )
         self._exec_schedule(train_schedule)
+
+        # TODO: fix this
+        self.agg_train_loss = 0
+
+        if self.timers:
+            self.timers.log(
+                [
+                    "execution/load_microbatch",
+                    "execution/forward",
+                    "execution/backward",
+                    "execution/step",
+                    "comm/reduce_gradients",
+                    "comm/reduced_tied_gradients",
+                    "comm/send_activations",
+                    "comm/recv_activations",
+                    "comm/send_gradients",
+                    "comm/recv_gradients",
+                    "samples/lr",
+                    "samples/train_loss",
+                ],
+                self.global_steps,
+            )
+
+        return self.agg_train_loss
 
     def is_first_stage(self):
         return self.layer_start_index == 0
@@ -564,4 +599,6 @@ if __name__ == "__main__":
     from oobleck.execution.pipeline import Pipeline
 
     pipeline = Pipeline(pipe_spec, model, train_dataloader, pg, args)
-    pipeline.train()
+    for i in range(30):
+        logger.info(i)
+        pipeline.train()
