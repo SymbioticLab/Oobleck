@@ -5,8 +5,6 @@ from datetime import datetime
 from types import MethodType
 from typing import Union, Any, Dict, Mapping, Tuple, List, Optional
 
-from torch.utils.checkpoint import checkpoint as checkpoint_fn
-
 from torch.distributed import ProcessGroup, Work
 from deepspeed import comm as dist
 from deepspeed.utils import logger, instrument_w_nvtx, RepeatingLoader
