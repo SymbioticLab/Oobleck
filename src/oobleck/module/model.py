@@ -8,6 +8,7 @@ from transformers import (
     AutoModelForImageClassification,
 )
 from oobleck.module.sharding import get_split_points, shard_model
+from oobleck.module.layer import Layer
 
 # Oobleck has been tested only with the following models.
 lang_models = ["gpt2", "t5", "bert", "bloom"]
@@ -62,6 +63,5 @@ class OobleckModel:
 
         split_points = get_split_points(model_config)
         sharded_model = shard_model(model, trace_input_names, split_points)
-
         self.model_name = model_name
-        self.model = sharded_model
+        self.model = [Layer(layer) for layer in sharded_model]

@@ -18,6 +18,7 @@ from deepspeed.runtime.lr_schedules import WarmupLR
 
 from oobleck.execution.dataloader import OobleckDataLoader
 from oobleck.module.model import OobleckModel
+from oobleck.module.layer import is_checkpointable
 from oobleck.execution.utils import (
     zero_grads,
     run_once,
@@ -93,22 +94,13 @@ class OobleckPipelineSchedule(schedule.TrainSchedule):
 
 
 class PipelineExecutionMixin(object):
-    @staticmethod
-    def is_checkpointable(layer: torch.fx.GraphModule) -> bool:
-        if any(isinstance(m, torch.nn.Embedding) for _, m in layer.named_modules()):
-            return False
-        if next(layer.parameters(), None) is None:
-            return False
-        return True
-
     def __init__(self):
         super().__init__()
 
         # store checkpointability for each layer
         for layer in self.model_layers:
-            layer.checkpointable = (
-                not self.is_last_stage()
-                and PipelineExecutionMixin.is_checkpointable(layer)
+            layer.set_checkpointable(
+                not self.is_last_stage() and is_checkpointable(layer)
             )
 
         # stores the loss for the current microbatch being processed
@@ -210,10 +202,7 @@ class PipelineExecutionMixin(object):
                 # add labels in input if it is the last layer:
                 inputs = inputs + self.pipe_buffers["labels"][buffer_id]
 
-            if layer.checkpointable:
-                inputs = checkpoint_fn(layer, *inputs)
-            else:
-                inputs = layer(*inputs)
+            inputs = layer(*inputs)
 
         outputs = inputs
 
@@ -343,16 +332,6 @@ class PipelineCommunicationMixin(object):
             if async_op
             else dist.recv(tensor, src_rank, self.process_group)
         )
-
-    @instrument_w_nvtx
-    @measure_time("comm/reduce_gradients")
-    def reduce_gradients(self):
-        pass
-
-    @instrument_w_nvtx
-    @measure_time("cpmm/reduced_tied_gradients")
-    def reduce_tied_gradients(self):
-        pass
 
     @run_once
     def _send_activation_meta(self, buffer: Tuple[torch.Tensor], receiver_rank: int):
@@ -497,8 +476,6 @@ class PipelineCommunicationMixin(object):
 # kwargs provided to the PipeInstruction from the scheduler.
 INSTRUCTION_MAP = {
     schedule.OptimizerStep: PipelineExecutionMixin.optimizer_step,
-    schedule.ReduceGrads: PipelineCommunicationMixin.reduce_gradients,
-    schedule.ReduceTiedGrads: PipelineCommunicationMixin.reduce_tied_gradients,
     schedule.LoadMicroBatch: PipelineExecutionMixin.load_microbatch,
     schedule.ForwardPass: PipelineExecutionMixin.forward_pass,
     schedule.BackwardPass: PipelineExecutionMixin.backward_pass,
@@ -600,8 +577,6 @@ class Pipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
                     "execution/forward",
                     "execution/backward",
                     "execution/step",
-                    "comm/reduce_gradients",
-                    "comm/reduced_tied_gradients",
                     "comm/send_activations",
                     "comm/recv_activations",
                     "comm/send_gradients",
