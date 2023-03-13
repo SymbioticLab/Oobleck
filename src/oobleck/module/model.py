@@ -1,11 +1,13 @@
 from deepspeed import comm as dist
 
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Type
 from transformers import (
     AutoConfig,
     AutoModelForPreTraining,
     AutoModelForCausalLM,
     AutoModelForImageClassification,
+    PretrainedConfig,
+    PreTrainedModel,
 )
 from oobleck.module.sharding import get_split_points, shard_model
 from oobleck.module.layer import Layer
@@ -56,14 +58,18 @@ class OobleckModel:
         config_args["remove_unused_columns"] = False
 
         # Use training_args for fp16/bf16
-        model_config = AutoConfig.from_pretrained(model_name, **config_args)
-        model = None
+        model_config: PretrainedConfig = AutoConfig.from_pretrained(
+            model_name, **config_args
+        )
+        model: Optional[Type[PreTrainedModel]] = None
         for key, automodel in automodel_dict.items():
             if key in model_name:
                 model = automodel.from_config(model_config).to("cuda")
                 break
 
         assert model, f"Given model {model_name} is not supported yet."
+
+        self.total_num_params = sum([p.numel() for p in model.parameters()])
 
         split_points = get_split_points(model_config)
         sharded_model = shard_model(model, trace_input_names, split_points)
