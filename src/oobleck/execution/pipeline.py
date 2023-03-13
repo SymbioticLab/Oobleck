@@ -475,7 +475,7 @@ INSTRUCTION_MAP = {
 }
 
 
-class Pipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
+class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
     """
     A realization of :class:`oobleck.planning.pipeline_spec.PipelineSpec`.
     It includes model to run, communication groups for pipeline execution,
