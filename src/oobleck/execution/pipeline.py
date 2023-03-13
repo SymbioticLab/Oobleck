@@ -3,7 +3,7 @@ import itertools
 
 from datetime import datetime
 from types import MethodType
-from typing import Union, Any, Dict, Mapping, Tuple, List, Optional
+from typing import Union, Any, Dict, Mapping, Tuple, List, Optional, Iterable
 
 from torch.distributed import ProcessGroup, Work
 from deepspeed import comm as dist
@@ -102,11 +102,10 @@ class PipelineExecutionMixin(object):
             )
 
         # stores the loss for the current microbatch being processed
-        self.loss = torch.tensor(0.0).to(self.device)
+        self.loss: Optional[Union[torch.Tensor, Iterable[torch.Tensor]]] = None
 
         # stores the loss for the entire batch
-        self.total_loss = None
-        self.agg_loss = torch.tensor(0.0, requires_grad=False).to(self.device)
+        self.total_loss: Optional[Union[torch.Tensor, Iterable[torch.Tensor]]] = None
 
         self.micro_steps = 0
         self.global_steps = 0
@@ -123,7 +122,7 @@ class PipelineExecutionMixin(object):
             eps=self.training_args.adam_epsilon,
             adam_w_mode=True,
         )
-        num_training_steps = 2000  # TODO: fix this
+        num_training_steps = len(self.dataloader.loader)
         self.lr_scheduler = WarmupLR(
             self.optimizer, self.training_args.get_warmup_steps(num_training_steps)
         )
@@ -216,6 +215,7 @@ class PipelineExecutionMixin(object):
                 if self.total_loss is None:
                     self.total_loss = [torch.zeros_like(l) for l in self.loss]
                 for idx, l in enumerate(self.loss):
+                    assert torch.is_tensor(l)
                     self.total_loss[idx] += l.detach()
         else:
             # XXX Hack
@@ -237,7 +237,6 @@ class PipelineExecutionMixin(object):
     def backward_pass(self, buffer_id: int):
         if self.is_last_stage():
             loss = self.loss
-            # TODO: gradient accumulation step scale loss
             loss.backward()
         else:
             output_tensors: Tuple[torch.Tensor] = self.pipe_buffers["outputs"][
@@ -273,14 +272,6 @@ class PipelineExecutionMixin(object):
         )
         if not overflow:
             self.lr_scheduler.step(**(lr_kwargs or {}))
-
-        self.global_steps += 1
-        self.global_samples += 0  # TODO: fix this
-
-        if self.monitor:
-            # TODO :log lr
-            # TODO: log train loss
-            pass
 
 
 class PipelineCommunicationMixin(object):
@@ -534,11 +525,11 @@ class Pipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         )
 
         self.training_args = training_args
-        super().__init__()
-
         self.model = model
         self.dataloader = dataloader
         self.data_iterator = iter(self.dataloader)
+
+        super().__init__()
 
         if dist.get_rank() == 0:
             self.monitor = MonitorMaster(
@@ -557,21 +548,28 @@ class Pipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
             self.monitor = None
             self.timers = None
 
-    def train(self):
-        train_schedule = OobleckPipelineSchedule(
-            self.training_args.per_device_train_batch_size,
-            self.total_num_stages,
-            self.local_rank,
-        )
-        self._exec_schedule(train_schedule)
-
-        # TODO: fix this
-        self.agg_train_loss = 0
-
+    def log(self):
         if self.timers:
+            # Log lr and loss
+            lr = next(
+                iter(
+                    [
+                        param_group["lr"]
+                        for param_group in self.optimizer.param_groups
+                        if "lr" in param_group
+                    ]
+                ),
+                0.0,
+            )
+            self.monitor.write_events([(f"samples/lr", lr, self.global_steps)])
+
+            loss = self.total_loss.mean().item()
+            self.monitor.write_events(
+                [(f"samples/train_loss", loss, self.global_steps)]
+            )
+
             self.timers.log(
                 [
-                    "execution/load_microbatch",
                     "execution/forward",
                     "execution/backward",
                     "execution/step",
@@ -585,7 +583,19 @@ class Pipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
                 self.global_steps,
             )
 
-        return self.agg_train_loss
+    def train(self):
+        train_schedule = OobleckPipelineSchedule(
+            self.training_args.per_device_train_batch_size,
+            self.total_num_stages,
+            self.local_rank,
+        )
+        self._exec_schedule(train_schedule)
+
+        self.global_steps += 1
+        self.global_samples += 0  # TODO: fix this
+
+        self.log()
+        self.total_loss = None
 
     def is_first_stage(self):
         return self.layer_start_index == 0
