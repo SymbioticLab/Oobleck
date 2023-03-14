@@ -27,9 +27,7 @@ def is_checkpointable(layer: torch.fx.GraphModule) -> bool:
 class Layer(torch.nn.Module):
     def __init__(self, layer: torch.fx.GraphModule, training_args: TrainingArguments):
         super().__init__()
-        self.add_module("graph", layer)
-
-        self.layer = layer
+        self.add_module("layer", layer)
         self.checkpointable = False
 
         # TODO: will be used for fp16/bf16
