@@ -167,15 +167,7 @@ class PipelineExecutionMixin(object):
 
         if self.is_first_stage():
             batch = next(self.data_iterator)
-            # labels = {"labels": batch.pop("labels")}
-
             self.pipe_buffers["inputs"][buffer_id] = self._prepare_inputs(batch)
-
-        # if self.is_first_stage():
-        #     self.pipe_buffers["inputs"][buffer_id] = self._prepare_inputs(batch)
-
-        # if self.is_last_stage():
-        #     self.pipe_buffers["labels"][buffer_id] = self._prepare_inputs(labels)
 
     @instrument_w_nvtx
     @measure_time("execution/forward")
