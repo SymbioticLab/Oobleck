@@ -74,5 +74,8 @@ class OobleckModel:
         split_points = get_split_points(model_config)
         sharded_model = shard_model(model, trace_input_names, split_points)
         self.model_name = model_name
-        self.model = [Layer(layer, training_args) for layer in sharded_model]
+        self.model = [
+            Layer(index, layer, training_args)
+            for index, layer in enumerate(sharded_model)
+        ]
         self.training_args = training_args

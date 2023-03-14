@@ -25,8 +25,9 @@ def is_checkpointable(layer: torch.fx.GraphModule) -> bool:
 
 
 class Layer(torch.nn.Module):
-    def __init__(self, layer: torch.fx.GraphModule, training_args: TrainingArguments):
+    def __init__(self, index: int, layer: torch.fx.GraphModule, training_args: TrainingArguments):
         super().__init__()
+        self.index = index
         self.add_module("layer", layer)
         self.checkpointable = False
 

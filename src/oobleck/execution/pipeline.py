@@ -95,6 +95,14 @@ class PipelineExecutionMixin(object):
     def __init__(self):
         super().__init__()
 
+        self.train_schedule = OobleckPipelineSchedule(
+            self.training_args.per_device_train_batch_size,
+            len(set(self.rank_layer_map)),  # total num stages
+            list(dict.fromkeys(self.rank_layer_map).keys()).index(
+                self.rank
+            ),
+        )
+
         # store checkpointability for each layer
         for layer in self.model_layers:
             layer.set_checkpointable(
@@ -190,6 +198,7 @@ class PipelineExecutionMixin(object):
 
         # Execute forward
         for layer in self.model_layers:
+            logger.info(f"forward {self.model_layers.index(layer)}")
             inputs = layer(*inputs)
 
         outputs = inputs
@@ -487,26 +496,32 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         )
 
         self.process_group = process_group
-        self.local_rank = dist.get_rank(self.process_group)
+        self.ranks = torch.distributed.get_process_group_ranks(self.process_group)
+        self.rank_layer_map = spec.map_ranks_to_spec(self.ranks)
+        self.rank = dist.get_rank()
         self.device = torch.device("cuda")
 
         self.model = model
-        self.layers_spec = spec.create_optimal_plan(model)
 
-        self.model_layers = self.model.model[
-            self.layers_spec[0].layer_index : self.layers_spec[-1].layer_index + 1
+        self.model_layers = [
+            self.model.model[index]
+            for index, l in enumerate(self.rank_layer_map)
+            if l == self.rank
         ]
         self.total_num_layers = len(self.model.model)
-        # self.total_num_stages = len(self.plan)
 
-        my_rank_index = self.layers_spec[0].ranks.index(self.local_rank)
+        my_layer_indices = [
+            index
+            for index, rank in enumerate(self.rank_layer_map)
+            if rank == self.rank
+        ]
         self.prev_rank = (
-            self.plan[my_rank_index - 1].ranks[my_rank_index]
+            self.rank[min(my_layer_indices) - 1]
             if not self.is_first_stage()
             else -1
         )
         self.next_rank = (
-            self.plan[my_rank_index + 1].ranks[my_rank_index]
+            self.rank[max(my_layer_indices) + 1]
             if not self.is_last_stage()
             else -1
         )
@@ -534,9 +549,6 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         else:
             self.monitor = None
             self.timers = None
-
-        for layer in self.model_layers:
-            layer.to(self.device)
 
     def log(self):
         if self.timers:
@@ -574,12 +586,7 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
             )
 
     def train(self):
-        train_schedule = OobleckPipelineSchedule(
-            self.training_args.per_device_train_batch_size,
-            1,  # self.total_num_stages,
-            self.local_rank,
-        )
-        self._exec_schedule(train_schedule)
+        self._exec_schedule(self.train_schedule)
 
         self.global_steps += 1
         self.global_samples += 0  # TODO: fix this
@@ -588,10 +595,10 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         self.total_loss = None
 
     def is_first_stage(self):
-        return self.layers_spec[0].layer_index == 0
+        return self.rank_layer_map[0] == self.rank
 
     def is_last_stage(self):
-        return self.layers_spec[-1].layer_index + 1 == self.total_num_layers
+        return self.rank_layer_map[-1] == self.rank
 
     def _exec_schedule(self, pipe_schedule: schedule.PipeSchedule):
         # Reserve and reset buffers.
