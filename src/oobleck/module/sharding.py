@@ -1,8 +1,10 @@
 import torch.fx
 
+from itertools import chain
+from collections import defaultdict
 from torch.fx.node import Node
 from transformers.utils.fx import symbolic_trace
-from typing import Type, List, Dict, Optional
+from typing import Type, List, Dict, Optional, Union, Any, Tuple
 
 from transformers import PretrainedConfig
 
@@ -17,7 +19,7 @@ def get_split_points(config: Type[PretrainedConfig]) -> List[str]:
     elif "bert" in config.model_type:
         for i in range(config.num_hidden_layers):
             split_points.append(f"bert.encoder.layer.{i}")
-        split_points.append("classifier")
+        split_points.append("cls")
     elif "t5" in config.model_type:
         for i in range(config.num_layers):
             split_points.append(f"encoder.block.{i}")
@@ -45,6 +47,66 @@ def get_split_points(config: Type[PretrainedConfig]) -> List[str]:
     return split_points
 
 
+def _split_nodes(
+    traced: torch.fx.GraphModule, split_points: List[str]
+) -> Tuple[Dict[str, int], Dict[int, List[str]], Dict[str, int]]:
+    """Analyze the given traced module and split it to subgraphs.
+    While partitioning, it also finds additioanl required inputs and outputs
+    so that they are added.
+
+    Args:
+        traced (torch.fx.GraphModule): A traced graph module to be split.
+    """
+
+    node_name_to_shard_id: Dict[str, int] = {}
+    shard_id_to_node: Dict[int, List[Node]] = defaultdict(list)
+    shard_id = 0
+
+    nodes_so_far: List[str] = []
+    extra_output: Dict[int, List[str]] = {}
+
+    for node in traced.graph.nodes:
+        if node.op == "placeholder":
+            node_name_to_shard_id[node.name] = shard_id
+            nodes_so_far.append(node.name)
+            shard_id_to_node[shard_id].append(node)
+        elif node.op in [
+            "get_attr",
+            "call_function",
+            "call_method",
+            "call_module",
+        ]:
+            node_name_to_shard_id[node.name] = shard_id
+            nodes_so_far.append(node.name)
+            shard_id_to_node[shard_id].append(node)
+
+            point = next(
+                filter(lambda p: node.next.name.startswith(p), split_points), None
+            )
+            if point:
+                # Record outputs that should be used later, so that it can be added
+                # in return of this shard
+                outputs = []
+                nodes = list(chain(*shard_id_to_node.values()))
+                for node in nodes:
+                    for user in node.users.keys():
+                        if user.name not in node_name_to_shard_id:
+                            outputs.append(node.name)
+
+                extra_output[shard_id] = list(dict.fromkeys(outputs).keys())
+
+                # If the current node is in the next shard, we increase shard count.
+                shard_id += 1
+                split_points.remove(point)
+
+        elif node.op == "output":
+            break
+
+    assert len(split_points) == 0, "Sharding is not complete."
+
+    return node_name_to_shard_id, extra_output
+
+
 def shard_model(
     model: torch.nn.Module, concrete_args: List[str], split_points: List[str]
 ) -> List[torch.fx.GraphModule]:
@@ -70,51 +132,43 @@ def shard_model(
     traced = symbolic_trace(model, input_names=concrete_args)
     split_points = [p.replace(".", "_") for p in split_points]
 
-    env: Dict[str, Node] = {}
+    node_name_to_shard_id, extra_outputs = _split_nodes(traced, split_points)
+
+    prev_shard_id = 1000
     prev_node: Optional[Node] = None
 
-    # Prepare pointers to nodes in existing traced graph. This is required to track users of the nodes.
-    existing_nodes = {}
-    for node in traced.graph.nodes:
-        existing_nodes[node.name] = node
+    env: Dict[str, Node] = {}
+    prev_node: Optional[Node] = None
 
     new_graph = torch.fx.Graph()
     # Iterate all nodes
     for node in traced.graph.nodes:
-        point = next(filter(lambda p: node.name.startswith(p), split_points), None)
-        if point:
-            # If the current node is in the next shard, we insert an output node.
-            # A new graph is created an a placeholder is added for the next shard.
-            assert prev_node, "prev_node cannot be None"
-            split_points.remove(point)
+        if node.name in node_name_to_shard_id:
+            current_shard_id = node_name_to_shard_id[node.name]
+            if prev_shard_id < current_shard_id:
+                assert prev_node, "prev_node cannot be None"
 
-            returns = [env[prev_node.name]]
-            # Check whether some placeholders of this graph need to be sent to the following stage.
-            for added_node in new_graph.nodes:
-                for user, _ in existing_nodes[added_node.name].users.items():
-                    if user.op != "output" and user.name not in env:
-                        returns.append(added_node)
-            # remove duplicate but maintain order
-            returns = list(dict.fromkeys(returns).keys())
+                # If the current node is in the next shard, we insert an output node.
+                # A new graph is created an a placeholder is added for the next shard.
 
-            with new_graph.inserting_after(prev_node):
-                new_graph.output(tuple(returns))
+                with new_graph.inserting_after(prev_node):
+                    if prev_shard_id in extra_outputs:
+                        outputs = extra_outputs[prev_shard_id]
+                        outputs = tuple([env[i] for i in outputs])
+                        new_graph.output(outputs)
+                    else:
+                        new_graph.output(tuple(env[prev_node.name]))
 
-            new_graph.lint()
-            module_list.append(torch.fx.GraphModule(model, new_graph))
+                new_graph.lint()
+                module_list.append(torch.fx.GraphModule(model, new_graph))
 
-            new_graph = torch.fx.Graph()
-            for return_node in returns:
-                # Add all nodes in return of the previous graph to its input
-                node_name = env[return_node.name].name
-                pl_node = new_graph.create_node("placeholder", node_name)
-                env[node_name] = pl_node
-
-            if not split_points:
-                # if there is no more split points, this graph is the last one;
-                # add labels placeholder.
-                label_node = new_graph.create_node("placeholder", "labels")
-                env["labels"] = label_node
+                # Create a new graph
+                new_graph = torch.fx.Graph()
+                for output in outputs:
+                    # Add all nodes in return of the previous graph to its input
+                    node_name = env[output.name].name
+                    pl_node = new_graph.create_node("placeholder", node_name)
+                    env[node_name] = pl_node
 
         # Cut is done. Add all nodes into the current graph (except for labels placeholder).
         if node.op in [
@@ -124,12 +178,9 @@ def shard_model(
             "call_method",
             "call_module",
         ]:
-            if node.op == "placeholder" and node.name == "labels":
-                pass
-            else:
-                # Copy the nodes from the existing graph to the new graph.
-                new_node = new_graph.node_copy(node, lambda x: env[x.name])
-                env[node.name] = new_node
+            # Copy the nodes from the existing graph to the new graph.
+            new_node = new_graph.node_copy(node, lambda x: env[x.name])
+            env[node.name] = new_node
         elif node.op == "output":
             # If this is the last node, we should add an output node and add the last graph to the list.
             assert prev_node, "prev_node cannot be None"
@@ -140,8 +191,6 @@ def shard_model(
             break
 
         prev_node = new_node
+        prev_shard_id = node_name_to_shard_id[node.name]
 
-    assert (
-        not split_points
-    ), f"Split points are not fully consumed. Remaining points: {split_points}"
     return module_list

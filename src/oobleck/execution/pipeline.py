@@ -165,14 +165,17 @@ class PipelineExecutionMixin(object):
             self.is_first_stage() or self.is_last_stage()
         ), "load_microatch can only be called at either the first stage or the last stage."
 
-        batch = next(self.data_iterator)
-        labels = {"labels": batch.pop("labels")}
-
         if self.is_first_stage():
+            batch = next(self.data_iterator)
+            # labels = {"labels": batch.pop("labels")}
+
             self.pipe_buffers["inputs"][buffer_id] = self._prepare_inputs(batch)
 
-        if self.is_last_stage():
-            self.pipe_buffers["labels"][buffer_id] = self._prepare_inputs(labels)
+        # if self.is_first_stage():
+        #     self.pipe_buffers["inputs"][buffer_id] = self._prepare_inputs(batch)
+
+        # if self.is_last_stage():
+        #     self.pipe_buffers["labels"][buffer_id] = self._prepare_inputs(labels)
 
     @instrument_w_nvtx
     @measure_time("execution/forward")
@@ -195,10 +198,6 @@ class PipelineExecutionMixin(object):
 
         # Execute forward
         for layer in self.model_layers:
-            if self.is_last_stage() and layer == self.model_layers[-1]:
-                # add labels in input if it is the last layer:
-                inputs = inputs + self.pipe_buffers["labels"][buffer_id]
-
             inputs = layer(*inputs)
 
         outputs = inputs
@@ -500,26 +499,22 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         self.device = torch.device("cuda")
 
         self.model = model
-        self.plan = spec.create_optimal_plan(model)
+        self.layers_spec = spec.create_optimal_plan(model)
 
-        # Let it raise an exception if there is no assigned stage by not adding default value to next().
-        stage_spec = next(filter(lambda s: self.local_rank in s.ranks, self.plan))
-        self.layer_start_index, self.layer_end_index = stage_spec.get_layer_indices()
         self.model_layers = self.model.model[
-            self.layer_start_index : self.layer_end_index
+            self.layers_spec[0].layer_index : self.layers_spec[-1].layer_index + 1
         ]
         self.total_num_layers = len(self.model.model)
-        self.total_num_stages = len(self.plan)
+        # self.total_num_stages = len(self.plan)
 
-        my_stage_index = self.plan.index(stage_spec)
-        my_rank_index = stage_spec.ranks.index(self.local_rank)
+        my_rank_index = self.layers_spec[0].ranks.index(self.local_rank)
         self.prev_rank = (
-            self.plan[my_stage_index - 1].ranks[my_rank_index]
+            self.plan[my_rank_index - 1].ranks[my_rank_index]
             if not self.is_first_stage()
             else -1
         )
         self.next_rank = (
-            self.plan[my_stage_index + 1].ranks[my_rank_index]
+            self.plan[my_rank_index + 1].ranks[my_rank_index]
             if not self.is_last_stage()
             else -1
         )
@@ -547,6 +542,9 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         else:
             self.monitor = None
             self.timers = None
+
+        for layer in self.model_layers:
+            layer.to(self.device)
 
     def log(self):
         if self.timers:
@@ -586,7 +584,7 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
     def train(self):
         train_schedule = OobleckPipelineSchedule(
             self.training_args.per_device_train_batch_size,
-            self.total_num_stages,
+            1,  # self.total_num_stages,
             self.local_rank,
         )
         self._exec_schedule(train_schedule)
@@ -598,10 +596,10 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         self.total_loss = None
 
     def is_first_stage(self):
-        return self.layer_start_index == 0
+        return self.layers_spec[0].layer_index == 0
 
     def is_last_stage(self):
-        return self.layer_end_index == self.total_num_layers
+        return self.layers_spec[-1].layer_index + 1 == self.total_num_layers
 
     def _exec_schedule(self, pipe_schedule: schedule.PipeSchedule):
         # Reserve and reset buffers.
