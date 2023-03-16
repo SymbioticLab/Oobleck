@@ -16,6 +16,7 @@ from deepspeed.ops.adam import FusedAdam
 from deepspeed.runtime.lr_schedules import WarmupLR
 
 from oobleck.execution.dataloader import OobleckTrainDataLoader
+from oobleck.module.layer import Layer
 from oobleck.module.model import OobleckModel
 from oobleck.module.layer import is_checkpointable
 from oobleck.execution.utils import (
@@ -93,8 +94,19 @@ class OobleckPipelineSchedule(schedule.TrainSchedule):
 
 
 class PipelineExecutionMixin(object):
-    def __init__(self):
-        super().__init__()
+    def __init__(
+        self,
+        model_layers: List[Layer],
+        training_args: TrainingArguments,
+        dataloader: OobleckTrainDataLoader,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+
+        self.model_layers = model_layers
+        self.training_args = training_args
+        self.dataloader = dataloader
+        self.device = torch.device("cuda")
 
         # store checkpointability for each layer
         for layer in self.model_layers:
@@ -255,8 +267,14 @@ class PipelineExecutionMixin(object):
 
 
 class PipelineCommunicationMixin(object):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, process_group: ProcessGroup, **kwargs):
+        super().__init__(**kwargs)
+
+        self.device = torch.device("cuda")
+        self.process_group = process_group
+        self.my_rank = dist.get_rank(self.process_group)
+        self.prev_rank: Optional[int] = None
+        self.next_rank: Optional[int] = None
 
         self.num_pipe_buffers: int = 0
         self.pipe_buffers: Dict[str, Tuple[torch.Tensor]] = {
@@ -468,28 +486,25 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         model: OobleckModel,
         dataloader: OobleckTrainDataLoader,
         process_group: ProcessGroup,
-        rank_to_layer_map: List[int],
         training_args: TrainingArguments,
     ):
-        self.process_group = process_group
-        self.my_rank = dist.get_rank(self.process_group)
-        self.rank_layer_map = rank_to_layer_map
-        self.device = torch.device("cuda")
-
+        self.layers_spec = spec.layers_spec
         self.model = model
+        self.total_num_layers = len(model.model)
 
-        self.model_layers = [
-            self.model.model[index]
-            for index, l in enumerate(self.rank_layer_map)
-            if l == self.my_rank
+        my_rank = dist.get_rank(process_group)
+        model_layers = [
+            layer
+            for layer, layer_spec in zip(model.model, self.layers_spec)
+            if layer_spec == my_rank
         ]
-        self.total_num_layers = len(self.model.model)
 
-        self.training_args = training_args
-        self.model = model
-        self.dataloader = dataloader
-
-        super().__init__()
+        super().__init__(
+            model_layers=model_layers,
+            dataloader=dataloader,
+            training_args=training_args,
+            process_group=process_group,
+        )
 
         if dist.get_rank() == 0:
             self.monitor = MonitorMaster(
@@ -547,7 +562,7 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         assert (
             torch.distributed.get_rank(self.process_group) >= 0
         ), "This pipeline is not what I am involved in."
-        unique_ranks = list(dict.fromkeys(self.rank_layer_map).keys())
+        unique_ranks = list(dict.fromkeys(self.layers_spec).keys())
         my_rank_index = unique_ranks.index(self.my_rank)
         self.train_schedule = OobleckPipelineSchedule(
             self.dataloader.num_my_microbatches,

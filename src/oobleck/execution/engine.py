@@ -253,10 +253,6 @@ class OobleckEngine(
                             self.model,
                             self.train_dataloader,
                             pp_pg,
-                            [
-                                torch.distributed.get_group_rank(pp_pg, rank)
-                                for rank in rank_to_layer_map
-                            ],
                             self.training_args,
                         )
 
