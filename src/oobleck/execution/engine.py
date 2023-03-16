@@ -8,7 +8,7 @@ from typing import Optional, Dict, List, Type, Any
 from torch.distributed import ProcessGroup
 
 from deepspeed import comm as dist
-from deepspeed.utils import RepeatingLoader, logger
+from deepspeed.utils import logger
 
 from oobleck.execution.dataset import OobleckDataset
 from oobleck.module.model import OobleckModel
@@ -17,7 +17,7 @@ from oobleck.planning.pipeline_spec import (
     get_pipeline_specs,
 )
 from oobleck.elastic.client import ElasticWorkerClientMixin, ElasticClientMonitorMixin
-from oobleck.execution.dataloader import OobleckDataLoader
+from oobleck.execution.dataloader import OobleckTrainDataLoader
 from oobleck.execution.pipeline import OobleckPipeline
 
 from transformers import TrainingArguments
@@ -100,7 +100,7 @@ class OobleckEngine(
         # Remove LOCAL_RANK env so that TrainingArgument does not
         # automatically initialize torch.distributed.
         self.local_rank = int(os.environ.pop("LOCAL_RANK", 0))
-        training_args = TrainingArguments("/tmp/output")
+        training_args = TrainingArguments("/tmp/output", gradient_accumulation_steps=4)
         if dist.is_initialized():
             dist.destroy_process_group()
 
@@ -117,15 +117,6 @@ class OobleckEngine(
         model_args["remove_unused_columns"] = False
         self.model = OobleckModel(
             model_name, self.dataset.trace_input_names, training_args, model_args
-        )
-
-        self.train_dataloader = RepeatingLoader(
-            OobleckDataLoader(
-                self.dataset.dataset["train"],
-                self.training_args.per_device_train_batch_size,
-                self.dataset.data_collator,
-                self.training_args,
-            )
         )
 
         # calculate minimum required # of GPUs to hold the parameters.
@@ -173,8 +164,6 @@ class OobleckEngine(
             sum(len(gpus) for gpus in self.world_info.values())
         )
 
-        logger.info
-
         # TODO: get master information from etcd
         # master_info = self.get_torch_master_info()
         # os.environ["MASTER_IP"] = master_info[0]
@@ -184,27 +173,29 @@ class OobleckEngine(
 
         dist.init_distributed("nccl", auto_mpi_discovery=False)
 
-        self.my_pipeline = self._deploy_pipelines()
-        # self.fsdp_pipelines: List[OobleckPipeline] = list(
-        #     p
-        #     for p in self.pipelines
-        #     if any(r in p.ranks for r in self.world_info[self.node_name])
-        # )
-        assert self.my_pipeline, "Cannot find a pipeline that I am belong to."
-        # assert self.fsdp_pipelines, "Cannot find FSDP pipelines that I am belong to."
+        self.num_pipeline_specs = self._get_num_instantiation_pipeline_specs()
 
-    def _deploy_pipelines(self) -> OobleckPipeline:
-        """Calculate required number of heterogeneous pipelines that
-        a linear combination of the pipelines fills the distributed world.
-        """
+        # TODO: change total number of microbatches properly.
+        self.train_dataloader = OobleckTrainDataLoader(
+            self.dataset.dataset["train"],
+            self.training_args,
+            self.training_args.gradient_accumulation_steps
+            * sum([num_spec for num_spec in self.num_pipeline_specs]),
+            self.dataset.data_collator,
+        )
+
+        self.my_pipeline = self._deploy_pipelines()
+        assert self.my_pipeline, "Cannot find a pipeline that I am belong to."
+
+    def _get_num_instantiation_pipeline_specs(self) -> List[int]:
         num_nodes = dist.get_world_size() // self.num_gpus_per_node
         assert num_nodes <= self.max_num_nodes, "World size is larger than max # nodes."
 
         # Current Alpha-level implementation: always prefer smaller pipelines.
         # TODO: analyze the best optimal combination that has the highest throughput.
-        num_pipelines = [0] * len(self.pipeline_specs)
-        num_pipelines[0] = math.floor(num_nodes / self.pipeline_specs[0].num_nodes)
-        total_assigned_nodes = num_pipelines[0] * self.pipeline_specs[0].num_nodes
+        num_pipeline_specs = [0] * len(self.pipeline_specs)
+        num_pipeline_specs[0] = math.floor(num_nodes / self.pipeline_specs[0].num_nodes)
+        total_assigned_nodes = num_pipeline_specs[0] * self.pipeline_specs[0].num_nodes
         assert (
             total_assigned_nodes <= num_nodes
         ), f"total assigned nodes {total_assigned_nodes} is not less than total given nodes {num_nodes}"
@@ -213,31 +204,40 @@ class OobleckEngine(
         while total_assigned_nodes < num_nodes:
             while (
                 smallest_non_zero_pipeline_index < len(self.pipeline_specs)
-                and num_pipelines[smallest_non_zero_pipeline_index] == 0
+                and num_pipeline_specs[smallest_non_zero_pipeline_index] == 0
             ):
                 smallest_non_zero_pipeline_index += 1
 
             if (
                 smallest_non_zero_pipeline_index + 1 < len(self.pipeline_specs)
-                and num_pipelines[smallest_non_zero_pipeline_index] > 0
+                and num_pipeline_specs[smallest_non_zero_pipeline_index] > 0
             ):
-                num_pipelines[smallest_non_zero_pipeline_index] -= 1
-                num_pipelines[smallest_non_zero_pipeline_index + 1] += 1
+                num_pipeline_specs[smallest_non_zero_pipeline_index] -= 1
+                num_pipeline_specs[smallest_non_zero_pipeline_index + 1] += 1
                 total_assigned_nodes += 1
 
         assert (
             sum(
-                num_pipelines[i] * self.pipeline_specs[i].num_nodes
+                num_pipeline_specs[i] * self.pipeline_specs[i].num_nodes
                 for i in range(0, len(self.pipeline_specs))
             )
             == num_nodes
         )
 
+        return num_pipeline_specs
+
+    def _deploy_pipelines(self) -> OobleckPipeline:
+        """Calculate required number of heterogeneous pipelines that
+        a linear combination of the pipelines fills the distributed world.
+        """
+
         list_nodes = list(self.world_info.keys())
         node_index = 0
         pipeline_process_group_ranks: List[List[int]] = []
         my_pipeline: Optional[OobleckPipeline] = None
-        for num_pipeline, pipeline_spec in zip(num_pipelines, self.pipeline_specs):
+        for num_pipeline, pipeline_spec in zip(
+            self.num_pipeline_specs, self.pipeline_specs
+        ):
             for i in range(num_pipeline):
                 nodes = list_nodes[node_index : node_index + pipeline_spec.num_nodes]
                 node_index += pipeline_spec.num_nodes
@@ -288,7 +288,7 @@ class OobleckEngine(
                 self.do_allreduce()
                 self.my_pipeline.optimizer_step()
         else:
-            num_steps = len(self.train_dataloader.loader)
+            num_steps = len(self.train_dataloader)
 
             for _ in range(int(self.training_args.num_train_epochs)):
                 for i in range(num_steps):

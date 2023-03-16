@@ -15,7 +15,7 @@ from deepspeed.monitor.config import get_monitor_config
 from deepspeed.ops.adam import FusedAdam
 from deepspeed.runtime.lr_schedules import WarmupLR
 
-from oobleck.execution.dataloader import OobleckDataLoader
+from oobleck.execution.dataloader import OobleckTrainDataLoader
 from oobleck.module.model import OobleckModel
 from oobleck.module.layer import is_checkpointable
 from oobleck.execution.utils import (
@@ -96,15 +96,6 @@ class PipelineExecutionMixin(object):
     def __init__(self):
         super().__init__()
 
-        print(self.rank_layer_map)
-        unique_ranks = list(dict.fromkeys(self.rank_layer_map).keys())
-
-        self.train_schedule = OobleckPipelineSchedule(
-            self.training_args.per_device_train_batch_size,
-            len(unique_ranks),  # total num stages
-            unique_ranks.index(self.my_rank),
-        )
-
         # store checkpointability for each layer
         for layer in self.model_layers:
             layer.set_checkpointable(
@@ -132,14 +123,10 @@ class PipelineExecutionMixin(object):
             eps=self.training_args.adam_epsilon,
             adam_w_mode=True,
         )
-        num_training_steps = len(self.dataloader.loader)
+        num_training_steps = len(self.dataloader)
         self.lr_scheduler = WarmupLR(
             self.optimizer, self.training_args.get_warmup_steps(num_training_steps)
         )
-
-    def bfloat16_enabled(self):
-        # TODO: modify this
-        return False
 
     # https://github.com/huggingface/transformers/blob/v4.26.1/src/transformers/trainer.py#L2454
     def _prepare_input(
@@ -246,17 +233,9 @@ class PipelineExecutionMixin(object):
             output_tensors = tuple([t for t in output_tensors if t.requires_grad])
             grad_tensors: Tuple[torch.Tensor] = self.grad_recv_buf
 
-            if self.bfloat16_enabled() and not self.is_last_stage():
-                # manually call because we don't call optimizer.backward()
-                self.optimizer.clear_lp_grads()
-
             # Oobleck sharded model always returns tuple with tensors and torch.Size.
             assert len(output_tensors) == len(grad_tensors)
             torch.autograd.backward(tensors=output_tensors, grad_tensors=grad_tensors)
-
-            if self.bfloat16_enabled() and not self.is_last_stage():
-                # manually call because we don't call optimizer.backward()
-                self.optimizer.update_hp_grads(clear_lp_grads=False)
 
         # Free up memory from the output of forward()
         self.pipe_buffers["outputs"][buffer_id] = None
@@ -487,7 +466,7 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         self,
         spec: PipelineSpec,
         model: OobleckModel,
-        dataloader: OobleckDataLoader,
+        dataloader: OobleckTrainDataLoader,
         process_group: ProcessGroup,
         rank_to_layer_map: List[int],
         training_args: TrainingArguments,
@@ -509,7 +488,6 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         self.training_args = training_args
         self.model = model
         self.dataloader = dataloader
-        self.data_iterator = iter(self.dataloader)
 
         super().__init__()
 
@@ -569,10 +547,22 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         assert (
             torch.distributed.get_rank(self.process_group) >= 0
         ), "This pipeline is not what I am involved in."
+        unique_ranks = list(dict.fromkeys(self.rank_layer_map).keys())
+        self.train_schedule = OobleckPipelineSchedule(
+            self.dataloader.num_my_microbatches,
+            len(unique_ranks),  # total num stages
+            unique_ranks.index(self.my_rank),
+        )
+
+        # reinitialize iterator.
+        self.data_iterator = iter(self.dataloader)
         self._exec_schedule(self.train_schedule)
 
         self.global_steps += 1
-        self.global_samples += 0  # TODO: fix this
+        self.global_samples += (
+            self.dataloader.num_total_microbatches
+            * self.training_args.per_device_train_batch_size
+        )
 
         self.log()
         self.total_loss = None

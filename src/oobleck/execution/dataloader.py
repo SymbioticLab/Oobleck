@@ -1,4 +1,5 @@
 import torch
+import deepspeed.comm as dist
 
 from torch.utils.data import BatchSampler, DataLoader
 from torch.utils.data.dataloader import _collate_fn_t
@@ -13,6 +14,8 @@ class OobleckSampler(BatchSampler):
         self,
         dataset: Dataset,
         microbatch_size: int,
+        num_total_microbatches: int,
+        num_my_microbatches: int,
         consumed_samples: int = 0,
         epoch: int = 0,
         shuffle: bool = True,
@@ -20,10 +23,9 @@ class OobleckSampler(BatchSampler):
     ):
         self.num_samples = len(dataset)
         self.microbatch_size = microbatch_size
-        self.num_microbatches = 4  # TODO: modify it
-        self.total_bucket_size = (
-            self.microbatch_size * self.num_microbatches
-        )  # TODO: modify it
+        self.num_microbatches = num_my_microbatches
+        self.num_total_microbatches = num_total_microbatches
+        self.total_bucket_size = self.microbatch_size * self.num_total_microbatches
         self.consumed_samples = consumed_samples
         self.epoch = epoch
 
@@ -53,18 +55,27 @@ class OobleckSampler(BatchSampler):
         return self.num_samples // self.total_bucket_size
 
 
-class OobleckDataLoader(DataLoader):
+class OobleckTrainDataLoader(DataLoader):
     def __init__(
         self,
         dataset: Dataset,
-        batch_size: int,
-        collate_fn: _collate_fn_t,
         args: TrainingArguments,
+        num_total_microbatches: int,
+        collate_fn: _collate_fn_t,
     ):
         assert isinstance(
             dataset, Dataset
         ), f"dataset type must be datasets.Dataset. Given: {type(dataset)}"
-        sampler = OobleckSampler(dataset, batch_size)
+
+        self.num_total_microbatches = num_total_microbatches
+        self.num_my_microbatches = args.gradient_accumulation_steps
+
+        sampler = OobleckSampler(
+            dataset,
+            args.per_device_train_batch_size,
+            self.num_total_microbatches,
+            self.num_my_microbatches,
+        )
 
         super().__init__(
             dataset,
