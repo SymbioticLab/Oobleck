@@ -523,7 +523,7 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
             )
             self.monitor.write_events([(f"samples/lr", lr, self.global_steps)])
 
-            loss = self.total_loss.mean().item()
+            loss = self.total_loss.mean().item() if self.is_last_stage() else -1
             self.monitor.write_events(
                 [(f"samples/train_loss", loss, self.global_steps)]
             )
@@ -548,11 +548,14 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
             torch.distributed.get_rank(self.process_group) >= 0
         ), "This pipeline is not what I am involved in."
         unique_ranks = list(dict.fromkeys(self.rank_layer_map).keys())
+        my_rank_index = unique_ranks.index(self.my_rank)
         self.train_schedule = OobleckPipelineSchedule(
             self.dataloader.num_my_microbatches,
             len(unique_ranks),  # total num stages
-            unique_ranks.index(self.my_rank),
+            my_rank_index,
         )
+        self.prev_rank = my_rank_index - 1
+        self.next_rank = my_rank_index + 1
 
         # reinitialize iterator.
         self.data_iterator = iter(self.dataloader)

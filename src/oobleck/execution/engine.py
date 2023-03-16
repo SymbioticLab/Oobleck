@@ -45,16 +45,16 @@ class DataSynchronizationMixin(object):
         super().__init__()
 
     def initialize_dp_process_groups(
-        self, model: OobleckModel, dp_layer_groups: List[ProcessGroup]
+        self, pipeline: OobleckPipeline, dp_layer_groups: List[ProcessGroup]
     ):
         assert len(dp_layer_groups) == len(
-            model.model
+            pipeline.model_layers
         ), "Number of model layer is inconsistent with number of process groups."
-        self.model = model
+        self.my_pipeline = pipeline
         self.dp_layer_groups = dp_layer_groups
 
     def do_allreduce(self):
-        for index, layer in reversed(list(enumerate(self.model.model))):
+        for index, layer in reversed(list(enumerate(self.my_pipeline.model_layers))):
             layer.reduce_gradients(self.dp_layer_groups[index])
 
 
@@ -126,7 +126,8 @@ class OobleckEngine(
         required_min_gpus = math.ceil(
             required_memory / torch.cuda.get_device_properties("cuda:0").total_memory
         )
-        self.required_min_nodes = math.ceil(required_min_gpus / self.num_gpus_per_node)
+        # self.required_min_nodes = math.ceil(required_min_gpus / self.num_gpus_per_node)
+        self.required_min_nodes = 2
 
         # create a list of pipelinespecs that can cover all nodes.
         # this is invariant and never changes over reconfiguration.
@@ -272,7 +273,7 @@ class OobleckEngine(
             dp_pg = dist.new_group(ranks)
             layer_dp_groups.append(dp_pg)
 
-        self.initialize_dp_process_groups(self.model, layer_dp_groups)
+        self.initialize_dp_process_groups(my_pipeline, layer_dp_groups)
 
         return my_pipeline
 
@@ -296,17 +297,3 @@ class OobleckEngine(
                     self.my_pipeline.train()
                     self.do_allreduce()
                     self.my_pipeline.optimizer_step()
-
-
-if __name__ == "__main__":
-    import os
-
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-    os.environ["LOCAL_RANK"] = "0"
-    os.environ["NODE_NAME"] = "localhost1"
-    os.environ["MAX_NUM_NODES"] = "2"
-    os.environ["NUM_GPUS_PER_NODE"] = "1"
-
-    engine = OobleckEngine(0, "gpt2", "wikitext", "wikitext-2-raw-v1")
-    engine.init_distributed()
-    engine.train()
