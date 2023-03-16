@@ -3,7 +3,7 @@ import math
 import torch
 import torch.distributed
 
-from typing import Optional, Dict, List, Type, Any
+from typing import Optional, Dict, List, Any
 
 from torch.distributed import ProcessGroup
 
@@ -19,6 +19,7 @@ from oobleck.planning.pipeline_spec import (
 from oobleck.elastic.client import ElasticWorkerClientMixin, ElasticClientMonitorMixin
 from oobleck.execution.dataloader import OobleckTrainDataLoader
 from oobleck.execution.pipeline import OobleckPipeline
+from oobleck.utils.timer import OobleckTimer, measure_time
 
 from transformers import TrainingArguments
 
@@ -53,6 +54,7 @@ class DataSynchronizationMixin(object):
         self.my_pipeline = pipeline
         self.dp_layer_groups = dp_layer_groups
 
+    @measure_time("comm/reduce_gradients")
     def do_allreduce(self):
         for index, layer in reversed(list(enumerate(self.my_pipeline.model_layers))):
             layer.reduce_gradients(self.dp_layer_groups[index])
@@ -126,8 +128,8 @@ class OobleckEngine(
         required_min_gpus = math.ceil(
             required_memory / torch.cuda.get_device_properties("cuda:0").total_memory
         )
-        # self.required_min_nodes = math.ceil(required_min_gpus / self.num_gpus_per_node)
-        self.required_min_nodes = 2
+        self.required_min_nodes = math.ceil(required_min_gpus / self.num_gpus_per_node)
+        # self.required_min_nodes = 2
 
         # create a list of pipelinespecs that can cover all nodes.
         # this is invariant and never changes over reconfiguration.
@@ -173,6 +175,7 @@ class OobleckEngine(
         os.environ["MASTER_PORT"] = "25400"
 
         dist.init_distributed("nccl", auto_mpi_discovery=False)
+        self.timer = OobleckTimer()
 
         self.num_pipeline_specs = self._get_num_instantiation_pipeline_specs()
 
@@ -245,8 +248,6 @@ class OobleckEngine(
                 for j in range(self.num_gpus_per_node):
                     ranks = [self.world_info[node][j] for node in nodes]
                     pp_pg = dist.new_group(ranks)
-                    rank_to_layer_map = pipeline_spec.map_ranks_to_spec(ranks)
-                    pipeline_process_group_ranks.append(rank_to_layer_map)
                     if dist.get_rank(pp_pg) >= 0:
                         my_pipeline = OobleckPipeline(
                             pipeline_spec,
@@ -255,6 +256,10 @@ class OobleckEngine(
                             pp_pg,
                             self.training_args,
                         )
+
+                    # Ranks per each layer. Used for creating :class:`ProcessGroup`s for each layer.
+                    ranks_to_layer_map = [ranks[i] for i in pipeline_spec.layers_spec]
+                    pipeline_process_group_ranks.append(ranks_to_layer_map)
 
                 # TODO: implement FSDP processgroup.
                 # Currently self.world_info[node] always has one rank,
@@ -278,12 +283,31 @@ class OobleckEngine(
         Train my pipeline and synchronize gradients after each schedule is done
         until specified steps or epoch is reached.
         """
+
+        def log():
+            self.timer.log(
+                [
+                    "execution/forward",
+                    "execution/backward",
+                    "execution/step",
+                    "comm/send_activations",
+                    "comm/recv_activations",
+                    "comm/send_gradients",
+                    "comm/recv_gradients",
+                    "comm/reduce_gradients",
+                    "samples/lr",
+                    "samples/train_loss",
+                ],
+                self.my_pipeline.global_steps,
+            )
+
         if self.training_args.max_steps > 0:
             for i in range(self.training_args.max_steps):
                 logger.info(f"[{i}] step")
                 self.my_pipeline.train()
                 self.do_allreduce()
                 self.my_pipeline.optimizer_step()
+                log()
         else:
             num_steps = len(self.train_dataloader)
 
@@ -293,3 +317,4 @@ class OobleckEngine(
                     self.my_pipeline.train()
                     self.do_allreduce()
                     self.my_pipeline.optimizer_step()
+                    log()

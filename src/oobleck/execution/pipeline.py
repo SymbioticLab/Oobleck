@@ -2,7 +2,6 @@ import torch
 import torch.distributed
 import itertools
 
-from datetime import datetime
 from types import MethodType
 from typing import Union, Any, Dict, Mapping, Tuple, List, Optional, Iterable
 
@@ -10,8 +9,6 @@ from torch.distributed import ProcessGroup, Work
 from deepspeed import comm as dist
 from deepspeed.utils import logger, instrument_w_nvtx
 from deepspeed.runtime.pipe import schedule
-from deepspeed.monitor.monitor import MonitorMaster
-from deepspeed.monitor.config import get_monitor_config
 from deepspeed.ops.adam import FusedAdam
 from deepspeed.runtime.lr_schedules import WarmupLR
 
@@ -491,6 +488,7 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         self.layers_spec = spec.layers_spec
         self.model = model
         self.total_num_layers = len(model.model)
+        self.timer = OobleckTimer()
 
         my_rank = dist.get_rank(process_group)
         model_layers = [
@@ -506,57 +504,22 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
             process_group=process_group,
         )
 
-        if dist.get_rank() == 0:
-            self.monitor = MonitorMaster(
-                get_monitor_config(
-                    {
-                        "tensorboard": {
-                            "enabled": True,
-                            "output_path": "/tmp/oobleck/tensorboard/",
-                            "job_name": f"{self.model.model_name}-{datetime.now().strftime('%m-%d-%Y,%H:%M:%S')}",
-                        }
-                    }
-                )
-            )
-            self.timers = OobleckTimer(self.monitor)
-        else:
-            self.monitor = None
-            self.timers = None
-
-    def log(self):
-        if self.timers:
-            # Log lr and loss
-            lr = next(
-                iter(
-                    [
-                        param_group["lr"]
-                        for param_group in self.optimizer.param_groups
-                        if "lr" in param_group
-                    ]
-                ),
-                0.0,
-            )
-            self.monitor.write_events([(f"samples/lr", lr, self.global_steps)])
-
-            loss = self.total_loss.mean().item() if self.is_last_stage() else -1
-            self.monitor.write_events(
-                [(f"samples/train_loss", loss, self.global_steps)]
-            )
-
-            self.timers.log(
+    def write_samples_logs(self):
+        lr = next(
+            iter(
                 [
-                    "execution/forward",
-                    "execution/backward",
-                    "execution/step",
-                    "comm/send_activations",
-                    "comm/recv_activations",
-                    "comm/send_gradients",
-                    "comm/recv_gradients",
-                    "samples/lr",
-                    "samples/train_loss",
-                ],
-                self.global_steps,
-            )
+                    param_group["lr"]
+                    for param_group in self.optimizer.param_groups
+                    if "lr" in param_group
+                ]
+            ),
+            0.0,
+        )
+        loss = self.total_loss.mean().item() if self.is_last_stage() else -1
+        self.total_loss = None
+
+        self.timer.write_events([(f"samples/lr", lr, self.global_steps)])
+        self.timer.write_events([(f"samples/train_loss", loss, self.global_steps)])
 
     def train(self):
         assert (
@@ -582,8 +545,7 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
             * self.training_args.per_device_train_batch_size
         )
 
-        self.log()
-        self.total_loss = None
+        self.write_samples_logs()
 
     def is_first_stage(self):
         return self.model_layers[0].index == 0

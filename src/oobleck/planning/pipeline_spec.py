@@ -34,21 +34,6 @@ class PipelineSpec:
 
         self.layers_spec = self._create_optimal_plan(model)
 
-    def map_ranks_to_spec(self, ranks: List[int]) -> List[int]:
-        """Maps given ranks (list of nodes that potentially have multiple ranks as a list)
-            to PipelineSpec.
-
-        Args:
-            ranks (List[int]): Actual ranks of GPUs in multiple nodes.
-                Length must match with PipelineSpec.num_nodes.
-
-        Returns:
-            List[LayerExecutionSpec]: list of layer exeecution specification but with
-                actual ranks assigned.
-        """
-        assert len(ranks) == self.num_nodes, "Number of nodes does not match with spec."
-        return [ranks[i] for i in self.layers_spec]
-
     def _create_optimal_plan(self, model: OobleckModel) -> List[int]:
         """Create an optimal execution plan with the given number of GPUs
         using profiled model execution information.
