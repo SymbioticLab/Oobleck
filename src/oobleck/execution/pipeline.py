@@ -1,4 +1,5 @@
 import torch
+import torch.distributed
 import itertools
 
 from datetime import datetime
@@ -95,12 +96,13 @@ class PipelineExecutionMixin(object):
     def __init__(self):
         super().__init__()
 
+        print(self.rank_layer_map)
+        unique_ranks = list(dict.fromkeys(self.rank_layer_map).keys())
+
         self.train_schedule = OobleckPipelineSchedule(
             self.training_args.per_device_train_batch_size,
-            len(set(self.rank_layer_map)),  # total num stages
-            list(dict.fromkeys(self.rank_layer_map).keys()).index(
-                self.rank
-            ),
+            len(unique_ranks),  # total num stages
+            unique_ranks.index(self.my_rank),
         )
 
         # store checkpointability for each layer
@@ -198,7 +200,6 @@ class PipelineExecutionMixin(object):
 
         # Execute forward
         for layer in self.model_layers:
-            logger.info(f"forward {self.model_layers.index(layer)}")
             inputs = layer(*inputs)
 
         outputs = inputs
@@ -488,17 +489,12 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         model: OobleckModel,
         dataloader: OobleckDataLoader,
         process_group: ProcessGroup,
+        rank_to_layer_map: List[int],
         training_args: TrainingArguments,
     ):
-        assert spec.num_nodes == dist.get_world_size(process_group), (
-            f"PipelineSpec (# nodes: {spec.num_nodes}) does not match with "
-            f"the given ProcessGroup size ({dist.get_world_size(process_group)})"
-        )
-
         self.process_group = process_group
-        self.ranks = torch.distributed.get_process_group_ranks(self.process_group)
-        self.rank_layer_map = spec.map_ranks_to_spec(self.ranks)
-        self.rank = dist.get_rank()
+        self.my_rank = dist.get_rank(self.process_group)
+        self.rank_layer_map = rank_to_layer_map
         self.device = torch.device("cuda")
 
         self.model = model
@@ -506,25 +502,9 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         self.model_layers = [
             self.model.model[index]
             for index, l in enumerate(self.rank_layer_map)
-            if l == self.rank
+            if l == self.my_rank
         ]
         self.total_num_layers = len(self.model.model)
-
-        my_layer_indices = [
-            index
-            for index, rank in enumerate(self.rank_layer_map)
-            if rank == self.rank
-        ]
-        self.prev_rank = (
-            self.rank[min(my_layer_indices) - 1]
-            if not self.is_first_stage()
-            else -1
-        )
-        self.next_rank = (
-            self.rank[max(my_layer_indices) + 1]
-            if not self.is_last_stage()
-            else -1
-        )
 
         self.training_args = training_args
         self.model = model
@@ -586,6 +566,9 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
             )
 
     def train(self):
+        assert (
+            torch.distributed.get_rank(self.process_group) >= 0
+        ), "This pipeline is not what I am involved in."
         self._exec_schedule(self.train_schedule)
 
         self.global_steps += 1
@@ -595,10 +578,10 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         self.total_loss = None
 
     def is_first_stage(self):
-        return self.rank_layer_map[0] == self.rank
+        return self.model_layers[0].index == 0
 
     def is_last_stage(self):
-        return self.rank_layer_map[-1] == self.rank
+        return self.model_layers[-1].index == self.total_num_layers - 1
 
     def _exec_schedule(self, pipe_schedule: schedule.PipeSchedule):
         # Reserve and reset buffers.

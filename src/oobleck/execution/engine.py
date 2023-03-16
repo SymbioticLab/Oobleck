@@ -1,6 +1,7 @@
 import os
 import math
 import torch
+import torch.distributed
 
 from typing import Optional, Dict, List, Type, Any
 
@@ -43,9 +44,18 @@ class DataSynchronizationMixin(object):
     def __init__(self):
         super().__init__()
 
+    def initialize_dp_process_groups(
+        self, model: OobleckModel, dp_layer_groups: List[ProcessGroup]
+    ):
+        assert len(dp_layer_groups) == len(
+            model.model
+        ), "Number of model layer is inconsistent with number of process groups."
+        self.model = model
+        self.dp_layer_groups = dp_layer_groups
+
     def do_allreduce(self):
-        for index, layer in reversed(list(enumerate(self.my_pipeline.model_layers))):
-            layer.reduce_gradients(self.dp_groups[index])
+        for index, layer in reversed(list(enumerate(self.model.model))):
+            layer.reduce_gradients(self.dp_layer_groups[index])
 
 
 class OobleckEngine(
@@ -225,7 +235,8 @@ class OobleckEngine(
 
         list_nodes = list(self.world_info.keys())
         node_index = 0
-        pipeline: Optional[OobleckPipeline] = None
+        pipeline_process_group_ranks: List[List[int]] = []
+        my_pipeline: Optional[OobleckPipeline] = None
         for num_pipeline, pipeline_spec in zip(num_pipelines, self.pipeline_specs):
             for i in range(num_pipeline):
                 nodes = list_nodes[node_index : node_index + pipeline_spec.num_nodes]
@@ -233,18 +244,37 @@ class OobleckEngine(
                 for j in range(self.num_gpus_per_node):
                     ranks = [self.world_info[node][j] for node in nodes]
                     pp_pg = dist.new_group(ranks)
+                    rank_to_layer_map = pipeline_spec.map_ranks_to_spec(ranks)
+                    pipeline_process_group_ranks.append(rank_to_layer_map)
                     if dist.get_rank(pp_pg) >= 0:
-                        assert pipeline is None, "Pipeline is already allocated for me."
-                        pipeline = OobleckPipeline(
+                        my_pipeline = OobleckPipeline(
                             pipeline_spec,
                             self.model,
                             self.train_dataloader,
                             pp_pg,
+                            [
+                                torch.distributed.get_group_rank(pp_pg, rank)
+                                for rank in rank_to_layer_map
+                            ],
                             self.training_args,
                         )
-                # TODO: implement FSDP processgroup
 
-        return pipeline
+                # TODO: implement FSDP processgroup.
+                # Currently self.world_info[node] always has one rank,
+                # all ranks in self.world_info[node] are for FSDP.
+
+        # For now, we don't use FSDP, thus pipelines are not sharded.
+        # Generate PGs for each layers in every pipelines.
+        # TODO: later when we adopt FSDP, each sharded point must be distinguished.
+        layer_dp_groups: List[ProcessGroup] = []
+        for layer_index in range(len(my_pipeline.model_layers)):
+            ranks = [ranks[layer_index] for ranks in pipeline_process_group_ranks]
+            dp_pg = dist.new_group(ranks)
+            layer_dp_groups.append(dp_pg)
+
+        self.initialize_dp_process_groups(self.model, layer_dp_groups)
+
+        return my_pipeline
 
     def train(self):
         """
@@ -273,7 +303,7 @@ if __name__ == "__main__":
 
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     os.environ["LOCAL_RANK"] = "0"
-    os.environ["NODE_NAME"] = "localhost2"
+    os.environ["NODE_NAME"] = "localhost1"
     os.environ["MAX_NUM_NODES"] = "2"
     os.environ["NUM_GPUS_PER_NODE"] = "1"
 
