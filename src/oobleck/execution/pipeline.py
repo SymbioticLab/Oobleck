@@ -485,16 +485,16 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         process_group: ProcessGroup,
         training_args: TrainingArguments,
     ):
-        self.layers_spec = spec.layers_spec
+        self.optimal_plan = spec.optimal_plan
         self.model = model
         self.total_num_layers = len(model.model)
         self.timer = OobleckTimer()
 
         my_rank = dist.get_rank(process_group)
         model_layers = [
-            layer
-            for layer, layer_spec in zip(model.model, self.layers_spec)
-            if layer_spec == my_rank
+            layer.to("cuda")
+            for layer, layer_rank in zip(model.model, self.optimal_plan)
+            if layer_rank == my_rank
         ]
 
         super().__init__(
@@ -525,7 +525,7 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         assert (
             torch.distributed.get_rank(self.process_group) >= 0
         ), "This pipeline is not what I am involved in."
-        unique_ranks = list(dict.fromkeys(self.layers_spec).keys())
+        unique_ranks = list(dict.fromkeys(self.optimal_plan).keys())
         my_rank_index = unique_ranks.index(self.my_rank)
         self.train_schedule = OobleckPipelineSchedule(
             self.dataloader.num_my_microbatches,

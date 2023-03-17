@@ -1,3 +1,5 @@
+import torch
+
 from deepspeed import comm as dist
 
 from typing import Optional, Dict, Any, List, Type
@@ -64,10 +66,14 @@ class OobleckModel:
         model: Optional[Type[PreTrainedModel]] = None
         for key, automodel in automodel_dict.items():
             if key in model_name:
-                model = automodel.from_config(model_config).to("cuda")
+                model = automodel.from_config(model_config)
                 break
 
         assert model, f"Given model {model_name} is not supported yet."
+
+        self.dummy_inputs: Dict[str, torch.Tensor] = model.dummy_inputs
+        if not trace_input_names:
+            trace_input_names = self.dummy_inputs.keys()
 
         self.total_num_params = sum([p.numel() for p in model.parameters()])
 

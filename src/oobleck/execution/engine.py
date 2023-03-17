@@ -3,6 +3,7 @@ import math
 import torch
 import torch.distributed
 
+from collections import defaultdict
 from typing import Optional, Dict, List, Any
 
 from torch.distributed import ProcessGroup
@@ -12,10 +13,7 @@ from deepspeed.utils import logger
 
 from oobleck.execution.dataset import OobleckDataset
 from oobleck.module.model import OobleckModel
-from oobleck.planning.pipeline_spec import (
-    PipelineSpec,
-    get_pipeline_specs,
-)
+from oobleck.planning.pipeline_spec import PipelineSpec
 from oobleck.elastic.client import ElasticWorkerClientMixin, ElasticClientMonitorMixin
 from oobleck.execution.dataloader import OobleckTrainDataLoader
 from oobleck.execution.pipeline import OobleckPipeline
@@ -70,7 +68,7 @@ class OobleckEngine(
     Oobleck distributed training execution engine based on DeepSpeed.
     It initializes several pipelines as needed and launch them in parallel across nodes.
     Heterogeneous pipeline might have different pipeline schedules, thus
-    :class:`oobleck.execution.pipeline.Pipeline` is responsible for pipeline task scheduling.
+    :class:`oobleck.execution.pipeline.OobleckPipeline` is responsible for pipeline task scheduling.
 
     Engine initialization has two parts: traditional `__init__` does distributed-agnostic
     initialization, while `init_distributed()` initializes distributed related arguments.
@@ -121,30 +119,20 @@ class OobleckEngine(
             model_name, self.dataset.trace_input_names, training_args, model_args
         )
 
-        # calculate minimum required # of GPUs to hold the parameters.
-        # assume we use AMP Adam (having 12x memory bloat).
-        # assume we don't consider activations, since we use activation recomputation.
-        required_memory = self.model.total_num_params * 12
-        required_min_gpus = math.ceil(
-            required_memory / torch.cuda.get_device_properties("cuda:0").total_memory
-        )
-        self.required_min_nodes = math.ceil(required_min_gpus / self.num_gpus_per_node)
-        # self.required_min_nodes = 2
-
         # create a list of pipelinespecs that can cover all nodes.
         # this is invariant and never changes over reconfiguration.
-        self.pipeline_specs: List[PipelineSpec] = get_pipeline_specs(
-            self.ft_spec,
-            self.required_min_nodes,
-            self.max_num_nodes,
-            self.num_gpus_per_node,
-            self.model,
+        self.pipeline_specs: List[PipelineSpec] = self.create_pipeline_specs(
+            self.ft_spec, self.max_num_nodes, self.model
         )
 
-    def init_distributed(self):
-        # TODO: get world_info from etcd
-        # world_info = self.get_world_info()
-        # self.world_info = {"localhost1": [0], "localhost2": [1]}
+    def _init_distributed_from_etcd(self):
+        pass
+
+    def _init_distributed_from_env(self):
+        """Temporary implementation that enables execution
+        without master/agent processes.
+        Must be removed and replaced with `init_distributed_from_etcd`.
+        """
         self.world_info = {"localhost1": [0], "localhost2": [1]}
         assert all(
             len(gpus) > 0 for gpus in self.world_info.values()
@@ -166,15 +154,14 @@ class OobleckEngine(
         os.environ["WORLD_SIZE"] = str(
             sum(len(gpus) for gpus in self.world_info.values())
         )
-
-        # TODO: get master information from etcd
-        # master_info = self.get_torch_master_info()
-        # os.environ["MASTER_IP"] = master_info[0]
-        # os.environ["MASTER_PORT"] = str(master_info[1])
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = "25400"
 
         dist.init_distributed("nccl", auto_mpi_discovery=False)
+
+    def init_distributed(self):
+        # TODO: setup with etcd
+        self._init_distributed_from_env()
         self.timer = OobleckTimer()
 
         self.num_pipeline_specs = self._get_num_instantiation_pipeline_specs()
@@ -258,7 +245,7 @@ class OobleckEngine(
                         )
 
                     # Ranks per each layer. Used for creating :class:`ProcessGroup`s for each layer.
-                    ranks_to_layer_map = [ranks[i] for i in pipeline_spec.layers_spec]
+                    ranks_to_layer_map = [ranks[i] for i in pipeline_spec.optimal_plan]
                     pipeline_process_group_ranks.append(ranks_to_layer_map)
 
                 # TODO: implement FSDP processgroup.
@@ -277,6 +264,116 @@ class OobleckEngine(
         self.initialize_dp_process_groups(my_pipeline, layer_dp_groups)
 
         return my_pipeline
+
+    def create_pipeline_specs(
+        self, ft_spec: int, max_num_nodes: int, model: OobleckModel
+    ) -> List[PipelineSpec]:
+        """Oobleck paper section 4.1.1. Configuring PipelineSpecs implementation
+        Generates the list of :class:`oobleck.planning.pipeline_spec.PipelineSpec`s
+        with heterogeneous number of nodes specifications, a linear combination of
+        which can represent any number N (min_num_nodes <= N <= max_num_nodes).
+
+        Oobleck exploits the Frobenius problem and creates a list of `PipelineSpec`s
+        based on the constraints:
+        1. # of `PipelineSpec`s > n0 - 1
+        2. ni's are consecutive integers (ni + 1 = n(i+1))
+        We define n0 = minimum number of nodes ths is required to hold states for training.
+
+        Args:
+            ft_spec (int): Fault tolerant spec.
+                Oobleck tries to create at least ft_spec + 1 model replica.
+            max_num_nodes (int): Maximum # nodes in the cluster.
+
+        Returns:
+            List[PipelineSpec]: List of `PipelineSpec`s.
+                Length of the list is the number of `PipelineSpec`s, p.
+        """
+        assert ft_spec >= 0, "Fault tolerance spec must not be negative."
+
+        required_memory = model.total_num_params * 12
+        required_min_gpus = math.ceil(
+            required_memory / torch.cuda.get_device_properties("cuda:0").total_memory
+        )
+        min_num_nodes = math.ceil(required_min_gpus / self.num_gpus_per_node)
+        assert (
+            ft_spec + 1
+        ) * min_num_nodes <= max_num_nodes, f"Maximum # nodes ({max_num_nodes}) cannot be smaller than minimum # nodes ({min_num_nodes})."
+        if (ft_spec + 1) * min_num_nodes > max_num_nodes:
+            logger.warning(
+                "The number of nodes is not enough to provide at least ft_spec + 1 copy of the model."
+                "Oobleck may fail to provide fault tolerancy if continue."
+            )
+
+        # p = n0 - 1
+        num_pipeline_specs = min_num_nodes
+        if num_pipeline_specs < 1:
+            num_pipeline_specs = 1
+
+        pipeline_specs = list(range(min_num_nodes, min_num_nodes + num_pipeline_specs))
+        assert all(
+            num_nodes <= max_num_nodes for num_nodes in pipeline_specs
+        ), "Some PipelineSpec needs to have more # nodes than maximum # nodes (impossible)."
+
+        return [
+            PipelineSpec(num_nodes, self.num_gpus_per_node, self.model)
+            for num_nodes in pipeline_specs
+        ]
+
+    # ==========================================================================================
+    # Paper section 4.1.2. is implemented in oobleck.planning.pipeline_spec.PipelineSpec.
+    # ==========================================================================================
+
+    def instantiate_pipelines(
+        self,
+        pipeline_specs: List[PipelineSpec],
+        num_nodes: int,
+        throughput_oriented: bool = True,
+    ) -> List[List[OobleckPipeline]]:
+        """Oobleck paper section 4.1.3. Instantiating PipelineSpecs implementation
+        Instantiates given `PipelineSpec`s to create actual :class:`oobleck.execution.pipeline.Pipeline`s.
+
+        Oobleck uses dynamic programming to find all feasible solutions, then picks one
+        in accordance with the user input `throughput_oriented`.
+
+        TODO: change it to degree factor, not boolean.
+
+        Args:
+            pipeline_specs (List[PipelineSpec]): List of `PipelineSpec`s to be instantiated.
+            num_nodes (int): Number of nodes to be used for training.
+            throughput_oriented (bool): Whether instantiation should priortize throughput or
+            smaller reconfiguration overhead.
+
+        Returns:
+            List[List[OobleckPipeline]]: List of instantiated `OobleckPipeline`s.
+                Inner `List[OobleckPipeline]` includes the list of instantiated pipelines with a single
+                `PipelineSpec`.
+        """
+
+        def dp_get_all_solutions() -> List[Dict[int, int]]:
+            dp: List[List[List[Dict[int, int]]]] = [
+                [[] for _ in range(num_nodes + 1)]
+                for _ in range(len(pipeline_specs) + 1)
+            ]
+
+            for i in range(1, len(pipeline_specs) + 1):
+                dp[i][0] = [defaultdict(int)]
+                for j in range(1, num_nodes + 1):
+                    # (1) in Figure: copy all dicts
+                    dp[i][j] = [combo.copy() for combo in dp[i - 1][j]]
+                    if pipeline_specs[i - 1].num_nodes <= j:
+                        # (2) in Figure: copy all dicts with one pipeline_specs[i - 1] added
+                        for combo in dp[i][j - pipeline_specs[i - 1]]:
+                            new_combo = combo.copy()
+                            new_combo[pipeline_specs[i - 1]] += 1
+
+                            # concatenate two lists
+                            dp[i][j].append(new_combo)
+
+            return dp[-1][-1]
+
+        solutions: List[Dict[int, int]] = dp_get_all_solutions()
+        # measure throughput of each solution using profiled data
+        assert False, "Finish implementation"
 
     def train(self):
         """

@@ -32,29 +32,29 @@ class PipelineSpec:
         self.num_gpus_per_node = num_gpus_per_node
         self.model = model
 
-        self.layers_spec = self._create_optimal_plan(model)
+        self.optimal_plan = self.get_optimal_execution_plan()
 
-    def _create_optimal_plan(self, model: OobleckModel) -> List[int]:
-        """Create an optimal execution plan with the given number of GPUs
-        using profiled model execution information.
+    def __repr__(self) -> str:
+        return f"(PipelineSpec: {self.num_nodes} nodes)"
 
-        Current Alpha-level implementation: divide layers individually.
-        Number of stages is equal to the number of nodes.
+    def get_optimal_execution_plan(self) -> List[int]:
+        """Oobleck paper section 4.1.2. Optimal Execution Plan implementation
+        It partitions the model into stages and assigns layers into them,
+        and map the stages with a group of GPUs that provides the highest throughput.
 
         This currently does not consider intra-node parallelism.
         For intra-node parallelism, each rank group must create its own :class:`PipelineSpec`.
 
-        Args:
-            model (OobleckModel): model to profile.
-
         Returns:
-            List[int]: The list of ranks that are assigned to each layer in the model.
+            List[int]: The list of ranks that each layer is assigned to.
         """
-        num_layer_per_node = len(model.model) // self.num_nodes
+        num_layer_per_node = len(self.model.model) // self.num_nodes
         # num_layers: number of layers that are assigned to each stage.
         num_layers = [num_layer_per_node] * self.num_nodes
-        if num_layer_per_node * self.num_nodes < len(model.model):
-            num_layers[-1] += len(model.model) - num_layer_per_node * self.num_nodes
+        if num_layer_per_node * self.num_nodes < len(self.model.model):
+            num_layers[-1] += (
+                len(self.model.model) - num_layer_per_node * self.num_nodes
+            )
 
         layer_specs: List[int] = []
         sum = 0
@@ -67,60 +67,3 @@ class PipelineSpec:
             sum += num_layer
 
         return layer_specs
-
-
-def get_pipeline_specs(
-    ft_spec: int,
-    min_num_nodes: int,
-    max_num_nodes: int,
-    num_gpus_per_node: int,
-    model: OobleckModel,
-) -> List[PipelineSpec]:
-    """Generates the list of :class:`.PipelineSpec`s that can represent any number N that
-    min_num_nodes <= N <= max_num_nodes as a linear combination of them.
-
-    Args:
-        ft_spec (int): Fault tolerant spec.
-            Oobleck tries to create at least ft_spec + 1 model replica.
-        min_num_nodes (int): Mininum # nodes to hold the model states for training.
-        max_num_nodes (int): Maximum # nodes in the cluster.
-        num_gpus_per_node (int): # GPUs per node.
-
-    Raises:
-        ValueError: Raised when given argument is unreasonable.
-    """
-    assert min_num_nodes > 0, "Minimum # nodes to hold moded states must be > 0."
-    assert (
-        max_num_nodes >= min_num_nodes
-    ), "Maximum # nodes cannot be smaller than minimum # nodes."
-
-    min_req_nodes = min_num_nodes * (ft_spec + 1)
-    if max_num_nodes < min_req_nodes:
-        logger.warning(
-            "The number of nodes is not enough to provide at least ft_spec + 1 copy of the model."
-            "Oobleck may fail to provide fault tolerancy if continue."
-        )
-
-    # Oobleck's requirements to solve the Frobenius problem
-    # 1. p > n[0] - 2 (thus the minimum p is n[0] - 1)
-    # 2. n's are contiguous integers (n[i] + 1 = n[i+1])
-    # TODO: verify that it is always better to have smaller number of GPUs per PipelineSpecs.
-    # (i.e. why we choose minimum p)
-    num_pipeline_specs = min_num_nodes - 1
-    if num_pipeline_specs < 1:
-        num_pipeline_specs = 1
-
-    pipeline_spec_num_nodes = list(
-        range(min_num_nodes, min_num_nodes + num_pipeline_specs)
-    )
-    # Some PipelineSpec cannot be realized with current max_num_nodes requirement.
-    assert not any(
-        num_nodes > max_num_nodes for num_nodes in pipeline_spec_num_nodes
-    ), "Some PipelineSpec needs to have more # nodes than maximum # nodes (impossible)."
-
-    pipeline_specs = [
-        PipelineSpec(num_nodes, num_gpus_per_node, model)
-        for num_nodes in pipeline_spec_num_nodes
-    ]
-
-    return pipeline_specs
