@@ -35,8 +35,8 @@ def get_split_points(config: Type[PretrainedConfig]) -> List[str]:
     # Sharding for the Microsoft's HuggingFace ResNet model
     # e.g. microsoft/resnet-152 (https://huggingface.co/microsoft/resnet-152)
     elif "resnet" in config.model_type:
-        for i in range(config.depths):
-            for j in range(config.depths[i]):
+        for i, depth in enumerate(config.depths):
+            for j in range(depth):
                 split_points.append(f"resnet.encoder.stages.{i}.layers.{j}")
         split_points.append("resnet.pooler")
 

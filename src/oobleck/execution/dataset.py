@@ -81,7 +81,7 @@ class OobleckDataset:
         ), f"Dataset it not initialized because given model {model_name} is not supported yet."
 
         trace_input = next(iter(self.dataset["train"]))
-        self.trace_input_names = list(trace_input.keys())
+        self.trace_input_names = list(self.data_collator([trace_input]).keys())
 
     @staticmethod
     def create_image_dataset(
