@@ -10,9 +10,8 @@ from pathlib import Path
 from deepspeed.utils.logging import logger
 from typing import List, Dict, Any, Optional
 
-from transformers import TrainingArguments
-
 from oobleck.module.model import OobleckModel
+from oobleck.module.layer import Layer
 
 
 PROFILE_CACHE = "/tmp/oobleck/profiles"
@@ -87,20 +86,8 @@ class Profiler:
     To support large model profiling, we offload parameters layer by layer.
     """
 
-    def __init__(self, model_name: str, model_args: Dict[str, Any] = None):
-        if model_args is None:
-            model_args = {}
-        model_args["use_cache"] = False
-        model_args["remove_unused_columns"] = False
-
-        # To prevent HfTrainingArguments to initialize torch.distributed
-        self.local_rank = os.environ.pop("LOCAL_RANK", None)
-        training_args = TrainingArguments(
-            output_dir=f"/tmp/oobleck/tmp_profile_output/{model_name}",
-        )
-
-        self.model = OobleckModel(model_name, [], training_args, model_args)
-        self.model_name = model_name
+    def __init__(self, model: OobleckModel):
+        self.model = model
 
     def profile(self) -> List[LayerExecutionResult]:
         if dist.is_initialized():
@@ -186,40 +173,59 @@ class Profiler:
         return table
 
     @staticmethod
-    def profile_allreduce(
-        model: OobleckModel, process_group: dist.ProcessGroup
-    ) -> List[float]:
-        results: List[float] = []
-        for layer in model.model:
-            numel = sum([p.numel() for p in layer.parameters()])
-            tensor = torch.zeros(
-                numel,
-                dtype=torch.float32,
-                device="cuda",
-            )
+    def profile_allreduce_layer(
+        layer: Layer, process_group: dist.ProcessGroup
+    ) -> float:
+        numel = sum([p.numel() for p in layer.parameters()])
+        tensor = torch.zeros(numel, dtype=torch.float32, device="cuda")
 
-            dist.barrier()
-            start = time.time()
-            dist.all_reduce(tensor, group=process_group)
-            end = time.time()
+        dist.barrier()
+        start = time.time()
+        dist.all_reduce(tensor, group=process_group)
+        end = time.time()
 
-            results.append((end - start) * 1000)
-
-            del tensor
-        return results
+        del tensor
+        return (end - start) * 1000
 
     @return_cache_if_exist("allreduce_corss_nodes")
     def _profile_allreduce_across_nodes(
-        self, process_group: dist.ProcessGroup
-    ) -> List[float]:
+        self, ranks: List[int]
+    ) -> List[Dict[int, float]]:
         assert dist.is_initialized()
         logger.info(f"Profile allreduce acorss nodes latency")
-        return Profiler.profile_allreduce(self.model, process_group)
+
+        results: List[Dict[int, List[float]]] = []
+        for layer in self.model.model:
+            result: Dict[int, List[float]] = {}
+            for num_nodes in range(1, len(ranks)):
+                ranks_pg = ranks[:num_nodes]
+                process_group = dist.new_group(ranks_pg)
+                result[num_nodes] = Profiler.profile_allreduce_layer(
+                    layer, process_group
+                )
+                dist.destroy_process_group(process_group)
+            results.append(result)
+
+        return results
 
     @return_cache_if_exist("allreduce_in_node")
     def _profile_allreduce_in_node(
-        self, process_group: dist.ProcessGroup
-    ) -> List[float]:
+        self, ranks: List[int], num_gpus_per_node: int
+    ) -> List[Dict[int, float]]:
         assert dist.is_initialized()
         logger.info(f"Profile allreduce within a node latency")
-        return Profiler.profile_allreduce(self.model, process_group)
+
+        results: List[Dict[int, List[float]]] = []
+        for layer in self.model.model:
+            result: Dict[int, List[float]] = {}
+            num_gpuss = [2**i for i in range(int(math.log2(num_gpus_per_node)))]
+            for num_gpus in num_gpuss:
+                ranks_pg = ranks[:num_gpus]
+                process_group = dist.new_group(ranks_pg)
+                result[num_gpus] = Profiler.profile_allreduce_layer(
+                    layer, process_group
+                )
+                dist.destroy_process_group(process_group)
+            results.append(result)
+
+        return results
