@@ -18,9 +18,9 @@ class StageExecutionResult:
             layer_exec (List[LayerExecutionResult]): Each layer execution
             device_num (int): _description_
         """
-        assert device_num < torch.cuda.device_count(), (
+        assert device_num <= torch.cuda.device_count(), (
             "Assuming this node is used for training as well, "
-            f"number of GPUs {torch.cuda.device_count()}"
+            f"number of GPUs {torch.cuda.device_count()} "
             f"is not enough to measure communication with {device_num} GPUs."
         )
 
@@ -56,6 +56,12 @@ class StageExecutionResult:
             / self.device_num
         )
 
+    def __repr__(self) -> str:
+        return (
+            f"(StageExecution [{self.layer_indicies[0]}, {self.layer_indicies[1]}) "
+            f"with {self.device_num} GPUs)"
+        )
+
 
 class DCExecutionResult:
     """A class wrapper of a list of the stages.
@@ -67,14 +73,14 @@ class DCExecutionResult:
         self.stages = stages
 
         if len(stages) == 0 or any(
-            stage.memory_consumption
+            stage.memory_consumption / stage.device_num
             > torch.cuda.get_device_properties("cuda:0").total_memory
             for stage in stages
         ):
             self.e1 = math.inf
             self.e2 = math.inf
             self.kstar = -1
-            self.e3 = {}
+            self.e3 = math.inf
             return
 
         self.e1 = sum([stage.forward + stage.backward for stage in stages])
@@ -84,7 +90,7 @@ class DCExecutionResult:
             stages[self.kstar].forward + stages[self.kstar].backward
         )
         self.e3 = sum(
-            [stage.forward + stage.backward] for stage in stages[self.kstar :]
+            [stage.forward + stage.backward for stage in stages[self.kstar :]]
         )
 
     # argmax without numpy: https://github.com/cjohnson318/til/blob/main/python/argmax-without-numpy.md
@@ -110,13 +116,25 @@ class DCExecutionResult:
         stages = e_left.stages + e_right.stages
         result = cls(stages)
 
+        # Verification of DC combine equations
         assert result.e1 == e_left.e1 + e_right.e1, "e1 calculation fail."
-        assert result.kstar in [e_left.kstar, e_right.kstar], "kstar calculation fail."
+        assert result.kstar in [
+            e_left.kstar,
+            e_right.kstar + len(e_left.stages),
+        ], "kstar calculation fail."
         if result.kstar == e_left.kstar:
-            assert result.e2 == e_left.e2, "e2 calculation fail."
+            stage_kstar = e_left.stages[e_left.kstar]
+            added_app = 4 * len(e_right.stages)
+            assert result.e2 == e_left.e2 + (
+                added_app - len(e_right.stages) + (result.kstar - e_left.kstar)
+            ) * (stage_kstar.forward + stage_kstar.backward), "e2 calculation fail."
             assert result.e3 == e_left.e3 + e_right.e1, "e3 calculation fail."
         else:
-            assert result.e2 == e_right.e2, "e2 calculation fail."
+            stage_kstar = e_right.stages[e_right.kstar]
+            added_app = 4 * len(e_left.stages)
+            assert result.e2 == e_right.e2 + (
+                added_app - len(e_left.stages) + (result.kstar - e_right.kstar)
+            ) * (stage_kstar.forward + stage_kstar.backward), "e2 calculation fail."
             assert result.e3 == e_right.e3, "e3 calculation fail."
         return result
 
@@ -134,12 +152,19 @@ class Planner:
         self.model_layers: List[LayerExecutionResult] = profiler.profile()
 
         self.cache = {}
-        self.his_count = 0
+        self.hit_count = 0
         self.miss_count = 0
 
     @staticmethod
     def get_max_num_stages(num_layers: int):
         return 2 ** math.floor(math.log2(num_layers))
+
+    def get_cache_hit_ratio(self, clear: bool = False) -> float:
+        hit_ratio = (self.hit_count / (self.hit_count + self.miss_count)) * 100
+        if clear:
+            self.hit_count = 0
+            self.miss_count = 0
+        return hit_ratio
 
     def get_execution_plan(self) -> DCExecutionResult:
         max_num_stages = Planner.get_max_num_stages(len(self.model_layers))
@@ -150,15 +175,11 @@ class Planner:
             # Iterate number of stages between # nodes (minimum)
             # and # layers (maximum) and get the best execution plan.
             new_e = self._run_divide_and_conquer(
-                s, self.model_layers, self.num_nodes, self.num_gpus_per_node
+                s, (0, len(self.model_layers)), self.num_nodes, self.num_gpus_per_node
             )
 
             if new_e.get_e() < e.get_e():
-                e = new_e()
-
-        logger.debug(
-            f"hit ratio: {self.his_count / (self.his_count + self.miss_count) * 100}%"
-        )
+                e = new_e
 
         return e
 
@@ -236,7 +257,7 @@ class Planner:
                         )
                         e_right = self._run_divide_and_conquer(
                             num_stages=num_stages - num_stages_left,
-                            layer_indices=(k + 1, layer_indices[1]),
+                            layer_indices=(k, layer_indices[1]),
                             num_nodes=1,
                             num_gpus_per_node=num_gpus_per_node - num_stages_left,
                         )
@@ -257,7 +278,7 @@ class Planner:
                         )
                         e_right = self._run_divide_and_conquer(
                             num_stages=num_stages - num_stages_left,
-                            layer_indices=(k + 1, layer_indices[1]),
+                            layer_indices=(k, layer_indices[1]),
                             num_nodes=num_nodes - num_nodes_left,
                             num_gpus_per_node=num_gpus_per_node,
                         )
@@ -299,25 +320,22 @@ class PipelineSpec:
         self.model = model
 
         planner = Planner(self.num_nodes, self.num_gpus_per_node, self.model)
-        optimal_plan = planner.get_execution_plan()
+        self.optimal_plan = planner.get_execution_plan()
 
         # Translate `DCExecutionResult` into layer-rank map
-        result: Dict[int, List[int]] = {}
-        used_device_num = 0
-        for stage in optimal_plan.stages:
+        layer_spec: List[List[int]] = [None] * len(model.model)
+        num_used_gpus = 0
+        for stage in sorted(
+            self.optimal_plan.stages, key=lambda s: s.layer_indicies[0]
+        ):
             for layer_index in range(stage.layer_indicies[0], stage.layer_indicies[1]):
-                result[layer_index] = list(
-                    range(used_device_num, used_device_num + stage.device_num)
+                layer_spec[layer_index] = list(
+                    range(num_used_gpus, num_used_gpus + stage.device_num)
                 )
-                used_device_num += stage.device_num
+            num_used_gpus += stage.device_num
 
-        self.optimal_plan = [None] * len(model.model)
-        for key, val in result.items():
-            self.optimal_plan[key] = val
-
-        assert all(
-            plan is not None for plan in self.optimal_plan
-        ), "Some layer has no plan."
+        assert all(spec is not None for spec in layer_spec), "Some layer has no plan."
+        self.layer_spec = layer_spec
 
     def __repr__(self) -> str:
         return f"(PipelineSpec: {self.num_nodes} nodes)"
