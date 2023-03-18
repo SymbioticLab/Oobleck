@@ -105,6 +105,8 @@ class PipelineExecutionMixin(object):
         self.dataloader = dataloader
         self.device = torch.device("cuda")
 
+        self.reset_data_iterator()
+
         # store checkpointability for each layer
         for layer in self.model_layers:
             layer.set_checkpointable(
@@ -136,6 +138,10 @@ class PipelineExecutionMixin(object):
         self.lr_scheduler = WarmupLR(
             self.optimizer, self.training_args.get_warmup_steps(num_training_steps)
         )
+
+    def reset_data_iterator(self):
+        self.data_iterator = iter(self.dataloader)
+        logger.info("iterator reset")
 
     # https://github.com/huggingface/transformers/blob/v4.26.1/src/transformers/trainer.py#L2454
     def _prepare_input(
@@ -302,19 +308,21 @@ class PipelineCommunicationMixin(object):
     def _send(
         self, tensor: torch.Tensor, dest_rank: int, async_op: bool = False
     ) -> Work:
+        dest_global_rank = dist.get_global_rank(self.process_group, dest_rank)
         return (
-            dist.isend(tensor, dest_rank, self.process_group)
+            dist.isend(tensor, dest_global_rank, self.process_group)
             if async_op
-            else dist.send(tensor, dest_rank, self.process_group)
+            else dist.send(tensor, dest_global_rank, self.process_group)
         )
 
     def _recv(
         self, tensor: torch.Tensor, src_rank: int, async_op: bool = False
     ) -> Work:
+        src_global_rank = dist.get_global_rank(self.process_group, src_rank)
         return (
-            dist.irecv(tensor, src_rank, self.process_group)
+            dist.irecv(tensor, src_global_rank, self.process_group)
             if async_op
-            else dist.recv(tensor, src_rank, self.process_group)
+            else dist.recv(tensor, src_global_rank, self.process_group)
         )
 
     @run_once
@@ -475,6 +483,9 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
     A realization of :class:`oobleck.planning.pipeline_spec.PipelineSpec`.
     It includes model to run, communication groups for pipeline execution,
     required functions for pipeline parallel execution of one pipeline.
+
+    Note that it only communicates within the given process_group with local ranks,
+    not global ranks.
     """
 
     def __init__(
@@ -485,7 +496,7 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         process_group: ProcessGroup,
         training_args: TrainingArguments,
     ):
-        self.optimal_plan = spec.optimal_plan
+        self.layer_spec = spec.layer_spec
         self.model = model
         self.total_num_layers = len(model.model)
         self.timer = OobleckTimer()
@@ -493,8 +504,8 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         my_rank = dist.get_rank(process_group)
         model_layers = [
             layer.to("cuda")
-            for layer, layer_rank in zip(model.model, self.optimal_plan)
-            if layer_rank == my_rank
+            for layer, layer_rank in zip(model.model, self.layer_spec)
+            if my_rank == layer_rank
         ]
 
         super().__init__(
@@ -502,6 +513,11 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
             dataloader=dataloader,
             training_args=training_args,
             process_group=process_group,
+        )
+
+        logger.info(
+            f"Creating pipeline ({len(spec.optimal_plan.stages)} stages): "
+            f"{spec.optimal_plan.stages}"
         )
 
     def write_samples_logs(self):
@@ -523,9 +539,9 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
 
     def train(self):
         assert (
-            torch.distributed.get_rank(self.process_group) >= 0
+            dist.get_rank(self.process_group) >= 0
         ), "This pipeline is not what I am involved in."
-        unique_ranks = list(dict.fromkeys(self.optimal_plan).keys())
+        unique_ranks = list(dict.fromkeys(self.layer_spec).keys())
         my_rank_index = unique_ranks.index(self.my_rank)
         self.train_schedule = OobleckPipelineSchedule(
             self.dataloader.num_my_microbatches,
@@ -535,8 +551,6 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         self.prev_rank = my_rank_index - 1
         self.next_rank = my_rank_index + 1
 
-        # reinitialize iterator.
-        self.data_iterator = iter(self.dataloader)
         self._exec_schedule(self.train_schedule)
 
         self.global_steps += 1
@@ -546,6 +560,9 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         )
 
         self.write_samples_logs()
+
+    def reset_data_iterator(self):
+        self.data_iterator = iter(self.dataloader)
 
     def is_first_stage(self):
         return self.model_layers[0].index == 0
