@@ -46,7 +46,7 @@ class OobleckModel:
     def __init__(
         self,
         model_name: str,
-        trace_input_names: List[str],
+        sample_inputs: Dict[str, Any],
         training_args: TrainingArguments,
         config_args: Optional[Dict[str, Any]] = None,
     ):
@@ -71,14 +71,13 @@ class OobleckModel:
 
         assert model, f"Given model {model_name} is not supported yet."
 
-        self.dummy_inputs: Dict[str, torch.Tensor] = model.dummy_inputs
-        if not trace_input_names:
-            trace_input_names = self.dummy_inputs.keys()
+        self.sample_inputs = sample_inputs
+        self.trace_input_names = list(sample_inputs.keys())
 
         self.total_num_params = sum([p.numel() for p in model.parameters()])
 
         split_points = get_split_points(model_config)
-        sharded_model = shard_model(model, trace_input_names, split_points)
+        sharded_model = shard_model(model, self.trace_input_names, split_points)
         self.model_name = model_name
         self.model = [
             Layer(index, layer, training_args)

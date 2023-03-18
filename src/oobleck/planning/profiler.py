@@ -69,8 +69,8 @@ def return_cache_if_exist(profile_type: str):
             if cache:
                 return cache
             result = func(s, *args, **kwargs)
-            store_cache(result, cache_path)
-            return cache
+            store_cache(cache_path, result)
+            return result
 
         return wrapper
 
@@ -96,8 +96,9 @@ class Profiler:
         Returns:
             List[LayerExecutionResult]: A list of execution results per layer.
         """
-        if dist.is_initialized():
-            dist.destroy_process_group()
+        dist_initialized = dist.is_initialized()
+        if not dist_initialized:
+            dist.init_process_group(backend="nccl")
 
         # forward/backward execution
         layer_execution_result = self._profile_execution_layers()
@@ -118,50 +119,74 @@ class Profiler:
                     execution["backward"],
                     ar_in_node,
                     ar_across_nodes,
+                    execution["num_elements"],
                 )
             )
 
-        dist.destroy_process_group()
+        if not dist_initialized:
+            dist.destroy_process_group()
         return results
 
     @return_cache_if_exist("layers")
     def _profile_execution_layers(self) -> List[Dict[str, float]]:
-        table = [{"forward": 0, "backward": 0} for _ in range(len(self.model.model))]
+        assert dist.is_initialized()
 
-        for i in range(num_warmup + num_iteration):
-            logger.info(f"Profiling layer executio ltency: {i} iteration")
-            input = tuple(self.model.dummy_inputs.values())
+        results: List[List[int]] = [[0, 0, 0]] * len(self.model.model)
+        if dist.get_rank() == 0:
+            for i in range(num_warmup + num_iteration):
+                logger.info(f"Profiling layer execution ltency: {i} iteration")
+                input = tuple(self.model.sample_inputs.values())
 
-            for idx, layer in enumerate(self.model.model):
-                if isinstance(input, tuple):
-                    input = tuple(
-                        [
-                            t.detach().to("cuda") if isinstance(t, torch.Tensor) else t
-                            for t in input
-                        ]
-                    )
-                else:
-                    input = input.detach().to("cuda")
+                for idx, layer in enumerate(self.model.model):
+                    if isinstance(input, tuple):
+                        input = tuple(
+                            [
+                                t.detach().to("cuda")
+                                if isinstance(t, torch.Tensor)
+                                else t
+                                for t in input
+                            ]
+                        )
+                    else:
+                        input = input.detach().to("cuda")
 
-                start = time.time()
-                output = layer(*input)
-                torch.cuda.synchronize()
-                end = time.time()
-                input = output
+                    gpu_layer = layer.to("cuda")
+                    torch.cuda.synchronize()
 
-                forward = end - start
+                    start = time.time()
+                    output = gpu_layer(*input)
+                    torch.cuda.synchronize()
+                    end = time.time()
+                    input = output
+                    forward = end - start
 
-                if i < num_warmup:
-                    continue
+                    del gpu_layer
+                    if i < num_warmup:
+                        continue
 
-                table[idx]["forward"] += forward * 1000
-                table[idx]["backward"] += forward * 2000
-                if "numel" not in table[idx]:
-                    table[idx]["numel"] = sum(
-                        [p.numel() for p in layer.parameters() if p.requires_grad]
-                    )
+                    results[idx][0] += forward * 1000
+                    results[idx][1] += forward * 2000
+                    if results[idx][2] == 0:
+                        results[idx][2] = sum(
+                            [p.numel() for p in layer.parameters() if p.requires_grad]
+                        )
 
-        return table
+        for result in results:
+            result[0] /= num_iteration
+            result[1] /= num_iteration
+
+        dist.barrier()
+
+        # 2d tensor, for each layer, multiple allreduce with different number of nodes
+        results: torch.Tensor = torch.tensor(
+            results, dtype=torch.float32, device="cuda", requires_grad=False
+        )
+        dist.broadcast(results, 0)
+
+        return [
+            {"forward": result[0], "backward": result[1], "num_elements": result[2]}
+            for result in results.tolist()
+        ]
 
     @staticmethod
     def profile_allreduce_layer(
@@ -195,16 +220,18 @@ class Profiler:
         logger.info(f"Profile allreduce acorss nodes latency")
 
         num_gpus_per_node = torch.cuda.device_count()
-        ranks = [range(0, dist.get_world_size(), num_gpus_per_node)]
+        ranks = list(range(0, dist.get_world_size(), num_gpus_per_node))
 
         process_groups: List[Tuple(bool, dist.ProcessGroup)] = []
-        for i in range(len(ranks) + 1):
+        for i in range(1, len(ranks) + 1):
             pg_ranks = ranks[:i]
             process_groups.append(
-                tuple(dist.get_rank() in pg_ranks, dist.new_group(pg_ranks))
+                (dist.get_rank() in pg_ranks, dist.new_group(pg_ranks))
             )
 
-        results: List[List[int]] = [[0] * len(process_groups)] * len(self.model.model)
+        results: List[List[int]] = [
+            [0 * len(process_groups)] for _ in range(len(self.model.model))
+        ]
         for layer_index, layer in enumerate(self.model.model):
             for pg_index, (should_run, pg) in enumerate(process_groups):
                 if should_run:
@@ -221,7 +248,7 @@ class Profiler:
         dist.broadcast(results, 0)
 
         return [
-            {len(ranks[:i]): result[i] for i in range(len(result))}
+            {len(ranks[:i]) + 1: result[i] for i in range(len(result))}
             for result in results.tolist()
         ]
 
@@ -242,16 +269,19 @@ class Profiler:
 
         num_gpus_per_node = torch.cuda.device_count()
         # 1, 2, 4, 8, ...
-        num_gpus_list = [2**i for i in range(int(math.log2(num_gpus_per_node)))]
+        num_gpus_list = [2**i for i in range(int(math.log2(num_gpus_per_node)) + 1)]
+        ranks = list(range(num_gpus_per_node))
 
         process_groups: List[Tuple(bool, dist.ProcessGroup)] = []
-        for i in range(len(num_gpus_list) + 1):
-            pg_ranks = num_gpus_per_node[: num_gpus_list[i]]
+        for i in range(len(num_gpus_list)):
+            pg_ranks = ranks[: num_gpus_list[i]]
             process_groups.append(
-                tuple(dist.get_rank() in pg_ranks, dist.new_group(pg_ranks))
+                (dist.get_rank() in pg_ranks, dist.new_group(pg_ranks))
             )
 
-        results: List[List[int]] = [[0] * len(process_groups)] * len(self.model.model)
+        results: List[List[int]] = [
+            [0 * len(process_groups)] for _ in range(len(self.model.model))
+        ]
         for layer_index, layer in enumerate(self.model.model):
             for pg_index, (should_run, pg) in enumerate(process_groups):
                 if should_run:
@@ -268,6 +298,6 @@ class Profiler:
         dist.broadcast(results, 0)
 
         return [
-            {len(num_gpus_list[:i]): result[i] for i in range(len(result))}
+            {num_gpus_list[i]: result[i] for i in range(len(result))}
             for result in results.tolist()
         ]

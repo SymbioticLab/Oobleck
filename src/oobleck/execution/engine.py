@@ -116,7 +116,7 @@ class OobleckEngine(
         model_args["use_cache"] = False
         model_args["remove_unused_columns"] = False
         self.model = OobleckModel(
-            model_name, self.dataset.trace_input_names, training_args, model_args
+            model_name, self.dataset.sample, training_args, model_args
         )
 
         # create a list of pipelinespecs that can cover all nodes.
