@@ -8,13 +8,15 @@ import torch.distributed as dist
 from ast import literal_eval
 from pathlib import Path
 from deepspeed.utils.logging import logger
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Tuple, Optional
 
 from oobleck.module.model import OobleckModel
 from oobleck.module.layer import Layer
 
 
 PROFILE_CACHE = "/tmp/oobleck/profiles"
+num_warmup = 2
+num_iteration = 3
 
 
 class LayerExecutionResult:
@@ -33,10 +35,6 @@ class LayerExecutionResult:
         self.allreduce_in_node = allreduce_in_node
         self.allreduce_cross_nodes = allreduce_cross_nodes
         self.num_elements = num_elements
-
-
-num_warmup = 2
-num_iteration = 3
 
 
 def return_cache_if_exist(profile_type: str):
@@ -66,7 +64,7 @@ def return_cache_if_exist(profile_type: str):
     def decorator(func):
         @functools.wraps(func)
         def wrapper(s, *args, **kwargs):
-            cache_path = f"{PROFILE_CACHE}/{s.model_name}/{profile_type}"
+            cache_path = f"{PROFILE_CACHE}/{s.model.model_name}/{profile_type}"
             cache = get_cache_if_exists(cache_path)
             if cache:
                 return cache
@@ -90,36 +88,28 @@ class Profiler:
         self.model = model
 
     def profile(self) -> List[LayerExecutionResult]:
+        """Profile the given model and return a list of execution result
+        per layer.
+        ExecutionResult includes forward/backward latency, allreduce in node,
+        and allreduce across nodes.
+
+        Returns:
+            List[LayerExecutionResult]: A list of execution results per layer.
+        """
         if dist.is_initialized():
             dist.destroy_process_group()
+
+        # forward/backward execution
         layer_execution_result = self._profile_execution_layers()
-
-        dist.init_process_group()
-        num_gpus_per_node = torch.cuda.device_count()
-        for start_index in range(0, dist.get_world_size(), num_gpus_per_node):
-            ranks = range(start_index, start_index + num_gpus_per_node)
-            process_group = dist.new_group(ranks)
-            if dist.get_rank() in ranks:
-                my_local_process_group = process_group
-        allreduce_in_node = self._profile_allreduce_in_node(my_local_process_group)
-
-        # TODO: get allreduce cross nodes
-        world_ranks = list(range(dist.get_world_size()))
-        for i in range(num_gpus_per_node):
-            ranks = world_ranks[i::num_gpus_per_node]
-            process_group = dist.new_group(ranks)
-            if dist.get_rank() in ranks:
-                my_cross_process_group = process_group
-        allreduce_cross_node = self._profile_allreduce_across_nodes(
-            my_cross_process_group
-        )
+        allreduce_across_nodes = self._profile_allreduce_across_nodes()
+        allreduce_in_node = self._profile_allreduce_in_node()
 
         results: List[LayerExecutionResult] = []
-        for layer, execution, ar_in_node, ar_cross_node in zip(
+        for layer, execution, ar_in_node, ar_across_nodes in zip(
             self.model.model,
             layer_execution_result,
             allreduce_in_node,
-            allreduce_cross_node,
+            allreduce_across_nodes,
         ):
             results.append(
                 LayerExecutionResult(
@@ -127,9 +117,10 @@ class Profiler:
                     execution["forward"],
                     execution["backward"],
                     ar_in_node,
-                    ar_cross_node,
+                    ar_across_nodes,
                 )
             )
+
         dist.destroy_process_group()
         return results
 
@@ -179,53 +170,104 @@ class Profiler:
         numel = sum([p.numel() for p in layer.parameters()])
         tensor = torch.zeros(numel, dtype=torch.float32, device="cuda")
 
-        dist.barrier()
+        dist.barrier(process_group)
         start = time.time()
         dist.all_reduce(tensor, group=process_group)
+        dist.barrier(process_group)
         end = time.time()
 
         del tensor
         return (end - start) * 1000
 
-    @return_cache_if_exist("allreduce_corss_nodes")
-    def _profile_allreduce_across_nodes(
-        self, ranks: List[int]
-    ) -> List[Dict[int, float]]:
+    @return_cache_if_exist("allreduce_cross_nodes")
+    def _profile_allreduce_across_nodes(self) -> List[Dict[int, float]]:
+        """Profile allreduce latency across nodes,
+        \# nodes = 2, 3, ... N.
+        Actual measurement is done only on global rank 0,
+        later others will receive the result from the rank.
+
+        Returns:
+            List[Dict[int, float]]: A list of allreduce latency,
+            where key is the number of nodes and value is the latency,
+            for every layer.
+        """
         assert dist.is_initialized()
         logger.info(f"Profile allreduce acorss nodes latency")
 
-        results: List[Dict[int, List[float]]] = []
-        for layer in self.model.model:
-            result: Dict[int, List[float]] = {}
-            for num_nodes in range(1, len(ranks)):
-                ranks_pg = ranks[:num_nodes]
-                process_group = dist.new_group(ranks_pg)
-                result[num_nodes] = Profiler.profile_allreduce_layer(
-                    layer, process_group
-                )
-                dist.destroy_process_group(process_group)
-            results.append(result)
+        num_gpus_per_node = torch.cuda.device_count()
+        ranks = [range(0, dist.get_world_size(), num_gpus_per_node)]
 
-        return results
+        process_groups: List[Tuple(bool, dist.ProcessGroup)] = []
+        for i in range(len(ranks) + 1):
+            pg_ranks = ranks[:i]
+            process_groups.append(
+                tuple(dist.get_rank() in pg_ranks, dist.new_group(pg_ranks))
+            )
+
+        results: List[List[int]] = [[0] * len(process_groups)] * len(self.model.model)
+        for layer_index, layer in enumerate(self.model.model):
+            for pg_index, (should_run, pg) in enumerate(process_groups):
+                if should_run:
+                    results[layer_index][pg_index] = Profiler.profile_allreduce_layer(
+                        layer, pg
+                    )
+
+        dist.barrier()
+
+        # 2d tensor, for each layer, multiple allreduce with different number of nodes
+        results: torch.Tensor = torch.tensor(
+            results, dtype=torch.float32, device="cuda", requires_grad=False
+        )
+        dist.broadcast(results, 0)
+
+        return [
+            {len(ranks[:i]): result[i] for i in range(len(result))}
+            for result in results.tolist()
+        ]
 
     @return_cache_if_exist("allreduce_in_node")
-    def _profile_allreduce_in_node(
-        self, ranks: List[int], num_gpus_per_node: int
-    ) -> List[Dict[int, float]]:
+    def _profile_allreduce_in_node(self) -> List[Dict[int, float]]:
+        """Profile allreduce latency between GPUs in node,
+        \# nodes = 1, 2, 4, ....
+        Actual measurement is done only on global rank 0,
+        later others will receive the result from the rank.
+
+        Returns:
+            List[Dict[int, float]]: A list of allreduce latency,
+            where key is the number of GPUs and value is the latency,
+            for every layer.
+        """
         assert dist.is_initialized()
         logger.info(f"Profile allreduce within a node latency")
 
-        results: List[Dict[int, List[float]]] = []
-        for layer in self.model.model:
-            result: Dict[int, List[float]] = {}
-            num_gpuss = [2**i for i in range(int(math.log2(num_gpus_per_node)))]
-            for num_gpus in num_gpuss:
-                ranks_pg = ranks[:num_gpus]
-                process_group = dist.new_group(ranks_pg)
-                result[num_gpus] = Profiler.profile_allreduce_layer(
-                    layer, process_group
-                )
-                dist.destroy_process_group(process_group)
-            results.append(result)
+        num_gpus_per_node = torch.cuda.device_count()
+        # 1, 2, 4, 8, ...
+        num_gpus_list = [2**i for i in range(int(math.log2(num_gpus_per_node)))]
 
-        return results
+        process_groups: List[Tuple(bool, dist.ProcessGroup)] = []
+        for i in range(len(num_gpus_list) + 1):
+            pg_ranks = num_gpus_per_node[: num_gpus_list[i]]
+            process_groups.append(
+                tuple(dist.get_rank() in pg_ranks, dist.new_group(pg_ranks))
+            )
+
+        results: List[List[int]] = [[0] * len(process_groups)] * len(self.model.model)
+        for layer_index, layer in enumerate(self.model.model):
+            for pg_index, (should_run, pg) in enumerate(process_groups):
+                if should_run:
+                    results[layer_index][pg_index] = Profiler.profile_allreduce_layer(
+                        layer, pg
+                    )
+
+        dist.barrier()
+
+        # 2d tensor, for each layer, multiple allreduce with different number of nodes
+        results: torch.Tensor = torch.tensor(
+            results, dtype=torch.float32, device="cuda", requires_grad=False
+        )
+        dist.broadcast(results, 0)
+
+        return [
+            {len(num_gpus_list[:i]): result[i] for i in range(len(result))}
+            for result in results.tolist()
+        ]
