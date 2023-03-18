@@ -323,15 +323,18 @@ class PipelineSpec:
         self.optimal_plan = planner.get_execution_plan()
 
         # Translate `DCExecutionResult` into layer-rank map
-        layer_spec: List[List[int]] = [None] * len(model.model)
+        # layer_spec has a list of ranks, each of which is mapped to each layer.
+        layer_spec: List[int] = [None] * len(model.model)
         num_used_gpus = 0
         for stage in sorted(
             self.optimal_plan.stages, key=lambda s: s.layer_indicies[0]
         ):
             for layer_index in range(stage.layer_indicies[0], stage.layer_indicies[1]):
-                layer_spec[layer_index] = list(
-                    range(num_used_gpus, num_used_gpus + stage.device_num)
-                )
+                gpus = list(range(num_used_gpus, num_used_gpus + stage.device_num))
+                assert (
+                    len(gpus) == 1
+                ), "TODO: Currently only one GPU can be assigned to each layer."
+                layer_spec[layer_index] = gpus[0]
             num_used_gpus += stage.device_num
 
         assert all(spec is not None for spec in layer_spec), "Some layer has no plan."
