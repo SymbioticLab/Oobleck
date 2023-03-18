@@ -169,18 +169,18 @@ class OobleckEngine(
         self._init_distributed_from_env()
         self.timer = OobleckTimer()
 
-        self.num_pipeline_specs = self._get_num_instantiation_pipeline_specs()
+        num_pipeline_specs = self._get_num_instantiation_pipeline_specs()
 
         # TODO: change total number of microbatches properly.
         self.train_dataloader = OobleckTrainDataLoader(
             self.dataset.dataset["train"],
             self.training_args,
             self.training_args.gradient_accumulation_steps
-            * sum([num_spec for num_spec in self.num_pipeline_specs]),
+            * sum([num_spec for num_spec in num_pipeline_specs]),
             self.dataset.data_collator,
         )
 
-        self.my_pipeline = self._deploy_pipelines()
+        self.my_pipeline = self._deploy_pipelines(num_pipeline_specs)
         assert self.my_pipeline, "Cannot find a pipeline that I am belong to."
 
     def _get_num_instantiation_pipeline_specs(self) -> List[int]:
@@ -222,7 +222,7 @@ class OobleckEngine(
 
         return num_pipeline_specs
 
-    def _deploy_pipelines(self) -> OobleckPipeline:
+    def _deploy_pipelines(self, num_pipeline_specs: List[int]) -> OobleckPipeline:
         """Calculate required number of heterogeneous pipelines that
         a linear combination of the pipelines fills the distributed world.
         """
@@ -232,9 +232,7 @@ class OobleckEngine(
         pipeline_ranks_list: List[List[int]] = []
         pipeline_pgs_list: List[ProcessGroup] = []
         my_pipeline: Optional[OobleckPipeline] = None
-        for num_pipeline, pipeline_spec in zip(
-            self.num_pipeline_specs, self.pipeline_specs
-        ):
+        for num_pipeline, pipeline_spec in zip(num_pipeline_specs, self.pipeline_specs):
             for i in range(num_pipeline):
                 nodes = list_nodes[node_index : node_index + pipeline_spec.num_nodes]
                 node_index += pipeline_spec.num_nodes
