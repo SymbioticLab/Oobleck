@@ -561,9 +561,6 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
 
         self.write_samples_logs()
 
-    def reset_data_iterator(self):
-        self.data_iterator = iter(self.dataloader)
-
     def is_first_stage(self):
         return self.model_layers[0].index == 0
 
