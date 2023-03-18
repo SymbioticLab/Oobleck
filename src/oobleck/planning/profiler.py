@@ -230,7 +230,7 @@ class Profiler:
             )
 
         results: List[List[int]] = [
-            [0 * len(process_groups)] for _ in range(len(self.model.model))
+            [0] * len(process_groups) for _ in range(len(self.model.model))
         ]
         for layer_index, layer in enumerate(self.model.model):
             for pg_index, (should_run, pg) in enumerate(process_groups):
@@ -280,7 +280,7 @@ class Profiler:
             )
 
         results: List[List[int]] = [
-            [0 * len(process_groups)] for _ in range(len(self.model.model))
+            [0] * len(process_groups) for _ in range(len(self.model.model))
         ]
         for layer_index, layer in enumerate(self.model.model):
             for pg_index, (should_run, pg) in enumerate(process_groups):
