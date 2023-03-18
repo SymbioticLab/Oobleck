@@ -141,7 +141,6 @@ class PipelineExecutionMixin(object):
 
     def reset_data_iterator(self):
         self.data_iterator = iter(self.dataloader)
-        logger.info("iterator reset")
 
     # https://github.com/huggingface/transformers/blob/v4.26.1/src/transformers/trainer.py#L2454
     def _prepare_input(

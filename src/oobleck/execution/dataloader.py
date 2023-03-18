@@ -1,5 +1,4 @@
 import torch
-import deepspeed.comm as dist
 
 from torch.utils.data import BatchSampler, DataLoader
 from torch.utils.data.dataloader import _collate_fn_t
@@ -33,6 +32,7 @@ class OobleckSampler(BatchSampler):
         self.seed = seed
 
     def __iter__(self) -> Iterator[List[int]]:
+        self.consumed_samples = 0
         if self.shuffle:
             # deterministically shuffle based on epoch and seed
             g = torch.Generator()
@@ -44,7 +44,7 @@ class OobleckSampler(BatchSampler):
         while self.consumed_samples < self.num_samples:
             if self.num_samples - self.consumed_samples < self.total_bucket_size:
                 # Last batch if not complete will be dropped.
-                return
+                break
 
             for i in range(self.num_microbatches):
                 yield indices[i * self.microbatch_size : (i + 1) * self.microbatch_size]
