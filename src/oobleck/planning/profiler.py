@@ -123,6 +123,7 @@ class Profiler:
                 )
             )
 
+        dist.barrier()
         if not dist_initialized:
             dist.destroy_process_group()
         return results
