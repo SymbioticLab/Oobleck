@@ -133,7 +133,12 @@ class OobleckEngine(
         without master/agent processes.
         Must be removed and replaced with `init_distributed_from_etcd`.
         """
-        self.world_info = {"localhost1": [0], "localhost2": [1]}
+        self.world_info = {
+            "localhost0": [0],
+            "localhost1": [1],
+            "localhost2": [2],
+            "localhost3": [3],
+        }
         assert all(
             len(gpus) > 0 for gpus in self.world_info.values()
         ), "Some node has no GPUs."
@@ -224,7 +229,8 @@ class OobleckEngine(
 
         list_nodes = list(self.world_info.keys())
         node_index = 0
-        pipeline_process_group_ranks: List[List[int]] = []
+        pipeline_ranks_list: List[List[int]] = []
+        pipeline_pgs_list: List[ProcessGroup] = []
         my_pipeline: Optional[OobleckPipeline] = None
         for num_pipeline, pipeline_spec in zip(
             self.num_pipeline_specs, self.pipeline_specs
@@ -233,8 +239,10 @@ class OobleckEngine(
                 nodes = list_nodes[node_index : node_index + pipeline_spec.num_nodes]
                 node_index += pipeline_spec.num_nodes
                 for j in range(self.num_gpus_per_node):
-                    ranks = [self.world_info[node][j] for node in nodes]
+                    ranks: List[int] = [self.world_info[node][j] for node in nodes]
+                    assert ranks
                     pp_pg = dist.new_group(ranks)
+
                     if dist.get_rank(pp_pg) >= 0:
                         my_pipeline = OobleckPipeline(
                             pipeline_spec,
@@ -245,8 +253,9 @@ class OobleckEngine(
                         )
 
                     # Ranks per each layer. Used for creating :class:`ProcessGroup`s for each layer.
-                    ranks_to_layer_map = [ranks[i] for i in pipeline_spec.optimal_plan]
-                    pipeline_process_group_ranks.append(ranks_to_layer_map)
+                    ranks_to_layer_map = [ranks[i] for i in pipeline_spec.layer_spec]
+                    pipeline_ranks_list.append(ranks_to_layer_map)
+                    pipeline_pgs_list.append(pp_pg)
 
                 # TODO: implement FSDP processgroup.
                 # Currently self.world_info[node] always has one rank,
@@ -257,7 +266,7 @@ class OobleckEngine(
         # TODO: later when we adopt FSDP, each sharded point must be distinguished.
         layer_dp_groups: List[ProcessGroup] = []
         for layer_index in range(len(my_pipeline.model_layers)):
-            ranks = [ranks[layer_index] for ranks in pipeline_process_group_ranks]
+            ranks = [ranks[layer_index] for ranks in pipeline_ranks_list]
             dp_pg = dist.new_group(ranks)
             layer_dp_groups.append(dp_pg)
 
@@ -294,7 +303,8 @@ class OobleckEngine(
         required_min_gpus = math.ceil(
             required_memory / torch.cuda.get_device_properties("cuda:0").total_memory
         )
-        min_num_nodes = math.ceil(required_min_gpus / self.num_gpus_per_node)
+        # min_num_nodes = math.ceil(required_min_gpus / self.num_gpus_per_node)
+        min_num_nodes = 2
         assert (
             ft_spec + 1
         ) * min_num_nodes <= max_num_nodes, f"Maximum # nodes ({max_num_nodes}) cannot be smaller than minimum # nodes ({min_num_nodes})."
@@ -401,7 +411,11 @@ class OobleckEngine(
         if self.training_args.max_steps > 0:
             for i in range(self.training_args.max_steps):
                 logger.info(f"[{i}] step")
-                self.my_pipeline.train()
+                try:
+                    self.my_pipeline.train()
+                except StopIteration:
+                    self.my_pipeline.reset_data_iterator()
+                    self.my_pipeline.train()
                 self.do_allreduce()
                 self.my_pipeline.optimizer_step()
                 log()
@@ -415,3 +429,4 @@ class OobleckEngine(
                     self.do_allreduce()
                     self.my_pipeline.optimizer_step()
                     log()
+                self.my_pipeline.reset_data_iterator()
