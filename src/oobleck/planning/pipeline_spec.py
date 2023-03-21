@@ -358,3 +358,62 @@ class PipelineSpec:
 
     def __repr__(self) -> str:
         return f"(PipelineSpec: {self.num_nodes} nodes)"
+
+    @classmethod
+    def create(
+        cls,
+        ft_spec: int,
+        max_num_nodes: int,
+        num_gpus_per_node: int,
+        model: OobleckModel,
+    ) -> List["PipelineSpec"]:
+        """Oobleck paper section 4.1. Configuring PipelineSpecs implementation
+        Generates the list of :class:`oobleck.planning.pipeline_spec.PipelineSpec`s
+        with heterogeneous number of nodes specifications, a linear combination of
+        which can represent any number N (min_num_nodes <= N <= max_num_nodes).
+
+        Oobleck exploits the Frobenius problem and creates a list of `PipelineSpec`s
+        based on the constraints:
+        1. \# of `PipelineSpec`s > n0 - 1
+        2. ni's are consecutive integers (ni + 1 = n(i+1))
+        We define n0 = minimum number of nodes ths is required to hold states for training.
+
+        Args:
+            ft_spec (int): Fault tolerant spec.
+                Oobleck tries to create at least ft_spec + 1 model replica.
+            max_num_nodes (int): Maximum # nodes in the cluster.
+
+        Returns:
+            List[PipelineSpec]: List of `PipelineSpec`s.
+                Length of the list is the number of `PipelineSpec`s, p.
+        """
+        assert ft_spec >= 0, "Fault tolerance spec must not be negative."
+
+        required_memory = model.total_num_params * 12
+        required_min_gpus = math.ceil(
+            required_memory / torch.cuda.get_device_properties("cuda:0").total_memory
+        )
+        # min_num_nodes = math.ceil(required_min_gpus / self.num_gpus_per_node)
+        min_num_nodes = 2
+        assert (
+            ft_spec + 1
+        ) * min_num_nodes <= max_num_nodes, f"Maximum # nodes ({max_num_nodes}) cannot be smaller than minimum # nodes ({min_num_nodes})."
+        if (ft_spec + 1) * min_num_nodes > max_num_nodes:
+            logger.warning(
+                "The number of nodes is not enough to provide at least ft_spec + 1 copy of the model."
+                "Oobleck may fail to provide fault tolerancy if continue."
+            )
+
+        # p = n0 - 1
+        num_pipeline_specs = min_num_nodes
+        if num_pipeline_specs < 1:
+            num_pipeline_specs = 1
+
+        pipeline_specs = list(range(min_num_nodes, min_num_nodes + num_pipeline_specs))
+        assert all(
+            num_nodes <= max_num_nodes for num_nodes in pipeline_specs
+        ), "Some PipelineSpec needs to have more # nodes than maximum # nodes (impossible)."
+
+        return [
+            cls(num_nodes, num_gpus_per_node, model) for num_nodes in pipeline_specs
+        ]

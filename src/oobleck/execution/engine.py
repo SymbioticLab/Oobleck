@@ -16,6 +16,10 @@ from deepspeed.utils import logger
 from oobleck.execution.dataset import OobleckDataset
 from oobleck.module.model import OobleckModel
 from oobleck.planning.pipeline_spec import PipelineSpec
+from oobleck.planning.instantiator import (
+    HeterogeneousPipelineExecutionPlan,
+    PipelineInstantiator,
+)
 from oobleck.elastic.client import ElasticWorkerClientMixin, ElasticClientMonitorMixin
 from oobleck.execution.dataloader import OobleckTrainDataLoader
 from oobleck.execution.pipeline import OobleckPipeline
@@ -131,9 +135,9 @@ class OobleckEngine(
         """
         self.world_info = {
             "localhost0": [0],
-            # "localhost1": [1],
-            # "localhost2": [2],
-            # "localhost3": [3],
+            "localhost1": [1],
+            "localhost2": [2],
+            "localhost3": [3],
         }
         assert all(
             len(gpus) > 0 for gpus in self.world_info.values()
@@ -167,78 +171,27 @@ class OobleckEngine(
 
         # create a list of pipelinespecs that can cover all nodes.
         # this is invariant and never changes over reconfiguration.
-        self.pipeline_specs: List[PipelineSpec] = self.create_pipeline_specs(
-            self.ft_spec, self.max_num_nodes, self.model
+        self.pipeline_specs: List[PipelineSpec] = PipelineSpec.create(
+            self.ft_spec, self.max_num_nodes, self.num_gpus_per_node, self.model
         )
-
-        # num_pipeline_specs = self._get_num_instantiation_pipeline_specs()
 
         # TODO: move it to user configurable arguments
         global_num_microbatch = 8
-
-        self.instantiate_pipelines(
-            self.pipeline_specs, len(self.world_info), global_num_microbatch
+        self.train_dataloader = OobleckTrainDataLoader(
+            self.dataset.dataset["train"],
+            self.training_args,
+            global_num_microbatch,
+            self.dataset.data_collator,
         )
-        # self.my_pipeline = self._deploy_pipelines(num_pipeline_specs)
-        # assert self.my_pipeline, "Cannot find a pipeline that I am belong to."
 
-    def create_pipeline_specs(
-        self, ft_spec: int, max_num_nodes: int, model: OobleckModel
-    ) -> List[PipelineSpec]:
-        """Oobleck paper section 4.1. Configuring PipelineSpecs implementation
-        Generates the list of :class:`oobleck.planning.pipeline_spec.PipelineSpec`s
-        with heterogeneous number of nodes specifications, a linear combination of
-        which can represent any number N (min_num_nodes <= N <= max_num_nodes).
-
-        Oobleck exploits the Frobenius problem and creates a list of `PipelineSpec`s
-        based on the constraints:
-        1. \# of `PipelineSpec`s > n0 - 1
-        2. ni's are consecutive integers (ni + 1 = n(i+1))
-        We define n0 = minimum number of nodes ths is required to hold states for training.
-
-        Args:
-            ft_spec (int): Fault tolerant spec.
-                Oobleck tries to create at least ft_spec + 1 model replica.
-            max_num_nodes (int): Maximum # nodes in the cluster.
-
-        Returns:
-            List[PipelineSpec]: List of `PipelineSpec`s.
-                Length of the list is the number of `PipelineSpec`s, p.
-        """
-        assert ft_spec >= 0, "Fault tolerance spec must not be negative."
-
-        required_memory = model.total_num_params * 12
-        required_min_gpus = math.ceil(
-            required_memory / torch.cuda.get_device_properties("cuda:0").total_memory
+        self.pipeline = self.instantiate_pipelines(
+            self.pipeline_specs, self.max_num_nodes, global_num_microbatch, True
         )
-        min_num_nodes = math.ceil(required_min_gpus / self.num_gpus_per_node)
-        # min_num_nodes = 2
-        assert (
-            ft_spec + 1
-        ) * min_num_nodes <= max_num_nodes, f"Maximum # nodes ({max_num_nodes}) cannot be smaller than minimum # nodes ({min_num_nodes})."
-        if (ft_spec + 1) * min_num_nodes > max_num_nodes:
-            logger.warning(
-                "The number of nodes is not enough to provide at least ft_spec + 1 copy of the model."
-                "Oobleck may fail to provide fault tolerancy if continue."
-            )
-
-        # p = n0 - 1
-        num_pipeline_specs = min_num_nodes
-        if num_pipeline_specs < 1:
-            num_pipeline_specs = 1
-
-        pipeline_specs = list(range(min_num_nodes, min_num_nodes + num_pipeline_specs))
-        assert all(
-            num_nodes <= max_num_nodes for num_nodes in pipeline_specs
-        ), "Some PipelineSpec needs to have more # nodes than maximum # nodes (impossible)."
-
-        return [
-            PipelineSpec(num_nodes, self.num_gpus_per_node, self.model)
-            for num_nodes in pipeline_specs
-        ]
 
     # ==========================================================================================
+    # Paper section 4.1. is implemented in oobleck.planning.pipeline_spec.PipelineSpec.
     # Paper section 4.2. is implemented in oobleck.planning.pipeline_spec.PipelineSpec.
+    # Paper section 4.3. is implemented in oobleck.planning.instantiator.PipelineInstantiator.
     # ==========================================================================================
 
     def instantiate_pipelines(
@@ -258,226 +211,32 @@ class OobleckEngine(
             throughput_oriented (bool, optional): Whether throughput oriented or
                 reconfiguration overhead oriented.
         """
-        pipeline_instantiation_set_list: List[
-            Dict[PipelineSpec, int]
-        ] = self.get_feasible_sets_of_pipeline_instantiation(pipeline_specs, num_nodes)
 
-        num_mb_per_pipelinespec_list: List[Dict[PipelineSpec, int]] = []
-        for set in pipeline_instantiation_set_list:
-            num_mb_per_pipelinespec_list.append(
-                self.distribute_batch(global_num_microbatch, set)
-            )
-
-        # For each feasible set, measure throughput
-        # FIXME: currently communication time only considers
-        # the first layer synchronization, believing communication of
-        # other layers can fully be hidden in backward pass computing.
-        tmp_throughput: float = math.inf
-        tmp_num_avg_nodes: float = math.inf
-        tmp_set: Dict[PipelineSpec, Tuple[int, int]] = {}
-        total_num_nodes_used = 0
-
-        for num_instance_set, num_mb_per_ppspec in zip(
-            pipeline_instantiation_set_list, num_mb_per_pipelinespec_list
-        ):
-
-            if throughput_oriented:
-                set_throughput = max(
-                    [
-                        spec.optimal_plan.get_e() * num_mb_per_ppspec[spec]
-                        for spec in num_instance_set.keys()
-                    ]
-                ) + (
-                    list(num_instance_set.keys())[0]
-                    .planner.model_layers[-1]
-                    .allreduce_cross_nodes[num_nodes]
-                )
-                if tmp_throughput > set_throughput:
-                    tmp_throughput = set_throughput
-                    tmp_set = {}
-                    for spec, num_instance in num_instance_set.items():
-                        tmp_set[spec] = (num_instance, num_mb_per_ppspec[spec])
-                    total_num_nodes_used += spec.num_nodes * num_instance
-            else:
-                # average number of nodes instantiated pipelines have
-                total_num_nodes = sum(
-                    [
-                        spec.num_nodes * num_instance
-                        for spec, num_instance in num_instance_set.items()
-                    ]
-                )
-                total_instance = sum(list(num_instance_set.values()))
-                set_num_avg_nodes = total_num_nodes / total_instance
-                if tmp_num_avg_nodes > set_num_avg_nodes:
-                    tmp_num_avg_nodes = set_num_avg_nodes
-                    tmp_set = {}
-                    for spec, num_instance in num_instance_set.items():
-                        tmp_set[spec] = tuple(num_instance, num_mb_per_ppspec[spec])
-                    total_num_nodes_used += spec.num_nodes * num_instance
-
-        sum_used_nodes = sum(
-            [
-                spec.num_nodes * num_instance
-                for spec, (num_instance, _) in tmp_set.items()
-            ]
-        )
-        assert (
-            num_nodes == sum_used_nodes
-        ), f"num nodes {num_nodes} is not equal to sum of used nodes {sum_used_nodes}"
-
-        # instantiate pipelines
-        total_num_nodes_used = 0
-        pipeline_ranks_list: List[List[int]] = []
-        pipeline_pgs_list: List[ProcessGroup] = []
-        num_total_microbatches = sum(
-            num_instance * num_mb for num_instance, num_mb in tmp_set.values()
+        instantiator = PipelineInstantiator(
+            pipeline_specs, num_nodes, global_num_microbatch
         )
 
-        for spec, (num_instance, num_mb) in tmp_set.items():
-            for i in range(num_instance):
-                ranks = list(
-                    range(total_num_nodes_used, total_num_nodes_used + spec.num_nodes)
-                )
-                pipeline_pg = dist.new_group(ranks)
-                pipeline_pgs_list.append(pipeline_pg)
+        execution_plan: HeterogeneousPipelineExecutionPlan = (
+            instantiator.get_best_execution_plan(throughput_oriented)
+        )
 
-                if dist.get_rank(pipeline_pg) >= 0:
-                    assert not hasattr(self, "my_pipeline")
-                    self.training_args.gradient_accumulation_steps = num_mb
+        self.training_args.gradient_accumulation_steps = (
+            execution_plan.get_my_number_of_microbatches(dist.get_rank())
+        )
+        pipeline, pipeline_ranks_list = execution_plan.instantiate(
+            self.model, self.train_dataloader, self.training_args
+        )
 
-                    self.train_dataloader = OobleckTrainDataLoader(
-                        self.dataset.dataset["train"],
-                        self.training_args,
-                        num_total_microbatches,
-                        self.dataset.data_collator,
-                    )
-
-                    my_pipeline = OobleckPipeline(
-                        spec,
-                        self.model,
-                        self.train_dataloader,
-                        pipeline_pg,
-                        self.training_args,
-                    )
-
-                ranks_to_layer_map = [ranks[i] for i in spec.layer_spec]
-                pipeline_ranks_list.append(ranks_to_layer_map)
-
-                total_num_nodes_used += spec.num_nodes
-
-        assert my_pipeline
-
+        # Reconstruct per-layer rank group for data parallelism from execution plan
         layer_dp_groups: List[ProcessGroup] = []
-        for layer_index in range(len(my_pipeline.model_layers)):
-            ranks = [ranks[layer_index] for ranks in pipeline_ranks_list]
-            dp_pg = dist.new_group(ranks)
-            layer_dp_groups.append(dp_pg)
+        for layer_index in range(len(pipeline.model_layers)):
+                ranks = [ranks[layer_index] for ranks in pipeline_ranks_list]
+                dp_pg = dist.new_group(ranks)
+                layer_dp_groups.append(dp_pg)
 
-        self.initialize_dp_process_groups(my_pipeline, layer_dp_groups)
+        self.initialize_dp_process_groups(pipeline, layer_dp_groups)
 
-        return my_pipeline
-
-    def get_feasible_sets_of_pipeline_instantiation(
-        self,
-        pipeline_specs: List[PipelineSpec],
-        num_nodes: int,
-    ) -> List[Dict[PipelineSpec, int]]:
-        """Oobleck paper section 4.3.1. Getting number of pipeline instances implementation
-        Get all feasible sets of xi's that can use all of the given nodes.
-
-        Args:
-            pipeline_specs (List[PipelineSpec]): List of `PipelineSpec`s to be instantiated.
-            num_nodes (int): Number of nodes to be used for training.
-
-        Returns:
-            List[Dict[PipelineSpec, int]]: List of feasible sets.
-                Each set is implemented as a dictionary, key as PipelineSpec and
-                value as how many instances should be created on the key PipelineSpec.
-        """
-
-        dp: List[List[List[Dict[PipelineSpec, int]]]] = [
-            [[] for _ in range(num_nodes + 1)] for _ in range(len(pipeline_specs) + 1)
-        ]
-
-        for i in range(1, len(pipeline_specs) + 1):
-            dp[i][0] = [defaultdict(int)]
-            for j in range(1, num_nodes + 1):
-                # (1) in Figure: copy all dicts
-                dp[i][j] = [combo.copy() for combo in dp[i - 1][j]]
-                if pipeline_specs[i - 1].num_nodes <= j:
-                    # (2) in Figure: copy all dicts with one pipeline_specs[i - 1] added
-                    for combo in dp[i][j - pipeline_specs[i - 1].num_nodes]:
-                        new_combo = combo.copy()
-                        new_combo[pipeline_specs[i - 1]] += 1
-
-                        # concatenate two lists
-                        dp[i][j].append(new_combo)
-
-        return dp[-1][-1]
-
-    def distribute_batch(
-        self,
-        global_num_microbatch: int,
-        instances_per_pipelinespec: Dict[PipelineSpec, int],
-    ) -> Dict[PipelineSpec, int]:
-        """Oobleck paper section 4.3.2. Calculating batch size for each pipeline template
-        satisfying the following two requirements
-        1. std(Bi * Ti) is minimized
-        2. sum(Bi) = B
-        3. Each Bi is divisible by b (training_args.per_device_train_batch_size)
-
-        Use Pyomo (Python Optimization Modeling Objects).
-
-        Args:
-            global_num_microbatch (int): Global batch // training_args.per_device_train_batch_size.
-            instances_per_pp_template (List[int]): List of number of pipeline instances per template
-            pipeline_iteration_time (List[float]): List of PipelineSpec.e.
-
-        Returns:
-            List[int]: List of number of microbatch per template.
-                Multiply by training_args.per_device_train_batch_size to calculate minibatch size.
-        """
-
-        model = pyomo.ConcreteModel()
-
-        model.I = pyomo.Set(initialize=list(range(len(instances_per_pipelinespec))))
-        T = {
-            i: pipeline_spec.optimal_plan.get_e()
-            for i, pipeline_spec in enumerate(instances_per_pipelinespec)
-        }
-        x = {
-            i: instance_num
-            for i, instance_num in enumerate(instances_per_pipelinespec.values())
-        }
-
-        # Define the Pyomo variable
-        # nb: number fo microbatches per PipelineSpec
-        model.nb = pyomo.Var(model.I, within=pyomo.PositiveIntegers)
-
-        # Objective function
-        def objective(model):
-            avg_bT = sum(model.nb[i] * T[i] for i in model.I) / len(model.I)
-            return sum((model.nb[i] * T[i] - avg_bT) ** 2 for i in model.I)
-
-        model.obj = pyomo.Objective(rule=objective)
-
-        # Define constraints
-        def c1(model):
-            return sum(model.nb[i] * x[i] for i in model.I) == global_num_microbatch
-
-        model.constraint1 = pyomo.Constraint(rule=c1)
-
-        pyomo.SolverFactory("mindtpy").solve(
-            model, mip_solver="glpk", nlp_solver="ipopt"
-        )
-
-        nb_optimal = {
-            spec: int(model.nb[i].value)
-            for i, spec in zip(model.I, instances_per_pipelinespec.keys())
-        }
-        # nb_optimal = [int(model.nb[i].value) for i in model.I]
-        logger.info(f"Number of microbatch per PipelineSpec: {nb_optimal}")
-        return nb_optimal
+        return pipeline
 
     def train(self):
         """
