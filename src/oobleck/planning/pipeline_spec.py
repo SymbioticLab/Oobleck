@@ -319,8 +319,8 @@ class PipelineSpec:
         self.num_gpus_per_node = num_gpus_per_node
         self.model = model
 
-        planner = Planner(self.num_nodes, self.num_gpus_per_node, self.model)
-        self.optimal_plan = planner.get_execution_plan()
+        self.planner = Planner(self.num_nodes, self.num_gpus_per_node, self.model)
+        self.optimal_plan = self.planner.get_execution_plan()
 
         # Translate `DCExecutionResult` into layer-rank map
         # layer_spec has a list of ranks, each of which is mapped to each layer.
@@ -339,6 +339,22 @@ class PipelineSpec:
 
         assert all(spec is not None for spec in layer_spec), "Some layer has no plan."
         self.layer_spec = layer_spec
+
+    # Use PipelineSpec as a key of dictionary in dynamic programming
+    def __hash__(self) -> int:
+        return hash(tuple(self.layer_spec))
+
+    def __eq__(self, other: "PipelineSpec") -> bool:
+        if (
+            len(self.layer_spec) != len(other.layer_spec)
+            or self.num_nodes != other.num_nodes
+            or self.num_gpus_per_node != other.num_gpus_per_node
+        ):
+            return False
+
+        return all(
+            my_l == his_l for my_l, his_l in zip(self.layer_spec, other.layer_spec)
+        )
 
     def __repr__(self) -> str:
         return f"(PipelineSpec: {self.num_nodes} nodes)"

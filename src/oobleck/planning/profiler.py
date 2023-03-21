@@ -25,8 +25,8 @@ class LayerExecutionResult:
         layer_index: int,
         forward: float,
         backward: float,
-        allreduce_in_node: float,
-        allreduce_cross_nodes: float,
+        allreduce_in_node: Dict[int, float],
+        allreduce_cross_nodes: Dict[int, float],
         num_elements: int,
     ):
         self.index = layer_index
