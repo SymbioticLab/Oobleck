@@ -229,10 +229,12 @@ class OobleckEngine(
 
         # Reconstruct per-layer rank group for data parallelism from execution plan
         layer_dp_groups: List[ProcessGroup] = []
-        for layer_index in range(len(pipeline.model_layers)):
-                ranks = [ranks[layer_index] for ranks in pipeline_ranks_list]
-                dp_pg = dist.new_group(ranks)
+        for layer_index in range(len(pipeline.model.model)):
+            ranks = [ranks[layer_index] for ranks in pipeline_ranks_list]
+            dp_pg = dist.new_group(ranks)
+            if self.rank in ranks:
                 layer_dp_groups.append(dp_pg)
+        assert len(layer_dp_groups) == len(pipeline.model_layers)
 
         self.initialize_dp_process_groups(pipeline, layer_dp_groups)
 
