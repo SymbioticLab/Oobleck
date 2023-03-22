@@ -30,8 +30,8 @@ class HeterogeneousPipelineExecutionPlan:
         )
 
     @property
-    def throughput(self) -> float:
-        compute_throughput = max(
+    def iteration_time(self) -> float:
+        max_iteration_time = max(
             spec.optimal_plan.get_e() * num_microbatches
             for spec, num_microbatches in self.num_microbatches_set.items()
         )
@@ -45,7 +45,10 @@ class HeterogeneousPipelineExecutionPlan:
             .allreduce_cross_nodes[self.num_nodes]
         )
 
-        return compute_throughput + synchronization_overhead
+        logger.info(
+            f"iteration_time of execution plan {self.num_instances_set}: {max_iteration_time + synchronization_overhead}"
+        )
+        return max_iteration_time + synchronization_overhead
 
     @property
     def average_num_nodes(self) -> float:
@@ -151,10 +154,14 @@ class PipelineInstantiator:
     def get_best_execution_plan(
         self, throughput_oriented: bool = True
     ) -> HeterogeneousPipelineExecutionPlan:
+        result: HeterogeneousPipelineExecutionPlan = None
         if throughput_oriented:
-            return max(self.execution_plans, key=lambda plan: plan.throughput)
+            result = min(self.execution_plans, key=lambda plan: plan.iteration_time)
         else:
-            return max(self.execution_plans, key=lambda plan: plan.average_num_nodes)
+            result = max(self.execution_plans, key=lambda plan: plan.average_num_nodes)
+
+        logger.info(f"Best execution plan: {result.num_instances_set}")
+        return result
 
     def _get_feasible_sets_of_pipeline_instantiation(
         self,
@@ -234,8 +241,8 @@ class PipelineInstantiator:
 
         # Objective function
         def objective(model):
-            avg_bT = sum(model.nb[i] * T[i] for i in model.I) / len(model.I)
-            return sum((model.nb[i] * T[i] - avg_bT) ** 2 for i in model.I)
+            sum_bT = sum(model.nb[i] * T[i] for i in model.I)
+            return sum((model.nb[i] * T[i] - sum_bT) ** 2 for i in model.I)
 
         model.obj = pyomo.Objective(rule=objective)
 
