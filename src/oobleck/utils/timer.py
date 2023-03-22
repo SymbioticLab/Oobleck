@@ -51,6 +51,18 @@ class OobleckTimer:
 
         self.monitor.write_events(event_lists)
 
+    def log_throughput(self, batch_size: int, iteration_name: str, step: int):
+        if (
+            not self.monitor
+            or not self.monitor.enabled
+            or iteration_name not in self.timer.timers
+        ):
+            return
+
+        elapsed_time = self.timer.timers[iteration_name].elapsed(reset=False)
+        string = [("throughput (batch per second)", batch_size / elapsed_time * 1000, step)]
+        self.monitor.write_events(string)
+
     def log(
         self,
         names: List[str],
@@ -81,7 +93,7 @@ def measure_time(timer_name: str):
             ), "Assign self.timer = OobleckTime() to measure time."
             if s.training_args.should_log and s.timer.timer:
                 s.timer.timer(timer_name).start()
-            result = func(self=s, *args, **kwargs)
+            result = func(s, *args, **kwargs)
             if s.training_args.should_log and s.timer.timer:
                 s.timer.timer(timer_name).stop()
             return result

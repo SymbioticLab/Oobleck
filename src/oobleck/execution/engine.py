@@ -167,7 +167,7 @@ class OobleckEngine(
     def init_distributed(self):
         # TODO: setup with etcd
         self._init_distributed_from_env()
-        self.timer = OobleckTimer()
+        self.timer: OobleckTimer = OobleckTimer()
 
         # create a list of pipelinespecs that can cover all nodes.
         # this is invariant and never changes over reconfiguration.
@@ -176,16 +176,16 @@ class OobleckEngine(
         )
 
         # TODO: move it to user configurable arguments
-        global_num_microbatch = 8
+        self.global_num_microbatch = 32
         self.train_dataloader = OobleckTrainDataLoader(
             self.dataset.dataset["train"],
             self.training_args,
-            global_num_microbatch,
+            self.global_num_microbatch,
             self.dataset.data_collator,
         )
 
         self.pipeline = self.instantiate_pipelines(
-            self.pipeline_specs, self.max_num_nodes, global_num_microbatch, True
+            self.pipeline_specs, self.max_num_nodes, self.global_num_microbatch, True
         )
 
     # ==========================================================================================
@@ -240,6 +240,19 @@ class OobleckEngine(
 
         return pipeline
 
+    @measure_time("samples/iteration")
+    def train_step(self, reset_iterator: bool):
+        if reset_iterator:
+            try:
+                self.my_pipeline.train()
+            except StopIteration:
+                self.my_pipeline.reset_data_iterator()
+                self.my_pipeline.train()
+        else:
+            self.my_pipeline.train()
+        self.do_allreduce()
+        self.my_pipeline.optimizer_step()
+
     def train(self):
         """
         Train my pipeline and synchronize gradients after each schedule is done
@@ -247,6 +260,12 @@ class OobleckEngine(
         """
 
         def log():
+            self.timer.log_throughput(
+                self.global_num_microbatch
+                * self.training_args.per_device_train_batch_size,
+                "samples/iteration",
+                self.my_pipeline.global_steps,
+            )
             self.timer.log(
                 [
                     "execution/forward",
@@ -259,6 +278,7 @@ class OobleckEngine(
                     "comm/reduce_gradients",
                     "samples/lr",
                     "samples/train_loss",
+                    "samples/iteration",
                 ],
                 self.my_pipeline.global_steps,
             )
@@ -266,13 +286,7 @@ class OobleckEngine(
         if self.training_args.max_steps > 0:
             for i in range(self.training_args.max_steps):
                 logger.info(f"[{i}] step")
-                try:
-                    self.my_pipeline.train()
-                except StopIteration:
-                    self.my_pipeline.reset_data_iterator()
-                    self.my_pipeline.train()
-                self.do_allreduce()
-                self.my_pipeline.optimizer_step()
+                self.train_step(True)
                 log()
         else:
             num_steps = len(self.train_dataloader)
@@ -280,8 +294,6 @@ class OobleckEngine(
             for _ in range(int(self.training_args.num_train_epochs)):
                 for i in range(num_steps):
                     logger.info(f"[{i}] step")
-                    self.my_pipeline.train()
-                    self.do_allreduce()
-                    self.my_pipeline.optimizer_step()
+                    self.train_step(False)
                     log()
                 self.my_pipeline.reset_data_iterator()
