@@ -228,7 +228,11 @@ class PipelineInstantiator:
 
         model.I = pyomo.Set(initialize=list(range(len(num_instances_set))))
         T = {
-            i: pipeline_spec.optimal_plan.get_e()
+            i: (
+                pipeline_spec.optimal_plan.get_e()
+                / (4 * len(pipeline_spec.optimal_plan.stages))
+                * 1_000_000
+            )
             for i, pipeline_spec in enumerate(num_instances_set)
         }
         x = {
@@ -241,10 +245,10 @@ class PipelineInstantiator:
 
         # Objective function
         def objective(model):
-            sum_bT = sum(model.nb[i] * T[i] for i in model.I)
-            return sum((model.nb[i] * T[i] - sum_bT) ** 2 for i in model.I)
+            avg_bT = sum(model.nb[i] * T[i] for i in model.I) / len(model.I)
+            return sum((model.nb[i] * T[i] - avg_bT) ** 2 for i in model.I)
 
-        model.obj = pyomo.Objective(rule=objective)
+        model.obj = pyomo.Objective(rule=objective, sense=pyomo.minimize)
 
         # Define constraints
         def c1(model):
