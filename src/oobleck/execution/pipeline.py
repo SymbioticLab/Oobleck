@@ -27,7 +27,8 @@ from oobleck.utils.timer import OobleckTimer, measure_time
 
 from transformers import TrainingArguments
 
-
+# Applied patch https://github.com/microsoft/DeepSpeed/pull/2862
+# for odd number of stages pipeline.
 class OobleckPipelineSchedule(schedule.TrainSchedule):
     """A schedule for training a batch using pipeline parallelism.
 
@@ -53,23 +54,24 @@ class OobleckPipelineSchedule(schedule.TrainSchedule):
 
             # Exchange activations
             if is_forward:
-                if self._valid_micro_batch(micro_batch_id) and self._valid_stage(
-                    self.prev_stage
-                ):
-                    cmds.append(schedule.RecvActivation(curr_buffer))
                 if self._valid_micro_batch(prev_micro_batch_id) and self._valid_stage(
                     self.prev_stage
                 ):
                     cmds.append(schedule.SendGrad(prev_buffer))
-            else:
-                if self._valid_micro_batch(prev_micro_batch_id) and self._valid_stage(
-                    self.next_stage
+                if self._valid_micro_batch(micro_batch_id) and self._valid_stage(
+                    self.prev_stage
                 ):
-                    cmds.append(schedule.SendActivation(prev_buffer))
+                    cmds.append(schedule.RecvActivation(curr_buffer))
+                
+            else:
                 if self._valid_micro_batch(micro_batch_id) and self._valid_stage(
                     self.next_stage
                 ):
                     cmds.append(schedule.RecvGrad(curr_buffer))
+                if self._valid_micro_batch(prev_micro_batch_id) and self._valid_stage(
+                    self.next_stage
+                ):
+                    cmds.append(schedule.SendActivation(prev_buffer))
 
             # First/last stage loads
             if self.stage_id == 0 or self.stage_id == self.stages - 1:
@@ -88,6 +90,16 @@ class OobleckPipelineSchedule(schedule.TrainSchedule):
             # Prepare state for next time
             prev_micro_batch_id = micro_batch_id
             yield cmds
+
+    def num_pipe_buffers(self):
+        """Return the number of pipeline buffers required for this stage.
+        This is equivalent to the maximum number of in-flight forward passes,
+        since we need to remember the activations of forward passes in order
+        to run backpropagation. For synchronous 1F1B, this is equivalent to
+        the index difference between this stage and the last stage.
+        """
+        buffers = min(self.stages - self.stage_id, self.micro_batches)
+        return max(2, buffers)
 
 
 class PipelineExecutionMixin(object):
@@ -450,7 +462,7 @@ class PipelineCommunicationMixin(object):
                 if tensor.requires_grad:
                     buffers.append(torch.zeros_like(tensor))
 
-            return buffers
+            return tuple(buffers)
 
         outputs = self.pipe_buffers["outputs"][buffer_id]
         assert isinstance(outputs, tuple)
