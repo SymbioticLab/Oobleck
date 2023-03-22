@@ -113,7 +113,7 @@ dependencies = [ # Optional
     "psutil",
     "tensorboard",
     "glpk",
-    "ipopt"
+    "scikit-learn"
 ]
 
 # List additional groups of dependencies here (e.g. development
