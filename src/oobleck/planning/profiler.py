@@ -48,7 +48,7 @@ def return_cache_if_exist(profile_type: str):
         return None
 
     def store_cache(cache_path: str, object: Any):
-        if dist.is_initialized() and dist.get_rank() != 0:
+        if dist.is_initialized() and int(os.environ["LOCAL_RANK"]) != 0:
             return
 
         path = Path(cache_path)
@@ -218,7 +218,9 @@ class Profiler:
             for every layer.
         """
         assert dist.is_initialized()
-        logger.info(f"Profile allreduce acorss nodes latency")
+        logger.info(
+            f"Profile allreduce acorss {os.environ['WORLD_SIZE']} nodes latency"
+        )
 
         num_gpus_per_node = torch.cuda.device_count()
         ranks = list(range(0, dist.get_world_size(), num_gpus_per_node))
