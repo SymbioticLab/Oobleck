@@ -1,4 +1,5 @@
 import functools
+
 from datetime import datetime
 from typing import List, Tuple, Any, Callable
 
@@ -6,7 +7,6 @@ from deepspeed import comm as dist
 from deepspeed.utils.timer import SynchronizedWallClockTimer
 from deepspeed.monitor.monitor import MonitorMaster
 from deepspeed.monitor.config import get_monitor_config
-from deepspeed.accelerator import get_accelerator
 
 
 class Singleton:
@@ -62,17 +62,14 @@ class OobleckTimer:
         ):
             return
 
-        mem_allocated = get_accelerator().memory_allocated() / (1024 * 1024 * 1024)
-
         elapsed_time = self.timer.timers[iteration_name].elapsed()
         strings = [
-            ("throughput (batch per second)", batch_size / elapsed_time * 1000, step),
+            ("throughput/batch per second", batch_size / elapsed_time * 1000, step),
             (
-                "throughput (batch per GPU per second)",
+                "throughput/batch per GPU per second",
                 batch_size / elapsed_time / world_size * 1000,
                 step,
             ),
-            ("memory allocated (GB per GPU)", mem_allocated, step),
             (iteration_name, elapsed_time, step),
         ]
         self.monitor.write_events(strings)
