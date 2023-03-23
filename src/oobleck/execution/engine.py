@@ -154,11 +154,10 @@ class OobleckEngine(
         if dist.is_initialized():
             dist.destroy_process_group()
 
+        self.world_size = sum(len(gpus) for gpus in self.world_info.values())
         os.environ["RANK"] = str(self.rank)
         os.environ["LOCAL_RANK"] = str(self.local_rank)
-        os.environ["WORLD_SIZE"] = str(
-            sum(len(gpus) for gpus in self.world_info.values())
-        )
+        os.environ["WORLD_SIZE"] = str(self.world_size)
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = "25400"
 
@@ -176,13 +175,7 @@ class OobleckEngine(
         )
 
         # TODO: move it to user configurable arguments
-        self.global_num_microbatch = 32
-        self.train_dataloader = OobleckTrainDataLoader(
-            self.dataset.dataset["train"],
-            self.training_args,
-            self.global_num_microbatch,
-            self.dataset.data_collator,
-        )
+        self.global_num_microbatch = 48
 
         self.pipeline = self.instantiate_pipelines(
             self.pipeline_specs, self.max_num_nodes, self.global_num_microbatch, True
@@ -223,8 +216,15 @@ class OobleckEngine(
         self.training_args.gradient_accumulation_steps = (
             execution_plan.get_my_number_of_microbatches(dist.get_rank())
         )
+        train_dataloader = OobleckTrainDataLoader(
+            self.dataset.dataset["train"],
+            self.training_args,
+            self.global_num_microbatch,
+            self.dataset.data_collator,
+        )
+
         pipeline, pipeline_ranks_list = execution_plan.instantiate(
-            self.model, self.train_dataloader, self.training_args
+            self.model, train_dataloader, self.training_args
         )
 
         # Reconstruct per-layer rank group for data parallelism from execution plan
@@ -263,6 +263,7 @@ class OobleckEngine(
             self.timer.log_throughput(
                 self.global_num_microbatch
                 * self.training_args.per_device_train_batch_size,
+                self.world_size,
                 "samples/iteration",
                 self.my_pipeline.global_steps,
             )
@@ -278,7 +279,6 @@ class OobleckEngine(
                     "comm/reduce_gradients",
                     "samples/lr",
                     "samples/train_loss",
-                    "samples/iteration",
                 ],
                 self.my_pipeline.global_steps,
             )
@@ -289,7 +289,7 @@ class OobleckEngine(
                 self.train_step(True)
                 log()
         else:
-            num_steps = len(self.train_dataloader)
+            num_steps = len(self.my_pipeline.dataloader)
 
             for _ in range(int(self.training_args.num_train_epochs)):
                 for i in range(num_steps):
