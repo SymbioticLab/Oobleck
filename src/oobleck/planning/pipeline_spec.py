@@ -406,7 +406,8 @@ class PipelineSpec:
 
         # p = n0 - 1
         # num_pipeline_specs = min_num_nodes
-        num_pipeline_specs = max_num_nodes - ft_spec * min_num_nodes
+        # p: length between n0 and N - fn0
+        num_pipeline_specs = max_num_nodes - ft_spec * min_num_nodes - min_num_nodes + 1
         if num_pipeline_specs < 1:
             num_pipeline_specs = 1
 
