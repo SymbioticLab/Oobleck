@@ -1,9 +1,9 @@
 import os
 import pyomo.environ as pyomo
+import redis
 
-from statistics import mean
-from typing import Optional, Dict, List, Any
-
+from ast import literal_eval
+from typing import Optional, Dict, Tuple, List, Any
 from torch.distributed import ProcessGroup
 
 from deepspeed import comm as dist
@@ -16,6 +16,7 @@ from oobleck.planning.instantiator import (
     HeterogeneousPipelineExecutionPlan,
     PipelineInstantiator,
 )
+
 # from oobleck.elastic.client import ElasticWorkerClientMixin, ElasticClientMonitorMixin
 from oobleck.execution.dataloader import OobleckTrainDataLoader
 from oobleck.execution.pipeline import OobleckPipeline
@@ -96,7 +97,7 @@ class OobleckEngine(
         # Initialization agnostic to distributed
         # ==================================================================
 
-        self.node_name = os.environ["NODE_NAME"]
+        self.node_name: Tuple[str, int] = literal_eval(os.environ["NODE_NAME"])
         self.max_num_nodes = int(os.environ["MAX_NUM_NODES"])
         self.num_gpus_per_node = int(os.environ["NUM_GPUS_PER_NODE"])
         # Remove LOCAL_RANK env so that TrainingArgument does not
@@ -121,8 +122,31 @@ class OobleckEngine(
             model_name, self.dataset.sample, training_args, model_args
         )
 
-    def _init_distributed_from_etcd(self):
-        pass
+    def _init_distributed_from_redis(self):
+        redis_addr = os.environ["REDIS_ADDR"]
+        self.redis = redis.Redis(redis_addr, 6379, decode_responses=True)
+        assert self.redis.ping() == True
+
+        self.world_info: Dict[Tuple[str, int], int] = literal_eval(
+            self.redis.get("oobleck:world_info")
+        )
+        assert all(
+            len(gpus) > 0 for gpus in self.world_info.values()
+        ), "Some node has no GPUs."
+        self.rank = self.world_info[self.node_name][self.local_rank]
+
+        self.num_gpus_per_node = len(self.world_info[self.node_name])
+        assert all(
+            len(gpus) == self.num_gpus_per_node for gpus in self.world_info.values()
+        ), "Some node has different number of GPUs."
+
+        # initiate distributed
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+        self.world_size = sum(len(gpus) for gpus in self.world_info.values())
+
+        dist.init_distributed("nccl", auto_mpi_discovery=False)
 
     def _init_distributed_from_env(self):
         """Temporary implementation that enables execution
@@ -164,8 +188,8 @@ class OobleckEngine(
         dist.init_distributed("nccl", auto_mpi_discovery=False)
 
     def init_distributed(self):
-        # TODO: setup with etcd
-        self._init_distributed_from_env()
+        self._init_distributed_from_redis()
+        # self._init_distributed_from_env()
         self.timer: OobleckTimer = OobleckTimer()
 
         # create a list of pipelinespecs that can cover all nodes.
