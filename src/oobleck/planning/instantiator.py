@@ -101,7 +101,7 @@ class HeterogeneousPipelineExecutionPlan:
                 if dist.get_rank(process_group) >= 0:
                     assert my_pipeline is None
                     my_pipeline = OobleckPipeline(
-                        spec, model, dataloader, process_group, training_args
+                        i, spec, model, dataloader, process_group, training_args
                     )
 
         assert my_pipeline, "No pipeline has been initiated for this rank"

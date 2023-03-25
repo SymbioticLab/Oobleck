@@ -27,6 +27,7 @@ from oobleck.utils.timer import OobleckTimer, measure_time
 
 from transformers import TrainingArguments
 
+
 # Applied patch https://github.com/microsoft/DeepSpeed/pull/2862
 # for odd number of stages pipeline.
 class OobleckPipelineSchedule(schedule.TrainSchedule):
@@ -62,7 +63,7 @@ class OobleckPipelineSchedule(schedule.TrainSchedule):
                     self.prev_stage
                 ):
                     cmds.append(schedule.RecvActivation(curr_buffer))
-                
+
             else:
                 if self._valid_micro_batch(micro_batch_id) and self._valid_stage(
                     self.next_stage
@@ -501,12 +502,14 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
 
     def __init__(
         self,
+        id: int,
         spec: PipelineSpec,
         model: OobleckModel,
         dataloader: OobleckTrainDataLoader,
         process_group: ProcessGroup,
         training_args: TrainingArguments,
     ):
+        self.id = id
         self.layer_spec = spec.layer_spec
         self.model = model
         self.total_num_layers = len(model.model)
