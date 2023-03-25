@@ -1,12 +1,8 @@
 import os
-import math
-import torch
-import torch.distributed
 import pyomo.environ as pyomo
 
 from statistics import mean
-from collections import defaultdict
-from typing import Optional, Dict, List, Tuple, Any
+from typing import Optional, Dict, List, Any
 
 from torch.distributed import ProcessGroup
 
@@ -20,7 +16,7 @@ from oobleck.planning.instantiator import (
     HeterogeneousPipelineExecutionPlan,
     PipelineInstantiator,
 )
-from oobleck.elastic.client import ElasticWorkerClientMixin, ElasticClientMonitorMixin
+# from oobleck.elastic.client import ElasticWorkerClientMixin, ElasticClientMonitorMixin
 from oobleck.execution.dataloader import OobleckTrainDataLoader
 from oobleck.execution.pipeline import OobleckPipeline
 from oobleck.utils.timer import OobleckTimer, measure_time
@@ -65,8 +61,8 @@ class DataSynchronizationMixin(object):
 
 
 class OobleckEngine(
-    ElasticClientMonitorMixin,
-    ElasticWorkerClientMixin,
+    # ElasticClientMonitorMixin,
+    # ElasticWorkerClientMixin,
     DataSynchronizationMixin,
     FSDPMixin,
 ):
@@ -138,6 +134,10 @@ class OobleckEngine(
             "localhost1": [1],
             "localhost2": [2],
             "localhost3": [3],
+            # "localhost4": [4],
+            # "localhost5": [5],
+            # "localhost6": [6],
+            # "localhost7": [7],
         }
         assert all(
             len(gpus) > 0 for gpus in self.world_info.values()
@@ -158,7 +158,7 @@ class OobleckEngine(
         os.environ["RANK"] = str(self.rank)
         os.environ["LOCAL_RANK"] = str(self.local_rank)
         os.environ["WORLD_SIZE"] = str(self.world_size)
-        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_ADDR"] = "ampere03"
         os.environ["MASTER_PORT"] = "25400"
 
         dist.init_distributed("nccl", auto_mpi_discovery=False)

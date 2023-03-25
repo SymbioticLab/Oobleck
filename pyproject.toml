@@ -96,26 +96,6 @@ classifiers = [  # Optional
   "Programming Language :: Python :: 3 :: Only",
 ]
 
-# This field lists other packages that your project depends on to run.
-# Any package you put here will be installed by pip when your project is
-# installed, so they must be valid existing projects.
-#
-# For an analysis of this field vs pip's requirements files see:
-# https://packaging.python.org/discussions/install-requires-vs-requirements/
-dependencies = [ # Optional
-    "torch>=1.12.0",
-    "transformers>=4.26.0",
-    "torchvision>=0.13.0",
-    "deepspeed>=0.8.1",
-    "datasets",
-    "etcd3",
-    "rpyc",
-    "psutil",
-    "tensorboard",
-    "glpk",
-    "scikit-learn"
-]
-
 # List additional groups of dependencies here (e.g. development
 # dependencies). Users will be able to install these using the "extras"
 # syntax, for example:
@@ -158,5 +138,5 @@ package-data = {}
 [build-system]
 # These are the assumed default build requirements from pip:
 # https://pip.pypa.io/en/stable/reference/pip/#pep-517-and-518-support
-requires = ["setuptools>=43.0.0", "wheel"]
+requires = ["setuptools"]
 build-backend = "setuptools.build_meta"

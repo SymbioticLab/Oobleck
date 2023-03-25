@@ -1,6 +1,7 @@
 import numpy as np
 
 import torch
+import evaluate 
 from itertools import chain
 from typing import Optional, Tuple, Dict, List, Any, Type
 from transformers import AutoTokenizer, AutoImageProcessor
@@ -16,7 +17,7 @@ from torchvision.transforms import (
     Resize,
     ToTensor,
 )
-from datasets import Dataset, load_dataset, load_metric
+from datasets import Dataset, load_dataset
 
 from oobleck.module.model import lang_models, image_models
 
@@ -34,7 +35,7 @@ class OobleckDataset:
         dataset_name: Optional[str] = None,
     ):
         # TODO: replace it with evaluate.load("accuracy")
-        metric = load_metric("accuracy")
+        metric = evaluate.load("accuracy")
 
         if any(lang_model in model_name for lang_model in lang_models):
             self.tokenizer, self.dataset = OobleckDataset.create_language_dataset(

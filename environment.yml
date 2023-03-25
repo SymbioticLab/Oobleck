@@ -1,0 +1,29 @@
+name: oobleck
+channels:
+  - conda-forge
+  - pytorch
+  - nvidia 
+  # We want to have a reproducible setup, so we don't want default channels,
+  # which may be different for different users. All required channels should
+  # be listed explicitly here.
+  - nodefaults
+dependencies:
+  - python
+  - pip
+  - pytorch==2.0.0
+  - torchvision==0.15.0
+  - pytorch-cuda=11.7
+  - cyipopt
+  - glpk
+  - setuptools
+  - pyomo
+  - pip:
+    - transformers>=4.26.0
+    - deepspeed>=0.8.1
+    - datasets
+    - redis[hiredis]
+    - rpyc
+    - psutil
+    - tensorboard
+    - evaluate
+    - scikit-learn
