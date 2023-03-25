@@ -129,7 +129,9 @@ class OobleckAgent:
             current_env["LOCAL_RANK"] = str(
                 rank % len(node_ranks)
             )  # TODO: fix it. wrong
-            current_env["CUDA_VISIBLE_DEVICES"] = current_env["LOCAL_RANK"]
+            # TODO: fix CUDA_VISIBLE_DEVICES properly.
+            # current_env["CUDA_VISIBLE_DEVICES"] = current_env["LOCAL_RANK"]
+            logger.info(f"Rank: {rank}, local rank: {current_env['LOCAL_RANK']}")
 
             # spawn the process
             cmd = [
