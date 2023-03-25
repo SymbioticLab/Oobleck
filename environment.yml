@@ -17,6 +17,7 @@ dependencies:
   - glpk
   - setuptools
   - pyomo
+  - poetry
   - pip:
     - transformers>=4.26.0
     - deepspeed>=0.8.1
