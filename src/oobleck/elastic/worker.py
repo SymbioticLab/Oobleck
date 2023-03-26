@@ -1,10 +1,15 @@
+import os
+import redis
+
 from ast import literal_eval
-from typing import Dict, Any
+from typing import Dict, Tuple, List, Optional, Any, TypeVar
 from oobleck.execution.engine import OobleckEngine
-from argparse import ArgumentParser
+from argparse import ArgumentParser, Namespace
+
+T = TypeVar("T", bound="ElasticWorker")
 
 
-def run():
+def parse_args() -> Namespace:
     parser = ArgumentParser()
     parser.add_argument("--ft_spec", type=int, default=0)
     parser.add_argument("--model_name", type=str)
@@ -12,17 +17,40 @@ def run():
     parser.add_argument("--dataset_name", type=str, required=False, default=None)
     parser.add_argument("--model_args", type=str, required=False, default=None)
 
-    args = parser.parse_args()
+    return parser.parse_args()
 
-    model_args: Dict[str, Any] = (
-        literal_eval(args.model_args) if args.model_args is not None else None
-    )
-    engine = OobleckEngine(
-        args.ft_spec, args.model_name, args.dataset_path, args.dataset_name, model_args
-    )
-    engine.init_distributed()
-    engine.train()
+
+class ElasticWorker:
+    def __init__(self):
+        super().__init__()
+
+    def run(
+        self,
+        ft_spec: int,
+        model_name: str,
+        dataset_path: str,
+        dataset_name: Optional[str] = None,
+        model_args: Optional[Dict[str, Any]] = None,
+    ):
+        self.engine = OobleckEngine(
+            ft_spec, model_name, dataset_path, dataset_name, model_args
+        )
+        self.engine.subscribe_reconfiguration()
+
+        world_info = self.engine.get_world_info()
+        torch_master_info = self.engine.get_torch_master_info(world_info)
+        self.engine.reconfiguration_info.append((world_info, torch_master_info))
+        self.engine.train()
 
 
 if __name__ == "__main__":
-    run()
+    worker = ElasticWorker()
+
+    args = parse_args()
+    model_args: Dict[str, Any] = (
+        literal_eval(args.model_args) if args.model_args is not None else None
+    )
+
+    worker.run(
+        args.ft_spec, args.model_name, args.dataset_path, args.dataset_name, model_args
+    )

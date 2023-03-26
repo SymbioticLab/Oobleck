@@ -1,14 +1,15 @@
 import os
 import pyomo.environ as pyomo
-import redis
 
 from ast import literal_eval
+from datetime import timedelta
 from typing import Optional, Dict, Tuple, List, Any
-from torch.distributed import ProcessGroup
+from torch.distributed import ProcessGroup, TCPStore, init_process_group
 
 from deepspeed import comm as dist
 from deepspeed.utils import logger
 
+from oobleck.elastic.client import ElasticWorkerRedisClientMixin
 from oobleck.execution.dataset import OobleckDataset
 from oobleck.module.model import OobleckModel
 from oobleck.planning.pipeline_spec import PipelineSpec
@@ -17,7 +18,6 @@ from oobleck.planning.instantiator import (
     PipelineInstantiator,
 )
 
-from oobleck.elastic.client import ElasticWorkerClientMixin
 from oobleck.execution.dataloader import OobleckTrainDataLoader
 from oobleck.execution.pipeline import OobleckPipeline
 from oobleck.utils.timer import OobleckTimer, measure_time
@@ -62,7 +62,7 @@ class DataSynchronizationMixin(object):
 
 
 class OobleckEngine(
-    ElasticWorkerClientMixin,
+    ElasticWorkerRedisClientMixin,
     DataSynchronizationMixin,
     FSDPMixin,
 ):
@@ -121,67 +121,38 @@ class OobleckEngine(
             model_name, self.dataset.sample, training_args, model_args
         )
 
-    def _init_distributed_from_redis(self):
-        self.world_info = self.get_world_info()
-        self.rank = self.world_info[self.node_name][self.local_rank]
-
-        # initiate distributed
-        if dist.is_initialized():
-            dist.destroy_process_group()
-
-        self.world_size = sum(len(gpus) for gpus in self.world_info.values())
-
-        master_info = self.get_torch_master_info(self.world_info)
-        os.environ["RANK"] = str(self.rank)
-        os.environ["LOCAL_RANK"] = str(self.local_rank)
-        os.environ["WORLD_SIZE"] = str(self.world_size)
-        os.environ["MASTER_ADDR"] = master_info[0]
-        os.environ["MASTER_PORT"] = str(master_info[1])
-
-        dist.init_distributed("nccl", auto_mpi_discovery=False)
-
-    def _init_distributed_from_env(self):
-        """Temporary implementation that enables execution
-        without master/agent processes.
-        Must be removed and replaced with `init_distributed_from_etcd`.
-        """
-        self.world_info = {
-            "localhost0": [0],
-            "localhost1": [1],
-            "localhost2": [2],
-            "localhost3": [3],
-            # "localhost4": [4],
-            # "localhost5": [5],
-            # "localhost6": [6],
-            # "localhost7": [7],
-        }
-        assert all(
-            len(gpus) > 0 for gpus in self.world_info.values()
-        ), "Some node has no GPUs."
-        self.rank = self.world_info[self.node_name][self.local_rank]
-
-        # use any node to get # of GPUs per node. They should all have the same #.
-        self.num_gpus_per_node = len(next(iter(self.world_info.values())))
-        assert all(
-            len(gpus) == self.num_gpus_per_node for gpus in self.world_info.values()
-        ), "Some node has different number of GPUs."
-
-        # initiate distributed
-        if dist.is_initialized():
-            dist.destroy_process_group()
-
-        self.world_size = sum(len(gpus) for gpus in self.world_info.values())
-        os.environ["RANK"] = str(self.rank)
-        os.environ["LOCAL_RANK"] = str(self.local_rank)
-        os.environ["WORLD_SIZE"] = str(self.world_size)
-        os.environ["MASTER_ADDR"] = "ampere03"
-        os.environ["MASTER_PORT"] = "25400"
-
-        dist.init_distributed("nccl", auto_mpi_discovery=False)
-
     def init_distributed(self):
-        self._init_distributed_from_redis()
-        # self._init_distributed_from_env()
+        assert self.reconfiguration_info, "Reconfiguration information is empty."
+        self.world_info, torch_master_info = self.reconfiguration_info.pop()
+        self.rank = self.world_info[self.node_name][self.local_rank]
+
+        # initiate distributed
+        if dist.is_initialized():
+            dist.barrier()
+            dist.destroy_process_group()
+            del self.tcpstore
+
+        logger.info(f"world info: {self.world_info}")
+        logger.info(f"torch master info: {torch_master_info}")
+
+        # TODO: rank should be determined in here, not when initialized.
+        self.world_size = sum(len(gpus) for gpus in self.world_info.values())
+        self.tcpstore = TCPStore(
+            torch_master_info[0],
+            0,
+            world_size=self.world_size,
+            is_master=self.rank == 0,
+            timeout=timedelta(seconds=30),
+        )
+
+        logger.info(f"port: {self.tcpstore.port}")
+
+        os.environ["LOCAL_RANK"] = str(self.local_rank)
+        init_process_group(
+            "nccl", store=self.tcpstore, rank=self.rank, world_size=self.world_size
+        )
+        dist.init_distributed("nccl", dist_init_required=False)
+
         self.timer: OobleckTimer = OobleckTimer()
 
         # create a list of pipelinespecs that can cover all nodes.
@@ -191,7 +162,7 @@ class OobleckEngine(
         )
 
         # TODO: move it to user configurable arguments
-        self.global_num_microbatch = 48
+        self.global_num_microbatch = 16
 
         self.pipeline = self.instantiate_pipelines(
             self.pipeline_specs, self.max_num_nodes, self.global_num_microbatch, True
@@ -299,16 +270,21 @@ class OobleckEngine(
                 self.my_pipeline.global_steps,
             )
 
+        self.init_distributed()
+
         if self.training_args.max_steps > 0:
             for i in range(self.training_args.max_steps):
+                if self.reconfiguration_info:
+                    self.init_distributed()
                 logger.info(f"[{i}] step")
                 self.train_step(True)
                 log()
         else:
-            num_steps = len(self.my_pipeline.dataloader)
-
             for _ in range(int(self.training_args.num_train_epochs)):
+                num_steps = len(self.my_pipeline.dataloader)
                 for i in range(num_steps):
+                    if self.reconfiguration_info:
+                        self.init_distributed()
                     logger.info(f"[{i}] step")
                     self.train_step(False)
                     log()
