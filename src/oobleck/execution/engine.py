@@ -17,7 +17,7 @@ from oobleck.planning.instantiator import (
     PipelineInstantiator,
 )
 
-# from oobleck.elastic.client import ElasticWorkerClientMixin, ElasticClientMonitorMixin
+from oobleck.elastic.client import ElasticWorkerClientMixin
 from oobleck.execution.dataloader import OobleckTrainDataLoader
 from oobleck.execution.pipeline import OobleckPipeline
 from oobleck.utils.timer import OobleckTimer, measure_time
@@ -62,8 +62,7 @@ class DataSynchronizationMixin(object):
 
 
 class OobleckEngine(
-    # ElasticClientMonitorMixin,
-    # ElasticWorkerClientMixin,
+    ElasticWorkerClientMixin,
     DataSynchronizationMixin,
     FSDPMixin,
 ):
@@ -123,28 +122,21 @@ class OobleckEngine(
         )
 
     def _init_distributed_from_redis(self):
-        redis_addr = os.environ["REDIS_ADDR"]
-        self.redis = redis.Redis(redis_addr, 6379, decode_responses=True)
-        assert self.redis.ping() == True
-
-        self.world_info: Dict[Tuple[str, int], int] = literal_eval(
-            self.redis.get("oobleck:world_info")
-        )
-        assert all(
-            len(gpus) > 0 for gpus in self.world_info.values()
-        ), "Some node has no GPUs."
+        self.world_info = self.get_world_info()
         self.rank = self.world_info[self.node_name][self.local_rank]
-
-        self.num_gpus_per_node = len(self.world_info[self.node_name])
-        assert all(
-            len(gpus) == self.num_gpus_per_node for gpus in self.world_info.values()
-        ), "Some node has different number of GPUs."
 
         # initiate distributed
         if dist.is_initialized():
             dist.destroy_process_group()
 
         self.world_size = sum(len(gpus) for gpus in self.world_info.values())
+
+        master_info = self.get_torch_master_info(self.world_info)
+        os.environ["RANK"] = str(self.rank)
+        os.environ["LOCAL_RANK"] = str(self.local_rank)
+        os.environ["WORLD_SIZE"] = str(self.world_size)
+        os.environ["MASTER_ADDR"] = master_info[0]
+        os.environ["MASTER_PORT"] = str(master_info[1])
 
         dist.init_distributed("nccl", auto_mpi_discovery=False)
 

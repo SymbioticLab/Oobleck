@@ -1,44 +1,9 @@
-import etcd3
+import os
 import rpyc
-
-from etcd3 import Etcd3Client
-from rpyc import Connection
+import redis
 
 from ast import literal_eval
 from typing import Optional, Dict, List, Tuple
-
-from oobleck.elastic import constants
-
-
-class ElasticAgentClientMixin(object):
-    """A mixin that is used by agent processes
-    to query data required for training.
-    Communicate with etcd and master process via rpyc.
-    """
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        master_ip = kwargs.get("master_ip", "localhost")
-        self.etcd: Etcd3Client = etcd3.client(master_ip)
-        self.client: Connection = rpyc.connect()
-        self.agent_id = self.client._channel.stream.sock.getsockname()
-        self.client.root.register_agent(self.agent_id)
-
-    def __del__(self):
-        # cancel all etcd wathces here
-        self.etcd.close()
-        self.client.close()
-
-    def wait_for_training_start(self):
-        """Wait until get a "oobleck/training_in_progress" etcd event.
-        It is a blocking operation.
-        """
-        iterator, cancel = self.etcd.watch(constants.OOBLECK_TRAINING_IN_PROGRESS)
-        for event in iterator:
-            if event._event.kv.value.decode() != str(True):
-                continue
-
-            cancel()
 
 
 class ElasticWorkerClientMixin(object):
@@ -49,31 +14,42 @@ class ElasticWorkerClientMixin(object):
 
     def __init__(self):
         super().__init__()
+        redis_addr = os.environ["REDIS_ADDR"]
 
-    def get_world_info(self) -> Optional[Dict[str, List[int]]]:
-        result = self.etcd.get(constants.OOBLECK_WORLD_INFO)[0]
-        if result == None:
-            return None
-        return literal_eval(result)
+        self.redis = redis.Redis(redis_addr, 6379, decode_responses=True)
+        assert self.redis.ping() == True
 
-    def get_torch_master_info(self) -> Tuple[str, int]:
-        master_info = self.etcd.get(constants.OOBLECK_TORCH_MASTER_INFO)
-        if master_info[0] == None:
-            raise ValueError("No master info in etcd.")
-        return literal_eval(master_info[0])
+        self.pubsub = self.redis.pubsub()
 
+    def get_world_info(self) -> Dict[Tuple[str, int], List[int]]:
+        world_info: Dict[Tuple[str, int], List[int]] = literal_eval(
+            self.redis.get("oobleck:world_info")
+        )
+        if len(world_info) == 0:
+            return {}
+        assert all(
+            len(gpus) > 0 for gpus in world_info.values()
+        ), "Some node has no GPUs."
+        assert all(
+            len(gpus) == len(next(iter(world_info.values())))
+            for gpus in world_info.values()
+        ), "Some node has different number of GPUs."
 
-class ElasticClientMonitorMixin(object):
-    def __init__(self):
-        super().__init__()
+        return world_info
 
-        self.etcd = etcd3.client()
+    def get_torch_master_info(
+        self, world_info: Dict[Tuple[str, int], List[int]]
+    ) -> Tuple[str, int]:
+        first_node = next(iter(sorted(world_info)))
+        return (first_node[0], "25400")
 
-    def on_reconfiguration_requested(self, event):
+    def on_reconfiguration_requested(self):
         """
-        We lose some other GPU, thus topology reconfiguration is needed.
+        We lose some some GPU, thus topology reconfiguration is needed.
         Pause training, reconfigure topology, and resume training.
 
         Args:
             event (_type_): an event of reconfiguration_needed
         """
+
+        self.pubsub.subscribe("oobleck:reconfiguration")
