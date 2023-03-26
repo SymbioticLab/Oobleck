@@ -36,10 +36,6 @@ class ElasticWorker:
             ft_spec, model_name, dataset_path, dataset_name, model_args
         )
         self.engine.subscribe_reconfiguration()
-
-        world_info = self.engine.get_world_info()
-        torch_master_info = self.engine.get_torch_master_info(world_info)
-        self.engine.reconfiguration_info.append((world_info, torch_master_info))
         self.engine.train()
 
 

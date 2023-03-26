@@ -63,10 +63,6 @@ class MasterServiceMixin(rpyc.Service):
         if len(self.agents) == 0:
             raise RuntimeError("No agent online.")
 
-        first_agent = next(iter(self.agents.values()))
-        # Just a randomized port. TODO: use specified port
-        master_info = (first_agent[0], OOBLECK_MASTER_DEFAULT_PORT)
-
         # all five arguments for OobleckEngine
         execution_info = {
             "fault_tolerance_spec": fault_tolerance_spec,
@@ -79,9 +75,11 @@ class MasterServiceMixin(rpyc.Service):
         # Replcae the above etcd transaction to one redis transaction using pipeline.
         with self.redis.pipeline() as pipe:
             pipe.set("oobleck:world_info", str(self.world_info))
-            pipe.set("oobleck:master_info", str(master_info))
             pipe.set("oobleck:execution_info", str(execution_info))
             pipe.set("oobleck:reconfiguration", Reconfiguration.NONE.name)
+            pipe.set("oobleck:epoch", 0)
+            pipe.set("oobleck:step", 0)
+            pipe.set("oobleck:consumed_samples", 0)
             pipe.publish("oobleck:training_start", 0)
             pipe.execute()
 

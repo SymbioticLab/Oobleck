@@ -1,5 +1,7 @@
 import os
 import redis
+import deepspeed.comm as dist
+import time
 
 from ast import literal_eval
 from typing import Dict, Tuple, List, Optional
@@ -17,9 +19,7 @@ class ElasticWorkerRedisClientMixin(object):
         self.pubsub = self.redis.pubsub(ignore_subscribe_messages=True)
         self.reconfiguration_thread: Optional[redis.client.PubSubWorkerThread] = None
 
-        self.reconfiguration_info: List[
-            Tuple[Dict[Tuple[str, int], List[int]], Tuple[str, int]]
-        ] = []
+        self.reconfiguration_required = True
 
     def __destory__(self):
         if self.reconfiguration_thread:
@@ -43,14 +43,41 @@ class ElasticWorkerRedisClientMixin(object):
 
         return world_info
 
-    def get_torch_master_info(
-        self, world_info: Dict[Tuple[str, int], List[int]]
-    ) -> Tuple[str, int]:
-        first_node = next(iter(sorted(world_info)))
-        return (first_node[0], 25400)
+    def set_torch_master_info(
+        self, addr: Optional[str] = None, port: Optional[int] = None
+    ):
+        if addr is None:
+            self.redis.delete("oobleck:torch_master_info")
+        else:
+            self.redis.set("oobleck:torch_master_info", str((addr, port)))
 
-    def set_training_progress(self):
-        pass
+    def get_torch_master_info(self) -> Tuple[str, int]:
+        result = None
+        while result is None:
+            result = self.redis.get("oobleck:torch_master_info")
+            time.sleep(0.01)
+        return literal_eval(result)
+
+    def set_training_progress(self, epoch: int, step: int, consumed_samples: int):
+        if dist.get_rank() != 0:
+            return
+
+        with self.redis.pipeline() as pipe:
+            pipe.set("oobleck:epoch", epoch)
+            pipe.set("oobleck:step", step)
+            pipe.set(
+                "oobleck:consumed_samples",
+                consumed_samples,
+            )
+            pipe.execute()
+
+    def get_training_progress(self) -> Tuple[int, int, int]:
+        with self.redis.pipeline() as pipe:
+            pipe.get("oobleck:epoch")
+            pipe.get("oobleck:step")
+            pipe.get("oobleck:consumed_samples")
+            epoch, step, consumed_samples = pipe.execute()
+            return (int(epoch), int(step), int(consumed_samples))
 
     def subscribe_reconfiguration(self):
         if self.reconfiguration_thread:
@@ -74,7 +101,4 @@ class ElasticWorkerRedisClientMixin(object):
         """
 
         print(f"Reconfiguration requested: {message}", flush=True)
-        new_world_info = self.get_world_info()
-        new_torch_master_info = self.get_torch_master_info(new_world_info)
-
-        self.reconfiguration_info.append((new_world_info, new_torch_master_info))
+        self.reconfiguration_required = True

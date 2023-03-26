@@ -196,6 +196,7 @@ class PipelineExecutionMixin(object):
     @instrument_w_nvtx
     @measure_time("execution/forward")
     def forward_pass(self, buffer_id: int):
+        logger.info("forward")
         inputs: tuple[torch.Tensor] = self.pipe_buffers["inputs"][buffer_id]
         zero_grads(inputs)
 
@@ -250,6 +251,7 @@ class PipelineExecutionMixin(object):
     @instrument_w_nvtx
     @measure_time("execution/backward")
     def backward_pass(self, buffer_id: int):
+        logger.info("backward")
         if self.is_last_stage():
             loss = self.loss
             loss.backward()

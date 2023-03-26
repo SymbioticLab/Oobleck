@@ -84,37 +84,27 @@ class OobleckAgent:
         execution_info: Dict[str, Any] = literal_eval(
             self.redis.get("oobleck:execution_info")
         )
-        world_info: Dict[str, List[int]] = literal_eval(
+        world_info: Dict[Tuple[str, int], List[int]] = literal_eval(
             self.redis.get("oobleck:world_info")
         )
-        master_info: Tuple[str, int] = literal_eval(
-            self.redis.get("oobleck:master_info")
-        )
 
-        p.unsubscribe("oobleck.training_start")
+        p.unsubscribe("oobleck:training_start")
+        self.launch_workers(world_info, execution_info)
 
-        self.launch_workers(world_info, master_info, execution_info)
-
+    # TODO: use MPI to automatically determine ranks.
     def launch_workers(
         self,
         world_info: Dict[Tuple[str, int], List[int]],
-        master_info: Tuple[str, int],
         execution_info: Dict[str, Any],
     ):
-        logger.info(f"World info: {world_info}")
-
-        world_size = sum([len(ranks) for ranks in world_info.values()])
-        node_ranks = world_info[self.agent_id]
+        num_workers = len(next(iter(world_info.values())))
+        ranks_in_my_node = world_info[self.agent_id]
 
         current_env = os.environ.copy()
-
-        current_env["MASTER_ADDR"] = master_info[0]
-        current_env["MASTER_PORT"] = "29501"
-        current_env["WORLD_SIZE"] = str(world_size)
         current_env["REDIS_ADDR"] = self.master_addr
+        current_env["MAX_NUM_NODES"] = str(len(world_info))
+        current_env["NUM_GPUS_PER_NODE"] = str(num_workers)
         current_env["NODE_NAME"] = str(self.agent_id)
-        current_env["MAX_NUM_NODES"] = str(world_size)
-        current_env["NUM_GPUS_PER_NODE"] = "1"
 
         model_name = execution_info["model_name"]
 
@@ -123,15 +113,8 @@ class OobleckAgent:
         os.makedirs(f"/tmp/oobleck/logs/{time}.{model_name}", exist_ok=True)
         # TODO: implement local worker failure case.
         self.processes = {}
-        for rank in node_ranks:
-            # each process rank
-            current_env["RANK"] = str(rank)
-            current_env["LOCAL_RANK"] = str(
-                rank % len(node_ranks)
-            )  # TODO: fix it. wrong
-            # TODO: fix CUDA_VISIBLE_DEVICES properly.
-            # current_env["CUDA_VISIBLE_DEVICES"] = current_env["LOCAL_RANK"]
-            logger.info(f"Rank: {rank}, local rank: {current_env['LOCAL_RANK']}")
+        for rank in ranks_in_my_node:
+            os.environ["LOCAL_RANK"] = str(rank)
 
             # spawn the process
             cmd = [

@@ -1,10 +1,13 @@
 import os
 import pyomo.environ as pyomo
+import torch.distributed
+import gc
+import time
 
 from ast import literal_eval
 from datetime import timedelta
 from typing import Optional, Dict, Tuple, List, Any
-from torch.distributed import ProcessGroup, TCPStore, init_process_group
+from torch.distributed import ProcessGroup
 
 from deepspeed import comm as dist
 from deepspeed.utils import logger
@@ -102,7 +105,7 @@ class OobleckEngine(
         # Remove LOCAL_RANK env so that TrainingArgument does not
         # automatically initialize torch.distributed.
         self.local_rank = int(os.environ.pop("LOCAL_RANK", 0))
-        training_args = TrainingArguments("/tmp/output", gradient_accumulation_steps=4)
+        training_args = TrainingArguments("/tmp/output")
         if dist.is_initialized():
             dist.destroy_process_group()
 
@@ -122,36 +125,47 @@ class OobleckEngine(
         )
 
     def init_distributed(self):
-        assert self.reconfiguration_info, "Reconfiguration information is empty."
-        self.world_info, torch_master_info = self.reconfiguration_info.pop()
+        self.world_info = self.get_world_info()
+        self.world_size = sum(len(gpus) for gpus in self.world_info.values())
         self.rank = self.world_info[self.node_name][self.local_rank]
+        os.environ["LOCAL_RANK"] = str(self.local_rank)
 
         # initiate distributed
         if dist.is_initialized():
-            dist.barrier()
             dist.destroy_process_group()
+            dist.cdb = None
             del self.tcpstore
+            gc.collect()
 
-        logger.info(f"world info: {self.world_info}")
-        logger.info(f"torch master info: {torch_master_info}")
+        if self.rank == 0:
+            addr = self.node_name[0]
+            self.tcpstore = torch.distributed.TCPStore(
+                addr,
+                0,
+                world_size=self.world_size,
+                is_master=True,
+                timeout=timedelta(seconds=30),
+            )
+            self.set_torch_master_info(addr, self.tcpstore.port)
+        else:
+            addr, port = self.get_torch_master_info()
+            self.tcpstore = torch.distributed.TCPStore(
+                addr,
+                port,
+                world_size=self.world_size,
+                is_master=False,
+                timeout=timedelta(seconds=30),
+            )
 
-        # TODO: rank should be determined in here, not when initialized.
-        self.world_size = sum(len(gpus) for gpus in self.world_info.values())
-        self.tcpstore = TCPStore(
-            torch_master_info[0],
-            0,
-            world_size=self.world_size,
-            is_master=self.rank == 0,
-            timeout=timedelta(seconds=30),
-        )
-
-        logger.info(f"port: {self.tcpstore.port}")
-
-        os.environ["LOCAL_RANK"] = str(self.local_rank)
-        init_process_group(
+        # TODO: use MPI so that we don't have to use TCPStore.
+        torch.distributed.init_process_group(
             "nccl", store=self.tcpstore, rank=self.rank, world_size=self.world_size
         )
         dist.init_distributed("nccl", dist_init_required=False)
+
+        # init_process_group is done. Now we can delete torch_master_info.
+        if self.rank == 0:
+            self.set_torch_master_info()
 
         self.timer: OobleckTimer = OobleckTimer()
 
@@ -167,6 +181,11 @@ class OobleckEngine(
         self.pipeline = self.instantiate_pipelines(
             self.pipeline_specs, self.max_num_nodes, self.global_num_microbatch, True
         )
+
+        self.reconfiguration_required = False
+
+        logger.info("Sleeping...")
+        time.sleep(5)
 
     # ==========================================================================================
     # Paper section 4.1. is implemented in oobleck.planning.pipeline_spec.PipelineSpec.
@@ -203,10 +222,13 @@ class OobleckEngine(
         self.training_args.gradient_accumulation_steps = (
             execution_plan.get_my_number_of_microbatches(dist.get_rank())
         )
+        self.epoch, self.step, consumed_samples = self.get_training_progress()
         train_dataloader = OobleckTrainDataLoader(
             self.dataset.dataset["train"],
             self.training_args,
             self.global_num_microbatch,
+            consumed_samples,
+            self.epoch,
             self.dataset.data_collator,
         )
 
@@ -273,19 +295,28 @@ class OobleckEngine(
         self.init_distributed()
 
         if self.training_args.max_steps > 0:
-            for i in range(self.training_args.max_steps):
-                if self.reconfiguration_info:
-                    self.init_distributed()
+            for i in range(self.step, self.training_args.max_steps):
                 logger.info(f"[{i}] step")
                 self.train_step(True)
+                self.set_training_progress(
+                    0, i, self.my_pipeline.dataloader.batch_sampler.consumed_samples
+                )
                 log()
+                if self.reconfiguration_required:
+                    self.init_distributed()
         else:
-            for _ in range(int(self.training_args.num_train_epochs)):
+            for e in range(self.epoch, int(self.training_args.num_train_epochs)):
                 num_steps = len(self.my_pipeline.dataloader)
-                for i in range(num_steps):
-                    if self.reconfiguration_info:
-                        self.init_distributed()
+                for i in range(self.step, num_steps):
                     logger.info(f"[{i}] step")
                     self.train_step(False)
+                    self.set_training_progress(
+                        e,
+                        i,
+                        self.my_pipeline.dataloader.batch_sampler.consumed_samples,
+                    )
                     log()
+                    if self.reconfiguration_required:
+                        self.init_distributed()
+                self.step = 0
                 self.my_pipeline.reset_data_iterator()

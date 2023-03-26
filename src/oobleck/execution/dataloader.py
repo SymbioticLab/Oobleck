@@ -61,6 +61,8 @@ class OobleckTrainDataLoader(DataLoader):
         dataset: Dataset,
         args: TrainingArguments,
         num_total_microbatches: int,
+        consumed_samples: int,
+        epoch: int,
         collate_fn: _collate_fn_t,
     ):
         assert isinstance(
@@ -75,6 +77,8 @@ class OobleckTrainDataLoader(DataLoader):
             args.per_device_train_batch_size,
             self.num_total_microbatches,
             self.num_my_microbatches,
+            consumed_samples,
+            epoch,
         )
 
         super().__init__(
