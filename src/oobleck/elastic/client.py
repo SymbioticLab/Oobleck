@@ -63,6 +63,12 @@ class RedisClient:
             epoch, step, consumed_samples = pipe.execute()
             return (int(epoch), int(step), int(consumed_samples))
 
+    def set_pipeline_ranks(self, pipeline_id: int, pipeline_ranks: List[int]):
+        self.redis.set(f"oobleck:pipeline{pipeline_id}_ranks", str(pipeline_ranks))
+
+    def get_pipeline_ranks(self, pipeline_id: int) -> List[int]:
+        return literal_eval(self.redis.get(f"oobleck:pipeline{pipeline_id}_ranks"))
+
     def subscribe_reconfiguration(self):
         if self.reconfiguration_thread:
             return

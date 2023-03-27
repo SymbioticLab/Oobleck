@@ -8,6 +8,7 @@ from typing import List, Dict, Tuple, Optional
 from deepspeed import comm as dist
 from deepspeed.utils import logger
 
+from oobleck.elastic.client import RedisClient
 from oobleck.planning.pipeline_spec import PipelineSpec
 from oobleck.execution.pipeline import OobleckPipeline
 from oobleck.execution.dataloader import OobleckTrainDataLoader
@@ -82,6 +83,7 @@ class HeterogeneousPipelineExecutionPlan:
         self,
         model: OobleckModel,
         dataloader: OobleckTrainDataLoader,
+        redis_client: RedisClient,
         training_args: TrainingArguments,
     ) -> Tuple[OobleckPipeline, List[List[int]]]:
         my_pipeline: Optional[OobleckPipeline] = None
@@ -105,6 +107,7 @@ class HeterogeneousPipelineExecutionPlan:
                     my_pipeline = OobleckPipeline(
                         i, spec, model, dataloader, process_group, training_args
                     )
+                    redis_client.set_pipeline_ranks(i, ranks_to_layer_map)
 
         assert my_pipeline, "No pipeline has been initiated for this rank"
         return my_pipeline, pipeline_ranks

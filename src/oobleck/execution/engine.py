@@ -236,7 +236,7 @@ class OobleckEngine(
         )
 
         pipeline, pipeline_ranks_list = execution_plan.instantiate(
-            self.model, train_dataloader, self.training_args
+            self.model, train_dataloader, self.redis, self.training_args
         )
 
         # Reconstruct per-layer rank group for data parallelism from execution plan
