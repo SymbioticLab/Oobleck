@@ -85,6 +85,7 @@ class HeterogeneousPipelineExecutionPlan:
         dataloader: OobleckTrainDataLoader,
         redis_client: RedisClient,
         training_args: TrainingArguments,
+        step: int = 0,
     ) -> Tuple[OobleckPipeline, List[List[int]]]:
         my_pipeline: Optional[OobleckPipeline] = None
         total_num_nodes_used = 0
@@ -105,7 +106,7 @@ class HeterogeneousPipelineExecutionPlan:
                 if dist.get_rank(process_group) >= 0:
                     assert my_pipeline is None
                     my_pipeline = OobleckPipeline(
-                        i, spec, model, dataloader, process_group, training_args
+                        i, spec, model, dataloader, step, process_group, training_args
                     )
                     redis_client.set_pipeline_ranks(i, ranks_to_layer_map)
 

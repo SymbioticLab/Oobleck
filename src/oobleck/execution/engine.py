@@ -242,7 +242,7 @@ class OobleckEngine(
         )
 
         pipeline, pipeline_ranks_list = execution_plan.instantiate(
-            self.model, train_dataloader, self.redis, self.training_args
+            self.model, train_dataloader, self.redis, self.training_args, self.step
         )
 
         # Reconstruct per-layer rank group for data parallelism from execution plan
@@ -305,11 +305,13 @@ class OobleckEngine(
         self.init_distributed()
 
         if self.training_args.max_steps > 0:
-            for i in range(self.step, self.training_args.max_steps):
-                logger.info(f"[{i}] step")
+            for _ in range(self.step, self.training_args.max_steps):
+                logger.info(f"[{self.my_pipeline.global_steps}] step")
                 self.train_step(True)
                 self.redis.set_training_progress(
-                    0, i + 1, self.my_pipeline.dataloader.batch_sampler.consumed_samples
+                    0,
+                    self.my_pipeline.global_steps,
+                    self.my_pipeline.dataloader.batch_sampler.consumed_samples,
                 )
                 log()
                 if self.redis.reconfiguration_required:
@@ -318,12 +320,12 @@ class OobleckEngine(
         else:
             for e in range(self.epoch, int(self.training_args.num_train_epochs)):
                 num_steps = len(self.my_pipeline.dataloader)
-                for i in range(self.step, num_steps):
-                    logger.info(f"[{i}] step")
+                for _ in range(self.step, num_steps):
+                    logger.info(f"[{self.my_pipeline.global_steps}] step")
                     self.train_step(False)
                     self.redis.set_training_progress(
                         e,
-                        i + 1,
+                        self.my_pipeline.global_steps,
                         self.my_pipeline.dataloader.batch_sampler.consumed_samples,
                     )
                     log()

@@ -108,6 +108,7 @@ class PipelineExecutionMixin(object):
         model_layers: List[Layer],
         training_args: TrainingArguments,
         dataloader: OobleckTrainDataLoader,
+        step: int,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -132,8 +133,7 @@ class PipelineExecutionMixin(object):
         self.total_loss: Optional[Union[torch.Tensor, Iterable[torch.Tensor]]] = None
 
         self.micro_steps = 0
-        self.global_steps = 0
-        self.global_samples = 0
+        self.global_steps = step
 
         # TODO: use HF arguments to initialize properly
         parameters = list(
@@ -509,6 +509,7 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         spec: PipelineSpec,
         model: OobleckModel,
         dataloader: OobleckTrainDataLoader,
+        step: int,
         process_group: ProcessGroup,
         training_args: TrainingArguments,
     ):
@@ -530,6 +531,7 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
             dataloader=dataloader,
             training_args=training_args,
             process_group=process_group,
+            step=step,
         )
 
         logger.info(
@@ -571,11 +573,6 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         self._exec_schedule(self.train_schedule)
 
         self.global_steps += 1
-        self.global_samples += (
-            self.dataloader.num_total_microbatches
-            * self.training_args.per_device_train_batch_size
-        )
-
         self.write_samples_logs()
 
     def is_first_stage(self):
