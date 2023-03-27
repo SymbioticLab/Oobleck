@@ -1,13 +1,12 @@
 import os
 import redis
 import deepspeed.comm as dist
-import time
 
 from ast import literal_eval
 from typing import Dict, Tuple, List, Optional
 
 
-class ElasticWorkerRedisClientMixin(object):
+class RedisClient:
     def __init__(self):
         super().__init__()
 

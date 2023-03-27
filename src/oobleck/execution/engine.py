@@ -10,7 +10,7 @@ from torch.distributed import ProcessGroup
 from deepspeed import comm as dist
 from deepspeed.utils import logger
 
-from oobleck.elastic.client import ElasticWorkerRedisClientMixin
+from oobleck.elastic.client import RedisClient
 from oobleck.execution.dataset import OobleckDataset
 from oobleck.module.model import OobleckModel
 from oobleck.planning.pipeline_spec import PipelineSpec
@@ -63,7 +63,6 @@ class DataSynchronizationMixin(object):
 
 
 class OobleckEngine(
-    ElasticWorkerRedisClientMixin,
     DataSynchronizationMixin,
     FSDPMixin,
 ):
@@ -132,7 +131,10 @@ class OobleckEngine(
         self.global_num_microbatch = 16
 
     def init_distributed(self):
-        self.world_info = self.get_world_info()
+        self.redis = RedisClient()
+        self.redis.subscribe_reconfiguration()
+
+        self.world_info = self.redis.get_world_info()
         self.world_size = sum(len(gpus) for gpus in self.world_info.values())
         self.rank = self.world_info[self.node_name][self.local_rank]
         os.environ["LOCAL_RANK"] = str(self.local_rank)
@@ -218,7 +220,7 @@ class OobleckEngine(
         self.training_args.gradient_accumulation_steps = (
             execution_plan.get_my_number_of_microbatches(dist.get_rank())
         )
-        self.epoch, self.step, consumed_samples = self.get_training_progress()
+        self.epoch, self.step, consumed_samples = self.redis.get_training_progress()
         if consumed_samples != 0:
             logger.info(
                 "Continuing training from (epoch, step, consumed_samples): "
@@ -300,7 +302,7 @@ class OobleckEngine(
             for i in range(self.step, self.training_args.max_steps):
                 logger.info(f"[{i}] step")
                 self.train_step(True)
-                self.set_training_progress(
+                self.redis.set_training_progress(
                     0, i + 1, self.my_pipeline.dataloader.batch_sampler.consumed_samples
                 )
                 log()
@@ -313,7 +315,7 @@ class OobleckEngine(
                 for i in range(self.step, num_steps):
                     logger.info(f"[{i}] step")
                     self.train_step(False)
-                    self.set_training_progress(
+                    self.redis.set_training_progress(
                         e,
                         i + 1,
                         self.my_pipeline.dataloader.batch_sampler.consumed_samples,

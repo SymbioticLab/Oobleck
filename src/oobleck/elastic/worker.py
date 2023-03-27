@@ -35,7 +35,6 @@ class ElasticWorker:
         self.engine = OobleckEngine(
             ft_spec, model_name, dataset_path, dataset_name, model_args
         )
-        self.engine.subscribe_reconfiguration()
         self.engine.train()
 
 
