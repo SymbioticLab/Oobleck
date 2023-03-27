@@ -183,7 +183,7 @@ class OobleckEngine(
             self.pipeline_specs, self.max_num_nodes, self.global_num_microbatch, True
         )
 
-        self.reconfiguration_required = False
+        self.redis.reconfiguration_required = False
 
     # ==========================================================================================
     # Paper section 4.1. is implemented in oobleck.planning.pipeline_spec.PipelineSpec.
@@ -306,7 +306,7 @@ class OobleckEngine(
                     0, i + 1, self.my_pipeline.dataloader.batch_sampler.consumed_samples
                 )
                 log()
-                if self.reconfiguration_required:
+                if self.redis.reconfiguration_required:
                     logger.info("Reconfiguration start...")
                     self.init_distributed()
         else:
@@ -321,7 +321,7 @@ class OobleckEngine(
                         self.my_pipeline.dataloader.batch_sampler.consumed_samples,
                     )
                     log()
-                    if self.reconfiguration_required:
+                    if self.redis.reconfiguration_required:
                         logger.info("Reconfiguration start...")
                         self.init_distributed()
                 self.step = 0
