@@ -1,5 +1,3 @@
-import functools
-
 from datetime import datetime
 from typing import List, Tuple, Any, Callable
 
@@ -8,17 +6,7 @@ from deepspeed.utils.timer import SynchronizedWallClockTimer
 from deepspeed.monitor.monitor import MonitorMaster
 from deepspeed.monitor.config import get_monitor_config
 
-
-class Singleton:
-    def __init__(self, cls):
-        self.cls = cls
-        self.instance = None
-        functools.update_wrapper(self, cls)
-
-    def __call__(self, *args, **kwargs):
-        if self.instance is None:
-            self.instance = self.cls(*args, **kwargs)
-        return self.instance
+from oobleck.utils.singleton import Singleton
 
 
 @Singleton

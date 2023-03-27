@@ -5,7 +5,7 @@ import gc
 import sys
 
 from ast import literal_eval
-from typing import Optional, Dict, Tuple, List, Any
+from typing import Optional, Dict, Tuple, List, Any, TypeVar
 from torch.distributed import ProcessGroup
 
 from deepspeed import comm as dist
@@ -25,6 +25,22 @@ from oobleck.execution.pipeline import OobleckPipeline
 from oobleck.utils.timer import OobleckTimer, measure_time
 
 from transformers import TrainingArguments
+
+T = TypeVar("T", bound="OobleckEngine")
+
+
+class DynamicReconfigurationMixin(object):
+    """
+    Oobleck dynamic reconfiguration Mixin.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def init_reconfiguration(self: T):
+        logger.info("Reconfiguration start...")
+
+        self.init_distributed()
 
 
 class FSDPMixin(object):
@@ -65,6 +81,7 @@ class DataSynchronizationMixin(object):
 
 class OobleckEngine(
     DataSynchronizationMixin,
+    DynamicReconfigurationMixin,
     FSDPMixin,
 ):
     """
@@ -132,8 +149,10 @@ class OobleckEngine(
         self.global_num_microbatch = 16
 
     def init_distributed(self):
-        self.redis = RedisClient()
-        self.redis.subscribe_reconfiguration()
+        if not hasattr(self, "redis") or self.redis is None:
+            self.redis = RedisClient()
+            self.redis.subscribe_reconfiguration()
+        self.redis.reconfiguration_required = False
 
         self.world_info = self.redis.get_world_info()
         self.world_size = sum(len(gpus) for gpus in self.world_info.values())
@@ -189,8 +208,6 @@ class OobleckEngine(
             self.pipeline_specs, self.world_size, self.global_num_microbatch, True
         )
 
-        self.redis.reconfiguration_required = False
-
     # ==========================================================================================
     # Paper section 4.1. is implemented in oobleck.planning.pipeline_spec.PipelineSpec.
     # Paper section 4.2. is implemented in oobleck.planning.pipeline_spec.PipelineSpec.
@@ -242,7 +259,7 @@ class OobleckEngine(
         )
 
         pipeline, pipeline_ranks_list = execution_plan.instantiate(
-            self.model, train_dataloader, self.redis, self.training_args, self.step
+            self.model, train_dataloader, self.training_args, self.step
         )
 
         # Reconstruct per-layer rank group for data parallelism from execution plan
@@ -303,6 +320,9 @@ class OobleckEngine(
 
         self.master_port = 25400
         self.init_distributed()
+        self.pipeline = self.instantiate_pipelines(
+            self.pipeline_specs, self.world_size, self.global_num_microbatch, True
+        )
 
         if self.training_args.max_steps > 0:
             for _ in range(self.step, self.training_args.max_steps):
@@ -315,8 +335,7 @@ class OobleckEngine(
                 )
                 log()
                 if self.redis.reconfiguration_required:
-                    logger.info("Reconfiguration start...")
-                    self.init_distributed()
+                    self.init_reconfiguration()
         else:
             for e in range(self.epoch, int(self.training_args.num_train_epochs)):
                 num_steps = len(self.my_pipeline.dataloader)
@@ -330,7 +349,6 @@ class OobleckEngine(
                     )
                     log()
                     if self.redis.reconfiguration_required:
-                        logger.info("Reconfiguration start...")
-                        self.init_distributed()
+                        self.init_reconfiguration()
                 self.step = 0
                 self.my_pipeline.reset_data_iterator()

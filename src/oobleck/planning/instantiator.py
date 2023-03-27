@@ -83,7 +83,6 @@ class HeterogeneousPipelineExecutionPlan:
         self,
         model: OobleckModel,
         dataloader: OobleckTrainDataLoader,
-        redis_client: RedisClient,
         training_args: TrainingArguments,
         step: int = 0,
     ) -> Tuple[OobleckPipeline, List[List[int]]]:
@@ -91,6 +90,8 @@ class HeterogeneousPipelineExecutionPlan:
         total_num_nodes_used = 0
 
         pipeline_ranks: List[List[int]] = []
+
+        redis = RedisClient()
 
         for spec in self.pipeline_specs:
             for i in range(self.num_instances_set[spec]):
@@ -108,7 +109,7 @@ class HeterogeneousPipelineExecutionPlan:
                     my_pipeline = OobleckPipeline(
                         i, spec, model, dataloader, step, process_group, training_args
                     )
-                    redis_client.set_pipeline_ranks(i, ranks_to_layer_map)
+                    redis.set_pipeline_ranks(i, ranks_to_layer_map)
 
         assert my_pipeline, "No pipeline has been initiated for this rank"
         return my_pipeline, pipeline_ranks

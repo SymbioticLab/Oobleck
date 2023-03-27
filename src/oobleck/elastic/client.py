@@ -5,7 +5,10 @@ import deepspeed.comm as dist
 from ast import literal_eval
 from typing import Dict, Tuple, List, Optional
 
+from oobleck.utils.singleton import Singleton
 
+
+@Singleton
 class RedisClient:
     def __init__(self):
         super().__init__()
@@ -74,6 +77,17 @@ class RedisClient:
 
     def get_pipeline_ranks(self, pipeline_id: int) -> List[int]:
         return literal_eval(self.redis.get(f"oobleck:pipeline{pipeline_id}_ranks"))
+
+    def get_ranks_for_layer(self, index: int) -> List[int]:
+        """
+        Iterate over all pipelines and return the ranks that has the layer
+        """
+        my_rank = dist.get_rank()
+        keys = self.redis.scan_iter("oobleck:pipeline*_ranks")
+        values = self.redis.mget(keys)
+        ranks: List[List[int]] = [literal_eval(v) for v in values]
+
+        return [r[index] for r in ranks if r[index] != my_rank]
 
     def subscribe_reconfiguration(self):
         if self.reconfiguration_thread:
