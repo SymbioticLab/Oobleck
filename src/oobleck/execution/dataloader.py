@@ -47,9 +47,8 @@ class OobleckSampler(BatchSampler):
                 break
 
             for i in range(self.num_microbatches):
+                self.consumed_samples += self.microbatch_size
                 yield indices[i * self.microbatch_size : (i + 1) * self.microbatch_size]
-
-            self.consumed_samples += self.total_bucket_size
 
     def __len__(self) -> int:
         return self.num_samples // self.total_bucket_size

@@ -141,6 +141,7 @@ class OobleckEngine(
         if dist.is_initialized():
             dist.destroy_process_group()
             del dist.cdb
+            dist.cdb = None
             del self.tcpstore
             del self.pipeline
             gc.collect()
@@ -218,6 +219,11 @@ class OobleckEngine(
             execution_plan.get_my_number_of_microbatches(dist.get_rank())
         )
         self.epoch, self.step, consumed_samples = self.get_training_progress()
+        if consumed_samples != 0:
+            logger.info(
+                "Continuing training from (epoch, step, consumed_samples): "
+                f"{self.epoch, self.step, consumed_samples}"
+            )
         train_dataloader = OobleckTrainDataLoader(
             self.dataset.dataset["train"],
             self.training_args,
@@ -295,13 +301,12 @@ class OobleckEngine(
                 logger.info(f"[{i}] step")
                 self.train_step(True)
                 self.set_training_progress(
-                    0, i, self.my_pipeline.dataloader.batch_sampler.consumed_samples
+                    0, i + 1, self.my_pipeline.dataloader.batch_sampler.consumed_samples
                 )
                 log()
                 if self.reconfiguration_required:
-                    logger.info("In reconfiguration...")
+                    logger.info("Reconfiguration start...")
                     self.init_distributed()
-                    logger.info("Reconfiguration done")
         else:
             for e in range(self.epoch, int(self.training_args.num_train_epochs)):
                 num_steps = len(self.my_pipeline.dataloader)
@@ -310,13 +315,12 @@ class OobleckEngine(
                     self.train_step(False)
                     self.set_training_progress(
                         e,
-                        i,
+                        i + 1,
                         self.my_pipeline.dataloader.batch_sampler.consumed_samples,
                     )
                     log()
                     if self.reconfiguration_required:
-                        logger.info("In reconfiguration...")
+                        logger.info("Reconfiguration start...")
                         self.init_distributed()
-                        logger.info("Reconfiguration done")
                 self.step = 0
                 self.my_pipeline.reset_data_iterator()
