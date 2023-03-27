@@ -2,10 +2,8 @@ import os
 import pyomo.environ as pyomo
 import torch.distributed
 import gc
-import time
 
 from ast import literal_eval
-from datetime import timedelta
 from typing import Optional, Dict, Tuple, List, Any
 from torch.distributed import ProcessGroup
 
@@ -124,51 +122,6 @@ class OobleckEngine(
             model_name, self.dataset.sample, training_args, model_args
         )
 
-    def init_distributed(self):
-        self.world_info = self.get_world_info()
-        self.world_size = sum(len(gpus) for gpus in self.world_info.values())
-        self.rank = self.world_info[self.node_name][self.local_rank]
-        os.environ["LOCAL_RANK"] = str(self.local_rank)
-
-        # initiate distributed
-        if dist.is_initialized():
-            dist.destroy_process_group()
-            dist.cdb = None
-            del self.tcpstore
-            gc.collect()
-
-        if self.rank == 0:
-            addr = self.node_name[0]
-            self.tcpstore = torch.distributed.TCPStore(
-                addr,
-                0,
-                world_size=self.world_size,
-                is_master=True,
-                timeout=timedelta(seconds=30),
-            )
-            self.set_torch_master_info(addr, self.tcpstore.port)
-        else:
-            addr, port = self.get_torch_master_info()
-            self.tcpstore = torch.distributed.TCPStore(
-                addr,
-                port,
-                world_size=self.world_size,
-                is_master=False,
-                timeout=timedelta(seconds=30),
-            )
-
-        # TODO: use MPI so that we don't have to use TCPStore.
-        torch.distributed.init_process_group(
-            "nccl", store=self.tcpstore, rank=self.rank, world_size=self.world_size
-        )
-        dist.init_distributed("nccl", dist_init_required=False)
-
-        # init_process_group is done. Now we can delete torch_master_info.
-        if self.rank == 0:
-            self.set_torch_master_info()
-
-        self.timer: OobleckTimer = OobleckTimer()
-
         # create a list of pipelinespecs that can cover all nodes.
         # this is invariant and never changes over reconfiguration.
         self.pipeline_specs: List[PipelineSpec] = PipelineSpec.create(
@@ -178,14 +131,56 @@ class OobleckEngine(
         # TODO: move it to user configurable arguments
         self.global_num_microbatch = 16
 
+    def init_distributed(self):
+        self.world_info = self.get_world_info()
+        self.world_size = sum(len(gpus) for gpus in self.world_info.values())
+        self.rank = self.world_info[self.node_name][self.local_rank]
+        os.environ["LOCAL_RANK"] = str(self.local_rank)
+
+        # initiate distributed
+        if dist.is_initialized():
+            dist.destroy_process_group()
+            del dist.cdb
+            del self.tcpstore
+            del self.pipeline
+            gc.collect()
+
+        if self.rank == 0:
+            addr = self.node_name[0]
+            self.tcpstore = torch.distributed.TCPStore(
+                addr,
+                self.master_port,
+                world_size=self.world_size,
+                is_master=True,
+                timeout=torch.distributed.default_pg_timeout,
+            )
+        else:
+            # Find the address of rank 0.
+            rank0_addr = next(k for k, v in self.world_info.items() if 0 in v)[0]
+
+            self.tcpstore = torch.distributed.TCPStore(
+                rank0_addr,
+                self.master_port,
+                world_size=self.world_size,
+                is_master=False,
+                timeout=torch.distributed.default_pg_timeout,
+            )
+
+        self.master_port += 1
+
+        # TODO: use MPI so that we don't have to use TCPStore.
+        torch.distributed.init_process_group(
+            "nccl", store=self.tcpstore, rank=self.rank, world_size=self.world_size
+        )
+        dist.init_distributed("nccl", dist_init_required=False)
+
+        self.timer: OobleckTimer = OobleckTimer()
+
         self.pipeline = self.instantiate_pipelines(
             self.pipeline_specs, self.max_num_nodes, self.global_num_microbatch, True
         )
 
         self.reconfiguration_required = False
-
-        logger.info("Sleeping...")
-        time.sleep(5)
 
     # ==========================================================================================
     # Paper section 4.1. is implemented in oobleck.planning.pipeline_spec.PipelineSpec.
@@ -292,6 +287,7 @@ class OobleckEngine(
                 self.my_pipeline.global_steps,
             )
 
+        self.master_port = 25400
         self.init_distributed()
 
         if self.training_args.max_steps > 0:
@@ -303,7 +299,9 @@ class OobleckEngine(
                 )
                 log()
                 if self.reconfiguration_required:
+                    logger.info("In reconfiguration...")
                     self.init_distributed()
+                    logger.info("Reconfiguration done")
         else:
             for e in range(self.epoch, int(self.training_args.num_train_epochs)):
                 num_steps = len(self.my_pipeline.dataloader)
@@ -317,6 +315,8 @@ class OobleckEngine(
                     )
                     log()
                     if self.reconfiguration_required:
+                        logger.info("In reconfiguration...")
                         self.init_distributed()
+                        logger.info("Reconfiguration done")
                 self.step = 0
                 self.my_pipeline.reset_data_iterator()

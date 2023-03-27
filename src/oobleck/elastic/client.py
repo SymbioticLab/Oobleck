@@ -43,21 +43,6 @@ class ElasticWorkerRedisClientMixin(object):
 
         return world_info
 
-    def set_torch_master_info(
-        self, addr: Optional[str] = None, port: Optional[int] = None
-    ):
-        if addr is None:
-            self.redis.delete("oobleck:torch_master_info")
-        else:
-            self.redis.set("oobleck:torch_master_info", str((addr, port)))
-
-    def get_torch_master_info(self) -> Tuple[str, int]:
-        result = None
-        while result is None:
-            result = self.redis.get("oobleck:torch_master_info")
-            time.sleep(0.01)
-        return literal_eval(result)
-
     def set_training_progress(self, epoch: int, step: int, consumed_samples: int):
         if dist.get_rank() != 0:
             return

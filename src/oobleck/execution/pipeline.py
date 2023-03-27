@@ -18,7 +18,6 @@ from oobleck.module.model import OobleckModel
 from oobleck.module.layer import is_checkpointable
 from oobleck.execution.utils import (
     zero_grads,
-    run_once,
     DTYPE_TO_ID,
     ID_TO_DTYPE,
 )
@@ -196,7 +195,6 @@ class PipelineExecutionMixin(object):
     @instrument_w_nvtx
     @measure_time("execution/forward")
     def forward_pass(self, buffer_id: int):
-        logger.info("forward")
         inputs: tuple[torch.Tensor] = self.pipe_buffers["inputs"][buffer_id]
         zero_grads(inputs)
 
@@ -251,7 +249,6 @@ class PipelineExecutionMixin(object):
     @instrument_w_nvtx
     @measure_time("execution/backward")
     def backward_pass(self, buffer_id: int):
-        logger.info("backward")
         if self.is_last_stage():
             loss = self.loss
             loss.backward()
@@ -300,6 +297,7 @@ class PipelineCommunicationMixin(object):
             "outputs": [],  # activations
         }
 
+        self.sent_activation_meta: bool = False
         # initialized in :func:`oobleck.execution.PipelineCommunicationMixin.recv_activations`.
         self.activation_recv_buf: Optional[Tuple[torch.Tensor]] = None
         # initialized in :func:`oobleck.execution.PipelineCommunicationMixin.recv_gradients`.
@@ -339,41 +337,44 @@ class PipelineCommunicationMixin(object):
             else dist.recv(tensor, src_global_rank, self.process_group)
         )
 
-    @run_once
-    def _send_activation_meta(self, buffer: Tuple[torch.Tensor], receiver_rank: int):
-        """Send activation dimension first to the next stage
-        so that it can initialize buffers.
-
-        Metadata is communicated in this order:
-            * num_tensors in tensor tuple
-            foreeach tensor in buffer:
-                * ndims
-                * dtype
-                * shape
-                * requires_grad
-        """
-        assert isinstance(buffer, tuple), f"Could not send meta type {type(buffer)}."
-        count_tensor = torch.LongTensor(data=[len(buffer)]).to(self.device)
-        self._send(count_tensor, receiver_rank)
-        for tensor in buffer:
-            assert isinstance(tensor, torch.Tensor)
-            send_ndims = torch.LongTensor(data=[len(tensor.size())]).to(self.device)
-            send_dtype = torch.LongTensor(data=[DTYPE_TO_ID[tensor.dtype]]).to(
-                self.device
-            )
-            send_shape = torch.LongTensor(data=tensor.size()).to(self.device)
-            send_req_grad = torch.LongTensor(
-                data=[1 if tensor.requires_grad else 0]
-            ).to(self.device)
-            self._send(send_ndims, receiver_rank)
-            self._send(send_dtype, receiver_rank)
-            self._send(send_shape, receiver_rank)
-            self._send(send_req_grad, receiver_rank)
-
     @measure_time("comm/send_activations")
     def send_activations(self, buffer_id: int):
+        def _send_activation_meta(buffer: Tuple[torch.Tensor], receiver_rank: int):
+            """Send activation dimension first to the next stage
+            so that it can initialize buffers.
+
+            Metadata is communicated in this order:
+                * num_tensors in tensor tuple
+                foreeach tensor in buffer:
+                    * ndims
+                    * dtype
+                    * shape
+                    * requires_grad
+            """
+            assert isinstance(
+                buffer, tuple
+            ), f"Could not send meta type {type(buffer)}."
+            count_tensor = torch.LongTensor(data=[len(buffer)]).to(self.device)
+            self._send(count_tensor, receiver_rank)
+            for tensor in buffer:
+                assert isinstance(tensor, torch.Tensor)
+                send_ndims = torch.LongTensor(data=[len(tensor.size())]).to(self.device)
+                send_dtype = torch.LongTensor(data=[DTYPE_TO_ID[tensor.dtype]]).to(
+                    self.device
+                )
+                send_shape = torch.LongTensor(data=tensor.size()).to(self.device)
+                send_req_grad = torch.LongTensor(
+                    data=[1 if tensor.requires_grad else 0]
+                ).to(self.device)
+                self._send(send_ndims, receiver_rank)
+                self._send(send_dtype, receiver_rank)
+                self._send(send_shape, receiver_rank)
+                self._send(send_req_grad, receiver_rank)
+
         outputs: Tuple[torch.Tensor] = self.pipe_buffers["outputs"][buffer_id]
-        self._send_activation_meta(outputs, self.next_rank)
+        if not self.sent_activation_meta:
+            _send_activation_meta(outputs, self.next_rank)
+            self.sent_activation_meta = True
 
         assert isinstance(outputs, tuple)
         for buffer in outputs:

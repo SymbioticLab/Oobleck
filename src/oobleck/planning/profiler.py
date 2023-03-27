@@ -96,9 +96,9 @@ class Profiler:
         Returns:
             List[LayerExecutionResult]: A list of execution results per layer.
         """
-        dist_initialized = dist.is_initialized()
-        if not dist_initialized:
-            dist.init_process_group(backend="nccl")
+        # dist_initialized = dist.is_initialized()
+        # if not dist_initialized:
+        #     dist.init_process_group(backend="nccl")
 
         # forward/backward execution
         layer_execution_result = self._profile_execution_layers()
@@ -123,9 +123,9 @@ class Profiler:
                 )
             )
 
-        dist.barrier()
-        if not dist_initialized:
-            dist.destroy_process_group()
+        # dist.barrier()
+        # if not dist_initialized:
+        #     dist.destroy_process_group()
         return results
 
     @return_cache_if_exist("layers")

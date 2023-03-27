@@ -1,4 +1,6 @@
 import pyomo.environ as pyomo
+import torch.distributed
+import datetime
 
 from collections import defaultdict
 from typing import List, Dict, Tuple, Optional
@@ -96,7 +98,7 @@ class HeterogeneousPipelineExecutionPlan:
                 ranks_to_layer_map = [ranks[i] for i in spec.layer_spec]
                 pipeline_ranks.append(ranks_to_layer_map)
                 total_num_nodes_used += spec.num_nodes
-                process_group = dist.new_group(ranks)
+                process_group = torch.distributed.new_group(ranks)
 
                 if dist.get_rank(process_group) >= 0:
                     assert my_pipeline is None
