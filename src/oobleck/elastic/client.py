@@ -56,6 +56,12 @@ class RedisClient:
             pipe.execute()
 
     def get_training_progress(self) -> Tuple[int, int, int]:
+        # Use mget instead
+        result = self.redis.mget(
+            "oobleck:epoch", "oobleck:step", "oobleck:consumed_samples"
+        )
+        return (int(result[0]), int(result[1]), int(result[2]))
+        # For backup
         with self.redis.pipeline() as pipe:
             pipe.get("oobleck:epoch")
             pipe.get("oobleck:step")
