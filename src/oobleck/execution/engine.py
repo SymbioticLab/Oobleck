@@ -2,6 +2,7 @@ import os
 import pyomo.environ as pyomo
 import torch.distributed
 import gc
+import sys
 
 from ast import literal_eval
 from typing import Optional, Dict, Tuple, List, Any
@@ -136,6 +137,11 @@ class OobleckEngine(
 
         self.world_info = self.redis.get_world_info()
         self.world_size = sum(len(gpus) for gpus in self.world_info.values())
+
+        if self.node_name not in self.world_info:
+            logger.info(f"{self.node_name} is preempted. Out.")
+            sys.exit(0)
+
         self.rank = self.world_info[self.node_name][self.local_rank]
         os.environ["LOCAL_RANK"] = str(self.local_rank)
 
@@ -180,7 +186,7 @@ class OobleckEngine(
         self.timer: OobleckTimer = OobleckTimer()
 
         self.pipeline = self.instantiate_pipelines(
-            self.pipeline_specs, self.max_num_nodes, self.global_num_microbatch, True
+            self.pipeline_specs, self.world_size, self.global_num_microbatch, True
         )
 
         self.redis.reconfiguration_required = False

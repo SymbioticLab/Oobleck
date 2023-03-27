@@ -86,6 +86,21 @@ class MasterServiceMixin(rpyc.Service):
         self.training_in_progress = True
         logger.info("Training %s started.", model_name)
 
+    def exposed_get_agents(self: T) -> List[Tuple[str, int]]:
+        return list(self.agents.values())
+
+    def exposed_remove_agent(self: T, agent_ip: Tuple[str, int]) -> bool:
+        """
+        Remove an agent from training. This is for emulating failure.
+        Corresponding agent will terminate itself at the end of the current iteration.
+        """
+        agent = next(filter(lambda a: a[1] == agent_ip, self.agents.items()), None)
+        if agent is None:
+            return False
+
+        self.delete_agent(agent[0])
+        return True
+
 
 class OobleckMaster(MasterServiceMixin):
     def __init__(
@@ -107,7 +122,6 @@ class OobleckMaster(MasterServiceMixin):
         self.redis = redis.Redis(host=ip, port=6379, decode_responses=True)
         for key in self.redis.scan_iter("oobleck:*"):
             self.redis.delete(key)
-        self.redis.set("oobleck:reconfiguration", Reconfiguration.NONE.name)
 
     def start(self):
         logger.info(f"Serving on {self.server.host}:{self.server.port}")
@@ -155,9 +169,8 @@ class OobleckMaster(MasterServiceMixin):
 
     def _broadcast_world_info_change(self, reconfiguration: Reconfiguration):
         with self.redis.pipeline() as pipe:
-            pipe.multi()
             pipe.set("oobleck:world_info", str(self.world_info))
-            pipe.set("oobleck:reconfiguration", reconfiguration.name)
+            pipe.publish("oobleck:reconfiguration", reconfiguration.name)
             pipe.execute()
 
 

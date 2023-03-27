@@ -393,8 +393,8 @@ class PipelineSpec:
         required_min_gpus = math.ceil(
             required_memory / torch.cuda.get_device_properties("cuda:0").total_memory
         )
-        # min_num_nodes = math.ceil(required_min_gpus / self.num_gpus_per_node)
-        min_num_nodes = 2
+        min_num_nodes = math.ceil(required_min_gpus / num_gpus_per_node)
+        # min_num_nodes = 2
         assert (
             ft_spec + 1
         ) * min_num_nodes <= max_num_nodes, f"Maximum # nodes ({max_num_nodes}) cannot be smaller than minimum # nodes ({min_num_nodes})."
