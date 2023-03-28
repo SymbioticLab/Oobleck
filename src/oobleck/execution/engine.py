@@ -99,7 +99,7 @@ class DynamicReconfigurationMixin(object):
             )
             if new_layer_rank == new_local_rank and old_layer_rank != old_local_rank
         ]
-        self.redis.append_missing_layers(self.rank, missing_layers)
+        self.redis.append_missing_layers(self.rank, [l.index for l in missing_layers])
         dist.barrier()
 
         if missing_layers:
