@@ -90,7 +90,7 @@ class HeterogeneousPipelineExecutionPlan:
         pipeline_ranks: List[List[int]] = []
 
         for spec in self.pipeline_specs:
-            for i in range(self.num_instances_set[spec]):
+            for _ in range(self.num_instances_set[spec]):
                 # TODO: implement FSDP by considering spec.num_gpus_per_node
                 ranks = list(
                     range(total_num_nodes_used, total_num_nodes_used + spec.num_nodes)
@@ -103,7 +103,7 @@ class HeterogeneousPipelineExecutionPlan:
                 if dist.get_rank(process_group) >= 0:
                     assert my_pipeline is None
                     my_pipeline = OobleckPipeline(
-                        i, spec, model, dataloader, step, process_group, training_args
+                        spec, model, dataloader, step, process_group, training_args
                     )
 
         assert my_pipeline, "No pipeline has been initiated for this rank"

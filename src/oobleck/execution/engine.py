@@ -43,16 +43,13 @@ class DynamicReconfigurationMixin(object):
         logger.info("Reconfiguration start...")
 
         start = time.time()
-        # World info has been changed due to node loss.
-        new_world_info = self.redis.get_world_info()
-        new_world_size = sum(len(gpus) for gpus in new_world_info.values())
         self.init_distributed()
         # We now have less number of GPUs.
 
-        logger.info("new world: %s", new_world_info)
+        logger.info("new world: %s", self.world_info)
 
         execution_plan = self.create_execution_plan(
-            self.pipeline_specs, new_world_size, self.global_num_microbatch, True
+            self.pipeline_specs, self.world_size, self.global_num_microbatch, True
         )
 
         old_local_rank = self.my_pipeline.my_rank
@@ -141,7 +138,7 @@ class DynamicReconfigurationMixin(object):
             # TODO: send optimizer state, too.
             # TODO: update opptimizer state dict. Modify class structure if needed.
             torch.distributed.broadcast_object_list(
-                [target_layer.state_dict()], src=source_rank
+                [list(target_layer.parameters())], src=source_rank
             )
 
         # Reinstantiate pipeline
