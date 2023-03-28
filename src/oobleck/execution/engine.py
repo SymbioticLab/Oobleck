@@ -112,16 +112,27 @@ class DynamicReconfigurationMixin(object):
                 "No missing layer. Waiting for other rank reconfiguration to be done."
             )
 
-        # For instance, I (rank=1) am missing layers with index 4 and 5.
-        # The key oobleck:missing_layer:4 and oobleck:missing_layer:5 will include "1" in the list.
-        # If another rank (e.g. rank=2) has layer 4, then it pops "1" from the list,
-        # and they set the key oobleck:send_to:1:4 to "2".
-        # Then, rank=1 will receive layer 4 from rank=2.
-
-        # A deadlock might happen if all ranks are missing some layer and just wait.
-        # To avoid this, odd rank will send the layer to the even rank first.
-        # If the even rank is missing the layer, it will send it to the odd rank after receiving the layer.
-        # Repeat it until all missing layers are gone.
+        all_missing_layers: Dict[int, List[int]] = self.redis.get_all_missing_layers()
+        logger.info("all missing layers: %s", all_missing_layers)
+        # all_missing_layers: the key is the index of layers, and the value is the list of ranks that need the layer.
+        # For example, {0: [0, 1, 2], 1: [0, 1, 2]} means that layer 0 and 1 are missing in rank 0, 1, and 2.
+        # Iterate all layers, broadcast the layer.
+        # Source of broadcast is the smallest rank in range(0, new_world_size) that is not in the list of ranks that need the layer.
+        # If my rank (self.rank) is in the list of ranks that need the layer, then I will receive the layer.
+        for layer_index, ranks in all_missing_layers.items():
+            # Find the smallest rank in range(0, new_world_size) that is not in the list of ranks that need the layer.
+            source_rank = min(
+                set(range(new_world_size)) - set(ranks), default=self.rank
+            )
+            if self.rank in ranks:
+                # I need the layer.
+                logger.info(f"Receiving layer {layer_index} from rank {source_rank}...")
+            else:
+                # I don't need the layer.
+                # if I (self.rank) am the source rank, then I will send the layer.
+                if self.rank == source_rank:
+                    logger.info(f"Sending layer {layer_index} to ranks {ranks}...")
+            dist.broadcast(self.model.model[layer_index], src=source_rank)
 
         # Reinstantiate pipeline
         self.pipeline = self.instantiate_pipelines(execution_plan)

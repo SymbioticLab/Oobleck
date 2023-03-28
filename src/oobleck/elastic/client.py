@@ -59,16 +59,20 @@ class RedisReconfigurationMixin(object):
                 pipe.rpush(f"oobleck:missing_layer:{layer_index}", rank)
             pipe.execute()
 
-    def get_missing_layers(self) -> List[List[int]]:
+    def get_all_missing_layers(self) -> Dict[int, List[int]]:
         """
         Get all the lists of missing layers.
         """
-        keys = self.redis.scan_iter("oobleck:missing_layer:*")
+        keys = list(self.redis.scan_iter("oobleck:missing_layer:*"))
         with self.redis.pipeline() as pipe:
             for key in keys:
                 pipe.lrange(key, 0, -1)
             results = pipe.execute()
-        return [literal_eval(r) for r in results]
+
+        return {
+            int(k.split(":")[-1]): [int(r) for r in result]
+            for k, result in zip(keys, results)
+        }
 
     def wait_for_missing_layer(self, missing_layers: List[int], rank: int):
         """

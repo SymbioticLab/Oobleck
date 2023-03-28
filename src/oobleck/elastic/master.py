@@ -120,8 +120,9 @@ class OobleckMaster(MasterServiceMixin):
 
         self.server = ThreadedServer(self, ip, port=port)
         self.redis = redis.Redis(host=ip, port=6379, decode_responses=True)
-        for key in self.redis.scan_iter("oobleck:*"):
-            self.redis.delete(key)
+        self.redis.delete("oobleck:*")
+        # for key in self.redis.scan_iter("oobleck:*"):
+        #     self.redis.delete(key)
 
     def start(self):
         logger.info(f"Serving on {self.server.host}:{self.server.port}")
