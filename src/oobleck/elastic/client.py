@@ -13,18 +13,6 @@ class RedisReconfigurationMixin(object):
     def __init__(self):
         super().__init__()
 
-    # def synchronize(self, num_ranks: int):
-    #     """
-    #     Wait until all ranks have called this function
-    #     """
-    #     key = "oobleck:synchronize"
-    #     self.redis.incr(key)
-    #     while int(self.redis.get(key)) < num_ranks:
-    #         time.sleep(0.01)
-
-    #     # Will only be deleted key is reached to the number of ranks
-    #     self.redis.delete(key)
-
     def append_my_rank_to_layers(self, rank: int, layer_indices: List[int]):
         """
         Advertise that the rank has the layers.
@@ -74,22 +62,6 @@ class RedisReconfigurationMixin(object):
             int(k.split(":")[-1]): [int(r) for r in result]
             for k, result in zip(keys, results)
         }
-
-    def wait_for_missing_layer(self, missing_layers: List[int], rank: int):
-        """
-        Some process will consume an item from the list "oobleck:missing_layer:{layer_index}"
-        and put a key "oobleck:send_to:{rank}". This function will wait until the key is created.
-        Use BLPOP command to wait for the key.
-        """
-
-        keys = [f"oobleck:send_to:{rank}:{layer}" for layer in missing_layers]
-        result = self.redis.blpop(keys, timeout=0)
-
-    def send_layer_to_rank(self, src_rank: int, target_rank: int, layer_index: int):
-        """
-        Put a key "oobleck:send_to:{rank}" to notify the rank that it should receive the layer.
-        """
-        self.redis.rpush(f"oobleck:send_to:{target_rank}:{layer_index}", src_rank)
 
 
 @Singleton

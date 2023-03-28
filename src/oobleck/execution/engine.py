@@ -3,6 +3,7 @@ import pyomo.environ as pyomo
 import torch.distributed
 import gc
 import sys
+import time
 
 from ast import literal_eval
 from typing import Optional, Dict, Tuple, List, Any, TypeVar
@@ -41,7 +42,8 @@ class DynamicReconfigurationMixin(object):
     def init_reconfiguration(self: T):
         logger.info("Reconfiguration start...")
 
-        # World info has been changed dueo to node loss.
+        start = time.time()
+        # World info has been changed due to node loss.
         new_world_info = self.redis.get_world_info()
         new_world_size = sum(len(gpus) for gpus in new_world_info.values())
         self.init_distributed()
@@ -60,7 +62,6 @@ class DynamicReconfigurationMixin(object):
         self.redis.append_my_rank_to_layers(
             self.rank, [l.index for l in self.my_pipeline.model_layers]
         )
-        # self.redis.synchronize(world_size)
         dist.barrier()
 
         # get who owns which layers
@@ -136,12 +137,18 @@ class DynamicReconfigurationMixin(object):
                 if self.rank == source_rank:
                     logger.info(f"Sending layer {layer_index} to ranks {ranks}...")
             target_layer = self.model.model[layer_index]
+
+            # TODO: send optimizer state, too.
+            # TODO: update opptimizer state dict. Modify class structure if needed.
             torch.distributed.broadcast_object_list(
                 [target_layer.state_dict()], src=source_rank
             )
 
         # Reinstantiate pipeline
         self.pipeline = self.instantiate_pipelines(execution_plan)
+
+        end = time.time()
+        logger.info("Reconfiguration time: %s s", end - start)
 
 
 class FSDPMixin(object):
