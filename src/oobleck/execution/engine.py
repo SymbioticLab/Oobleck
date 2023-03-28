@@ -13,6 +13,7 @@ from deepspeed.utils import logger
 
 from oobleck.elastic.client import RedisClient
 from oobleck.execution.dataset import OobleckDataset
+from oobleck.module.layer import Layer
 from oobleck.module.model import OobleckModel
 from oobleck.planning.pipeline_spec import PipelineSpec
 from oobleck.planning.instantiator import (
@@ -40,7 +41,90 @@ class DynamicReconfigurationMixin(object):
     def init_reconfiguration(self: T):
         logger.info("Reconfiguration start...")
 
+        # World info has been changed dueo to node loss.
+        new_world_info = self.redis.get_world_info()
+        new_world_size = sum(len(gpus) for gpus in new_world_info.values())
         self.init_distributed()
+        # We now have less number of GPUs.
+
+        logger.info("new world: %s", new_world_info)
+
+        execution_plan = self.create_execution_plan(
+            self.pipeline_specs, new_world_size, self.global_num_microbatch, True
+        )
+
+        old_local_rank = self.my_pipeline.my_rank
+        old_spec: List[int] = self.my_pipeline.layer_spec
+
+        # 1. First, advertise that I have the layers
+        self.redis.append_my_rank_to_layers(self.rank, old_spec)
+        # self.redis.synchronize(world_size)
+        dist.barrier()
+
+        # check whether there is a layer owned by nobody
+        assert (
+            self.redis.check_all_layers_have_ranks()
+        ), "Some layers are not owned by any node."
+
+        # =======================================================
+        # =================== Reconfiguration ===================
+        # =======================================================
+        # 2. find me from execution plan
+        def get_my_pipeline_spec() -> Tuple[PipelineSpec, int]:
+            total_num_nodes_used = 0
+            for spec in execution_plan.pipeline_specs:
+                for _ in range(execution_plan.num_instances_set[spec]):
+                    if self.rank in range(
+                        total_num_nodes_used, total_num_nodes_used + spec.num_nodes
+                    ):
+                        return spec, self.rank - total_num_nodes_used
+                    total_num_nodes_used += spec.num_nodes
+            raise ValueError("Cannot find my pipeline spec")
+
+        # local_rank: my location in the pipeline process group starting from 0.
+        # new_pipeline_spec.layer_spec has rank assigned to each layer,
+        # which includes my local rank.
+        new_pipeline_spec, new_local_rank = get_my_pipeline_spec()
+
+        # 3. find missing layers
+        # Missing layers mean layers that I didn't own but assigned to me in a new spec.
+        # If any, report it to Redis.
+        assert (
+            len(self.model.model) == len(new_pipeline_spec.layer_spec) == len(old_spec)
+        ), "Number of layers in the model is inconsistent with the number of layers in the pipeline spec."
+        missing_layers: List[Layer] = [
+            layer
+            for layer, old_layer_rank, new_layer_rank in zip(
+                self.model.model, old_spec, new_pipeline_spec.layer_spec
+            )
+            if new_layer_rank == new_local_rank and old_layer_rank != old_local_rank
+        ]
+        self.redis.append_missing_layers(self.rank, missing_layers)
+        dist.barrier()
+
+        if missing_layers:
+            logger.info(
+                f"Getting {len(missing_layers)} missing layers: "
+                f"{[l.index for l in missing_layers]}"
+            )
+        else:
+            logger.info(
+                "No missing layer. Waiting for other rank reconfiguration to be done."
+            )
+
+        # For instance, I (rank=1) am missing layers with index 4 and 5.
+        # The key oobleck:missing_layer:4 and oobleck:missing_layer:5 will include "1" in the list.
+        # If another rank (e.g. rank=2) has layer 4, then it pops "1" from the list,
+        # and they set the key oobleck:send_to:1:4 to "2".
+        # Then, rank=1 will receive layer 4 from rank=2.
+
+        # A deadlock might happen if all ranks are missing some layer and just wait.
+        # To avoid this, odd rank will send the layer to the even rank first.
+        # If the even rank is missing the layer, it will send it to the odd rank after receiving the layer.
+        # Repeat it until all missing layers are gone.
+
+        # Reinstantiate pipeline
+        self.pipeline = self.instantiate_pipelines(execution_plan)
 
 
 class FSDPMixin(object):
@@ -154,7 +238,7 @@ class OobleckEngine(
             self.redis.subscribe_reconfiguration()
         self.redis.reconfiguration_required = False
 
-        self.world_info = self.redis.get_world_info()
+        self.world_info: Dict[Tuple[str, int], List[int]] = self.redis.get_world_info()
         self.world_size = sum(len(gpus) for gpus in self.world_info.values())
 
         if self.node_name not in self.world_info:
@@ -204,22 +288,28 @@ class OobleckEngine(
 
         self.timer: OobleckTimer = OobleckTimer()
 
-        self.pipeline = self.instantiate_pipelines(
-            self.pipeline_specs, self.world_size, self.global_num_microbatch, True
-        )
-
     # ==========================================================================================
     # Paper section 4.1. is implemented in oobleck.planning.pipeline_spec.PipelineSpec.
     # Paper section 4.2. is implemented in oobleck.planning.pipeline_spec.PipelineSpec.
     # Paper section 4.3. is implemented in oobleck.planning.instantiator.PipelineInstantiator.
     # ==========================================================================================
 
-    def instantiate_pipelines(
+    def create_execution_plan(
         self,
         pipeline_specs: List[PipelineSpec],
         num_nodes: int,
         global_num_microbatch: int,
         throughput_oriented: bool = True,
+    ) -> HeterogeneousPipelineExecutionPlan:
+        instantiator = PipelineInstantiator(
+            pipeline_specs, num_nodes, global_num_microbatch
+        )
+
+        return instantiator.get_best_execution_plan(throughput_oriented)
+
+    def instantiate_pipelines(
+        self,
+        execution_plan: HeterogeneousPipelineExecutionPlan,
     ) -> OobleckPipeline:
         """Oobleck paper section 4.3. Instantiating Pipeline Templates implementation
         Instantiate given `PipelineSpec`s and create `OobleckPipeline`s.
@@ -231,14 +321,6 @@ class OobleckEngine(
             throughput_oriented (bool, optional): Whether throughput oriented or
                 reconfiguration overhead oriented.
         """
-
-        instantiator = PipelineInstantiator(
-            pipeline_specs, num_nodes, global_num_microbatch
-        )
-
-        execution_plan: HeterogeneousPipelineExecutionPlan = (
-            instantiator.get_best_execution_plan(throughput_oriented)
-        )
 
         self.training_args.gradient_accumulation_steps = (
             execution_plan.get_my_number_of_microbatches(dist.get_rank())
@@ -320,9 +402,10 @@ class OobleckEngine(
 
         self.master_port = 25400
         self.init_distributed()
-        self.pipeline = self.instantiate_pipelines(
+        execution_plan = self.create_execution_plan(
             self.pipeline_specs, self.world_size, self.global_num_microbatch, True
         )
+        self.pipeline = self.instantiate_pipelines(execution_plan)
 
         if self.training_args.max_steps > 0:
             for _ in range(self.step, self.training_args.max_steps):

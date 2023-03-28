@@ -286,7 +286,7 @@ class PipelineCommunicationMixin(object):
 
         self.device = torch.device("cuda")
         self.process_group = process_group
-        self.my_rank = dist.get_rank(self.process_group)
+        self.my_rank: int = dist.get_rank(self.process_group)
         self.prev_rank: Optional[int] = None
         self.next_rank: Optional[int] = None
 

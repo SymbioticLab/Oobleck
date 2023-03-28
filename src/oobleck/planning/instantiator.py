@@ -1,6 +1,5 @@
 import pyomo.environ as pyomo
 import torch.distributed
-import datetime
 
 from collections import defaultdict
 from typing import List, Dict, Tuple, Optional
@@ -8,7 +7,6 @@ from typing import List, Dict, Tuple, Optional
 from deepspeed import comm as dist
 from deepspeed.utils import logger
 
-from oobleck.elastic.client import RedisClient
 from oobleck.planning.pipeline_spec import PipelineSpec
 from oobleck.execution.pipeline import OobleckPipeline
 from oobleck.execution.dataloader import OobleckTrainDataLoader
@@ -91,8 +89,6 @@ class HeterogeneousPipelineExecutionPlan:
 
         pipeline_ranks: List[List[int]] = []
 
-        redis = RedisClient()
-
         for spec in self.pipeline_specs:
             for i in range(self.num_instances_set[spec]):
                 # TODO: implement FSDP by considering spec.num_gpus_per_node
@@ -109,7 +105,6 @@ class HeterogeneousPipelineExecutionPlan:
                     my_pipeline = OobleckPipeline(
                         i, spec, model, dataloader, step, process_group, training_args
                     )
-                    redis.set_pipeline_ranks(i, ranks_to_layer_map)
 
         assert my_pipeline, "No pipeline has been initiated for this rank"
         return my_pipeline, pipeline_ranks

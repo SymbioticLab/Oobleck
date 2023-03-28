@@ -1,6 +1,7 @@
 import os
 import redis
 import deepspeed.comm as dist
+import time
 
 from ast import literal_eval
 from typing import Dict, Tuple, List, Optional
@@ -8,8 +9,86 @@ from typing import Dict, Tuple, List, Optional
 from oobleck.utils.singleton import Singleton
 
 
+class RedisReconfigurationMixin(object):
+    def __init__(self):
+        super().__init__()
+
+    # def synchronize(self, num_ranks: int):
+    #     """
+    #     Wait until all ranks have called this function
+    #     """
+    #     key = "oobleck:synchronize"
+    #     self.redis.incr(key)
+    #     while int(self.redis.get(key)) < num_ranks:
+    #         time.sleep(0.01)
+
+    #     # Will only be deleted key is reached to the number of ranks
+    #     self.redis.delete(key)
+
+    def append_my_rank_to_layers(self, rank: int, layer_indices: List[int]):
+        """
+        Advertise that the rank has the layers.
+        """
+        with self.redis.pipeline() as pipe:
+            for layer_index in layer_indices:
+                pipe.append(f"oobleck:layer:{layer_index}", f",{rank}")
+
+            pipe.execute()
+
+    def check_all_layers_have_ranks(self) -> bool:
+        """
+        Check if all layers have ranks.
+        """
+        keys = self.redis.scan_iter("oobleck:layer:*")
+        values = self.redis.mget(keys)
+        return all(v is not None for v in values)
+
+    def get_layer_ranks(self, layer_index: int) -> List[int]:
+        ranks = self.redis.get(f"oobleck:layer:{layer_index}")
+        if ranks is None:
+            return []
+        return [int(r) for r in ranks.split(",")[1:]]  # Skip the first comma
+
+    def append_missing_layers(self, rank: int, layer_indices: List[int]):
+        """
+        This is to advertise that the rank is missing some layers.
+        Other processes will use this information to decide whether to send the layers to the rank.
+        """
+        with self.redis.pipeline() as pipe:
+            for layer_index in layer_indices:
+                pipe.rpush(f"oobleck:missing_layer:{layer_index}", rank)
+            pipe.execute()
+
+    def get_missing_layers(self) -> List[List[int]]:
+        """
+        Get all the lists of missing layers.
+        """
+        keys = self.redis.scan_iter("oobleck:missing_layer:*")
+        with self.redis.pipeline() as pipe:
+            for key in keys:
+                pipe.lrange(key, 0, -1)
+            results = pipe.execute()
+        return [literal_eval(r) for r in results]
+
+    def wait_for_missing_layer(self, missing_layers: List[int], rank: int):
+        """
+        Some process will consume an item from the list "oobleck:missing_layer:{layer_index}"
+        and put a key "oobleck:send_to:{rank}". This function will wait until the key is created.
+        Use BLPOP command to wait for the key.
+        """
+
+        keys = [f"oobleck:send_to:{rank}:{layer}" for layer in missing_layers]
+        result = self.redis.blpop(keys, timeout=0)
+
+    def send_layer_to_rank(self, src_rank: int, target_rank: int, layer_index: int):
+        """
+        Put a key "oobleck:send_to:{rank}" to notify the rank that it should receive the layer.
+        """
+        self.redis.rpush(f"oobleck:send_to:{target_rank}:{layer_index}", src_rank)
+
+
 @Singleton
-class RedisClient:
+class RedisClient(RedisReconfigurationMixin):
     def __init__(self):
         super().__init__()
 
@@ -72,22 +151,28 @@ class RedisClient:
             epoch, step, consumed_samples = pipe.execute()
             return (int(epoch), int(step), int(consumed_samples))
 
-    def set_pipeline_ranks(self, pipeline_id: int, pipeline_ranks: List[int]):
-        self.redis.set(f"oobleck:pipeline{pipeline_id}_ranks", str(pipeline_ranks))
+    # def set_pipeline_ranks(self, pipeline_id: int, pipeline_ranks: List[int]):
+    #     self.redis.set(f"oobleck:pipeline{pipeline_id}_ranks", str(pipeline_ranks))
 
-    def get_pipeline_ranks(self, pipeline_id: int) -> List[int]:
-        return literal_eval(self.redis.get(f"oobleck:pipeline{pipeline_id}_ranks"))
+    # def get_pipeline_ranks(self, pipeline_id: int) -> List[int]:
+    #     return literal_eval(self.redis.get(f"oobleck:pipeline{pipeline_id}_ranks"))
 
-    def get_ranks_for_layer(self, index: int) -> List[int]:
-        """
-        Iterate over all pipelines and return the ranks that has the layer
-        """
-        my_rank = dist.get_rank()
-        keys = self.redis.scan_iter("oobleck:pipeline*_ranks")
-        values = self.redis.mget(keys)
-        ranks: List[List[int]] = [literal_eval(v) for v in values]
+    # def get_all_pipeline_ranks(self) -> List[List[int]]:
+    #     keys = self.redis.scan_iter("oobleck:pipeline*_ranks")
+    #     values = self.redis.mget(keys)
+    #     ranks: List[List[int]] = [literal_eval(v) for v in values]
+    #     return ranks
 
-        return [r[index] for r in ranks if r[index] != my_rank]
+    # def get_ranks_for_layer(self, index: int) -> List[int]:
+    #     """
+    #     Iterate over all pipelines and return the ranks that has the layer
+    #     """
+    #     my_rank = dist.get_rank()
+    #     keys = self.redis.scan_iter("oobleck:pipeline*_ranks")
+    #     values = self.redis.mget(keys)
+    #     ranks: List[List[int]] = [literal_eval(v) for v in values]
+
+    #     return [r[index] for r in ranks if r[index] != my_rank]
 
     def subscribe_reconfiguration(self):
         if self.reconfiguration_thread:
