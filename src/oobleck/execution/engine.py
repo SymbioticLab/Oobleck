@@ -57,13 +57,18 @@ class DynamicReconfigurationMixin(object):
         old_spec: List[int] = self.my_pipeline.layer_spec
 
         # 1. First, advertise that I have the layers
-        self.redis.append_my_rank_to_layers(self.rank, old_spec)
+        self.redis.append_my_rank_to_layers(
+            self.rank, [l.index for l in self.my_pipeline.model_layers]
+        )
         # self.redis.synchronize(world_size)
         dist.barrier()
 
+        # get who owns which layers
+        having_layers = self.redis.get_all_having_layers()
+        logger.info("having_layers: %s", having_layers)
         # check whether there is a layer owned by nobody
-        assert (
-            self.redis.check_all_layers_have_ranks()
+        assert len(having_layers) == len(self.model.model) and all(
+            l for l in having_layers.values()
         ), "Some layers are not owned by any node."
 
         # =======================================================
@@ -121,9 +126,7 @@ class DynamicReconfigurationMixin(object):
         # If my rank (self.rank) is in the list of ranks that need the layer, then I will receive the layer.
         for layer_index, ranks in all_missing_layers.items():
             # Find the smallest rank in range(0, new_world_size) that is not in the list of ranks that need the layer.
-            source_rank = min(
-                set(range(new_world_size)) - set(ranks), default=self.rank
-            )
+            source_rank = min(set(having_layers[layer_index]), default=self.rank)
             if self.rank in ranks:
                 # I need the layer.
                 logger.info(f"Receiving layer {layer_index} from rank {source_rank}...")
@@ -132,7 +135,10 @@ class DynamicReconfigurationMixin(object):
                 # if I (self.rank) am the source rank, then I will send the layer.
                 if self.rank == source_rank:
                     logger.info(f"Sending layer {layer_index} to ranks {ranks}...")
-            dist.broadcast(self.model.model[layer_index], src=source_rank)
+            target_layer = self.model.model[layer_index]
+            torch.distributed.broadcast_object_list(
+                [target_layer.state_dict()], src=source_rank
+            )
 
         # Reinstantiate pipeline
         self.pipeline = self.instantiate_pipelines(execution_plan)

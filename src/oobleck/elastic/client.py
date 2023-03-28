@@ -31,23 +31,24 @@ class RedisReconfigurationMixin(object):
         """
         with self.redis.pipeline() as pipe:
             for layer_index in layer_indices:
-                pipe.append(f"oobleck:layer:{layer_index}", f",{rank}")
+                pipe.rpush(f"oobleck:layer:{layer_index}", rank)
 
             pipe.execute()
 
-    def check_all_layers_have_ranks(self) -> bool:
+    def get_all_having_layers(self) -> Dict[int, List[int]]:
         """
-        Check if all layers have ranks.
+        Get all the lists of having layers.
         """
-        keys = self.redis.scan_iter("oobleck:layer:*")
-        values = self.redis.mget(keys)
-        return all(v is not None for v in values)
+        keys = list(self.redis.scan_iter("oobleck:layer:*"))
+        with self.redis.pipeline() as pipe:
+            for key in keys:
+                pipe.lrange(key, 0, -1)
+            results = pipe.execute()
 
-    def get_layer_ranks(self, layer_index: int) -> List[int]:
-        ranks = self.redis.get(f"oobleck:layer:{layer_index}")
-        if ranks is None:
-            return []
-        return [int(r) for r in ranks.split(",")[1:]]  # Skip the first comma
+        return {
+            int(k.split(":")[-1]): [int(r) for r in result]
+            for k, result in zip(keys, results)
+        }
 
     def append_missing_layers(self, rank: int, layer_indices: List[int]):
         """
