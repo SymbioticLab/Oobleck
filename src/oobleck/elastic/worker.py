@@ -16,6 +16,7 @@ def parse_args() -> Namespace:
     parser.add_argument("--dataset_path", type=str)
     parser.add_argument("--dataset_name", type=str, required=False, default=None)
     parser.add_argument("--model_args", type=str, required=False, default=None)
+    parser.add_argument("--training_args", type=str, required=False, default=None)
 
     return parser.parse_args()
 
@@ -31,9 +32,10 @@ class ElasticWorker:
         dataset_path: str,
         dataset_name: Optional[str] = None,
         model_args: Optional[Dict[str, Any]] = None,
+        training_args: Optional[Dict[str, Any]] = None,
     ):
         self.engine = OobleckEngine(
-            ft_spec, model_name, dataset_path, dataset_name, model_args
+            ft_spec, model_name, dataset_path, dataset_name, model_args, training_args
         )
         self.engine.train()
 
@@ -45,7 +47,15 @@ if __name__ == "__main__":
     model_args: Dict[str, Any] = (
         literal_eval(args.model_args) if args.model_args is not None else None
     )
+    training_args: Dict[str, Any] = (
+        literal_eval(args.training_args) if args.training_args is not None else None
+    )
 
     worker.run(
-        args.ft_spec, args.model_name, args.dataset_path, args.dataset_name, model_args
+        args.ft_spec,
+        args.model_name,
+        args.dataset_path,
+        args.dataset_name,
+        model_args,
+        training_args,
     )

@@ -135,6 +135,9 @@ class OobleckAgent:
             if execution_info["model_args"] is not None:
                 cmd.extend(["--model_args", str(execution_info["model_args"])])
 
+            if execution_info["training_args"] is not None:
+                cmd.extend(["--training_args", str(execution_info["training_args"])])
+
             with open(f"/tmp/oobleck/logs/{time}.{model_name}/{rank}.log", "w") as f:
                 process = subprocess.Popen(
                     cmd, env=current_env, stdout=f, stderr=subprocess.STDOUT

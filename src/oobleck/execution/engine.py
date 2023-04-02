@@ -208,6 +208,7 @@ class OobleckEngine(
         dataset_path: str,
         dataset_name: Optional[str] = None,
         model_args: Optional[Dict[str, Any]] = None,
+        training_args: Optional[Dict[str, Any]] = None,
     ):
         assert (
             not dist.is_initialized()
@@ -225,7 +226,7 @@ class OobleckEngine(
         # Remove LOCAL_RANK env so that TrainingArgument does not
         # automatically initialize torch.distributed.
         self.local_rank = int(os.environ.pop("LOCAL_RANK", 0))
-        training_args = TrainingArguments("/tmp/output")
+        training_args = TrainingArguments("/tmp/output", **training_args)
         if dist.is_initialized():
             dist.destroy_process_group()
 

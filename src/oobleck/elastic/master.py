@@ -56,6 +56,7 @@ class MasterServiceMixin(rpyc.Service):
         dataset_path: str,
         dataset_name: Optional[str] = None,
         model_args: Optional[Dict[str, Any]] = None,
+        training_args: Optional[Dict[str, Any]] = None,
     ):
         if self.training_in_progress:
             raise Exception("Training already in progress")
@@ -70,6 +71,7 @@ class MasterServiceMixin(rpyc.Service):
             "model_args": model_args,
             "dataset_path": dataset_path,
             "dataset_name": dataset_name,
+            "training_args": training_args,
         }
 
         # Replcae the above etcd transaction to one redis transaction using pipeline.
