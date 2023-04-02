@@ -389,12 +389,14 @@ class PipelineSpec:
         """
         assert ft_spec >= 0, "Fault tolerance spec must not be negative."
 
-        required_memory = model.total_num_params * 12
-        required_min_gpus = math.ceil(
-            required_memory / torch.cuda.get_device_properties("cuda:0").total_memory
+        required_memory = model.total_num_params * 12 * 2
+        gpu_memory = torch.cuda.get_device_properties("cuda:0").total_memory
+        required_min_gpus = math.ceil(required_memory / gpu_memory)
+        logger.info(
+            f"Required memory: {required_memory/1e6:.2f} MB, Capacity: {gpu_memory/1e6:.2f} MB"
         )
         min_num_nodes = math.ceil(required_min_gpus / num_gpus_per_node)
-        # min_num_nodes = 2
+        min_num_nodes = max(min_num_nodes, 1)
         assert (
             ft_spec + 1
         ) * min_num_nodes <= max_num_nodes, f"Maximum # nodes ({max_num_nodes}) cannot be smaller than minimum # nodes ({min_num_nodes})."
