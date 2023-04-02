@@ -1,7 +1,7 @@
 import numpy as np
 
 import torch
-import evaluate 
+import evaluate
 from itertools import chain
 from typing import Optional, Tuple, Dict, List, Any, Type
 from transformers import AutoTokenizer, AutoImageProcessor
@@ -176,7 +176,7 @@ class OobleckDataset:
             tokenize_function,
             batched=True,
             remove_columns=column_names,
-            load_from_cache_file=False,
+            load_from_cache_file=True,
         )
 
         def group_texts(examples):
@@ -201,7 +201,7 @@ class OobleckDataset:
             return result
 
         tokenized_datasets = tokenized_datasets.map(
-            group_texts, batched=True, load_from_cache_file=False
+            group_texts, batched=True, load_from_cache_file=True
         )
 
         return tokenizer, tokenized_datasets
