@@ -35,6 +35,15 @@ class LayerExecutionResult:
         self.allreduce_cross_nodes = allreduce_cross_nodes
         self.num_elements = num_elements
 
+    def __repr__(self) -> str:
+        return (
+            f"LayerExecutionResult(index={self.index}, "
+            f"forward={self.forward}, backward={self.backward}, "
+            f"allreduce_in_node={self.allreduce_in_node}, "
+            f"allreduce_cross_nodes={self.allreduce_cross_nodes}, "
+            f"num_elements={self.num_elements})"
+        )
+
 
 def get_profile_results(model: OobleckModel) -> List[LayerExecutionResult]:
     """Get the profiling results.
