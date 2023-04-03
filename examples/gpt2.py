@@ -42,5 +42,11 @@ training_args = {
 
 client = rpyc.connect("localhost", 27322)
 client.root.run_model(
-    ft_spec, model_name, dataset_path, dataset_name, model_args, training_args
+    ft_spec,
+    model_name,
+    dataset_path,
+    dataset_name,
+    model_size,
+    model_args,
+    training_args,
 )
