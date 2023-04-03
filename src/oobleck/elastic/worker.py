@@ -1,8 +1,5 @@
-import os
-import redis
-
 from ast import literal_eval
-from typing import Dict, Tuple, List, Optional, Any, TypeVar
+from typing import Dict, Optional, Any, TypeVar
 from oobleck.execution.engine import OobleckEngine
 from argparse import ArgumentParser, Namespace
 
@@ -16,6 +13,7 @@ def parse_args() -> Namespace:
     parser.add_argument("--dataset_path", type=str)
     parser.add_argument("--dataset_name", type=str, required=False, default=None)
     parser.add_argument("--model_args", type=str, required=False, default=None)
+    parser.add_argument("--model_tag", type=str, required=False, default=None)
     parser.add_argument("--training_args", type=str, required=False, default=None)
 
     return parser.parse_args()
@@ -31,11 +29,18 @@ class ElasticWorker:
         model_name: str,
         dataset_path: str,
         dataset_name: Optional[str] = None,
+        model_tag: Optional[str] = None,
         model_args: Optional[Dict[str, Any]] = None,
         training_args: Optional[Dict[str, Any]] = None,
     ):
         self.engine = OobleckEngine(
-            ft_spec, model_name, dataset_path, dataset_name, model_args, training_args
+            ft_spec,
+            model_name,
+            dataset_path,
+            model_tag,
+            dataset_name,
+            model_args,
+            training_args,
         )
         self.engine.train()
 
@@ -56,6 +61,7 @@ if __name__ == "__main__":
         args.model_name,
         args.dataset_path,
         args.dataset_name,
+        args.model_tag,
         model_args,
         training_args,
     )

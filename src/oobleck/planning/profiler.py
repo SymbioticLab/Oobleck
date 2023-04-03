@@ -1,7 +1,6 @@
 import os
 import math
 import time
-import functools
 import torch
 import torch.distributed as dist
 
@@ -37,44 +36,47 @@ class LayerExecutionResult:
         self.num_elements = num_elements
 
 
-def return_cache_if_exist(profile_type: str):
-    def get_cache_if_exists(cache_path: str) -> Optional[dict]:
+def get_profile_results(model: OobleckModel) -> List[LayerExecutionResult]:
+    """Get the profiling results.
+
+    Returns:
+        List[LayerExecutionResult]: A list of execution results per layer.
+    """
+
+    def get_cache(cache_path: str):
         file = Path(cache_path)
-        if file.is_file():
-            logger.info("Loading cache %s", cache_path)
-            with file.open(mode="r") as f:
-                return literal_eval(f.read())
+        assert (
+            file.is_file()
+        ), f"Cache {cache_path} does not exist. Run profiler and cache the results."
+        logger.info("Loading cache %s", cache_path)
+        with file.open(mode="r") as f:
+            return literal_eval(f.read())
 
-        return None
+    directory = f"{PROFILE_CACHE}/{model.model_name}-{model.model_tag}"
 
-    def store_cache(cache_path: str, object: Any):
-        if dist.is_initialized() and int(os.environ["LOCAL_RANK"]) != 0:
-            return
+    layer_execution_result = get_cache(f"{directory}/layers")
+    allreduce_across_nodes = get_cache(f"{directory}/allreduce_across_nodes")
+    allreduce_in_node = get_cache(f"{directory}/allreduce_in_node")
 
-        path = Path(cache_path)
-        if not path.parent.exists():
-            os.makedirs(path.parent, exist_ok=True)
+    results: List[LayerExecutionResult] = []
+    for layer, execution, ar_in_node, ar_across_nodes in zip(
+        model.model,
+        layer_execution_result,
+        allreduce_in_node,
+        allreduce_across_nodes,
+    ):
+        results.append(
+            LayerExecutionResult(
+                layer.index,
+                execution["forward"],
+                execution["backward"],
+                ar_in_node,
+                ar_across_nodes,
+                execution["num_elements"],
+            )
+        )
 
-        logger.info("Storing cache %s", cache_path)
-
-        with path.open(mode="w") as f:
-            f.write(str(object))
-            f.flush()
-
-    def decorator(func):
-        @functools.wraps(func)
-        def wrapper(s, *args, **kwargs):
-            cache_path = f"{PROFILE_CACHE}/{s.model.model_name}/{profile_type}"
-            cache = get_cache_if_exists(cache_path)
-            if cache:
-                return cache
-            result = func(s, *args, **kwargs)
-            store_cache(cache_path, result)
-            return result
-
-        return wrapper
-
-    return decorator
+    return results
 
 
 class Profiler:
@@ -84,52 +86,13 @@ class Profiler:
     To support large model profiling, we offload parameters layer by layer.
     """
 
-    def __init__(self, model: OobleckModel):
+    def __init__(
+        self,
+        model: OobleckModel,
+    ):
         self.model = model
 
-    def profile(self) -> List[LayerExecutionResult]:
-        """Profile the given model and return a list of execution result
-        per layer.
-        ExecutionResult includes forward/backward latency, allreduce in node,
-        and allreduce across nodes.
-
-        Returns:
-            List[LayerExecutionResult]: A list of execution results per layer.
-        """
-        # dist_initialized = dist.is_initialized()
-        # if not dist_initialized:
-        #     dist.init_process_group(backend="nccl")
-
-        # forward/backward execution
-        layer_execution_result = self._profile_execution_layers()
-        allreduce_across_nodes = self._profile_allreduce_across_nodes()
-        allreduce_in_node = self._profile_allreduce_in_node()
-
-        results: List[LayerExecutionResult] = []
-        for layer, execution, ar_in_node, ar_across_nodes in zip(
-            self.model.model,
-            layer_execution_result,
-            allreduce_in_node,
-            allreduce_across_nodes,
-        ):
-            results.append(
-                LayerExecutionResult(
-                    layer.index,
-                    execution["forward"],
-                    execution["backward"],
-                    ar_in_node,
-                    ar_across_nodes,
-                    execution["num_elements"],
-                )
-            )
-
-        # dist.barrier()
-        # if not dist_initialized:
-        #     dist.destroy_process_group()
-        return results
-
-    @return_cache_if_exist("layers")
-    def _profile_execution_layers(self) -> List[Dict[str, float]]:
+    def profile_execution_layers(self) -> List[Dict[str, float]]:
         assert dist.is_initialized()
 
         results: List[List[int]] = [[0, 0, 0]] * len(self.model.model)
@@ -205,8 +168,7 @@ class Profiler:
         del tensor
         return (end - start) * 1000
 
-    @return_cache_if_exist("allreduce_cross_nodes")
-    def _profile_allreduce_across_nodes(self) -> List[Dict[int, float]]:
+    def profile_allreduce_across_nodes(self) -> List[Dict[int, float]]:
         """Profile allreduce latency across nodes,
         \# nodes = 2, 3, ... N.
         Actual measurement is done only on global rank 0,
@@ -255,8 +217,7 @@ class Profiler:
             for result in results.tolist()
         ]
 
-    @return_cache_if_exist("allreduce_in_node")
-    def _profile_allreduce_in_node(self) -> List[Dict[int, float]]:
+    def profile_allreduce_in_node(self) -> List[Dict[int, float]]:
         """Profile allreduce latency between GPUs in node,
         \# nodes = 1, 2, 4, ....
         Actual measurement is done only on global rank 0,
@@ -304,3 +265,63 @@ class Profiler:
             {num_gpus_list[i]: result[i] for i in range(len(result))}
             for result in results.tolist()
         ]
+
+
+def profile(
+    model_name: str,
+    sample_inputs: Dict[str, Any],
+    master_addr: str,
+    master_port: int,
+    world_size: int,
+    rank: int,
+    local_rank: int,
+    model_tag: Optional[str] = None,
+    model_args: Optional[Dict[str, Any]] = None,
+):
+    """Profile the given model and return a list of execution result
+    per layer.
+    ExecutionResult includes forward/backward latency, allreduce in node,
+    and allreduce across nodes.
+
+    Result is stored in cache for future use.
+    Path: /tmp/oobleck/profiles/{model_name}-{tag}/{layers|allreduce_in_node|allreduce_across_nodes}
+    """
+    os.environ["MASTER_ADDR"] = master_addr
+    os.environ["MASTER_PORT"] = str(master_port)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["RANK"] = str(rank)
+    os.environ["LOCAL_RANK"] = str(local_rank)
+
+    directory = f"{PROFILE_CACHE}/{model_name}-{model_tag}"
+    if Path(directory).exists():
+        logger.info("Profile results already exist. Skipping profiling.")
+        return
+
+    # assert dist.is_initialized(), "Distributed is not initialized."
+    assert not dist.is_initialized(), "Distributed is already initialized."
+    dist.init_process_group(backend="nccl")
+
+    os.makedirs(directory, exist_ok=True)
+    logger.info("Profiling model %s", model_name)
+
+    model = OobleckModel(model_name, sample_inputs, None, model_tag, model_args)
+    profiler = Profiler(model)
+    # forward/backward execution
+    layer_execution_result = profiler.profile_execution_layers()
+    allreduce_across_nodes = profiler.profile_allreduce_across_nodes()
+    allreduce_in_node = profiler.profile_allreduce_in_node()
+
+    if "0" in os.environ["CUDA_VISIBLE_DEVICES"]:
+        with Path(f"{directory}/layers").open(mode="w") as f:
+            f.write(str(layer_execution_result))
+            f.flush()
+        with Path(f"{directory}/allreduce_across_nodes").open(mode="w") as f:
+            f.write(str(allreduce_across_nodes))
+            f.flush()
+        with Path(f"{directory}/allreduce_in_node").open(mode="w") as f:
+            f.write(str(allreduce_in_node))
+            f.flush()
+        logger.info("Profile data is stored in %s", directory)
+
+    dist.barrier()
+    dist.destroy_process_group()

@@ -5,7 +5,7 @@ from collections import defaultdict
 from typing import List, Tuple, Dict
 from deepspeed.utils.logging import logger
 
-from oobleck.planning.profiler import Profiler, LayerExecutionResult
+from oobleck.planning.profiler import LayerExecutionResult, get_profile_results
 from oobleck.module.model import OobleckModel
 
 
@@ -148,8 +148,7 @@ class Planner:
         self.num_nodes = num_nodes
         self.num_gpus_per_node = num_gpus_per_node
 
-        profiler = Profiler(model)
-        self.model_layers: List[LayerExecutionResult] = profiler.profile()
+        self.model_layers: List[LayerExecutionResult] = get_profile_results(model)
 
         self.cache = {}
         self.hit_count = 0

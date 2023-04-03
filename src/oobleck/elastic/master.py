@@ -55,6 +55,7 @@ class MasterServiceMixin(rpyc.Service):
         model_name: str,
         dataset_path: str,
         dataset_name: Optional[str] = None,
+        model_tag: Optional[str] = None,
         model_args: Optional[Dict[str, Any]] = None,
         training_args: Optional[Dict[str, Any]] = None,
     ):
@@ -69,6 +70,7 @@ class MasterServiceMixin(rpyc.Service):
             "fault_tolerance_spec": fault_tolerance_spec,
             "model_name": model_name,
             "model_args": model_args,
+            "model_tag": model_tag,
             "dataset_path": dataset_path,
             "dataset_name": dataset_name,
             "training_args": training_args,

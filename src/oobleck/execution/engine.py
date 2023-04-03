@@ -4,6 +4,7 @@ import torch.distributed
 import gc
 import sys
 import time
+import multiprocess as mp
 
 from ast import literal_eval
 from typing import Optional, Dict, Tuple, List, Any, TypeVar
@@ -14,8 +15,10 @@ from deepspeed.utils import logger
 
 from oobleck.elastic.client import RedisClient
 from oobleck.execution.dataset import OobleckDataset
+from oobleck.execution.utils import run_once
 from oobleck.module.layer import Layer
 from oobleck.module.model import OobleckModel
+from oobleck.planning.profiler import profile
 from oobleck.planning.pipeline_spec import PipelineSpec
 from oobleck.planning.instantiator import (
     HeterogeneousPipelineExecutionPlan,
@@ -206,6 +209,7 @@ class OobleckEngine(
         fault_tolerance_spec: int,
         model_name: str,
         dataset_path: str,
+        model_tag: Optional[str] = None,
         dataset_name: Optional[str] = None,
         model_args: Optional[Dict[str, Any]] = None,
         training_args: Optional[Dict[str, Any]] = None,
@@ -237,27 +241,48 @@ class OobleckEngine(
         self.training_args = training_args
 
         self.dataset = OobleckDataset(model_name, dataset_path, dataset_name)
-
-        model_args = {} if model_args is None else model_args
-        model_args["use_cache"] = False
-        model_args["remove_unused_columns"] = False
         self.model = OobleckModel(
-            model_name, self.dataset.sample, training_args, model_args
+            model_name, self.dataset.sample, training_args, model_tag, model_args
         )
 
-        # create a list of pipelinespecs that can cover all nodes.
-        # this is invariant and never changes over reconfiguration.
-        self.pipeline_specs: List[PipelineSpec] = PipelineSpec.create(
-            self.ft_spec, self.max_num_nodes, self.num_gpus_per_node, self.model
-        )
+        self.global_num_microbatch = self.training_args.gradient_accumulation_steps
 
-        self.global_num_microbatch = training_args.gradient_accumulation_steps
+    @run_once
+    def profile_model(
+        self,
+        model_name: str,
+        sample_inputs: Dict[str, Any],
+        master_addr: str,
+        master_port: int,
+        world_size: int,
+        rank: int,
+        local_rank: int,
+        model_tag: Optional[str] = None,
+        model_args: Optional[Dict[str, Any]] = None,
+    ):
+        # Profile the model to get the execution plan.
+        mp.context._force_start_method("spawn")
+
+        p = mp.context.Process(
+            target=profile,
+            args=(
+                model_name,
+                sample_inputs,
+                master_addr,
+                master_port,
+                world_size,
+                rank,
+                local_rank,
+                model_tag,
+                model_args,
+            ),
+        )
+        p.start()
+        p.join()
+        assert p.exitcode == 0, f"Profiling failed. exitcode: {p.exitcode}"
 
     def init_distributed(self):
-        if not hasattr(self, "redis") or self.redis is None:
-            self.redis = RedisClient()
-            self.redis.subscribe_reconfiguration()
-        self.redis.reconfiguration_required = False
+        self.redis = RedisClient()
 
         self.world_info: Dict[Tuple[str, int], List[int]] = self.redis.get_world_info()
         self.world_size = sum(len(gpus) for gpus in self.world_info.values())
@@ -267,8 +292,32 @@ class OobleckEngine(
             sys.exit(0)
 
         self.rank = self.world_info[self.node_name][self.local_rank]
-        os.environ["LOCAL_RANK"] = str(self.local_rank)
+        self.master_addr = (
+            self.node_name[0]
+            if self.rank == 0
+            else next(k for k, v in self.world_info.items() if 0 in v)[0]
+        )
 
+        # Profile the model if needed.
+        self.profile_model(
+            self.model.model_name,
+            self.dataset.sample,
+            self.master_addr,
+            self.master_port,
+            self.world_size,
+            self.rank,
+            self.local_rank,
+            self.model.model_tag,
+            self.model.model_args,
+        )
+
+        # create a list of pipelinespecs that can cover all nodes.
+        # this is invariant and never changes over reconfiguration.
+        self.pipeline_specs: List[PipelineSpec] = PipelineSpec.create(
+            self.ft_spec, self.max_num_nodes, self.num_gpus_per_node, self.model
+        )
+
+        os.environ["LOCAL_RANK"] = str(self.local_rank)
         # initiate distributed
         if dist.is_initialized():
             dist.destroy_process_group()
@@ -279,26 +328,24 @@ class OobleckEngine(
             gc.collect()
 
         if self.rank == 0:
-            addr = self.node_name[0]
             self.tcpstore = torch.distributed.TCPStore(
-                addr,
+                self.master_addr,
                 self.master_port,
                 world_size=self.world_size,
                 is_master=True,
                 timeout=torch.distributed.default_pg_timeout,
             )
         else:
-            # Find the address of rank 0.
-            rank0_addr = next(k for k, v in self.world_info.items() if 0 in v)[0]
-
             self.tcpstore = torch.distributed.TCPStore(
-                rank0_addr,
+                self.master_addr,
                 self.master_port,
                 world_size=self.world_size,
                 is_master=False,
                 timeout=torch.distributed.default_pg_timeout,
             )
-
+        # This is because destroying the TCPStore would take time
+        # and the next TCPStore might fail to bind to the same port.
+        # Will be removed when we move to use MPI.
         self.master_port += 1
 
         # TODO: use MPI so that we don't have to use TCPStore.
@@ -308,6 +355,9 @@ class OobleckEngine(
         dist.init_distributed("nccl", dist_init_required=False)
 
         self.timer: OobleckTimer = OobleckTimer()
+
+        self.redis.subscribe_reconfiguration()
+        self.redis.reconfiguration_required = False
 
     # ==========================================================================================
     # Paper section 4.1. is implemented in oobleck.planning.pipeline_spec.PipelineSpec.

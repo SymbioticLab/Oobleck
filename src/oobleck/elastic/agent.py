@@ -113,8 +113,8 @@ class OobleckAgent:
         os.makedirs(f"/tmp/oobleck/logs/{time}.{model_name}", exist_ok=True)
         # TODO: implement local worker failure case.
         self.processes = {}
-        for rank in ranks_in_my_node:
-            os.environ["LOCAL_RANK"] = str(rank)
+        for index, rank in enumerate(ranks_in_my_node):
+            current_env["LOCAL_RANK"] = str(index)
 
             # spawn the process
             cmd = [
@@ -128,6 +128,9 @@ class OobleckAgent:
                 "--dataset_path",
                 execution_info["dataset_path"],
             ]
+
+            if execution_info["model_tag"] is not None:
+                cmd.extend(["--model_tag", execution_info["model_tag"]])
 
             if execution_info["dataset_name"] is not None:
                 cmd.extend(["--dataset_name", execution_info["dataset_name"]])
@@ -165,9 +168,6 @@ class OobleckAgent:
 
 if __name__ == "__main__":
     logger = logging.LoggerFactory.create_logger("oobleck.agent")
-
-    visible_devices = input("Enter value for CUDA_VISIBLE_DEVICES: ")
-    os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
 
     args = parse_args()
     agent = OobleckAgent(args.master_addr, args.master_port)

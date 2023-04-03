@@ -47,7 +47,8 @@ class OobleckModel:
         self,
         model_name: str,
         sample_inputs: Dict[str, Any],
-        training_args: TrainingArguments,
+        training_args: Optional[TrainingArguments] = None,
+        model_tag: Optional[str] = None,
         config_args: Optional[Dict[str, Any]] = None,
     ):
         assert (
@@ -79,8 +80,10 @@ class OobleckModel:
         split_points = get_split_points(model_config)
         sharded_model = shard_model(model, self.trace_input_names, split_points)
         self.model_name = model_name
+        self.model_tag = model_tag
         self.model = [
             Layer(index, layer, training_args)
             for index, layer in enumerate(sharded_model)
         ]
         self.training_args = training_args
+        self.model_args = config_args
