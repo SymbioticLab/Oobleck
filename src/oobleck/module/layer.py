@@ -37,7 +37,7 @@ class Layer(torch.nn.Module):
         self.training_args = training_args
 
         # Load pre-installed or JIT compile (un)flatten ops
-        util_ops = UtilsBuilder().load()
+        util_ops = UtilsBuilder().load(verbose=False)
         self.flatten = util_ops.flatten
         self.unflatten = util_ops.unflatten
 
