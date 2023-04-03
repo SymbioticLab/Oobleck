@@ -6,6 +6,7 @@ dataset_path = "Maysee/tiny-imagenet"
 dataset_name = None
 training_args = {
     "per_device_train_batch_size": 16,
+    "gradient_accumulation_steps": 64,
     "max_steps": 30,
 }
 
