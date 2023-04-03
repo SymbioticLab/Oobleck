@@ -251,8 +251,7 @@ class OobleckEngine(
             self.ft_spec, self.max_num_nodes, self.num_gpus_per_node, self.model
         )
 
-        # TODO: move it to user configurable arguments
-        self.global_num_microbatch = 16
+        self.global_num_microbatch = training_args.gradient_accumulation_steps
 
     def init_distributed(self):
         if not hasattr(self, "redis") or self.redis is None:
