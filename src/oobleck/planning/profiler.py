@@ -57,7 +57,7 @@ def get_profile_results(model: OobleckModel) -> List[LayerExecutionResult]:
         assert (
             file.is_file()
         ), f"Cache {cache_path} does not exist. Run profiler and cache the results."
-        logger.info("Loading cache %s", cache_path)
+        logger.debug("Loading cache %s", cache_path)
         with file.open(mode="r") as f:
             return literal_eval(f.read())
 
@@ -140,9 +140,7 @@ class Profiler:
                     results[idx][0] += forward * 1000
                     results[idx][1] += forward * 2000
                     if results[idx][2] == 0:
-                        results[idx][2] = sum(
-                            [p.numel() for p in layer.parameters() if p.requires_grad]
-                        )
+                        results[idx][2] = sum([p.numel() for p in layer.parameters()])
 
         for result in results:
             result[0] /= num_iteration
