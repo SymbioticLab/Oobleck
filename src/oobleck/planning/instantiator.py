@@ -46,7 +46,7 @@ class HeterogeneousPipelineExecutionPlan:
             .allreduce_cross_nodes[self.num_nodes]
         )
 
-        logger.info(
+        logger.debug(
             f"iteration_time of execution plan {self.num_instances_set}: {max_iteration_time + synchronization_overhead}"
         )
         return max_iteration_time + synchronization_overhead
@@ -99,6 +99,11 @@ class HeterogeneousPipelineExecutionPlan:
                 pipeline_ranks.append(ranks_to_layer_map)
                 total_num_nodes_used += spec.num_nodes
                 process_group = torch.distributed.new_group(ranks)
+
+                logger.info(
+                    f"Instantiating a {len(spec.optimal_plan.stages)}-stage "
+                    f"pipeline with {spec.num_nodes} nodes"
+                )
 
                 if dist.get_rank(process_group) >= 0:
                     assert my_pipeline is None

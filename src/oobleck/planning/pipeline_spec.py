@@ -330,7 +330,7 @@ class PipelineSpec:
         self.model = model
 
         self.planner = Planner(self.model)
-        self.optimal_plan = self.planner.get_execution_plan(
+        self.optimal_plan: DCExecutionResult = self.planner.get_execution_plan(
             self.num_nodes, self.num_gpus_per_node
         )
 
