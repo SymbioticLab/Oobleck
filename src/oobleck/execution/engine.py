@@ -281,6 +281,12 @@ class OobleckEngine(
         p.join()
         assert p.exitcode == 0, f"Profiling failed. exitcode: {p.exitcode}"
 
+        # create a list of pipelinespecs that can cover all nodes.
+        # this is invariant and never changes over reconfiguration.
+        self.pipeline_specs: List[PipelineSpec] = PipelineSpec.create(
+            self.ft_spec, self.max_num_nodes, self.num_gpus_per_node, self.model
+        )
+
     def init_distributed(self):
         self.redis = RedisClient()
 
@@ -309,12 +315,6 @@ class OobleckEngine(
             self.local_rank,
             self.model.model_tag,
             self.model.model_args,
-        )
-
-        # create a list of pipelinespecs that can cover all nodes.
-        # this is invariant and never changes over reconfiguration.
-        self.pipeline_specs: List[PipelineSpec] = PipelineSpec.create(
-            self.ft_spec, self.max_num_nodes, self.num_gpus_per_node, self.model
         )
 
         os.environ["LOCAL_RANK"] = str(self.local_rank)
