@@ -137,10 +137,13 @@ class PipelineInstantiator:
 
         # For each feasible xi set, calculate batch distribution and stores
         # a tuple of number of instance of the pipelinespec, and batch size.
-        num_microbatches_set_list: List[Dict[PipelineSpec, int]] = [
-            self._distribute_batch(self.global_num_microbatch, num_instances_set)
-            for num_instances_set in num_instances_set_list
-        ]
+        num_microbatches_set_list: List[Dict[PipelineSpec, int]] = []
+        for num_instances_set in num_instances_set_list:
+            num_microbatches_set = self._distribute_batch(
+                self.global_num_microbatch, num_instances_set
+            )
+            if num_instances_set is not None:
+                num_microbatches_set_list.append(num_microbatches_set)
 
         self.execution_plans: List[HeterogeneousPipelineExecutionPlan] = [
             HeterogeneousPipelineExecutionPlan(
@@ -207,7 +210,7 @@ class PipelineInstantiator:
         self,
         global_num_microbatch: int,
         num_instances_set: Dict[PipelineSpec, int],
-    ) -> Dict[PipelineSpec, int]:
+    ) -> Optional[Dict[PipelineSpec, int]]:
         """Oobleck paper section 4.3.2. Calculating batch size for each pipeline template
         satisfying the following two requirements
         1. std(Bi * Ti) is minimized
@@ -229,16 +232,20 @@ class PipelineInstantiator:
         model = pyomo.ConcreteModel()
 
         model.I = pyomo.Set(initialize=list(range(len(num_instances_set))))
+
         T = {
             i: (
                 pipeline_spec.optimal_plan.get_e()
-                / (4 * len(pipeline_spec.optimal_plan.stages))
-                * 1_000_000
+                * 1_000_000  # Just multiply large enough number so it doesn't get wrong answer
             )
             for i, pipeline_spec in enumerate(num_instances_set)
         }
         x = {
             i: instance_num for i, instance_num in enumerate(num_instances_set.values())
+        }
+        s = {
+            i: len(pipeline_spec.optimal_plan.stages)
+            for i, pipeline_spec in enumerate(num_instances_set.keys())
         }
 
         # Define the Pyomo variable
@@ -247,8 +254,8 @@ class PipelineInstantiator:
 
         # Objective function
         def objective(model):
-            avg_bT = sum(model.nb[i] * T[i] for i in model.I) / len(model.I)
-            return sum((model.nb[i] * T[i] - avg_bT) ** 2 for i in model.I)
+            avg_bT = sum(model.nb[i] / s[i] * T[i] for i in model.I) / len(model.I)
+            return sum((model.nb[i] / s[i] * T[i] - avg_bT) ** 2 for i in model.I)
 
         model.obj = pyomo.Objective(rule=objective, sense=pyomo.minimize)
 
@@ -261,6 +268,10 @@ class PipelineInstantiator:
         pyomo.SolverFactory("mindtpy").solve(
             model, mip_solver="glpk", nlp_solver="ipopt"
         )
+
+        # check for all i model.nb[i].value is integer, otherwise return None
+        if not all(model.nb[i].value for i in model.I):
+            return None
 
         nb_optimal = {
             spec: int(model.nb[i].value)
