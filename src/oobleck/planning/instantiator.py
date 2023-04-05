@@ -137,13 +137,10 @@ class PipelineInstantiator:
 
         # For each feasible xi set, calculate batch distribution and stores
         # a tuple of number of instance of the pipelinespec, and batch size.
-        num_microbatches_set_list: List[Dict[PipelineSpec, int]] = []
-        for num_instances_set in num_instances_set_list:
-            num_microbatches_set = self._distribute_batch(
-                self.global_num_microbatch, num_instances_set
-            )
-            if num_instances_set is not None:
-                num_microbatches_set_list.append(num_microbatches_set)
+        num_microbatches_set_list: List[Dict[PipelineSpec, int]] = [
+            self._distribute_batch(self.global_num_microbatch, num_instances_set)
+            for num_instances_set in num_instances_set_list
+        ]
 
         self.execution_plans: List[HeterogeneousPipelineExecutionPlan] = [
             HeterogeneousPipelineExecutionPlan(
@@ -151,9 +148,10 @@ class PipelineInstantiator:
                 num_instances_set,
                 num_microbatches_set,
             )
-            for spec, num_instances_set, num_microbatches_set in zip(
-                self.pipeline_specs, num_instances_set_list, num_microbatches_set_list
+            for num_instances_set, num_microbatches_set in zip(
+                num_instances_set_list, num_microbatches_set_list
             )
+            if num_instances_set is not None and num_microbatches_set is not None
         ]
 
     def get_best_execution_plan(
