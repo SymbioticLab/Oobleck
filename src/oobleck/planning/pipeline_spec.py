@@ -1,5 +1,6 @@
 import math
 import torch
+import time
 
 from collections import defaultdict
 from typing import List, Tuple, Dict
@@ -7,6 +8,7 @@ from deepspeed.utils.logging import logger
 
 from oobleck.planning.profiler import LayerExecutionResult, get_profile_results
 from oobleck.module.model import OobleckModel
+from oobleck.utils.singleton import Singleton
 
 
 class StageExecutionResult:
@@ -72,11 +74,12 @@ class DCExecutionResult:
     def __init__(self, stages: List[StageExecutionResult] = []):
         self.stages = stages
 
-        if len(stages) == 0 or any(
-            stage.memory_consumption / stage.device_num
-            > torch.cuda.get_device_properties("cuda:0").total_memory
-            for stage in stages
-        ):
+        # if len(stages) == 0 or any(
+        #     stage.memory_consumption / stage.device_num
+        #     > torch.cuda.get_device_properties("cuda:0").total_memory
+        #     for stage in stages
+        # ):
+        if len(stages) == 0:
             self.e1 = math.inf
             self.e2 = math.inf
             self.kstar = -1
@@ -139,46 +142,54 @@ class DCExecutionResult:
         return result
 
 
+@Singleton
 class Planner:
     """Oobleck paper section 4.1.2. Divide and Conquer Algorithm implementation
     For each PipelineSpec, planner generates
     """
 
-    def __init__(self, num_nodes: int, num_gpus_per_node: int, model: OobleckModel):
-        self.num_nodes = num_nodes
-        self.num_gpus_per_node = num_gpus_per_node
-
-        self.model_layers: List[LayerExecutionResult] = get_profile_results(model)
-
+    def __init__(self, model: OobleckModel):
         self.cache = {}
         self.hit_count = 0
         self.miss_count = 0
 
-    @staticmethod
-    def get_max_num_stages(num_layers: int):
-        return 2 ** math.floor(math.log2(num_layers))
+        self.model_layers = get_profile_results(model)
 
     def get_cache_hit_ratio(self, clear: bool = False) -> float:
-        hit_ratio = (self.hit_count / (self.hit_count + self.miss_count)) * 100
+        hit_ratio = 0.0
+        if not self.hit_count + self.miss_count == 0:
+            hit_ratio = (self.hit_count / (self.hit_count + self.miss_count)) * 100
         if clear:
             self.hit_count = 0
             self.miss_count = 0
         return hit_ratio
 
-    def get_execution_plan(self) -> DCExecutionResult:
-        max_num_stages = Planner.get_max_num_stages(len(self.model_layers))
-        min_num_stages = self.num_nodes
+    def get_execution_plan(
+        self, num_nodes: int, num_gpus_per_node: int
+    ) -> DCExecutionResult:
+        max_num_stages = len(self.model_layers)
+        min_num_stages = num_nodes
 
+        start = time.time()
         e = DCExecutionResult()
         for s in range(min_num_stages, max_num_stages + 1):
             # Iterate number of stages between # nodes (minimum)
             # and # layers (maximum) and get the best execution plan.
             new_e = self._run_divide_and_conquer(
-                s, (0, len(self.model_layers)), self.num_nodes, self.num_gpus_per_node
+                s, (0, len(self.model_layers)), num_nodes, num_gpus_per_node
             )
 
             if new_e.get_e() < e.get_e():
                 e = new_e
+
+        end = time.time()
+
+        logger.info(
+            "Getting execution plan with %d nodes in %.2f ms. Cache hit ratio: %.2f%%",
+            num_nodes,
+            (end - start) * 1000,
+            self.get_cache_hit_ratio(clear=True),
+        )
 
         return e
 
@@ -318,8 +329,10 @@ class PipelineSpec:
         self.num_gpus_per_node = num_gpus_per_node
         self.model = model
 
-        self.planner = Planner(self.num_nodes, self.num_gpus_per_node, self.model)
-        self.optimal_plan = self.planner.get_execution_plan()
+        self.planner = Planner(self.model)
+        self.optimal_plan = self.planner.get_execution_plan(
+            self.num_nodes, self.num_gpus_per_node
+        )
 
         # Translate `DCExecutionResult` into layer-rank map
         # layer_spec has a list of ranks, each of which is mapped to each layer.
@@ -336,7 +349,9 @@ class PipelineSpec:
                 layer_spec[layer_index] = gpus[0]
             num_used_gpus += stage.device_num
 
-        assert all(spec is not None for spec in layer_spec), "Some layer has no plan."
+        assert all(
+            spec is not None for spec in layer_spec
+        ), f"Some layer has no plan: {layer_spec}"
         self.layer_spec = layer_spec
 
     # Use PipelineSpec as a key of dictionary in dynamic programming
@@ -388,34 +403,44 @@ class PipelineSpec:
         """
         assert ft_spec >= 0, "Fault tolerance spec must not be negative."
 
-        required_memory = model.total_num_params * 12 * 2
+        # TODO: currently required memory calculation is not correct.
+        required_memory = model.total_num_params * 12 * 6
         gpu_memory = torch.cuda.get_device_properties("cuda:0").total_memory
         required_min_gpus = math.ceil(required_memory / gpu_memory)
         logger.info(
             f"Required memory: {required_memory/1e6:.2f} MB, Capacity: {gpu_memory/1e6:.2f} MB"
         )
-        min_num_nodes = math.ceil(required_min_gpus / num_gpus_per_node)
-        min_num_nodes = max(min_num_nodes, 1)
+        min_pipeline_spec = math.ceil(required_min_gpus / num_gpus_per_node)
+        min_pipeline_spec = max(min_pipeline_spec, 1)
         assert (
             ft_spec + 1
-        ) * min_num_nodes <= max_num_nodes, f"Maximum # nodes ({max_num_nodes}) cannot be smaller than minimum # nodes ({min_num_nodes})."
-        if (ft_spec + 1) * min_num_nodes > max_num_nodes:
+        ) * min_pipeline_spec <= max_num_nodes, f"Maximum # nodes ({max_num_nodes}) cannot be smaller than minimum # nodes ({min_pipeline_spec})."
+        if (ft_spec + 1) * min_pipeline_spec > max_num_nodes:
             logger.warning(
                 "The number of nodes is not enough to provide at least ft_spec + 1 copy of the model."
                 "Oobleck may fail to provide fault tolerancy if continue."
             )
 
         # p = n0 - 1
-        # num_pipeline_specs = min_num_nodes
+        # num_pipeline_specs = min_pipeline_spec
         # p: length between n0 and N - fn0
-        num_pipeline_specs = max_num_nodes - ft_spec * min_num_nodes - min_num_nodes + 1
-        if num_pipeline_specs < 1:
-            num_pipeline_specs = 1
+        max_pipeline_spec = max_num_nodes - ft_spec * min_pipeline_spec
+        if max_pipeline_spec < 2:
+            max_pipeline_spec = 2
 
-        pipeline_specs = list(range(min_num_nodes, min_num_nodes + num_pipeline_specs))
+        pipeline_specs = list(range(min_pipeline_spec, max_pipeline_spec + 1))
         assert all(
             num_nodes <= max_num_nodes for num_nodes in pipeline_specs
         ), "Some PipelineSpec needs to have more # nodes than maximum # nodes (impossible)."
+
+        results = []
+        for num_nodes in pipeline_specs:
+            try:
+                spec = cls(num_nodes, num_gpus_per_node, model)
+                results.append(spec)
+            except AssertionError:
+                pass
+        return results
 
         return [
             cls(num_nodes, num_gpus_per_node, model) for num_nodes in pipeline_specs
