@@ -75,7 +75,7 @@ class OobleckModel:
         self.sample_inputs = sample_inputs
         self.trace_input_names = list(sample_inputs.keys())
 
-        self.total_num_params = sum([p.numel() for p in model.parameters()])
+        # self.total_num_params = sum([p.numel() for p in model.parameters()])
 
         split_points = get_split_points(model_config)
         sharded_model = shard_model(model, self.trace_input_names, split_points)
@@ -85,5 +85,8 @@ class OobleckModel:
             Layer(index, layer, training_args)
             for index, layer in enumerate(sharded_model)
         ]
+        self.total_num_params = sum(
+            sum(p.numel() for p in layer.parameters()) for layer in self.model
+        )
         self.training_args = training_args
         self.model_args = config_args
