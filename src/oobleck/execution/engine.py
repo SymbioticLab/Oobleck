@@ -241,7 +241,10 @@ class OobleckEngine(
         self.training_args = training_args
 
         self.dataset = OobleckDataset(
-            model_name, dataset_path, dataset_name, self.training_args.n_positions
+            model_name,
+            dataset_path,
+            dataset_name,
+            model_args["n_positions"] if model_args else None,
         )
         self.model = OobleckModel(
             model_name, self.dataset.sample, training_args, model_tag, model_args
