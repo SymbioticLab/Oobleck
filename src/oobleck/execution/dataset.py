@@ -33,13 +33,14 @@ class OobleckDataset:
         model_name: str,
         dataset_path: str,
         dataset_name: Optional[str] = None,
+        max_seq_length: Optional[int] = None,
     ):
         # TODO: replace it with evaluate.load("accuracy")
         metric = evaluate.load("accuracy")
 
         if any(lang_model in model_name for lang_model in lang_models):
             self.tokenizer, self.dataset = OobleckDataset.create_language_dataset(
-                model_name, dataset_path, dataset_name
+                model_name, dataset_path, dataset_name, max_seq_length
             )
 
             def compute_metrics(eval_preds):
@@ -151,6 +152,7 @@ class OobleckDataset:
         model_name: str,
         dataset_path: str,
         dataset_name: Optional[str],
+        max_seq_length: Optional[int] = None,
     ) -> Tuple[Type[PreTrainedTokenizer], Dataset]:
         tokenizer = AutoTokenizer.from_pretrained(model_name)
 
@@ -165,9 +167,8 @@ class OobleckDataset:
         column_names = list(raw_dataset["train"].features)
         text_column_name = "text" if "text" in column_names else column_names[0]
 
-        max_seq_length = tokenizer.model_max_length
-        if max_seq_length > 1024:
-            max_seq_length = 1024
+        if max_seq_length is None:
+            max_seq_length = tokenizer.model_max_length
 
         def tokenize_function(examples):
             return tokenizer(examples[text_column_name])

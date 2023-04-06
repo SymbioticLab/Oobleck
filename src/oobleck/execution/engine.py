@@ -240,7 +240,9 @@ class OobleckEngine(
         self.dataset_name = dataset_name
         self.training_args = training_args
 
-        self.dataset = OobleckDataset(model_name, dataset_path, dataset_name)
+        self.dataset = OobleckDataset(
+            model_name, dataset_path, dataset_name, self.training_args.n_positions
+        )
         self.model = OobleckModel(
             model_name, self.dataset.sample, training_args, model_tag, model_args
         )
@@ -396,6 +398,11 @@ class OobleckEngine(
         self.training_args.gradient_accumulation_steps = (
             execution_plan.get_my_number_of_microbatches(dist.get_rank())
         )
+        logger.info(
+            "Setting number of microbatches: "
+            f"{self.training_args.gradient_accumulation_steps}"
+        )
+
         self.epoch, self.step, consumed_samples = self.redis.get_training_progress()
         if consumed_samples != 0:
             logger.info(
