@@ -1,4 +1,5 @@
 import os
+import gc
 import math
 import time
 import torch
@@ -26,14 +27,14 @@ class LayerExecutionResult:
         backward: float,
         allreduce_in_node: Dict[int, float],
         allreduce_cross_nodes: Dict[int, float],
-        num_elements: int,
+        mem_required: int,
     ):
         self.index = layer_index
         self.forward = forward
         self.backward = backward
         self.allreduce_in_node = allreduce_in_node
         self.allreduce_cross_nodes = allreduce_cross_nodes
-        self.num_elements = num_elements
+        self.mem_required = mem_required
 
     def __repr__(self) -> str:
         return (
@@ -41,7 +42,7 @@ class LayerExecutionResult:
             f"forward={self.forward}, backward={self.backward}, "
             f"allreduce_in_node={self.allreduce_in_node}, "
             f"allreduce_cross_nodes={self.allreduce_cross_nodes}, "
-            f"num_elements={self.num_elements})"
+            f"mem_required={self.mem_required})"
         )
 
 
@@ -81,7 +82,7 @@ def get_profile_results(model: OobleckModel) -> List[LayerExecutionResult]:
                 execution["backward"],
                 ar_in_node,
                 ar_across_nodes,
-                execution["num_elements"],
+                execution["mem_required"],
             )
         )
 
@@ -101,46 +102,59 @@ class Profiler:
     ):
         self.model = model
 
-    def profile_execution_layers(self) -> List[Dict[str, float]]:
+    def profile_execution_layers(self, batch_size: int) -> List[Dict[str, float]]:
         assert dist.is_initialized()
+        import copy
 
         results: List[List[int]] = [[0, 0, 0]] * len(self.model.model)
         if dist.get_rank() == 0:
             for i in range(num_warmup + num_iteration):
                 logger.info(f"Profiling layer execution ltency: {i} iteration")
-                input = tuple(self.model.sample_inputs.values())
+                input = tuple([t.detach().clone().to("cuda") for t in self.model.sample_inputs.values()])
+
+                input = tuple(torch.stack([input[i]] * batch_size) for i in range(len(input)))
 
                 for idx, layer in enumerate(self.model.model):
-                    if isinstance(input, tuple):
-                        input = tuple(
-                            [
-                                t.detach().to("cuda")
-                                if isinstance(t, torch.Tensor)
-                                else t
-                                for t in input
-                            ]
-                        )
-                    else:
-                        input = input.detach().to("cuda")
+                    start_mem = torch.cuda.memory_allocated()
 
-                    gpu_layer = layer.to("cuda")
+                    gpu_layer = copy.deepcopy(layer).to("cuda").requires_grad_(True)
                     torch.cuda.synchronize()
 
                     start = time.time()
                     output = gpu_layer(*input)
                     torch.cuda.synchronize()
                     end = time.time()
-                    input = output
+
+                    end_mem = torch.cuda.memory_allocated()
+                    mem_required = end_mem - start_mem
+
+                    if isinstance(output, tuple):
+                        input = tuple(
+                            [
+                                t.detach().clone()
+                                if isinstance(t, torch.Tensor)
+                                else t
+                                for t in output
+                            ]
+                        )
+                    elif isinstance(output, torch.Tensor):
+                        input = output.detach().clone()
+
                     forward = end - start
 
-                    del gpu_layer
+                    output = None
+                    gpu_layer = None
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
                     if i < num_warmup:
                         continue
 
                     results[idx][0] += forward * 1000
                     results[idx][1] += forward * 2000
                     if results[idx][2] == 0:
-                        results[idx][2] = sum([p.numel() for p in layer.parameters()])
+                        # results[idx][2] = sum([p.numel() for p in layer.parameters()])
+                        results[idx][2] = mem_required
 
         for result in results:
             result[0] /= num_iteration
@@ -155,7 +169,7 @@ class Profiler:
         dist.broadcast(results, 0)
 
         return [
-            {"forward": result[0], "backward": result[1], "num_elements": result[2]}
+            {"forward": result[0], "backward": result[1], "mem_required": result[2]}
             for result in results.tolist()
         ]
 
@@ -282,6 +296,7 @@ def profile(
     world_size: int,
     rank: int,
     local_rank: int,
+    microbatch_size: int,
     model_tag: Optional[str] = None,
     model_args: Optional[Dict[str, Any]] = None,
 ):
@@ -314,7 +329,7 @@ def profile(
     model = OobleckModel(model_name, sample_inputs, None, model_tag, model_args)
     profiler = Profiler(model)
     # forward/backward execution
-    layer_execution_result = profiler.profile_execution_layers()
+    layer_execution_result = profiler.profile_execution_layers(microbatch_size)
     allreduce_across_nodes = profiler.profile_allreduce_across_nodes()
     allreduce_in_node = profiler.profile_allreduce_in_node()
 

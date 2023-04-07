@@ -33,7 +33,7 @@ class StageExecutionResult:
         self.forward = 0
         self.backward = 0
         self.allreduce_across_nodes = defaultdict(float)
-        self.num_elements = 0
+        self.mem_required = 0
 
         for l in layer_exec:
             self.forward += l.forward / self.device_num
@@ -43,7 +43,7 @@ class StageExecutionResult:
                 self.forward += l.allreduce_in_node[self.device_num]
                 self.backward += l.allreduce_in_node[self.device_num]
 
-            self.num_elements += l.num_elements
+            self.mem_required += l.mem_required
 
             for num_replica, ar in l.allreduce_cross_nodes.items():
                 self.allreduce_across_nodes[num_replica] += ar
@@ -51,12 +51,7 @@ class StageExecutionResult:
     @property
     def memory_consumption(self) -> int:
         # TODO: consider activation as well.
-        return (
-            self.num_elements
-            * 12
-            * (torch.finfo(torch.float32).bits // 8)
-            / self.device_num
-        )
+        return self.mem_required / self.device_num
 
     def __repr__(self) -> str:
         return (
@@ -74,12 +69,12 @@ class DCExecutionResult:
     def __init__(self, stages: List[StageExecutionResult] = []):
         self.stages = stages
 
-        # if len(stages) == 0 or any(
-        #     stage.memory_consumption / stage.device_num
-        #     > torch.cuda.get_device_properties("cuda:0").total_memory
-        #     for stage in stages
-        # ):
-        if len(stages) == 0:
+        if len(stages) == 0 or any(
+            stage.memory_consumption / stage.device_num
+            > torch.cuda.get_device_properties("cuda:0").total_memory
+            for stage in stages
+        ):
+            # if len(stages) == 0:
             self.e1 = math.inf
             self.e2 = math.inf
             self.kstar = -1
@@ -404,7 +399,9 @@ class PipelineSpec:
         assert ft_spec >= 0, "Fault tolerance spec must not be negative."
 
         # TODO: currently required memory calculation is not correct.
-        required_memory = model.total_num_params * 12 * 6
+        model_layers = get_profile_results(model)
+        required_memory = sum(layer.mem_required for layer in model_layers) * 3 * 1.5
+        # required_memory = model.total_num_params * 12 * 4
         gpu_memory = torch.cuda.get_device_properties("cuda:0").total_memory
         required_min_gpus = math.ceil(required_memory / gpu_memory)
         logger.info(

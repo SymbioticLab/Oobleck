@@ -269,6 +269,7 @@ class OobleckEngine(
         world_size: int,
         rank: int,
         local_rank: int,
+        microbatch_size: int,
         model_tag: Optional[str] = None,
         model_args: Optional[Dict[str, Any]] = None,
     ):
@@ -285,6 +286,7 @@ class OobleckEngine(
                 world_size,
                 rank,
                 local_rank,
+                microbatch_size,
                 model_tag,
                 model_args,
             ),
@@ -325,6 +327,7 @@ class OobleckEngine(
             self.world_size,
             self.rank,
             self.local_rank,
+            self.training_args.per_device_train_batch_size,
             self.model.model_tag,
             self.model.model_args,
         )
