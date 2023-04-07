@@ -122,9 +122,7 @@ class PipelineExecutionMixin(object):
 
         # store checkpointability for each layer
         for layer in self.model_layers:
-            layer.set_checkpointable(
-                not self.is_last_stage() and is_checkpointable(layer)
-            )
+            layer.set_checkpointable(is_checkpointable(layer))
 
         # stores the loss for the current microbatch being processed
         self.loss: Optional[Union[torch.Tensor, Iterable[torch.Tensor]]] = None
@@ -220,6 +218,7 @@ class PipelineExecutionMixin(object):
         # Optionally compute loss on the last stage
         if self.is_last_stage():
             self.loss = outputs["loss"]
+            del outputs["logits"]
 
             if isinstance(self.loss, torch.Tensor):
                 if self.total_loss is None:

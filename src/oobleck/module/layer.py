@@ -19,6 +19,8 @@ from transformers import TrainingArguments
 def is_checkpointable(layer: torch.fx.GraphModule) -> bool:
     if any(isinstance(m, torch.nn.Embedding) for _, m in layer.named_modules()):
         return False
+    if any(isinstance(m, torch.nn.CrossEntropyLoss) for _, m in layer.named_modules()):
+        return False
     if next(layer.parameters(), None) is None:
         return False
     return True
