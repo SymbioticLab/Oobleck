@@ -143,12 +143,12 @@ class Planner:
     For each PipelineSpec, planner generates
     """
 
-    def __init__(self, model: OobleckModel):
+    def __init__(self, model: OobleckModel, microbatch_size: int):
         self.cache = {}
         self.hit_count = 0
         self.miss_count = 0
 
-        self.model_layers = get_profile_results(model)
+        self.model_layers = get_profile_results(model, microbatch_size)
 
     def get_cache_hit_ratio(self, clear: bool = False) -> float:
         hit_ratio = 0.0
@@ -312,7 +312,7 @@ class PipelineSpec:
     as a linear of combination of PipelineSpecs with consecutive number of nodes.
     """
 
-    def __init__(self, num_nodes: int, num_gpus_per_node: int, model: OobleckModel):
+    def __init__(self, num_nodes: int, num_gpus_per_node: int, model: OobleckModel, microbatch_size: int):
         assert (
             num_nodes > 0 and num_gpus_per_node > 0
         ), f"Number of nodes or GPUs cannot be 0 or negative - # nodes: {num_nodes}, # GPUs: {num_gpus_per_node}"
@@ -324,7 +324,7 @@ class PipelineSpec:
         self.num_gpus_per_node = num_gpus_per_node
         self.model = model
 
-        self.planner = Planner(self.model)
+        self.planner = Planner(self.model, microbatch_size)
         self.optimal_plan: DCExecutionResult = self.planner.get_execution_plan(
             self.num_nodes, self.num_gpus_per_node
         )
@@ -375,6 +375,7 @@ class PipelineSpec:
         max_num_nodes: int,
         num_gpus_per_node: int,
         model: OobleckModel,
+        microbatch_size: int,
     ) -> List["PipelineSpec"]:
         """Oobleck paper section 4.1. Configuring PipelineSpecs implementation
         Generates the list of :class:`oobleck.planning.pipeline_spec.PipelineSpec`s
@@ -399,8 +400,8 @@ class PipelineSpec:
         assert ft_spec >= 0, "Fault tolerance spec must not be negative."
 
         # TODO: currently required memory calculation is not correct.
-        model_layers = get_profile_results(model)
-        required_memory = sum(layer.mem_required for layer in model_layers) * 3 * 1.5
+        model_layers = get_profile_results(model, microbatch_size)
+        required_memory = sum(layer.mem_required for layer in model_layers) * 6 * 1.2
         # required_memory = model.total_num_params * 12 * 4
         gpu_memory = torch.cuda.get_device_properties("cuda:0").total_memory
         required_min_gpus = math.ceil(required_memory / gpu_memory)
@@ -433,7 +434,7 @@ class PipelineSpec:
         results = []
         for num_nodes in pipeline_specs:
             try:
-                spec = cls(num_nodes, num_gpus_per_node, model)
+                spec = cls(num_nodes, num_gpus_per_node, model, microbatch_size)
                 results.append(spec)
             except AssertionError:
                 pass

@@ -46,7 +46,7 @@ class LayerExecutionResult:
         )
 
 
-def get_profile_results(model: OobleckModel) -> List[LayerExecutionResult]:
+def get_profile_results(model: OobleckModel, microbatch_size: int) -> List[LayerExecutionResult]:
     """Get the profiling results.
 
     Returns:
@@ -64,9 +64,9 @@ def get_profile_results(model: OobleckModel) -> List[LayerExecutionResult]:
 
     directory = f"{PROFILE_CACHE}/{model.model_name}-{model.model_tag}"
 
-    layer_execution_result = get_cache(f"{directory}/layers")
-    allreduce_across_nodes = get_cache(f"{directory}/allreduce_across_nodes")
-    allreduce_in_node = get_cache(f"{directory}/allreduce_in_node")
+    layer_execution_result = get_cache(f"{directory}/mb{microbatch_size}/layers")
+    allreduce_across_nodes = get_cache(f"{directory}/mb{microbatch_size}/allreduce_across_nodes")
+    allreduce_in_node = get_cache(f"{directory}/mb{microbatch_size}/allreduce_in_node")
 
     results: List[LayerExecutionResult] = []
     for layer, execution, ar_in_node, ar_across_nodes in zip(
@@ -315,7 +315,7 @@ def profile(
     os.environ["LOCAL_RANK"] = str(local_rank)
 
     directory = f"{PROFILE_CACHE}/{model_name}-{model_tag}"
-    if Path(directory).exists():
+    if Path(f"{directory}/mb{microbatch_size}").exists():
         logger.info("Profile results already exist. Skipping profiling.")
         return
 
@@ -323,7 +323,7 @@ def profile(
     assert not dist.is_initialized(), "Distributed is already initialized."
     dist.init_process_group(backend="nccl")
 
-    os.makedirs(directory, exist_ok=True)
+    os.makedirs(f"{directory}/mb{microbatch_size}", exist_ok=True)
     logger.info("Profiling model %s", model_name)
 
     model = OobleckModel(model_name, sample_inputs, None, model_tag, model_args)
@@ -334,13 +334,13 @@ def profile(
     allreduce_in_node = profiler.profile_allreduce_in_node()
 
     if "0" in os.environ["CUDA_VISIBLE_DEVICES"]:
-        with Path(f"{directory}/layers").open(mode="w") as f:
+        with Path(f"{directory}/mb{microbatch_size}/layers").open(mode="w") as f:
             f.write(str(layer_execution_result))
             f.flush()
-        with Path(f"{directory}/allreduce_across_nodes").open(mode="w") as f:
+        with Path(f"{directory}/mb{microbatch_size}/allreduce_across_nodes").open(mode="w") as f:
             f.write(str(allreduce_across_nodes))
             f.flush()
-        with Path(f"{directory}/allreduce_in_node").open(mode="w") as f:
+        with Path(f"{directory}/mb{microbatch_size}/allreduce_in_node").open(mode="w") as f:
             f.write(str(allreduce_in_node))
             f.flush()
         logger.info("Profile data is stored in %s", directory)

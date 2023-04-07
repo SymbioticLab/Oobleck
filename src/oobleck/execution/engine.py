@@ -298,7 +298,7 @@ class OobleckEngine(
         # create a list of pipelinespecs that can cover all nodes.
         # this is invariant and never changes over reconfiguration.
         self.pipeline_specs: List[PipelineSpec] = PipelineSpec.create(
-            self.ft_spec, self.max_num_nodes, self.num_gpus_per_node, self.model
+            self.ft_spec, self.max_num_nodes, self.num_gpus_per_node, self.model, microbatch_size
         )
 
     def init_distributed(self):
