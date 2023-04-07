@@ -30,6 +30,25 @@ class HeterogeneousPipelineExecutionPlan:
             for spec, num_instances in num_instances_set.items()
         )
 
+    def __repr__(self) -> str:
+        result = ""
+        total_num_microbatches = 0
+        for spec in self.pipeline_specs:
+            if (
+                spec not in self.num_instances_set
+                or spec not in self.num_microbatches_set
+            ):
+                continue
+            result += (
+                f"{self.num_instances_set[spec]} x {spec} pipelines "
+                f"(num microbatches: {self.num_microbatches_set[spec]})\n"
+            )
+            total_num_microbatches += (
+                self.num_instances_set[spec] * self.num_microbatches_set[spec]
+            )
+        result += f"total microbatches: {total_num_microbatches}"
+        return result
+
     @property
     def iteration_time(self) -> float:
         max_iteration_time = max(
@@ -239,7 +258,7 @@ class PipelineInstantiator:
         T = {
             i: (
                 pipeline_spec.optimal_plan.get_e()
-                * 1_000_000  # Just multiply large enough number so it doesn't get wrong answer
+                * 1_000_000_000  # Just multiply large enough number so it doesn't get wrong answer
             )
             for i, pipeline_spec in enumerate(num_instances_set)
         }
@@ -257,8 +276,8 @@ class PipelineInstantiator:
 
         # Objective function
         def objective(model):
-            avg_bT = sum(model.nb[i] / s[i] * T[i] for i in model.I) / len(model.I)
-            return sum((model.nb[i] / s[i] * T[i] - avg_bT) ** 2 for i in model.I)
+            avg_bT = sum(T[i] / s[i] * model.nb[i] for i in model.I) / len(model.I)
+            return sum((T[i] / s[i] * model.nb[i] - avg_bT) ** 2 for i in model.I)
 
         model.obj = pyomo.Objective(rule=objective, sense=pyomo.minimize)
 
@@ -266,7 +285,11 @@ class PipelineInstantiator:
         def c1(model):
             return sum(model.nb[i] * x[i] for i in model.I) == global_num_microbatch
 
+        def c2(model, i):
+            return model.nb[i] >= 2 * s[i]
+
         model.constraint1 = pyomo.Constraint(rule=c1)
+        model.constraints2 = pyomo.Constraint(range(len(model.I)), rule=c2)
 
         pyomo.SolverFactory("mindtpy").solve(
             model, mip_solver="glpk", nlp_solver="ipopt"
@@ -281,5 +304,5 @@ class PipelineInstantiator:
             for i, spec in zip(model.I, num_instances_set.keys())
         }
 
-        logger.info(f"Number of microbatch per PipelineSpec: {nb_optimal}")
+        logger.debug(f"Number of microbatch per PipelineSpec: {nb_optimal}")
         return nb_optimal
