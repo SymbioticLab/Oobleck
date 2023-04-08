@@ -2,6 +2,7 @@ from datetime import datetime
 from typing import List, Tuple, Any, Callable
 
 from deepspeed import comm as dist
+from deepspeed.utils.logging import logger
 from deepspeed.utils.timer import SynchronizedWallClockTimer
 from deepspeed.monitor.monitor import MonitorMaster
 from deepspeed.monitor.config import get_monitor_config
@@ -60,6 +61,7 @@ class OobleckTimer:
             ),
             (iteration_name, elapsed_time, step),
         ]
+        logger.info(strings)
         self.monitor.write_events(strings)
 
     def log(
@@ -81,6 +83,7 @@ class OobleckTimer:
                 elapsed_time = self.timer.timers[name].elapsed(reset=reset) / normalizer
                 strings.append((name, elapsed_time, step))
 
+        logger.info(strings)
         self.monitor.write_events(strings)
 
 
