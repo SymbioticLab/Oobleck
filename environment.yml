@@ -28,3 +28,4 @@ dependencies:
     - tensorboard
     - evaluate
     - scikit-learn
+    - dill

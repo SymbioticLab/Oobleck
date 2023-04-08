@@ -1,9 +1,12 @@
 import math
 import torch
 import time
+import dill
+import os
+from pathlib import Path
 
 from collections import defaultdict
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Optional
 from deepspeed.utils.logging import logger
 
 from oobleck.planning.profiler import LayerExecutionResult, get_profile_results
@@ -328,10 +331,9 @@ class PipelineSpec:
 
         self.num_nodes = num_nodes
         self.num_gpus_per_node = num_gpus_per_node
-        self.model = model
 
-        self.planner = Planner(self.model, microbatch_size)
-        self.optimal_plan: DCExecutionResult = self.planner.get_execution_plan(
+        planner = Planner(model, microbatch_size)
+        self.optimal_plan: DCExecutionResult = planner.get_execution_plan(
             self.num_nodes, self.num_gpus_per_node
         )
 
@@ -373,6 +375,34 @@ class PipelineSpec:
 
     def __repr__(self) -> str:
         return f"(PipelineSpec: {self.num_nodes} nodes)"
+
+    def save_cache(self, model: OobleckModel, microbatch_size: int):
+        path = Path(
+            f"/tmp/oobleck/specs/{model.model_name}_{model.model_tag}"
+            f"/n{self.num_nodes}g{self.num_gpus_per_node}mb{microbatch_size}.pkl"
+        )
+
+        if not path.exists():
+            os.makedirs(path.parent, exist_ok=True)
+            with open(path, "wb") as f:
+                dill.dump(self, f)
+
+    @classmethod
+    def create_from_cache(
+        cls,
+        num_nodes: int,
+        num_gpus_per_node,
+        model: OobleckModel,
+        microbatch_size: int,
+    ) -> Optional["PipelineSpec"]:
+        path = Path(
+            f"/tmp/oobleck/specs/{model.model_name}_{model.model_tag}"
+            f"/n{num_nodes}g{num_gpus_per_node}mb{microbatch_size}.pkl"
+        )
+        if path.exists():
+            with open(path, "rb") as f:
+                return dill.load(f)
+        return None
 
     @classmethod
     def create(
@@ -440,7 +470,12 @@ class PipelineSpec:
         results = []
         for num_nodes in pipeline_specs:
             try:
-                spec = cls(num_nodes, num_gpus_per_node, model, microbatch_size)
+                spec = cls.create_from_cache(
+                    num_nodes, num_gpus_per_node, model, microbatch_size
+                )
+                if spec is None:
+                    spec = cls(num_nodes, num_gpus_per_node, model, microbatch_size)
+                    spec.save_cache(model, microbatch_size)
                 results.append(spec)
             except AssertionError:
                 pass

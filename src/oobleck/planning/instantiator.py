@@ -7,7 +7,7 @@ from typing import List, Dict, Tuple, Optional
 from deepspeed import comm as dist
 from deepspeed.utils import logger
 
-from oobleck.planning.pipeline_spec import PipelineSpec
+from oobleck.planning.pipeline_spec import PipelineSpec, Planner
 from oobleck.execution.pipeline import OobleckPipeline
 from oobleck.execution.dataloader import OobleckTrainDataLoader
 from oobleck.module.model import OobleckModel
@@ -60,8 +60,8 @@ class HeterogeneousPipelineExecutionPlan:
         # of the first layer, believing communication of other layers
         # can fully be hidden in backward pass computing.
         synchronization_overhead = (
-            self.pipeline_specs[0]
-            .planner.model_layers[-1]
+            Planner()  # Hack: should return instance here... Because Planner is a singleton
+            .model_layers[-1]
             .allreduce_cross_nodes[self.num_nodes]
         )
 
