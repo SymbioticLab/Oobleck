@@ -259,10 +259,6 @@ class PipelineInstantiator:
             i: pipeline_spec.optimal_plan.get_e()
             for i, pipeline_spec in enumerate(num_instances_set)
         }
-        # Just multiply large enough number so it doesn't get wrong answer
-        while any(t < 1 for t in T.values()):
-            for i in T:
-                T[i] *= 10
 
         x = {
             i: instance_num for i, instance_num in enumerate(num_instances_set.values())
