@@ -52,7 +52,7 @@ class HeterogeneousPipelineExecutionPlan:
     @property
     def iteration_time(self) -> float:
         max_iteration_time = max(
-            spec.optimal_plan.get_e() * num_microbatches
+            spec.optimal_plan.get_e() * num_microbatches / len(spec.optimal_plan.stages)
             for spec, num_microbatches in self.num_microbatches_set.items()
         )
 
