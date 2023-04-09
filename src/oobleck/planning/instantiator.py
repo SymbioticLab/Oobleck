@@ -256,7 +256,7 @@ class PipelineInstantiator:
         model.I = pyomo.Set(initialize=list(range(len(num_instances_set))))
 
         T = {
-            i: pipeline_spec.optimal_plan.get_e()
+            i: pipeline_spec.optimal_plan.get_e() / 10
             for i, pipeline_spec in enumerate(num_instances_set)
         }
 
@@ -283,11 +283,11 @@ class PipelineInstantiator:
         def c1(model):
             return sum(model.nb[i] * x[i] for i in model.I) == global_num_microbatch
 
-        def c2(model, i):
-            return model.nb[i] >= 2 * s[i]
+        # def c2(model, i):
+        #     return model.nb[i] >= 2 * s[i]
 
         model.constraint1 = pyomo.Constraint(rule=c1)
-        model.constraints2 = pyomo.Constraint(range(len(model.I)), rule=c2)
+        # model.constraint2 = pyomo.Constraint(range(len(model.I)), rule=c2)
 
         pyomo.SolverFactory("mindtpy").solve(
             model, mip_solver="glpk", nlp_solver="ipopt"
