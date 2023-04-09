@@ -38,6 +38,8 @@ class StageExecutionResult:
         self.allreduce_across_nodes = defaultdict(float)
         self.mem_required = 0
 
+        max_activation_mem = 0
+
         for l in layer_exec:
             self.forward += l.forward / self.device_num
             self.backward += l.backward / self.device_num
@@ -46,15 +48,19 @@ class StageExecutionResult:
                 self.forward += l.allreduce_in_node[self.device_num]
                 self.backward += l.allreduce_in_node[self.device_num]
 
-            self.mem_required += l.mem_required
+            self.mem_required += l.mem_required[0]
+            max_activation_mem = max(max_activation_mem, l.mem_required[1])
 
             for num_replica, ar in l.allreduce_cross_nodes.items():
                 self.allreduce_across_nodes[num_replica] += ar
 
+        self.mem_required = self.mem_required * 6
+        self.mem_required += max_activation_mem
+
     @property
     def memory_consumption(self) -> int:
         # TODO: consider activation as well.
-        return self.mem_required / self.device_num * 4.5
+        return self.mem_required / self.device_num
 
     def __repr__(self) -> str:
         return (
@@ -437,7 +443,9 @@ class PipelineSpec:
 
         # TODO: currently required memory calculation is not correct.
         model_layers = get_profile_results(model, microbatch_size)
-        required_memory = sum(layer.mem_required for layer in model_layers) * 4.5
+        required_memory = sum(
+            layer.mem_required[0] for layer in model_layers
+        ) * 6 + max(layer.mem_required[1] for layer in model_layers)
         # required_memory = model.total_num_params * 12 * 4
         gpu_memory = torch.cuda.get_device_properties("cuda:0").total_memory
         required_min_gpus = math.ceil(required_memory / gpu_memory)
@@ -468,9 +476,9 @@ class PipelineSpec:
         ), "Some PipelineSpec needs to have more # nodes than maximum # nodes (impossible)."
 
         results = []
+        Planner(model, microbatch_size)  # Hack to create a singleton instance.
         for num_nodes in pipeline_specs:
             try:
-                Planner(model, microbatch_size)  # Hack to create a singleton instance.
                 spec = cls.create_from_cache(
                     num_nodes, num_gpus_per_node, model, microbatch_size
                 )

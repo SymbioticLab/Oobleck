@@ -27,7 +27,7 @@ class LayerExecutionResult:
         backward: float,
         allreduce_in_node: Dict[int, float],
         allreduce_cross_nodes: Dict[int, float],
-        mem_required: int,
+        mem_required: Tuple[int, int],
     ):
         self.index = layer_index
         self.forward = forward
@@ -108,7 +108,7 @@ class Profiler:
         assert dist.is_initialized()
         import copy
 
-        results: List[List[int]] = [[0.0, 0.0, 0.0]] * len(self.model.model)
+        results: List[List[int]] = [[0.0, 0.0, 0.0, 0.0]] * len(self.model.model)
         if dist.get_rank() == 0:
             for i in range(num_warmup + 1):
                 logger.info(f"Profiling layer execution ltency: {i} iteration")
@@ -119,23 +119,28 @@ class Profiler:
                     ]
                 )
 
-                input = tuple(
-                    torch.stack([input[i]] * batch_size) for i in range(len(input))
-                )
+                # Implement a batch
+                if batch_size > 1:
+                    input = tuple(
+                        torch.stack([input[i]] * batch_size) for i in range(len(input))
+                    )
 
                 for idx, layer in enumerate(self.model.model):
                     start_mem = torch.cuda.memory_allocated()
 
-                    gpu_layer = copy.deepcopy(layer).to("cuda").requires_grad_(False)
+                    gpu_layer = copy.deepcopy(layer).to("cuda")
                     torch.cuda.synchronize()
+                    end_mem = torch.cuda.memory_allocated()
+                    model_mem = end_mem - start_mem
 
                     start = time.time()
-                    output = gpu_layer(*input)
-                    torch.cuda.synchronize()
+                    with torch.no_grad():
+                        output = gpu_layer(*input)
+                        torch.cuda.synchronize()
                     end = time.time()
 
-                    end_mem = torch.cuda.memory_allocated()
-                    mem_required = end_mem - start_mem
+                    end_mem2 = torch.cuda.memory_allocated()
+                    activation_mem = end_mem2 - end_mem
 
                     if isinstance(output, tuple):
                         input = tuple(
@@ -159,7 +164,8 @@ class Profiler:
 
                     results[idx][0] = forward
                     results[idx][1] = forward * 3
-                    results[idx][2] = mem_required
+                    results[idx][2] = model_mem
+                    results[idx][3] = activation_mem
 
         dist.barrier()
 
@@ -170,7 +176,11 @@ class Profiler:
         dist.broadcast(results, 0)
 
         return [
-            {"forward": result[0], "backward": result[1], "mem_required": result[2]}
+            {
+                "forward": result[0],
+                "backward": result[1],
+                "mem_required": (result[2], result[3]),
+            }
             for result in results.tolist()
         ]
 
