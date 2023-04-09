@@ -108,9 +108,9 @@ class Profiler:
         assert dist.is_initialized()
         import copy
 
-        results: List[List[int]] = [[0, 0, 0]] * len(self.model.model)
+        results: List[List[int]] = [[0.0, 0.0, 0.0]] * len(self.model.model)
         if dist.get_rank() == 0:
-            for i in range(num_warmup + num_iteration):
+            for i in range(num_warmup + 1):
                 logger.info(f"Profiling layer execution ltency: {i} iteration")
                 input = tuple(
                     [
@@ -126,7 +126,7 @@ class Profiler:
                 for idx, layer in enumerate(self.model.model):
                     start_mem = torch.cuda.memory_allocated()
 
-                    gpu_layer = copy.deepcopy(layer).to("cuda").requires_grad_(True)
+                    gpu_layer = copy.deepcopy(layer).to("cuda").requires_grad_(False)
                     torch.cuda.synchronize()
 
                     start = time.time()
@@ -157,15 +157,9 @@ class Profiler:
                     if i < num_warmup:
                         continue
 
-                    results[idx][0] += forward * 1000
-                    results[idx][1] += forward * 2000
-                    if results[idx][2] == 0:
-                        # results[idx][2] = sum([p.numel() for p in layer.parameters()])
-                        results[idx][2] = mem_required
-
-        for result in results:
-            result[0] /= num_iteration
-            result[1] /= num_iteration
+                    results[idx][0] = forward
+                    results[idx][1] = forward * 3
+                    results[idx][2] = mem_required
 
         dist.barrier()
 
