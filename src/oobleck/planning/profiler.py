@@ -122,7 +122,7 @@ class Profiler:
                 # Implement a batch
                 if batch_size > 1:
                     input = tuple(
-                        torch.stack([input[i]] * batch_size) for i in range(len(input))
+                        [input[i].repeat(batch_size, 1) for i in range(len(input))],
                     )
 
                 for idx, layer in enumerate(self.model.model):
