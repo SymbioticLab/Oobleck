@@ -4,11 +4,18 @@ from torch.utils.data import BatchSampler, DataLoader
 from torch.utils.data.dataloader import _collate_fn_t
 from datasets import Dataset
 from typing import Iterator, List
+from enum import Enum
 
 from transformers import TrainingArguments
 
 
 class OobleckSampler(BatchSampler):
+    """
+    Sampler that generates batches of indices.
+    To support heterogeneous pipeline execution, we need to get total number of microbatches
+    and number of microbatches for this worker, so that no processor takes the same input.
+    """
+
     def __init__(
         self,
         dataset: Dataset,
@@ -54,11 +61,17 @@ class OobleckSampler(BatchSampler):
         return self.num_samples // self.total_bucket_size
 
 
-class OobleckTrainDataLoader(DataLoader):
+class LoaderType(Enum):
+    Training = (0,)
+    Evaluation = (1,)
+
+
+class OobleckDataLoader(DataLoader):
     def __init__(
         self,
         dataset: Dataset,
         args: TrainingArguments,
+        dataloaer_type: LoaderType,
         num_total_microbatches: int,
         consumed_samples: int,
         epoch: int,
@@ -73,7 +86,9 @@ class OobleckTrainDataLoader(DataLoader):
 
         sampler = OobleckSampler(
             dataset,
-            args.per_device_train_batch_size,
+            args.per_device_train_batch_size
+            if dataloaer_type == LoaderType.Training
+            else args.per_device_eval_batch_size,
             self.num_total_microbatches,
             self.num_my_microbatches,
             consumed_samples,
