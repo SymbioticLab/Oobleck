@@ -6,7 +6,7 @@ from itertools import chain
 from typing import Optional, Tuple, Dict, List, Any, Type
 from transformers import AutoTokenizer, AutoImageProcessor
 from transformers.data.data_collator import default_data_collator
-from transformers.tokenization_utils import PreTrainedTokenizer
+from transformers.tokenization_utils import PreTrainedTokenizerBase
 from transformers.image_processing_utils import BaseImageProcessor
 from torchvision.transforms import (
     CenterCrop,
@@ -153,7 +153,7 @@ class OobleckDataset:
         dataset_path: str,
         dataset_name: Optional[str],
         max_seq_length: Optional[int] = None,
-    ) -> Tuple[Type[PreTrainedTokenizer], Dataset]:
+    ) -> Tuple[Type[PreTrainedTokenizerBase], Dataset]:
         tokenizer = AutoTokenizer.from_pretrained(model_name)
 
         raw_dataset = load_dataset(dataset_path, dataset_name)
