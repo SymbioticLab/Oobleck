@@ -1,6 +1,9 @@
-[submodule "oobleck/csrc/modules/libcoro"]
-	path = oobleck/csrc/modules/libcoro
-	url = https://github.com/jbaldwin/libcoro
 [submodule "oobleck/csrc/modules/concurrentqueue"]
 	path = oobleck/csrc/modules/concurrentqueue
 	url = https://github.com/cameron314/concurrentqueue
+[submodule "oobleck/csrc/modules/json"]
+	path = oobleck/csrc/modules/json
+	url = https://github.com/taocpp/json
+[submodule "oobleck/csrc/modules/thread-pool"]
+	path = oobleck/csrc/modules/thread-pool
+	url = https://github.com/bshoshany/thread-pool
