@@ -1,19 +1,9 @@
 [submodule "oobleck/csrc/modules/concurrentqueue"]
 	path = oobleck/csrc/modules/concurrentqueue
 	url = https://github.com/cameron314/concurrentqueue
-[submodule "oobleck/csrc/modules/thread-pool"]
-	path = oobleck/csrc/modules/thread-pool
-	url = https://github.com/bshoshany/thread-pool
 [submodule "oobleck/csrc/modules/json"]
 	path = oobleck/csrc/modules/json
 	url = https://github.com/nlohmann/json
 [submodule "oobleck/csrc/modules/parallel-hashmap"]
 	path = oobleck/csrc/modules/parallel-hashmap
 	url = https://github.com/greg7mdp/parallel-hashmap
-[submodule "oobleck/csrc/modules/cppcoro"]
-	path = oobleck/csrc/modules/cppcoro
-	url = https://github.com/andreasbuhr/cppcoro
-	branch = add_cmake_support
-[submodule "libcoro"]
-	path = libcoro
-	url = https://github.com/jbaldwin/libcoro
