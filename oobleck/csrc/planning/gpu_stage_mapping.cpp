@@ -1,8 +1,10 @@
-#include <concurrentqueue.h>
 #include <parallel_hashmap/phmap.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <cassert>
+#include <cppcoro/static_thread_pool.hpp>
+#include <cppcoro/sync_wait.hpp>
+#include <cppcoro/task.hpp>
 #include <nlohmann/json.hpp>
 #include "execution_result.h"
 #include "pipeline_template.h"
@@ -18,9 +20,9 @@ namespace oobleck {
 
 using LayerIndex = int;
 
-static moodycamel::ConcurrentQueue<DCExecutionResult> divide_queue;
-static moodycamel::ConcurrentQueue<DCExecutionResult> conquer_queue;
-static moodycamel::ConcurrentQueue<DCExecutionResult> combine_queue;
+// static moodycamel::ConcurrentQueue<DCExecutionResult> divide_queue;
+// static moodycamel::ConcurrentQueue<DCExecutionResult> conquer_queue;
+// static moodycamel::ConcurrentQueue<DCExecutionResult> combine_queue;
 static map<LayerIndex, LayerExecutionResult> layer_execution_results;
 
 void push_task(map<DCExecutionResult::key, double>& cache,
@@ -44,10 +46,22 @@ std::vector<PipelineTemplate> create_pipeline_templates(
   // 1. Create a cache, where the key is the DCExecutionResult::key
   // and the value is the execution time.
   map<DCExecutionResult::key, double> cache;
+
+  return {};
 }
 
 int test_task_execute() {
-  return 42;
+  cppcoro::static_thread_pool pool;
+
+  auto job = [&]() -> cppcoro::task<int> {
+    // First schedule the coroutine onto the threadpool.
+    co_await pool.schedule();
+
+    // When it resumes, this coroutine is now running on the threadpool.
+    co_return 42;
+  };
+
+  return cppcoro::sync_wait(job());
 }
 
 }  // namespace oobleck

@@ -20,6 +20,7 @@ dependencies:
   - pybind11
   - ninja
   - cmake
+  - gxx==11
   - pip:
     - transformers>=4.26.0
     - deepspeed>=0.8.1
