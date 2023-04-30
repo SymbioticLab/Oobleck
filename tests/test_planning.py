@@ -1,10 +1,10 @@
 import unittest
-from oobleck.cplanning import test
+from cplanning import test
 
 
 class TestOobleckPlanning(unittest.TestCase):
     def test(self):
-        self.assertEqual(test(), 0)
+        self.assertEqual(test(), 42)
 
 
 if __name__ == "__main__":

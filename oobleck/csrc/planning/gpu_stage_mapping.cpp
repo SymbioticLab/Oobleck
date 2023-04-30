@@ -2,7 +2,6 @@
 #include <parallel_hashmap/phmap.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-#include <BS_thread_pool.hpp>
 #include <cassert>
 #include <nlohmann/json.hpp>
 #include "execution_result.h"
@@ -47,9 +46,13 @@ std::vector<PipelineTemplate> create_pipeline_templates(
   map<DCExecutionResult::key, double> cache;
 }
 
+int test_task_execute() {
+  return 42;
+}
+
 }  // namespace oobleck
 
-// PYBIND11_MODULE(cplanning, m) {
-//   m.doc() = "Oobleck planning module";
-//   m.def("test", &oobleck::test, "Test function");
-// }
+PYBIND11_MODULE(cplanning, m) {
+  m.doc() = "Oobleck planning module";
+  m.def("test", &oobleck::test_task_execute, "Test function");
+}
