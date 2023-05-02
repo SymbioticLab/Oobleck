@@ -1,12 +1,9 @@
 #ifndef _OOBLECK_PLANNING_EXECUTION_RESULT_H_
 #define _OOBLECK_PLANNING_EXECUTION_RESULT_H_
 
-#include <pybind11/pybind11.h>
 #include <map>
 #include <tuple>
 #include <vector>
-
-namespace py = pybind11;
 
 namespace oobleck {
 
@@ -32,15 +29,6 @@ class LayerExecutionResult {
         allreduce_in_node_(allreduce_in_node),
         allreduce_cross_nodes_(allreduce_cross_nodes),
         mem_required_(mem_required) {}
-
-  LayerExecutionResult(const py::object& obj)
-      : LayerExecutionResult(
-            obj.attr("layer_index").cast<int>(),
-            obj.attr("forward").cast<double>(),
-            obj.attr("backward").cast<double>(),
-            obj.attr("allreduce_in_node").cast<std::map<int, double>>(),
-            obj.attr("allreduce_cross_nodes").cast<std::map<int, double>>(),
-            obj.attr("mem_required").cast<std::tuple<int, int>>()) {}
 
   int layer_index_;
   double forward_;
@@ -83,6 +71,13 @@ class StageExecutionResult {
   int device_num() const { return device_num_; }
   int memory_consumption() const { return mem_required_ / device_num_; }
   int num_layers() const { return layer_indices_.size(); }
+  std::string to_string() const {
+    int first_layer_index = layer_indices_.front();
+    int last_layer_index = layer_indices_.back();
+    return "StageExecutionResult[" + std::to_string(first_layer_index) + ":" +
+           std::to_string(last_layer_index) + "] with " +
+           std::to_string(device_num_) + " devices";
+  }
 
  private:
   int device_num_;
@@ -164,10 +159,16 @@ class DCExecutionResult {
 
   double get_t() const { return t1_ + t2_ + t3_; }
   double get_kstar_latency() const {
+    if (stages_.size() == 0) {
+      return 0;
+    }
     return stages_[kstar_].forward_ + stages_[kstar_].backward_;
   }
   key get_key() const {
-    auto& last_stage = stages_[stages_.size()];
+    if (stages_.size() == 0) {
+      return std::make_tuple(0, 0, 0, 0, 0);
+    }
+    auto& last_stage = stages_[stages_.size() - 1];
     return std::make_tuple(
         stages_.size(), stages_[0].layer_indices_[0],
         last_stage.layer_indices_[last_stage.layer_indices_.size() - 1],

@@ -5,6 +5,7 @@
 #include <cppcoro/static_thread_pool.hpp>
 #include <cppcoro/sync_wait.hpp>
 #include <cppcoro/task.hpp>
+#include <iostream>
 #include <memory>
 #include <string>
 #include <tuple>
@@ -32,6 +33,7 @@ class PipelineTemplate {
     // 2. stages cover all layers
     int num_gpus_used = 0;
     for (auto& stage : stage_execution_results_) {
+      std::cout << stage.to_string() << std::endl;
       num_gpus_used += stage.device_num();
     }
     assert(num_gpus_used == num_nodes * num_gpus_per_node);

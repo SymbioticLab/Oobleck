@@ -1,11 +1,21 @@
 import unittest
-from cplanning import test
+from pipeline_template import PipelineTemplate, PipelineTemplateGenerator
+import faulthandler
 
 
-class TestOobleckPlanning(unittest.TestCase):
-    def test(self):
-        self.assertEqual(test(), 42)
+class TestOobleckPipelineTemplate(unittest.TestCase):
+    def test_create_generator(self):
+        generator: PipelineTemplateGenerator = PipelineTemplateGenerator()
+        self.assertIsNotNone(generator)
+
+    def test_create_templates(self):
+        generator: PipelineTemplateGenerator = PipelineTemplateGenerator()
+        template: PipelineTemplate = generator.create_pipeline_templates(
+            "gpt2", "2.7b", 2, (2, 7), 1
+        )
+        self.assertEqual(isinstance(template), list)
 
 
 if __name__ == "__main__":
+    faulthandler.enable()
     unittest.main()

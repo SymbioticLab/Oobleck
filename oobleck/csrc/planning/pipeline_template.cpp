@@ -1,16 +1,13 @@
 #include "pipeline_template.h"
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
 #include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cppcoro/when_all.hpp>
 #include <fstream>
+#include <iostream>
 #include <nlohmann/json.hpp>
 #include <ranges>
 #include <string>
-
-namespace py = pybind11;
 
 /**
  * Section 4.1.2. GPU-Stage Mapping using divide and conquer algorithm.
@@ -20,35 +17,58 @@ namespace py = pybind11;
 
 namespace oobleck {
 
+map<DCExecutionResult::key, DCExecutionResult>
+    PipelineTemplateGenerator::dc_cache_;
+cppcoro::static_thread_pool PipelineTemplateGenerator::thread_pool_;
+
 std::vector<LayerExecutionResult>
 PipelineTemplateGenerator::get_profiler_results(const std::string& model_name,
                                                 const std::string& model_tag,
                                                 const int microbatch_size) {
   auto get_cache = [](const std::string& cache_path) -> nlohmann::json {
     std::ifstream ifs(cache_path);
-    assert(ifs.good());
+    assert(ifs.is_open());
     return nlohmann::json::parse(ifs);
   };
 
   std::string profile_path =
-      "/tmp/oobleck/profiles" + model_name + "-" + model_tag;
+      "/tmp/oobleck/profiles/" + model_name + "-" + model_tag;
   auto mb = get_cache(profile_path + "/mb" + std::to_string(microbatch_size) +
                       ".json");
   auto allreduce_in_node = get_cache(profile_path + "/allreduce_in_node.json");
   auto allreduce_across_nodes =
       get_cache(profile_path + "/allreduce_across_nodes.json");
-  assert(mb.size() == allreduce_across_nodes.size() ==
-         allreduce_in_node.size());
+  std::cout << "mb size: " << mb.size()
+            << ", ar across: " << allreduce_across_nodes.size()
+            << ", ar in: " << allreduce_in_node.size() << std::endl;
+  //   assert(mb.size() == allreduce_across_nodes.size() ==
+  //          allreduce_in_node.size());
+
+  std::cout << "Loading done. creating layer execution results..." << std::endl;
 
   int num_layers = mb.size();
   std::vector<LayerExecutionResult> layer_execution_results;
   for (int i = 0; i < num_layers; i++) {
+    std::map<int, double> allreduce_in_node_map;
+    for (auto& [key, value] : allreduce_in_node[i].items()) {
+      allreduce_in_node_map[std::stoi(key)] = value;
+    }
+    std::map<int, double> allreduce_across_nodes_map;
+    for (auto& [key, value] : allreduce_across_nodes[i].items()) {
+      allreduce_across_nodes_map[std::stoi(key)] = value;
+    }
+
+    // std::tuple<int, int> mem_required_tuple = std::make_tuple(
+    //     static_cast<int>(mb[i]["mem_required"][0].get<double>()),
+    //     static_cast<int>(mb[i]["mem_required"][1].get<double>()));
+
     layer_execution_results.emplace_back(LayerExecutionResult(
         i, mb[i]["forward"].get<double>(), mb[i]["backward"].get<double>(),
-        allreduce_in_node[i].get<std::map<int, double>>(),
-        allreduce_across_nodes[i].get<std::map<int, double>>(),
+        allreduce_in_node_map, allreduce_across_nodes_map,
         mb[i]["mem_required"].get<std::tuple<int, int>>()));
   }
+
+  std::cout << "Returning from get_profiler_results" << std::endl;
 
   return std::move(layer_execution_results);
 }
@@ -69,6 +89,7 @@ PipelineTemplateGenerator::create_pipeline_templates(
 
   std::map<int, std::vector<cppcoro::task<DCExecutionResult>>> tasks;
   for (int i = min_num_nodes; i < max_num_nodes; i++) {
+    std::cout << "Creating tasks for " << i << " nodes" << std::endl;
     int min_num_stages = i;
     int max_num_stages = layer_execution_results.size();
     std::vector<cppcoro::task<DCExecutionResult>> num_node_tasks;
@@ -83,15 +104,29 @@ PipelineTemplateGenerator::create_pipeline_templates(
   std::vector<PipelineTemplate> pipeline_templates;
 
   for (auto& num_node_tasks : tasks) {
+    std::cout << "Waiting for tasks for " << num_node_tasks.first << " nodes"
+              << std::endl;
     std::vector<DCExecutionResult> results =
         cppcoro::sync_wait(cppcoro::when_all(std::move(num_node_tasks.second)));
-    DCExecutionResult optimal_result = *std::min_element(
+    std::cout << "Wait done" << std::endl;
+
+    if (std::all_of(results.begin(), results.end(),
+                    [](const DCExecutionResult& result) -> bool {
+                      return result.get_t() == 0.0;
+                    })) {
+      std::cout << "All results are 0.0" << std::endl;
+      continue;
+    }
+
+    auto optimal_result = std::min_element(
         std::begin(results), std::end(results),
         [](const DCExecutionResult& a, const DCExecutionResult& b) {
           return a.get_t() < b.get_t();
         });
+    std::cout << "Finding minimum element done" << std::endl;
+
     pipeline_templates.emplace_back(PipelineTemplate(
-        optimal_result.get_stages(), layer_execution_results.size(),
+        optimal_result->get_stages(), layer_execution_results.size(),
         num_node_tasks.first, num_gpus_per_node));
   }
 
@@ -135,11 +170,11 @@ cppcoro::task<DCExecutionResult> PipelineTemplateGenerator::divide_and_conquer(
       // One stage cannot have non-power-of-two number of GPUs
       dc_cache_[key] = result;
       co_return result;
-    } else if (num_nodes > num_stages) {
-      // Two ore more node cannot be assigned to the same stage
-      dc_cache_[key] = result;
-      co_return result;
     }
+  } else if (num_nodes > num_stages) {
+    // Two ore more node cannot be assigned to the same stage
+    dc_cache_[key] = result;
+    co_return result;
   }
 
   // Base case (conquer phase)
@@ -253,28 +288,3 @@ cppcoro::task<DCExecutionResult> PipelineTemplateGenerator::divide_and_conquer(
 }
 
 }  // namespace oobleck
-
-PYBIND11_MODULE(pipeline_template, m) {
-  m.doc() = "Oobleck pipeline template module";
-
-  py::class_<oobleck::StageExecutionResult>(m, "StageExecutionResult");
-
-  py::class_<oobleck::PipelineTemplate>(m, "PipelineTemplate")
-      .def(py::init<std::vector<oobleck::StageExecutionResult>&, int, int,
-                    int>(),
-           py::arg("stage_execution_result"), py::arg("num_layers"),
-           py::arg("num_nodes"), py::arg("num_gpus_per_node"))
-      .def("get_stage_execution_result",
-           &oobleck::PipelineTemplate::get_stage_execution_results)
-      .def("get_num_nodes", &oobleck::PipelineTemplate::get_num_nodes)
-      .def("get_num_gpus_per_node",
-           &oobleck::PipelineTemplate::get_num_gpus_per_node);
-
-  py::class_<oobleck::PipelineTemplateGenerator>(m, "PipelineTemplateGenerator")
-      .def(py::init<>())
-      .def("create_pipeline_templates",
-           &oobleck::PipelineTemplateGenerator::create_pipeline_templates,
-           py::arg("model_name"), py::arg("model_tag"),
-           py::arg("microbatch_size"), py::arg("num_nodes"),
-           py::arg("num_gpus_per_node"));
-}
