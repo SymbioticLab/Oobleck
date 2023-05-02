@@ -97,7 +97,7 @@ setup(
     author_email="insujang@umich.edu",
     description="Resilient Distributed Training Framework",
     long_description="",
-    ext_modules=[CMakeExtension("cplanning", Path("oobleck/csrc").absolute())],
+    ext_modules=[CMakeExtension("pipeline_template", Path("oobleck/csrc").absolute())],
     cmdclass={"build_ext": CmakeBuild},
     zip_safe=False,
     python_requires=">=3.8",

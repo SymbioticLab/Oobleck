@@ -1,17 +1,23 @@
 #ifndef _OOBLECK_PLANNING_EXECUTION_RESULT_H_
 #define _OOBLECK_PLANNING_EXECUTION_RESULT_H_
 
+#include <pybind11/pybind11.h>
 #include <map>
-#include <utility>
+#include <tuple>
 #include <vector>
 
+namespace py = pybind11;
+
 namespace oobleck {
+
+class PipelineTemplate;
 
 /**
  * Execution result of a layer.
  */
 class LayerExecutionResult {
   friend class StageExecutionResult;
+  friend class PipelineTemplate;
 
  public:
   LayerExecutionResult(int layer_index,
@@ -19,7 +25,7 @@ class LayerExecutionResult {
                        double backward,
                        const std::map<int, double>& allreduce_in_node,
                        const std::map<int, double>& allreduce_cross_nodes,
-                       const std::pair<int, int>& mem_required)
+                       const std::tuple<int, int>& mem_required)
       : layer_index_(layer_index),
         forward_(forward),
         backward_(backward),
@@ -27,13 +33,21 @@ class LayerExecutionResult {
         allreduce_cross_nodes_(allreduce_cross_nodes),
         mem_required_(mem_required) {}
 
- private:
+  LayerExecutionResult(const py::object& obj)
+      : LayerExecutionResult(
+            obj.attr("layer_index").cast<int>(),
+            obj.attr("forward").cast<double>(),
+            obj.attr("backward").cast<double>(),
+            obj.attr("allreduce_in_node").cast<std::map<int, double>>(),
+            obj.attr("allreduce_cross_nodes").cast<std::map<int, double>>(),
+            obj.attr("mem_required").cast<std::tuple<int, int>>()) {}
+
   int layer_index_;
   double forward_;
   double backward_;
   std::map<int, double> allreduce_in_node_;
   std::map<int, double> allreduce_cross_nodes_;
-  std::pair<int, int> mem_required_;
+  std::tuple<int, int> mem_required_;
 };
 
 /**
@@ -61,13 +75,14 @@ class StageExecutionResult {
       for (const auto& it : layer_results[i].allreduce_cross_nodes_) {
         allreduce_cross_nodes_[it.first] += it.second;
       }
-      mem_required_ += layer_results[i].mem_required_.first * 6;
-      mem_required_ += layer_results[i].mem_required_.second;
+      mem_required_ += std::get<0>(layer_results[i].mem_required_) * 6;
+      mem_required_ += std::get<1>(layer_results[i].mem_required_);
     }
   }
 
   int device_num() const { return device_num_; }
   int memory_consumption() const { return mem_required_ / device_num_; }
+  int num_layers() const { return layer_indices_.size(); }
 
  private:
   int device_num_;
@@ -82,10 +97,7 @@ class DCExecutionResult {
  public:
   // # stage, start layer index, end layer index, num nodes, num GPUs per node
   using key = std::tuple<int, int, int, int, int>;
-  enum class Status {
-    NOT_VALID,
-    READY,
-  };
+
   // Non-valid constructor
   DCExecutionResult()
       : t1_(0),
@@ -93,8 +105,7 @@ class DCExecutionResult {
         t3_(0),
         kstar_(0),
         num_nodes_(0),
-        num_gpus_per_node_(0),
-        status_(Status::NOT_VALID) {}
+        num_gpus_per_node_(0) {}
   // Basic constructor
   DCExecutionResult(StageExecutionResult& stage,
                     int num_nodes,
@@ -105,7 +116,6 @@ class DCExecutionResult {
         num_nodes_(num_nodes),
         num_gpus_per_node_(num_gpus_per_node),
         kstar_(0),
-        status_(Status::READY),
         stages_({stage}) {}
   // Combine constructor
   DCExecutionResult(const DCExecutionResult& left,
@@ -148,7 +158,6 @@ class DCExecutionResult {
         }()),
         num_nodes_(num_nodes),
         num_gpus_per_node_(num_gpus_per_node),
-        status_(Status::READY),
         stages_(left.stages_) {
     stages_.insert(stages_.end(), right.stages_.begin(), right.stages_.end());
   }
@@ -164,13 +173,15 @@ class DCExecutionResult {
         last_stage.layer_indices_[last_stage.layer_indices_.size() - 1],
         num_nodes_, num_gpus_per_node_);
   }
+  const std::vector<StageExecutionResult>& get_stages() const {
+    return stages_;
+  }
 
  private:
   int kstar_;
   double t1_, t2_, t3_;
   int num_nodes_;
   int num_gpus_per_node_;
-  Status status_;
   std::vector<StageExecutionResult> stages_;
 };
 
