@@ -2,6 +2,7 @@
 #define _OOBLECK_PLANNING_PIPELINE_TEMPLATE_H_
 
 #include <parallel_hashmap/phmap.h>
+#include <atomic>
 #include <cppcoro/static_thread_pool.hpp>
 #include <cppcoro/sync_wait.hpp>
 #include <cppcoro/task.hpp>
@@ -59,7 +60,8 @@ class PipelineTemplate {
 
 class PipelineTemplateGenerator {
  public:
-  static map<DCExecutionResult::key, DCExecutionResult> dc_cache_;
+  static map<DCExecutionResult::key, std::shared_ptr<DCExecutionResult>>
+      dc_cache_;
   static cppcoro::static_thread_pool thread_pool_;
 
   std::vector<PipelineTemplate> create_pipeline_templates(
@@ -70,16 +72,20 @@ class PipelineTemplateGenerator {
       const int num_gpus_per_node);
 
  private:
-  std::vector<LayerExecutionResult> get_profiler_results(
+  std::unique_ptr<std::vector<LayerExecutionResult>> get_profiler_results(
       const std::string& model_name,
       const std::string& model_tag,
       const int microbatch_size);
 
-  cppcoro::task<DCExecutionResult> divide_and_conquer(
-      const std::vector<LayerExecutionResult>& layer_execution_results,
+  cppcoro::task<std::shared_ptr<DCExecutionResult>> divide_and_conquer(
+      std::unique_ptr<std::vector<LayerExecutionResult>>
+          layer_execution_results,
       const int num_stages,
       const int num_nodes,
       const int num_gpus_per_node);
+
+  std::atomic<unsigned long> cache_hit_;
+  std::atomic<unsigned long> cache_miss_;
 };
 
 }  // namespace oobleck
