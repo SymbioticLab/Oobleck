@@ -11,6 +11,10 @@
 #include <ranges>
 #include <string>
 
+#ifdef PYBIND11_MODULE
+#include <pybind11/pybind11.h>
+#endif
+
 /**
  * Section 4.1.2. GPU-Stage Mapping using divide and conquer algorithm.
  * The divide and conquer is accelerated using multithreading
@@ -81,6 +85,11 @@ PipelineTemplateGenerator::create_pipeline_templates(
   int min_num_nodes = std::get<0>(num_nodes);
   int max_num_nodes = std::get<1>(num_nodes);
 
+#ifdef PYBIND11_MODULE
+  // Release GIL
+  pybind11::gil_scoped_release release;
+#endif
+
   // Load JSON files to create std::vector<LayerExecutionResult>
   auto layer_execution_results =
       get_profiler_results(model_name, model_tag, microbatch_size);
@@ -104,12 +113,15 @@ PipelineTemplateGenerator::create_pipeline_templates(
   }
 
   std::vector<PipelineTemplate> pipeline_templates;
-
-  for (auto& num_node_tasks : tasks) {
-    std::cout << "Waiting for tasks for " << num_node_tasks.first << " nodes"
+  for (auto num_node_tasks = tasks.begin(); num_node_tasks != tasks.end();
+       // for (auto num_node_tasks = tasks.rbegin(); num_node_tasks !=
+       // tasks.rend();
+       num_node_tasks++) {
+    std::cout << "Waiting for tasks for " << num_node_tasks->first << " nodes"
               << std::endl;
     std::vector<std::shared_ptr<DCExecutionResult>> results =
-        cppcoro::sync_wait(cppcoro::when_all(std::move(num_node_tasks.second)));
+        cppcoro::sync_wait(
+            cppcoro::when_all(std::move(num_node_tasks->second)));
     std::cout << "Wait done" << std::endl;
 
     std::cout << "Cache hit: " << cache_hit_.load()
@@ -139,8 +151,13 @@ PipelineTemplateGenerator::create_pipeline_templates(
            optimal_result->get_stages().size() > 0);
     pipeline_templates.emplace_back(PipelineTemplate(
         optimal_result->get_stages(), layer_execution_results->size(),
-        num_node_tasks.first, num_gpus_per_node));
+        num_node_tasks->first, num_gpus_per_node));
   }
+
+#ifdef PYBIND11_MODULE
+  // Acquire GIL
+  pybind11::gil_scoped_acquire acquire;
+#endif
 
   return std::move(pipeline_templates);
 }
