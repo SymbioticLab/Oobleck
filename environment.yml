@@ -21,6 +21,7 @@ dependencies:
   - ninja
   - cmake
   - gxx==11
+  - tbb-devel
   - pip:
     - transformers>=4.26.0
     - deepspeed>=0.8.1

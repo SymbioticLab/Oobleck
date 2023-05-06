@@ -1,7 +1,7 @@
 #ifndef _OOBLECK_PLANNING_EXECUTION_RESULT_H_
 #define _OOBLECK_PLANNING_EXECUTION_RESULT_H_
 
-#include <limits>
+#include <oneapi/tbb/concurrent_hash_map.h>
 #include <map>
 #include <memory>
 #include <tuple>
@@ -50,11 +50,16 @@ class StageExecutionResult {
 
  public:
   StageExecutionResult(
-      std::unique_ptr<std::vector<LayerExecutionResult>>&& layer_results,
+      const std::shared_ptr<std::vector<LayerExecutionResult>> layer_results,
+      const std::tuple<int, int>& layer_indices,
       int device_num)
-      : device_num_(device_num), layer_indices_(layer_results->size()) {
-    for (int i = 0; i < layer_results->size(); ++i) {
-      layer_indices_[i] = (*layer_results)[i].layer_index_;
+      : device_num_(device_num) {
+    int layer_start_index = std::get<0>(layer_indices);
+    int layer_end_index = std::get<1>(layer_indices);
+    assert(layer_end_index <= layer_results->size());
+
+    for (int i = layer_start_index; i < layer_end_index; ++i) {
+      layer_indices_.push_back((*layer_results)[i].layer_index_);
       forward_ += (*layer_results)[i].forward_;
       backward_ += (*layer_results)[i].backward_;
 
@@ -96,16 +101,28 @@ class DCExecutionResult {
   // # stage, start layer index, end layer index, num nodes, num GPUs per node
   using key = std::tuple<int, int, int, int, int>;
 
-  // // Non-valid constructor
-  // DCExecutionResult()
-  //     : t1_(std::numeric_limits<double>::infinity()),
-  //       t2_(std::numeric_limits<double>::infinity()),
-  //       t3_(std::numeric_limits<double>::infinity()),
-  //       kstar_(0),
-  //       num_nodes_(0),
-  //       num_gpus_per_node_(0) {}
+  class KeyCompare {
+   public:
+    std::size_t hash(const oobleck::DCExecutionResult::key& key) const {
+      std::string string_key = std::to_string(std::get<0>(key)) + "." +
+                               std::to_string(std::get<1>(key)) + "." +
+                               std::to_string(std::get<2>(key)) + "." +
+                               std::to_string(std::get<3>(key)) + "." +
+                               std::to_string(std::get<4>(key));
+      return std::hash<std::string>()(string_key);
+    }
+    bool equal(const oobleck::DCExecutionResult::key& key1,
+               const oobleck::DCExecutionResult::key& key2) const {
+      return std::get<0>(key1) == std::get<0>(key2) &&
+             std::get<1>(key1) == std::get<1>(key2) &&
+             std::get<2>(key1) == std::get<2>(key2) &&
+             std::get<3>(key1) == std::get<3>(key2) &&
+             std::get<4>(key1) == std::get<4>(key2);
+    }
+  };
+
   // Basic constructor
-  DCExecutionResult(StageExecutionResult&& stage,
+  DCExecutionResult(const StageExecutionResult& stage,
                     int num_nodes,
                     int num_gpus_per_node)
       : t1_(stage.forward_ + stage.backward_),
@@ -115,25 +132,20 @@ class DCExecutionResult {
         num_gpus_per_node_(num_gpus_per_node),
         kstar_(0),
         stages_(std::make_shared<std::vector<StageExecutionResult>>()) {
-    stages_->emplace_back(std::move(stage));
+    stages_->emplace_back(stage);
   }
 
   // Combine constructor
-  DCExecutionResult(const std::shared_ptr<DCExecutionResult>& left,
-                    const std::shared_ptr<DCExecutionResult>& right,
+  DCExecutionResult(const std::shared_ptr<DCExecutionResult> left,
+                    const std::shared_ptr<DCExecutionResult> right,
                     int num_nodes,
                     int num_gpus_per_node)
       : num_nodes_(num_nodes),
         num_gpus_per_node_(num_gpus_per_node),
         stages_(left->stages_) {
-    if (left->is_valid() == false || right->is_valid()) {
-      kstar_ = 0;
-      t1_ = std::numeric_limits<double>::infinity();
-      t2_ = std::numeric_limits<double>::infinity();
-      t3_ = std::numeric_limits<double>::infinity();
-      stages_->clear();
-      return;
-    }
+    assert(left != nullptr && right != nullptr && left->stages_ != nullptr &&
+           right->stages_ != nullptr);
+
     kstar_ = left->get_kstar_latency() > right->get_kstar_latency()
                  ? left->kstar_
                  : right->kstar_ + left->stages_->size();
@@ -159,34 +171,17 @@ class DCExecutionResult {
     }
     t3_ = latency;
 
+    std::cout << "size: " << left->stages_->size() << " "
+              << right->stages_->size() << std::endl;
     stages_->insert(stages_->end(), right->stages_->begin(),
                     right->stages_->end());
   }
 
-  bool is_valid() const {
-    return t1_ != std::numeric_limits<double>::infinity();
-  }
-  double get_t() const {
-    double inf = std::numeric_limits<double>::infinity();
-    return t1_ == inf ? inf : t1_ + t2_ + t3_;
-  }
+  double get_t() const { return t1_ + t2_ + t3_; }
   double get_kstar_latency() const {
-    if (stages_->size() == 0) {
-      return 0;
-    }
     return (*stages_)[kstar_].forward_ + (*stages_)[kstar_].backward_;
   }
-  key get_key() const {
-    if (stages_->size() == 0) {
-      return std::make_tuple(0, 0, 0, 0, 0);
-    }
-    auto& last_stage = (*stages_)[stages_->size() - 1];
-    return std::make_tuple(
-        stages_->size(), (*stages_)[0].layer_indices_[0],
-        last_stage.layer_indices_[last_stage.layer_indices_.size() - 1],
-        num_nodes_, num_gpus_per_node_);
-  }
-  const std::shared_ptr<std::vector<StageExecutionResult>>& get_stages() const {
+  std::shared_ptr<std::vector<StageExecutionResult>> get_stages() const {
     return stages_;
   }
 
@@ -199,5 +194,10 @@ class DCExecutionResult {
 };
 
 }  // namespace oobleck
+
+using CacheMap = oneapi::tbb::concurrent_hash_map<
+    oobleck::DCExecutionResult::key,
+    std::shared_ptr<oobleck::DCExecutionResult>,
+    oobleck::DCExecutionResult::KeyCompare>;
 
 #endif

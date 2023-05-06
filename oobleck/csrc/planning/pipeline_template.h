@@ -1,7 +1,7 @@
 #ifndef _OOBLECK_PLANNING_PIPELINE_TEMPLATE_H_
 #define _OOBLECK_PLANNING_PIPELINE_TEMPLATE_H_
 
-#include <parallel_hashmap/phmap.h>
+#include <oneapi/tbb/concurrent_hash_map.h>
 #include <atomic>
 #include <cppcoro/static_thread_pool.hpp>
 #include <cppcoro/sync_wait.hpp>
@@ -14,9 +14,6 @@
 #include "execution_result.h"
 
 namespace oobleck {
-
-template <typename K, typename V>
-using map = phmap::parallel_flat_hash_map<K, V>;
 
 class PipelineTemplate {
  public:
@@ -60,8 +57,7 @@ class PipelineTemplate {
 
 class PipelineTemplateGenerator {
  public:
-  static map<DCExecutionResult::key, std::shared_ptr<DCExecutionResult>>
-      dc_cache_;
+  static CacheMap dc_cache_;
   static cppcoro::static_thread_pool thread_pool_;
 
   std::vector<PipelineTemplate> create_pipeline_templates(
@@ -72,14 +68,15 @@ class PipelineTemplateGenerator {
       const int num_gpus_per_node);
 
  private:
-  std::unique_ptr<std::vector<LayerExecutionResult>> get_profiler_results(
+  std::shared_ptr<std::vector<LayerExecutionResult>> get_profiler_results(
       const std::string& model_name,
       const std::string& model_tag,
       const int microbatch_size);
 
   cppcoro::task<std::shared_ptr<DCExecutionResult>> divide_and_conquer(
-      std::unique_ptr<std::vector<LayerExecutionResult>>
+      std::shared_ptr<std::vector<LayerExecutionResult>>
           layer_execution_results,
+      const std::tuple<int, int>& layer_indices,
       const int num_stages,
       const int num_nodes,
       const int num_gpus_per_node);
