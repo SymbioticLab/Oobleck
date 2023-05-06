@@ -122,17 +122,17 @@ class DCExecutionResult {
   };
 
   // Basic constructor
-  DCExecutionResult(const StageExecutionResult& stage,
+  DCExecutionResult(std::shared_ptr<StageExecutionResult> stage,
                     int num_nodes,
                     int num_gpus_per_node)
-      : t1_(stage.forward_ + stage.backward_),
-        t2_(2 * (stage.forward_ + stage.backward_)),
-        t3_(stage.forward_ + stage.backward_),
+      : t1_(stage->forward_ + stage->backward_),
+        t2_(2 * (stage->forward_ + stage->backward_)),
+        t3_(stage->forward_ + stage->backward_),
         num_nodes_(num_nodes),
         num_gpus_per_node_(num_gpus_per_node),
         kstar_(0),
-        stages_(std::make_shared<std::vector<StageExecutionResult>>()) {
-    stages_->emplace_back(stage);
+        stages_({stage}) {
+    assert(stage != nullptr);
   }
 
   // Combine constructor
@@ -143,45 +143,39 @@ class DCExecutionResult {
       : num_nodes_(num_nodes),
         num_gpus_per_node_(num_gpus_per_node),
         stages_(left->stages_) {
-    assert(left != nullptr && right != nullptr && left->stages_ != nullptr &&
-           right->stages_ != nullptr);
+    assert(left->stages_.size() > 0 && right->stages_.size() > 0);
 
     kstar_ = left->get_kstar_latency() > right->get_kstar_latency()
                  ? left->kstar_
-                 : right->kstar_ + left->stages_->size();
+                 : right->kstar_ + left->stages_.size();
     t1_ = left->t1_ + right->t1_;
     int num_kstar_stage_microbatch =
-        2 * (left->stages_->size() + right->stages_->size()) + kstar_ + 1;
+        2 * (left->stages_.size() + right->stages_.size()) + kstar_ + 1;
     double latency = 0;
     if (kstar_ == left->kstar_) {
       t2_ = num_kstar_stage_microbatch * left->get_kstar_latency();
-      for (int i = left->kstar_; i < left->stages_->size(); i++) {
-        latency += (*left->stages_)[i].forward_ + (*left->stages_)[i].backward_;
+      for (int i = left->kstar_; i < left->stages_.size(); i++) {
+        latency += left->stages_[i]->forward_ + left->stages_[i]->backward_;
       }
-      for (int i = 0; i < right->stages_->size(); i++) {
-        latency +=
-            (*right->stages_)[i].forward_ + (*right->stages_)[i].backward_;
+      for (int i = 0; i < right->stages_.size(); i++) {
+        latency += right->stages_[i]->forward_ + right->stages_[i]->backward_;
       }
     } else {
       t2_ = num_kstar_stage_microbatch * right->get_kstar_latency();
-      for (int i = right->kstar_; i < right->stages_->size(); i++) {
-        latency +=
-            (*right->stages_)[i].forward_ + (*right->stages_)[i].backward_;
+      for (int i = right->kstar_; i < right->stages_.size(); i++) {
+        latency += right->stages_[i]->forward_ + right->stages_[i]->backward_;
       }
     }
     t3_ = latency;
 
-    std::cout << "size: " << left->stages_->size() << " "
-              << right->stages_->size() << std::endl;
-    stages_->insert(stages_->end(), right->stages_->begin(),
-                    right->stages_->end());
+    stages_.insert(stages_.end(), right->stages_.begin(), right->stages_.end());
   }
 
   double get_t() const { return t1_ + t2_ + t3_; }
   double get_kstar_latency() const {
-    return (*stages_)[kstar_].forward_ + (*stages_)[kstar_].backward_;
+    return stages_[kstar_]->forward_ + stages_[kstar_]->backward_;
   }
-  std::shared_ptr<std::vector<StageExecutionResult>> get_stages() const {
+  const std::vector<std::shared_ptr<StageExecutionResult>>& get_stages() const {
     return stages_;
   }
 
@@ -190,7 +184,7 @@ class DCExecutionResult {
   double t1_, t2_, t3_;
   int num_nodes_;
   int num_gpus_per_node_;
-  const std::shared_ptr<std::vector<StageExecutionResult>> stages_;
+  std::vector<std::shared_ptr<StageExecutionResult>> stages_;
 };
 
 }  // namespace oobleck

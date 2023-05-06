@@ -42,15 +42,14 @@ PipelineTemplateGenerator::get_profiler_results(const std::string& model_name,
   std::cout << "mb size: " << mb.size()
             << ", ar across: " << allreduce_across_nodes.size()
             << ", ar in: " << allreduce_in_node.size() << std::endl;
-  //   assert(mb.size() == allreduce_across_nodes.size() ==
-  //          allreduce_in_node.size());
+  // assert(mb.size() == allreduce_across_nodes.size() ==
+  //        allreduce_in_node.size());
 
   std::cout << "Loading done. creating layer execution results..." << std::endl;
 
   int num_layers = mb.size();
   auto layer_execution_results =
       std::make_shared<std::vector<LayerExecutionResult>>();
-  // std::vector<LayerExecutionResult> layer_execution_results;
   for (int i = 0; i < num_layers; i++) {
     std::map<int, double> allreduce_in_node_map;
     for (auto& [key, value] : allreduce_in_node[i].items()) {
@@ -60,10 +59,6 @@ PipelineTemplateGenerator::get_profiler_results(const std::string& model_name,
     for (auto& [key, value] : allreduce_across_nodes[i].items()) {
       allreduce_across_nodes_map[std::stoi(key)] = value;
     }
-
-    // std::tuple<int, int> mem_required_tuple = std::make_tuple(
-    //     static_cast<int>(mb[i]["mem_required"][0].get<double>()),
-    //     static_cast<int>(mb[i]["mem_required"][1].get<double>()));
 
     layer_execution_results->emplace_back(LayerExecutionResult(
         i, mb[i]["forward"].get<double>(), mb[i]["backward"].get<double>(),
@@ -90,44 +85,20 @@ PipelineTemplateGenerator::create_pipeline_templates(
   auto layer_execution_results =
       get_profiler_results(model_name, model_tag, microbatch_size);
 
-  /**
-   * TESTTESTTEESTTESTTESTTEESTTESTTESTTEESTTESTTESTTEEST
-   */
-  {
-    std::vector<cppcoro::task<std::shared_ptr<DCExecutionResult>>> tasks;
-    for (int i = min_num_nodes; i < max_num_nodes; i++) {
-      int min_num_stages = i;
-      int max_num_stages = layer_execution_results->size();
-      for (int num_stages = min_num_stages; num_stages < max_num_stages;
-           num_stages++) {
-        tasks.emplace_back(divide_and_conquer(
-            layer_execution_results,
-            std::make_tuple(0, layer_execution_results->size()), num_stages, i,
-            num_gpus_per_node));
-      }
-    }
-
-    std::vector<std::shared_ptr<DCExecutionResult>> results =
-        cppcoro::sync_wait(cppcoro::when_all(std::move(tasks)));
-    std::cout << "Wait done" << std::endl;
-
-    std::cout << "Cache hit: " << cache_hit_.load()
-              << ", miss: " << cache_miss_.load() << std::endl;
-    exit(1);
-  }
-
-  // =====================================================
-#if 0
-  std::map<int, std::vector<cppcoro::task<DCExecutionResult>>> tasks;
+  std::map<int, std::vector<cppcoro::task<std::shared_ptr<DCExecutionResult>>>>
+      tasks;
   for (int i = min_num_nodes; i < max_num_nodes; i++) {
     std::cout << "Creating tasks for " << i << " nodes" << std::endl;
     int min_num_stages = i;
     int max_num_stages = layer_execution_results->size();
-    std::vector<cppcoro::task<DCExecutionResult>> num_node_tasks;
+    std::vector<cppcoro::task<std::shared_ptr<DCExecutionResult>>>
+        num_node_tasks;
     for (int num_stages = min_num_stages; num_stages < max_num_stages;
          num_stages++) {
       num_node_tasks.emplace_back(divide_and_conquer(
-          layer_execution_results, num_stages, i, num_gpus_per_node));
+          layer_execution_results,
+          std::make_tuple(0, layer_execution_results->size()), num_stages, i,
+          num_gpus_per_node));
     }
     tasks[i] = std::move(num_node_tasks);
   }
@@ -137,7 +108,7 @@ PipelineTemplateGenerator::create_pipeline_templates(
   for (auto& num_node_tasks : tasks) {
     std::cout << "Waiting for tasks for " << num_node_tasks.first << " nodes"
               << std::endl;
-    std::vector<DCExecutionResult> results =
+    std::vector<std::shared_ptr<DCExecutionResult>> results =
         cppcoro::sync_wait(cppcoro::when_all(std::move(num_node_tasks.second)));
     std::cout << "Wait done" << std::endl;
 
@@ -145,22 +116,26 @@ PipelineTemplateGenerator::create_pipeline_templates(
               << ", miss: " << cache_miss_.load() << std::endl;
 
     if (std::all_of(results.begin(), results.end(),
-                    [](const DCExecutionResult& result) -> bool {
-                      return result.get_t() ==
-                             std::numeric_limits<double>::infinity();
-                    })) {
+                    [](const std::shared_ptr<DCExecutionResult>& result)
+                        -> bool { return result == nullptr; })) {
       std::cout << "All results are invalid" << std::endl;
       continue;
     }
 
-    auto optimal_result = std::min_element(
-        std::begin(results), std::end(results),
-        [](const DCExecutionResult& a, const DCExecutionResult& b) {
-          return a.get_t() < b.get_t();
-        });
-    std::cout << "Finding minimum element done" << std::endl;
+    auto optimal_result = [&]() {
+      std::shared_ptr<DCExecutionResult> result(nullptr);
+      for (int i = 0; i < results.size(); i++) {
+        if (result == nullptr) {
+          result = results[i];
+        } else if (results[i] != nullptr &&
+                   results[i]->get_t() < result->get_t()) {
+          result = results[i];
+        }
+      }
+      return result;
+    }();
 
-    assert(optimal_result != std::end(results) &&
+    assert(optimal_result != nullptr &&
            optimal_result->get_stages().size() > 0);
     pipeline_templates.emplace_back(PipelineTemplate(
         optimal_result->get_stages(), layer_execution_results->size(),
@@ -168,7 +143,6 @@ PipelineTemplateGenerator::create_pipeline_templates(
   }
 
   return std::move(pipeline_templates);
-#endif
 }
 
 /**
@@ -181,7 +155,7 @@ PipelineTemplateGenerator::divide_and_conquer(
     const int num_stages,
     const int num_nodes,
     const int num_gpus_per_node) {
-  co_await thread_pool_.schedule();
+  // co_await thread_pool_.schedule();
 
   int start_layer_index = std::get<0>(layer_indices);
   int end_layer_index = std::get<1>(layer_indices);
@@ -204,33 +178,29 @@ PipelineTemplateGenerator::divide_and_conquer(
   cache_miss_++;
 
   // Infeasible cases
+  bool infeasible = false;
   if (num_stages > end_layer_index - start_layer_index) {
     // If the number of stages is more than number of layers
-    CacheMap::accessor accessor;
-    dc_cache_.insert(accessor, key);
-    accessor->second = nullptr;
-    co_return nullptr;
+    infeasible = true;
   }
 
   if (num_nodes == 1) {
     if (num_gpus_per_node < num_stages) {
       // At least one GPU should be assigned to each stage
-      CacheMap::accessor accessor;
-      dc_cache_.insert(accessor, key);
-      accessor->second = nullptr;
-      co_return nullptr;
+      infeasible = true;
     }
 
     double log_num_gpus_per_node = log2(num_gpus_per_node);
     if (num_stages == 1 &&
         log_num_gpus_per_node != trunc(log_num_gpus_per_node)) {
-      CacheMap::accessor accessor;
-      dc_cache_.insert(accessor, key);
-      accessor->second = nullptr;
-      co_return nullptr;
+      infeasible = true;
     }
   } else if (num_nodes > num_stages) {
     // Two ore more node cannot be assigned to the same stage
+    infeasible = true;
+  }
+
+  if (infeasible) {
     CacheMap::accessor accessor;
     dc_cache_.insert(accessor, key);
     accessor->second = nullptr;
@@ -241,12 +211,10 @@ PipelineTemplateGenerator::divide_and_conquer(
   if (num_stages == 1) {
     assert(num_nodes == 1);
     // If there is only one stage, assign all layers to that stage
-    StageExecutionResult stage(layer_execution_results, layer_indices,
-                               num_gpus_per_node);
-    auto result = std::make_shared<DCExecutionResult>(
-        std::move(stage), num_nodes, num_gpus_per_node);
-    std::cout << "Adding cache (t): " << std::to_string(result->get_t())
-              << std::endl;
+    auto stage = std::make_shared<StageExecutionResult>(
+        layer_execution_results, layer_indices, num_gpus_per_node);
+    auto result = std::make_shared<DCExecutionResult>(stage, num_nodes,
+                                                      num_gpus_per_node);
     CacheMap::accessor accessor;
     dc_cache_.insert(accessor, key);
     accessor->second = result;
@@ -302,7 +270,7 @@ PipelineTemplateGenerator::divide_and_conquer(
 
           auto new_result = std::make_shared<DCExecutionResult>(
               result_left, result_right, num_nodes, num_gpus_per_node);
-          if (new_result->get_t() < result->get_t()) {
+          if (result == nullptr || new_result->get_t() < result->get_t()) {
             result = new_result;
           }
         }
@@ -363,7 +331,7 @@ PipelineTemplateGenerator::divide_and_conquer(
 
   CacheMap::accessor accessor;
   dc_cache_.insert(accessor, key);
-  accessor->second = (result == nullptr ? nullptr : result);
+  accessor->second = result;
   co_return result;
 }
 

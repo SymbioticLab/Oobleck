@@ -17,11 +17,11 @@ namespace oobleck {
 
 class PipelineTemplate {
  public:
-  PipelineTemplate(
-      const std::vector<StageExecutionResult>& stage_execution_results,
-      const int num_layers,
-      const int num_nodes,
-      const int num_gpus_per_node)
+  PipelineTemplate(const std::vector<std::shared_ptr<StageExecutionResult>>&
+                       stage_execution_results,
+                   const int num_layers,
+                   const int num_nodes,
+                   const int num_gpus_per_node)
       : stage_execution_results_(stage_execution_results),
         num_nodes_(num_nodes),
         num_gpus_per_node_(num_gpus_per_node) {
@@ -31,26 +31,27 @@ class PipelineTemplate {
     // 2. stages cover all layers
     int num_gpus_used = 0;
     for (auto& stage : stage_execution_results_) {
-      std::cout << stage.to_string() << std::endl;
-      num_gpus_used += stage.device_num();
+      std::cout << stage->to_string() << std::endl;
+      num_gpus_used += stage->device_num();
     }
     assert(num_gpus_used == num_nodes * num_gpus_per_node);
 
     int stage_num_layers = 0;
     for (auto& stage : stage_execution_results_) {
-      stage_num_layers += stage.num_layers();
+      stage_num_layers += stage->num_layers();
     }
     assert(stage_num_layers == num_layers);
   }
 
-  std::vector<StageExecutionResult> get_stage_execution_results() const {
+  const std::vector<std::shared_ptr<StageExecutionResult>>&
+  get_stage_execution_results() const {
     return stage_execution_results_;
   }
   int get_num_nodes() const { return num_nodes_; }
   int get_num_gpus_per_node() const { return num_gpus_per_node_; }
 
  private:
-  std::vector<StageExecutionResult> stage_execution_results_;
+  std::vector<std::shared_ptr<StageExecutionResult>> stage_execution_results_;
   const int num_nodes_;
   const int num_gpus_per_node_;
 };

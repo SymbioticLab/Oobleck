@@ -11,9 +11,9 @@ class TestOobleckPipelineTemplate(unittest.TestCase):
     def test_create_templates(self):
         generator: PipelineTemplateGenerator = PipelineTemplateGenerator()
         template: PipelineTemplate = generator.create_pipeline_templates(
-            "gpt2", "2.7b", 2, (2, 7), 1
+            "gpt2", "2.7b", 2, (3, 11), 1
         )
-        self.assertEqual(isinstance(template), list)
+        self.assertTrue(isinstance(template, list))
 
 
 if __name__ == "__main__":
