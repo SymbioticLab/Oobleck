@@ -1,7 +1,7 @@
 #ifndef _OOBLECK_PLANNING_EXECUTION_RESULT_H_
 #define _OOBLECK_PLANNING_EXECUTION_RESULT_H_
 
-#include <oneapi/tbb/concurrent_hash_map.h>
+#include <oneapi/tbb/concurrent_unordered_map.h>
 #include <map>
 #include <memory>
 #include <tuple>
@@ -101,18 +101,19 @@ class DCExecutionResult {
   // # stage, start layer index, end layer index, num nodes, num GPUs per node
   using key = std::tuple<int, int, int, int, int>;
 
-  class KeyCompare {
-   public:
-    std::size_t hash(const oobleck::DCExecutionResult::key& key) const {
-      std::string string_key = std::to_string(std::get<0>(key)) + "." +
-                               std::to_string(std::get<1>(key)) + "." +
-                               std::to_string(std::get<2>(key)) + "." +
-                               std::to_string(std::get<3>(key)) + "." +
+  struct KeyHash {
+    std::size_t operator()(const key& key) const {
+      std::string string_key = std::to_string(std::get<0>(key)) + "[" +
+                               std::to_string(std::get<1>(key)) + "-" +
+                               std::to_string(std::get<2>(key)) + "]" +
+                               std::to_string(std::get<3>(key)) + "x" +
                                std::to_string(std::get<4>(key));
       return std::hash<std::string>()(string_key);
     }
-    bool equal(const oobleck::DCExecutionResult::key& key1,
-               const oobleck::DCExecutionResult::key& key2) const {
+  };
+
+  struct KeyEqual {
+    std::size_t operator()(const key& key1, const key& key2) const {
       return std::get<0>(key1) == std::get<0>(key2) &&
              std::get<1>(key1) == std::get<1>(key2) &&
              std::get<2>(key1) == std::get<2>(key2) &&
@@ -189,9 +190,10 @@ class DCExecutionResult {
 
 }  // namespace oobleck
 
-using CacheMap = oneapi::tbb::concurrent_hash_map<
+using CacheMap = oneapi::tbb::concurrent_unordered_map<
     oobleck::DCExecutionResult::key,
     std::shared_ptr<oobleck::DCExecutionResult>,
-    oobleck::DCExecutionResult::KeyCompare>;
+    oobleck::DCExecutionResult::KeyHash,
+    oobleck::DCExecutionResult::KeyEqual>;
 
 #endif

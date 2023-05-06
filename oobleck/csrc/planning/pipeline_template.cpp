@@ -155,7 +155,7 @@ PipelineTemplateGenerator::divide_and_conquer(
     const int num_stages,
     const int num_nodes,
     const int num_gpus_per_node) {
-  // co_await thread_pool_.schedule();
+  co_await thread_pool_.schedule();
 
   int start_layer_index = std::get<0>(layer_indices);
   int end_layer_index = std::get<1>(layer_indices);
@@ -166,16 +166,14 @@ PipelineTemplateGenerator::divide_and_conquer(
                       num_gpus_per_node);
 
   // Return cached result if it exists
-  {
-    CacheMap::const_accessor accessor;
-    if (dc_cache_.find(accessor, key)) {
-      cache_hit_++;
-      result = accessor->second;
-      co_return result;
-    }
+  auto it = dc_cache_.find(key);
+  if (it != dc_cache_.end()) {
+    cache_hit_.fetch_add(1, std::memory_order_relaxed);
+    result = it->second;
+    co_return result;
   }
 
-  cache_miss_++;
+  cache_miss_.fetch_add(1, std::memory_order_relaxed);
 
   // Infeasible cases
   bool infeasible = false;
@@ -201,9 +199,8 @@ PipelineTemplateGenerator::divide_and_conquer(
   }
 
   if (infeasible) {
-    CacheMap::accessor accessor;
-    dc_cache_.insert(accessor, key);
-    accessor->second = nullptr;
+    dc_cache_.insert({key, nullptr});
+    // accessor->second = nullptr;
     co_return nullptr;
   }
 
@@ -215,9 +212,8 @@ PipelineTemplateGenerator::divide_and_conquer(
         layer_execution_results, layer_indices, num_gpus_per_node);
     auto result = std::make_shared<DCExecutionResult>(stage, num_nodes,
                                                       num_gpus_per_node);
-    CacheMap::accessor accessor;
-    dc_cache_.insert(accessor, key);
-    accessor->second = result;
+    dc_cache_.insert({key, result});
+    // accessor->second = result;
     co_return result;
   }
 
@@ -230,19 +226,16 @@ PipelineTemplateGenerator::divide_and_conquer(
            std::ranges::iota_view<int, int>(1, num_gpus_per_node)) {
         for (int num_stages_left :
              std::ranges::iota_view<int, int>(1, num_stages)) {
-          std::unique_ptr<CacheMap::const_accessor> accessor(nullptr);
           std::shared_ptr<DCExecutionResult> result_left(nullptr);
           std::shared_ptr<DCExecutionResult> result_right(nullptr);
 
           auto key_left = std::make_tuple(num_stages_left, start_layer_index, k,
                                           num_nodes, num_gpus_left);
 
-          accessor = std::make_unique<CacheMap::const_accessor>();
-          if (dc_cache_.find(*accessor, key_left)) {
-            result_left = (*accessor)->second;
-            accessor.reset();
+          auto it = dc_cache_.find(key_left);
+          if (it != dc_cache_.end()) {
+            result_left = it->second;
           } else {
-            accessor.reset();
             result_left = co_await divide_and_conquer(
                 layer_execution_results, std::make_tuple(start_layer_index, k),
                 num_stages_left, num_nodes, num_gpus_left);
@@ -252,12 +245,10 @@ PipelineTemplateGenerator::divide_and_conquer(
               std::make_tuple(num_stages - num_stages_left, k, end_layer_index,
                               num_nodes, num_gpus_per_node - num_gpus_left);
 
-          accessor = std::make_unique<CacheMap::const_accessor>();
-          if (dc_cache_.find(*accessor, key_right)) {
-            result_right = (*accessor)->second;
-            accessor.reset();
+          it = dc_cache_.find(key_right);
+          if (it != dc_cache_.end()) {
+            result_right = it->second;
           } else {
-            accessor.reset();
             result_right = co_await divide_and_conquer(
                 layer_execution_results, std::make_tuple(k, end_layer_index),
                 num_stages - num_stages_left, num_nodes,
@@ -281,19 +272,16 @@ PipelineTemplateGenerator::divide_and_conquer(
            std::ranges::iota_view<int, int>(1, num_nodes)) {
         for (int num_stages_left :
              std::ranges::iota_view<int, int>(1, num_stages)) {
-          std::unique_ptr<CacheMap::const_accessor> accessor(nullptr);
           std::shared_ptr<DCExecutionResult> result_left(nullptr);
           std::shared_ptr<DCExecutionResult> result_right(nullptr);
 
           auto key_left = std::make_tuple(num_stages_left, start_layer_index, k,
                                           num_nodes_left, num_gpus_per_node);
 
-          accessor = std::make_unique<CacheMap::const_accessor>();
-          if (dc_cache_.find(*accessor, key_left)) {
-            result_left = (*accessor)->second;
-            accessor.reset();
+          auto it = dc_cache_.find(key_left);
+          if (it != dc_cache_.end()) {
+            result_left = it->second;
           } else {
-            accessor.reset();
             result_left = co_await divide_and_conquer(
                 layer_execution_results, std::make_tuple(start_layer_index, k),
                 num_stages_left, num_nodes_left, num_gpus_per_node);
@@ -303,12 +291,10 @@ PipelineTemplateGenerator::divide_and_conquer(
               std::make_tuple(num_stages - num_stages_left, k, end_layer_index,
                               num_nodes - num_nodes_left, num_gpus_per_node);
 
-          accessor = std::make_unique<CacheMap::const_accessor>();
-          if (dc_cache_.find(*accessor, key_right)) {
-            result_right = (*accessor)->second;
-            accessor.reset();
+          it = dc_cache_.find(key_right);
+          if (it != dc_cache_.end()) {
+            result_right = it->second;
           } else {
-            accessor.reset();
             result_right = co_await divide_and_conquer(
                 layer_execution_results, std::make_tuple(k, end_layer_index),
                 num_stages - num_stages_left, num_nodes - num_nodes_left,
@@ -329,9 +315,7 @@ PipelineTemplateGenerator::divide_and_conquer(
     }
   }
 
-  CacheMap::accessor accessor;
-  dc_cache_.insert(accessor, key);
-  accessor->second = result;
+  dc_cache_.insert({key, result});
   co_return result;
 }
 
