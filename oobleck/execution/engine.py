@@ -5,6 +5,7 @@ import gc
 import sys
 import time
 import multiprocess as mp
+import math
 
 from ast import literal_eval
 from typing import Optional, Dict, Tuple, List, Any, TypeVar
@@ -13,13 +14,13 @@ from torch.distributed import ProcessGroup
 from deepspeed import comm as dist
 from deepspeed.utils import logger
 
+from pipeline_template import PipelineTemplate, PipelineTemplateGenerator
 from oobleck.elastic.client import RedisClient
 from oobleck.execution.dataset import OobleckDataset
 from oobleck.execution.utils import run_once
 from oobleck.module.layer import Layer
 from oobleck.module.model import OobleckModel
-from oobleck.planning.profiler import profile
-from oobleck.planning.pipeline_spec import PipelineSpec
+from oobleck.planning.profiler import profile, get_profile_results
 from oobleck.planning.instantiator import (
     HeterogeneousPipelineExecutionPlan,
     PipelineInstantiator,
@@ -52,7 +53,7 @@ class DynamicReconfigurationMixin(object):
         logger.info("new world: %s", self.world_info)
 
         execution_plan = self.create_execution_plan(
-            self.pipeline_specs, self.world_size, self.global_num_microbatch, True
+            self.pipeline_templates, self.world_size, self.global_num_microbatch, True
         )
 
         old_local_rank = self.my_pipeline.my_rank
@@ -76,9 +77,9 @@ class DynamicReconfigurationMixin(object):
         # =================== Reconfiguration ===================
         # =======================================================
         # 2. find me from execution plan
-        def get_my_pipeline_spec() -> Tuple[PipelineSpec, int]:
+        def get_my_pipeline_spec() -> Tuple[PipelineTemplate, int]:
             total_num_nodes_used = 0
-            for spec in execution_plan.pipeline_specs:
+            for spec in execution_plan.pipeline_templates:
                 for _ in range(execution_plan.num_instances_set[spec]):
                     if self.rank in range(
                         total_num_nodes_used, total_num_nodes_used + spec.num_nodes
@@ -295,10 +296,27 @@ class OobleckEngine(
         p.join()
         assert p.exitcode == 0, f"Profiling failed. exitcode: {p.exitcode}"
 
-        # create a list of pipelinespecs that can cover all nodes.
+        gpu_memory = torch.cuda.get_device_properties("cuda:0").total_memory
+
+        # create a list of pipeline templates that can cover all nodes.
         # this is invariant and never changes over reconfiguration.
-        self.pipeline_specs: List[PipelineSpec] = PipelineSpec.create(
-            self.ft_spec, self.max_num_nodes, self.num_gpus_per_node, self.model, microbatch_size
+        model_layers = get_profile_results(self.model, microbatch_size)
+        required_memory = sum(
+            layer.mem_required[0] for layer in model_layers
+        ) * 6 + max(layer.mem_required[1] for layer in model_layers)
+        gpu_memory = torch.cuda.get_device_properties("cuda:0").total_memory
+        min_gpus = math.ceil(required_memory / gpu_memory)
+        min_num_nodes = math.ceil(min_gpus / self.num_gpus_per_node)
+
+        generator = PipelineTemplateGenerator()
+        self.pipeline_templates: List[
+            PipelineTemplate
+        ] = generator.create_pipeline_templates(
+            self.model.model_name,
+            self.model.model_tag,
+            microbatch_size,
+            (min_num_nodes, self.max_num_nodes),
+            self.num_gpus_per_node,
         )
 
     def init_distributed(self):
@@ -375,20 +393,20 @@ class OobleckEngine(
         self.redis.reconfiguration_required = False
 
     # ==========================================================================================
-    # Paper section 4.1. is implemented in oobleck.planning.pipeline_spec.PipelineSpec.
-    # Paper section 4.2. is implemented in oobleck.planning.pipeline_spec.PipelineSpec.
+    # Paper section 4.1. is implemented in oobleck.planning.pipeline_spec.PipelineTemplate.
+    # Paper section 4.2. is implemented in oobleck.planning.pipeline_spec.PipelineTemplate.
     # Paper section 4.3. is implemented in oobleck.planning.instantiator.PipelineInstantiator.
     # ==========================================================================================
 
     def create_execution_plan(
         self,
-        pipeline_specs: List[PipelineSpec],
+        pipeline_templates: List[PipelineTemplate],
         num_nodes: int,
         global_num_microbatch: int,
         throughput_oriented: bool = True,
     ) -> HeterogeneousPipelineExecutionPlan:
         instantiator = PipelineInstantiator(
-            pipeline_specs, num_nodes, global_num_microbatch
+            pipeline_templates, num_nodes, global_num_microbatch
         )
 
         return instantiator.get_best_execution_plan(throughput_oriented)
@@ -398,10 +416,10 @@ class OobleckEngine(
         execution_plan: HeterogeneousPipelineExecutionPlan,
     ) -> OobleckPipeline:
         """Oobleck paper section 4.3. Instantiating Pipeline Templates implementation
-        Instantiate given `PipelineSpec`s and create `OobleckPipeline`s.
+        Instantiate given `PipelineTemplate`s and create `OobleckPipeline`s.
 
         Args:
-            pipeline_specs (List[PipelineSpec]): List of `PipelineSpec`s to be
+            pipeline_templates (List[PipelineTemplate]): List of `PipelineTemplate`s to be
                 used for instantiation.
             num_nodes: int: Number of nodes.
             throughput_oriented (bool, optional): Whether throughput oriented or
@@ -494,7 +512,7 @@ class OobleckEngine(
         self.master_port = 25400
         self.init_distributed()
         execution_plan = self.create_execution_plan(
-            self.pipeline_specs, self.world_size, self.global_num_microbatch, True
+            self.pipeline_templates, self.world_size, self.global_num_microbatch, True
         )
         self.pipeline = self.instantiate_pipelines(execution_plan)
 

@@ -82,13 +82,12 @@ PipelineTemplateGenerator::create_pipeline_templates(
     const int microbatch_size,
     const std::tuple<int, int> num_nodes,
     const int num_gpus_per_node) {
-  int min_num_nodes = std::get<0>(num_nodes);
-  int max_num_nodes = std::get<1>(num_nodes);
-
 #ifdef PYBIND11_MODULE
   // Release GIL
   pybind11::gil_scoped_release release;
 #endif
+  int min_num_nodes = std::get<0>(num_nodes);
+  int max_num_nodes = std::get<1>(num_nodes);
 
   // Load JSON files to create std::vector<LayerExecutionResult>
   auto layer_execution_results =
