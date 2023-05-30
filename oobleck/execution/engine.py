@@ -403,13 +403,12 @@ class OobleckEngine(
         pipeline_templates: List[PipelineTemplate],
         num_nodes: int,
         global_num_microbatch: int,
-        throughput_oriented: bool = True,
     ) -> HeterogeneousPipelineExecutionPlan:
-        instantiator = PipelineInstantiator(
+        instantiator = PipelineInstantiator()
+
+        return instantiator.get_best_execution_plan(
             pipeline_templates, num_nodes, global_num_microbatch
         )
-
-        return instantiator.get_best_execution_plan(throughput_oriented)
 
     def instantiate_pipelines(
         self,
