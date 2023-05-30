@@ -7,7 +7,7 @@ from typing import List, Dict, Tuple, Optional
 from deepspeed import comm as dist
 from deepspeed.utils import logger
 
-from oobleck.planning.pipeline_spec import PipelineSpec, Planner
+from pipeline_template import PipelineTemplate, PipelineTemplateGenerator
 from oobleck.execution.pipeline import OobleckPipeline
 from oobleck.execution.dataloader import OobleckTrainDataLoader
 from oobleck.module.model import OobleckModel
@@ -18,42 +18,44 @@ from transformers import TrainingArguments
 class HeterogeneousPipelineExecutionPlan:
     def __init__(
         self,
-        pipeline_specs: List[PipelineSpec],
-        num_instances_set: Dict[PipelineSpec, int],
-        num_microbatches_set: Dict[PipelineSpec, int],
+        pipeline_templates: List[PipelineTemplate],
+        num_instances_set: Dict[PipelineTemplate, int],
+        num_microbatches_set: Dict[PipelineTemplate, int],
     ):
-        self.pipeline_specs = pipeline_specs
+        self.pipeline_templates = pipeline_templates
         self.num_instances_set = num_instances_set
         self.num_microbatches_set = num_microbatches_set
         self.num_nodes = sum(
-            spec.num_nodes * num_instances
-            for spec, num_instances in num_instances_set.items()
+            t.get_num_nodes() * num_instances
+            for t, num_instances in num_instances_set.items()
         )
 
     def __repr__(self) -> str:
         result = ""
         total_num_microbatches = 0
-        for spec in self.pipeline_specs:
+        for template in self.pipeline_templates:
             if (
-                spec not in self.num_instances_set
-                or spec not in self.num_microbatches_set
+                template not in self.num_instances_set
+                or template not in self.num_microbatches_set
             ):
                 continue
             result += (
-                f"{self.num_instances_set[spec]} x {spec} pipelines "
-                f"(num microbatches: {self.num_microbatches_set[spec]})\n"
+                f"{self.num_instances_set[template]} x {template} pipelines "
+                f"(num microbatches: {self.num_microbatches_set[template]})\n"
             )
             total_num_microbatches += (
-                self.num_instances_set[spec] * self.num_microbatches_set[spec]
+                self.num_instances_set[template] * self.num_microbatches_set[template]
             )
         result += f"total microbatches: {total_num_microbatches}"
         return result
 
     @property
     def iteration_time(self) -> float:
+        # Insu: pipeline templates are all optimal plans.
+        # Implement getting iteration time in PipelineTemplate into C++ and use it.
         max_iteration_time = max(
-            spec.optimal_plan.get_e() * num_microbatches / len(spec.optimal_plan.stages)
-            for spec, num_microbatches in self.num_microbatches_set.items()
+            t.optimal_plan.get_e() * num_microbatches / len(t.optimal_plan.stages)
+            for t, num_microbatches in self.num_microbatches_set.items()
         )
 
         # FIXME: currently we only consider communication overhead
@@ -135,40 +137,24 @@ class HeterogeneousPipelineExecutionPlan:
 
 
 class PipelineInstantiator:
-    def __init__(
+    def get_best_execution_plan(
         self,
-        pipeline_specs: List[PipelineSpec],
+        pipeline_templates: List[PipelineTemplate],
         num_nodes: int,
         global_num_microbatch: int,
-    ):
-        """Oobleck paper section 4.3. Instantiating Pipeline Templates implementation
-        Instantiate given `PipelineSpec`s and create `OobleckPipeline`s.
-
-        Args:
-            pipeline_specs (List[PipelineSpec]): List of `PipelineSpec`s to be
-                used for instantiation.
-            num_nodes: int: Number of nodes.
-            throughput_oriented (bool, optional): Whether throughput oriented or
-                reconfiguration overhead oriented.
-        """
-        self.pipeline_specs = pipeline_specs
-        self.num_nodes = num_nodes
-        self.global_num_microbatch = global_num_microbatch
-
+    ) -> HeterogeneousPipelineExecutionPlan:
         num_instances_set_list: List[
-            Dict[PipelineSpec, int]
-        ] = self._get_feasible_sets_of_pipeline_instantiation(pipeline_specs, num_nodes)
+            Dict[PipelineTemplate, int]
+        ] = self._enumerate_instantiation_options(pipeline_templates, num_nodes)
 
-        # For each feasible xi set, calculate batch distribution and stores
-        # a tuple of number of instance of the pipelinespec, and batch size.
-        num_microbatches_set_list: List[Dict[PipelineSpec, int]] = [
-            self._distribute_batch(self.global_num_microbatch, num_instances_set)
+        num_microbatches_set_list: List[Dict[PipelineTemplate, int]] = [
+            self._distribute_batch(global_num_microbatch, num_instances_set)
             for num_instances_set in num_instances_set_list
         ]
 
-        self.execution_plans: List[HeterogeneousPipelineExecutionPlan] = [
+        execution_plans: List[HeterogeneousPipelineExecutionPlan] = [
             HeterogeneousPipelineExecutionPlan(
-                self.pipeline_specs,
+                pipeline_templates,
                 num_instances_set,
                 num_microbatches_set,
             )
@@ -178,50 +164,37 @@ class PipelineInstantiator:
             if num_instances_set is not None and num_microbatches_set is not None
         ]
 
-    def get_best_execution_plan(
-        self, throughput_oriented: bool = True
-    ) -> HeterogeneousPipelineExecutionPlan:
-        result: HeterogeneousPipelineExecutionPlan = None
-        if throughput_oriented:
-            result = min(self.execution_plans, key=lambda plan: plan.iteration_time)
-        else:
-            result = max(self.execution_plans, key=lambda plan: plan.average_num_nodes)
+        result: HeterogeneousPipelineExecutionPlan = min(
+            execution_plans, key=lambda plan: plan.iteration_time
+        )
 
         logger.info(f"Best execution plan: {result.num_instances_set}")
         return result
 
-    def _get_feasible_sets_of_pipeline_instantiation(
+    def _enumerate_instantiation_options(
         self,
-        pipeline_specs: List[PipelineSpec],
+        pipeline_templates: List[PipelineTemplate],
         num_nodes: int,
-    ) -> List[Dict[PipelineSpec, int]]:
-        """Oobleck paper section 4.3.1. Getting number of pipeline instances implementation
+    ) -> List[Dict[PipelineTemplate, int]]:
+        """Oobleck paper section 4.2.1. Enumerating instantiation options implementation
         Get all feasible sets of xi's that can use all of the given nodes.
-
-        Args:
-            pipeline_specs (List[PipelineSpec]): List of `PipelineSpec`s to be instantiated.
-            num_nodes (int): Number of nodes to be used for training.
-
-        Returns:
-            List[Dict[PipelineSpec, int]]: List of feasible sets.
-                Each set is implemented as a dictionary, key as PipelineSpec and
-                value as how many instances should be created on the key PipelineSpec.
         """
 
-        dp: List[List[List[Dict[PipelineSpec, int]]]] = [
-            [[] for _ in range(num_nodes + 1)] for _ in range(len(pipeline_specs) + 1)
+        dp: List[List[List[Dict[PipelineTemplate, int]]]] = [
+            [[] for _ in range(num_nodes + 1)]
+            for _ in range(len(pipeline_templates) + 1)
         ]
 
-        for i in range(1, len(pipeline_specs) + 1):
+        for i in range(1, len(pipeline_templates) + 1):
             dp[i][0] = [defaultdict(int)]
             for j in range(1, num_nodes + 1):
                 # (1) in Figure: copy all dicts
                 dp[i][j] = [combo.copy() for combo in dp[i - 1][j]]
-                if pipeline_specs[i - 1].num_nodes <= j:
-                    # (2) in Figure: copy all dicts with one pipeline_specs[i - 1] added
-                    for combo in dp[i][j - pipeline_specs[i - 1].num_nodes]:
+                if pipeline_templates[i - 1].num_nodes <= j:
+                    # (2) in Figure: copy all dicts with one pipeline_templates[i - 1] added
+                    for combo in dp[i][j - pipeline_templates[i - 1].num_nodes]:
                         new_combo = combo.copy()
-                        new_combo[pipeline_specs[i - 1]] += 1
+                        new_combo[pipeline_templates[i - 1]] += 1
 
                         # concatenate two lists
                         dp[i][j].append(new_combo)
@@ -231,9 +204,9 @@ class PipelineInstantiator:
     def _distribute_batch(
         self,
         global_num_microbatch: int,
-        num_instances_set: Dict[PipelineSpec, int],
-    ) -> Optional[Dict[PipelineSpec, int]]:
-        """Oobleck paper section 4.3.2. Calculating batch size for each pipeline template
+        num_instances_set: Dict[PipelineTemplate, int],
+    ) -> Optional[Dict[PipelineTemplate, int]]:
+        """Oobleck paper section 4.2.2. Batch distribution implementation
         satisfying the following two requirements
         1. std(Bi * Ti) is minimized
         2. sum(Bi) = B
@@ -256,16 +229,16 @@ class PipelineInstantiator:
         model.I = pyomo.Set(initialize=list(range(len(num_instances_set))))
 
         T = {
-            i: pipeline_spec.optimal_plan.get_e() / 10
-            for i, pipeline_spec in enumerate(num_instances_set)
+            i: pipeline_templates.optimal_plan.get_e() / 10
+            for i, pipeline_templates in enumerate(num_instances_set)
         }
 
         x = {
             i: instance_num for i, instance_num in enumerate(num_instances_set.values())
         }
         s = {
-            i: len(pipeline_spec.optimal_plan.stages)
-            for i, pipeline_spec in enumerate(num_instances_set.keys())
+            i: len(pipeline_templates.optimal_plan.stages)
+            for i, pipeline_templates in enumerate(num_instances_set.keys())
         }
 
         # Define the Pyomo variable
