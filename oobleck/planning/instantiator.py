@@ -26,8 +26,8 @@ class HeterogeneousPipelineExecutionPlan:
         self.num_instances_set = num_instances_set
         self.num_microbatches_set = num_microbatches_set
         self.num_nodes = sum(
-            t.get_num_nodes() * num_instances
-            for t, num_instances in num_instances_set.items()
+            pipeline_template.get_num_nodes() * num_instances
+            for pipeline_template, num_instances in num_instances_set.items()
         )
 
     def __repr__(self) -> str:
@@ -54,8 +54,10 @@ class HeterogeneousPipelineExecutionPlan:
         # Insu: pipeline templates are all optimal plans.
         # Implement getting iteration time in PipelineTemplate into C++ and use it.
         max_iteration_time = max(
-            t.optimal_plan.get_e() * num_microbatches / len(t.optimal_plan.stages)
-            for t, num_microbatches in self.num_microbatches_set.items()
+            pipeline_template.get_iteration_time()
+            * num_microbatches
+            / len(pipeline_template.get_stages())
+            for pipeline_template, num_microbatches in self.num_microbatches_set.items()
         )
 
         # FIXME: currently we only consider communication overhead
@@ -75,8 +77,8 @@ class HeterogeneousPipelineExecutionPlan:
     @property
     def average_num_nodes(self) -> float:
         total_num_nodes = sum(
-            spec.num_nodes * num_instance
-            for spec, num_instance in self.num_instances_set.items()
+            pipeline_template.get_num_nodes() * num_instance
+            for pipeline_template, num_instance in self.num_instances_set.items()
         )
         total_num_instances = sum(list(self.num_instances_set.values()))
         return total_num_nodes / total_num_instances
@@ -110,26 +112,34 @@ class HeterogeneousPipelineExecutionPlan:
 
         pipeline_ranks: List[List[int]] = []
 
-        for spec in self.pipeline_specs:
-            for _ in range(self.num_instances_set[spec]):
+        for pipeline_template in self.pipeline_templates:
+            for _ in range(self.num_instances_set[pipeline_template]):
                 # TODO: implement FSDP by considering spec.num_gpus_per_node
                 ranks = list(
-                    range(total_num_nodes_used, total_num_nodes_used + spec.num_nodes)
+                    range(
+                        total_num_nodes_used,
+                        total_num_nodes_used + pipeline_template.get_num_nodes(),
+                    )
                 )
                 ranks_to_layer_map = [ranks[i] for i in spec.layer_spec]
                 pipeline_ranks.append(ranks_to_layer_map)
-                total_num_nodes_used += spec.num_nodes
+                total_num_nodes_used += pipeline_template.get_num_nodes()
                 process_group = torch.distributed.new_group(ranks)
 
                 logger.info(
-                    f"Instantiating a {len(spec.optimal_plan.stages)}-stage "
-                    f"pipeline with {spec.num_nodes} nodes"
+                    f"Instantiating a {len(pipeline_template.get_stages())}-stage "
+                    f"pipeline with {pipeline_template.get_num_nodes()} nodes"
                 )
 
                 if dist.get_rank(process_group) >= 0:
                     assert my_pipeline is None
                     my_pipeline = OobleckPipeline(
-                        spec, model, dataloader, step, process_group, training_args
+                        pipeline_template,
+                        model,
+                        dataloader,
+                        step,
+                        process_group,
+                        training_args,
                     )
 
         assert my_pipeline, "No pipeline has been initiated for this rank"
@@ -143,6 +153,9 @@ class PipelineInstantiator:
         num_nodes: int,
         global_num_microbatch: int,
     ) -> HeterogeneousPipelineExecutionPlan:
+        """
+        Section 4.2. Pipeline Instantiation implementation
+        """
         num_instances_set_list: List[
             Dict[PipelineTemplate, int]
         ] = self._enumerate_instantiation_options(pipeline_templates, num_nodes)
@@ -229,16 +242,16 @@ class PipelineInstantiator:
         model.I = pyomo.Set(initialize=list(range(len(num_instances_set))))
 
         T = {
-            i: pipeline_templates.optimal_plan.get_e() / 10
-            for i, pipeline_templates in enumerate(num_instances_set)
+            i: pipeline_template.get_iteration_time() / 10
+            for i, pipeline_template in enumerate(num_instances_set)
         }
 
         x = {
             i: instance_num for i, instance_num in enumerate(num_instances_set.values())
         }
         s = {
-            i: len(pipeline_templates.optimal_plan.stages)
-            for i, pipeline_templates in enumerate(num_instances_set.keys())
+            i: len(pipeline_template.get_stages())
+            for i, pipeline_template in enumerate(num_instances_set.keys())
         }
 
         # Define the Pyomo variable

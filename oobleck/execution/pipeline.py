@@ -21,7 +21,7 @@ from oobleck.execution.utils import (
     DTYPE_TO_ID,
     ID_TO_DTYPE,
 )
-from oobleck.planning.pipeline_spec import PipelineSpec
+from pipeline_template import PipelineTemplate
 from oobleck.utils.timer import OobleckTimer, measure_time
 
 from transformers import TrainingArguments
@@ -504,7 +504,7 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
 
     def __init__(
         self,
-        spec: PipelineSpec,
+        pipeline_template: PipelineTemplate,
         model: OobleckModel,
         dataloader: OobleckTrainDataLoader,
         step: int,
@@ -532,8 +532,8 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         )
 
         logger.info(
-            f"Creating pipeline ({len(spec.optimal_plan.stages)} stages): "
-            f"{spec.optimal_plan.stages}"
+            f"Creating pipeline ({len(pipeline_template.get_stages())} stages): "
+            f"{pipeline_template.get_stages()}"
         )
 
     def write_samples_logs(self):
