@@ -46,8 +46,7 @@ class PipelineTemplate {
   }
 
   const double get_iteration_time() const { return iteration_time_; }
-  const std::vector<std::shared_ptr<StageExecutionResult>>&
-  get_stage_execution_results() const {
+  const std::vector<std::shared_ptr<StageExecutionResult>>& get_stages() const {
     return stage_execution_results_;
   }
   int get_num_nodes() const { return num_nodes_; }
