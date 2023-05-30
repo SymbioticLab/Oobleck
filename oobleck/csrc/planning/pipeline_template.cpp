@@ -133,7 +133,7 @@ PipelineTemplateGenerator::create_pipeline_templates(
       continue;
     }
 
-    auto optimal_result = [&]() {
+    auto optimal_result = [&]() -> std::shared_ptr<DCExecutionResult> {
       std::shared_ptr<DCExecutionResult> result(nullptr);
       for (int i = 0; i < results.size(); i++) {
         if (result == nullptr) {
@@ -148,9 +148,10 @@ PipelineTemplateGenerator::create_pipeline_templates(
 
     assert(optimal_result != nullptr &&
            optimal_result->get_stages().size() > 0);
-    pipeline_templates.emplace_back(PipelineTemplate(
-        optimal_result->get_stages(), layer_execution_results->size(),
-        num_node_tasks->first, num_gpus_per_node));
+    pipeline_templates.emplace_back(
+        PipelineTemplate(optimal_result->get_stages(), optimal_result->get_t(),
+                         layer_execution_results->size(), num_node_tasks->first,
+                         num_gpus_per_node));
   }
 
 #ifdef PYBIND11_MODULE

@@ -19,10 +19,12 @@ class PipelineTemplate {
  public:
   PipelineTemplate(const std::vector<std::shared_ptr<StageExecutionResult>>&
                        stage_execution_results,
+                   const double iteration_time,
                    const int num_layers,
                    const int num_nodes,
                    const int num_gpus_per_node)
       : stage_execution_results_(stage_execution_results),
+        iteration_time_(iteration_time),
         num_nodes_(num_nodes),
         num_gpus_per_node_(num_gpus_per_node) {
     // Run divide and conquer to create a vector of StageExecutionResult
@@ -43,6 +45,7 @@ class PipelineTemplate {
     assert(stage_num_layers == num_layers);
   }
 
+  const double get_iteration_time() const { return iteration_time_; }
   const std::vector<std::shared_ptr<StageExecutionResult>>&
   get_stage_execution_results() const {
     return stage_execution_results_;
@@ -52,6 +55,7 @@ class PipelineTemplate {
 
  private:
   std::vector<std::shared_ptr<StageExecutionResult>> stage_execution_results_;
+  const double iteration_time_;
   const int num_nodes_;
   const int num_gpus_per_node_;
 };
