@@ -3,23 +3,33 @@ from datasets import Dataset
 from transformers.tokenization_utils import PreTrainedTokenizerBase
 from transformers.image_processing_utils import BaseImageProcessor
 
-
-def test_init_text_dataset():
-    dataset = OobleckDataset("gpt2", "wikitext", "wikitext-2-raw-v1")
-    assert "train" in dataset.dataset
-    assert "validation" in dataset.dataset
-    assert isinstance(dataset.dataset["train"], Dataset)
-    assert isinstance(dataset.dataset["validation"], Dataset)
-    assert isinstance(dataset.tokenizer, PreTrainedTokenizerBase)
+import pytest
 
 
-def test_init_image_dataset():
-    dataset = OobleckDataset("microsoft/resnet-152", "Maysee/tiny-imagenet")
-    assert "train" in dataset.dataset
-    assert "validation" in dataset.dataset
-    assert isinstance(dataset.dataset["train"], Dataset)
-    assert isinstance(dataset.dataset["validation"], Dataset)
-    assert isinstance(dataset.tokenizer, BaseImageProcessor)
+@pytest.fixture(scope="session")
+def wikitext_dataset():
+    return OobleckDataset("gpt2", "wikitext", "wikitext-2-raw-v1")
+
+
+@pytest.fixture(scope="session")
+def imagenet_dataset():
+    return OobleckDataset("microsoft/resnet-152", "Maysee/tiny-imagenet")
+
+
+def test_init_text_dataset(wikitext_dataset):
+    assert "train" in wikitext_dataset.dataset
+    assert "validation" in wikitext_dataset.dataset
+    assert isinstance(wikitext_dataset.dataset["train"], Dataset)
+    assert isinstance(wikitext_dataset.dataset["validation"], Dataset)
+    assert isinstance(wikitext_dataset.tokenizer, PreTrainedTokenizerBase)
+
+
+def test_init_image_dataset(imagenet_dataset):
+    assert "train" in imagenet_dataset.dataset
+    assert "validation" in imagenet_dataset.dataset
+    assert isinstance(imagenet_dataset.dataset["train"], Dataset)
+    assert isinstance(imagenet_dataset.dataset["validation"], Dataset)
+    assert isinstance(imagenet_dataset.tokenizer, BaseImageProcessor)
 
 
 # class TestOobleckDataset(unittest.TestCase):

@@ -6,6 +6,7 @@ from oobleck.execution.dataloader import OobleckDataLoader, LoaderType
 from transformers import TrainingArguments
 from typing import List
 
+from .test_dataset import wikitext_dataset
 
 TRAIN_BATCH_SIZE = 8
 EVAL_BATCH_SIZE = 4
@@ -13,13 +14,7 @@ GRADIENT_ACCUMULATION_STEP = 2
 
 
 @pytest.fixture(scope="module")
-@pytest.mark.dependency(depends=["test_init_text_dataset"])
-def dataset():
-    return OobleckDataset("gpt2", "wikitext", "wikitext-2-raw-v1")
-
-
-@pytest.fixture(scope="module")
-def dataloaders(dataset):
+def dataloaders(wikitext_dataset):
     training_args = TrainingArguments(
         output_dir="/tmp/output",
         per_device_train_batch_size=TRAIN_BATCH_SIZE,
@@ -27,7 +22,7 @@ def dataloaders(dataset):
         gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEP,
     )
     training_dataloader = OobleckDataLoader(
-        dataset,
+        wikitext_dataset,
         training_args,
         LoaderType.Training,
         # total number of microbatches.
@@ -38,7 +33,7 @@ def dataloaders(dataset):
         0,
     )
     eval_dataloader = OobleckDataLoader(
-        dataset,
+        wikitext_dataset,
         training_args,
         LoaderType.Evaluation,
         # total number of microbatches.
