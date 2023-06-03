@@ -20,7 +20,7 @@ from oobleck.execution.dataset import OobleckDataset
 from oobleck.execution.utils import run_once
 from oobleck.module.layer import Layer
 from oobleck.module.model import OobleckModel
-from oobleck.planning.profiler import profile, get_profile_results
+from oobleck.planning.profiler import profile, get_profile_results, LayerExecutionResult
 from oobleck.planning.instantiator import (
     HeterogeneousPipelineExecutionPlan,
     PipelineInstantiator,
@@ -300,10 +300,10 @@ class OobleckEngine(
 
         # create a list of pipeline templates that can cover all nodes.
         # this is invariant and never changes over reconfiguration.
-        model_layers = get_profile_results(self.model, microbatch_size)
+        self.model_layers = get_profile_results(self.model, microbatch_size)
         required_memory = sum(
-            layer.mem_required[0] for layer in model_layers
-        ) * 6 + max(layer.mem_required[1] for layer in model_layers)
+            layer.mem_required[0] for layer in self.model_layers
+        ) * 6 + max(layer.mem_required[1] for layer in self.model_layers)
         gpu_memory = torch.cuda.get_device_properties("cuda:0").total_memory
         min_gpus = math.ceil(required_memory / gpu_memory)
         min_num_nodes = math.ceil(min_gpus / self.num_gpus_per_node)
@@ -400,6 +400,7 @@ class OobleckEngine(
 
     def create_execution_plan(
         self,
+        model_layers: List[LayerExecutionResult],
         pipeline_templates: List[PipelineTemplate],
         num_nodes: int,
         global_num_microbatch: int,
@@ -407,7 +408,7 @@ class OobleckEngine(
         instantiator = PipelineInstantiator()
 
         return instantiator.get_best_execution_plan(
-            pipeline_templates, num_nodes, global_num_microbatch
+            model_layers, pipeline_templates, num_nodes, global_num_microbatch
         )
 
     def instantiate_pipelines(
@@ -511,7 +512,11 @@ class OobleckEngine(
         self.master_port = 25400
         self.init_distributed()
         execution_plan = self.create_execution_plan(
-            self.pipeline_templates, self.world_size, self.global_num_microbatch, True
+            self.model_layers,
+            self.pipeline_templates,
+            self.world_size,
+            self.global_num_microbatch,
+            True,
         )
         self.pipeline = self.instantiate_pipelines(execution_plan)
 

@@ -11,6 +11,7 @@ from pipeline_template import PipelineTemplate, PipelineTemplateGenerator
 from oobleck.execution.pipeline import OobleckPipeline
 from oobleck.execution.dataloader import OobleckTrainDataLoader
 from oobleck.module.model import OobleckModel
+from oobleck.planning.profiler import LayerExecutionResult
 
 from transformers import TrainingArguments
 
@@ -18,13 +19,18 @@ from transformers import TrainingArguments
 class HeterogeneousPipelineExecutionPlan:
     def __init__(
         self,
+        model_layers: List[LayerExecutionResult],
         pipeline_templates: List[PipelineTemplate],
         num_instances_set: Dict[PipelineTemplate, int],
         num_microbatches_set: Dict[PipelineTemplate, int],
     ):
+        self.model_layers = model_layers
         self.pipeline_templates = pipeline_templates
         self.num_instances_set = num_instances_set
         self.num_microbatches_set = num_microbatches_set
+        self.num_pipelines = sum(
+            num_instances for num_instances in num_instances_set.values()
+        )
         self.num_nodes = sum(
             pipeline_template.get_num_nodes() * num_instances
             for pipeline_template, num_instances in num_instances_set.items()
@@ -63,11 +69,9 @@ class HeterogeneousPipelineExecutionPlan:
         # FIXME: currently we only consider communication overhead
         # of the first layer, believing communication of other layers
         # can fully be hidden in backward pass computing.
-        synchronization_overhead = (
-            Planner()  # Hack: should return instance here... Because Planner is a singleton
-            .model_layers[-1]
-            .allreduce_cross_nodes[self.num_nodes]
-        )
+        synchronization_overhead = self.model_layers[0].allreduce_cross_nodes[
+            self.num_pipelines
+        ]
 
         logger.debug(
             f"iteration_time of execution plan {self.num_instances_set}: {max_iteration_time + synchronization_overhead}"
@@ -115,13 +119,19 @@ class HeterogeneousPipelineExecutionPlan:
         for pipeline_template in self.pipeline_templates:
             for _ in range(self.num_instances_set[pipeline_template]):
                 # TODO: implement FSDP by considering spec.num_gpus_per_node
-                ranks = list(
-                    range(
-                        total_num_nodes_used,
-                        total_num_nodes_used + pipeline_template.get_num_nodes(),
+                ranks_to_layer_map = []
+                ranks = []
+                for stage in pipeline_template.get_stages():
+                    ranks_to_layer_map.extend(
+                        [total_num_nodes_used for _ in stage.num_layers()]
                     )
-                )
-                ranks_to_layer_map = [ranks[i] for i in spec.layer_spec]
+                    ranks.append(total_num_nodes_used)
+                    total_num_nodes_used += 1
+
+                assert len(ranks_to_layer_map) == len(
+                    self.model_layers
+                ), "# ranks does not match to # layers."
+
                 pipeline_ranks.append(ranks_to_layer_map)
                 total_num_nodes_used += pipeline_template.get_num_nodes()
                 process_group = torch.distributed.new_group(ranks)
@@ -149,6 +159,7 @@ class HeterogeneousPipelineExecutionPlan:
 class PipelineInstantiator:
     def get_best_execution_plan(
         self,
+        model_layers: List[LayerExecutionResult],
         pipeline_templates: List[PipelineTemplate],
         num_nodes: int,
         global_num_microbatch: int,
@@ -167,6 +178,7 @@ class PipelineInstantiator:
 
         execution_plans: List[HeterogeneousPipelineExecutionPlan] = [
             HeterogeneousPipelineExecutionPlan(
+                model_layers,
                 pipeline_templates,
                 num_instances_set,
                 num_microbatches_set,
