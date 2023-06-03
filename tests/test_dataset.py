@@ -3,18 +3,6 @@ from datasets import Dataset
 from transformers.tokenization_utils import PreTrainedTokenizerBase
 from transformers.image_processing_utils import BaseImageProcessor
 
-import pytest
-
-
-@pytest.fixture(scope="session")
-def wikitext_dataset():
-    return OobleckDataset("gpt2", "wikitext", "wikitext-2-raw-v1")
-
-
-@pytest.fixture(scope="session")
-def imagenet_dataset():
-    return OobleckDataset("microsoft/resnet-152", "Maysee/tiny-imagenet")
-
 
 def test_init_text_dataset(wikitext_dataset):
     assert "train" in wikitext_dataset.dataset
