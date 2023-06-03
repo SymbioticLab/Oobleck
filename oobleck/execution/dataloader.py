@@ -2,11 +2,12 @@ import torch
 
 from torch.utils.data import BatchSampler, DataLoader
 from torch.utils.data.dataloader import _collate_fn_t
-from datasets import Dataset
 from typing import Iterator, List
 from enum import Enum
 
 from transformers import TrainingArguments
+from datasets import Dataset
+from oobleck.execution.dataset import OobleckDataset
 
 
 class OobleckSampler(BatchSampler):
@@ -69,26 +70,30 @@ class LoaderType(Enum):
 class OobleckDataLoader(DataLoader):
     def __init__(
         self,
-        dataset: Dataset,
+        datasets: OobleckDataset,
         args: TrainingArguments,
-        dataloaer_type: LoaderType,
+        dataloader_type: LoaderType,
         num_total_microbatches: int,
         consumed_samples: int,
         epoch: int,
-        collate_fn: _collate_fn_t,
     ):
         assert isinstance(
-            dataset, Dataset
-        ), f"dataset type must be datasets.Dataset. Given: {type(dataset)}"
+            datasets, OobleckDataset
+        ), f"dataset type must be OobleckDataset. Given: {type(dataset)}"
 
         self.num_total_microbatches = num_total_microbatches
         self.num_my_microbatches = args.gradient_accumulation_steps
 
+        if dataloader_type == LoaderType.Training:
+            dataset = datasets.dataset["train"]
+            batch_size = args.per_device_train_batch_size
+        else:
+            dataset = datasets.dataset["validation"]
+            batch_size = args.per_device_eval_batch_size
+
         sampler = OobleckSampler(
             dataset,
-            args.per_device_train_batch_size
-            if dataloaer_type == LoaderType.Training
-            else args.per_device_eval_batch_size,
+            batch_size,
             self.num_total_microbatches,
             self.num_my_microbatches,
             consumed_samples,
@@ -98,7 +103,7 @@ class OobleckDataLoader(DataLoader):
         super().__init__(
             dataset,
             batch_sampler=sampler,
-            collate_fn=collate_fn,
+            collate_fn=datasets.data_collator,
             num_workers=args.dataloader_num_workers,
             pin_memory=args.dataloader_pin_memory,
         )

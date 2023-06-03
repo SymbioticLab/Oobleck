@@ -24,6 +24,7 @@ dependencies:
   - pip:
     - transformers>=4.26.0
     - deepspeed>=0.8.1
+    - accelerate
     - datasets
     - redis[hiredis]
     - rpyc
@@ -32,3 +33,5 @@ dependencies:
     - evaluate
     - scikit-learn
     - dill
+    - pytest
+    - pytest-dependency
