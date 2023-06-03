@@ -94,12 +94,14 @@ class HeterogeneousPipelineExecutionPlan:
             int: number of microbatches for this rank
         """
         num_ranks_used = 0
-        for spec in self.pipeline_specs:
+        for pipeline_template in self.pipeline_templates:
             num_ranks_spec = (
-                spec.num_nodes * spec.num_gpus_per_node * self.num_instances_set[spec]
+                pipeline_template.get_num_nodes()
+                * pipeline_template.get_num_gpus_per_node()
+                * self.num_instances_set[pipeline_template]
             )
             if global_rank in range(num_ranks_used, num_ranks_used + num_ranks_spec):
-                return self.num_microbatches_set[spec]
+                return self.num_microbatches_set[pipeline_template]
             num_ranks_used += num_ranks_spec
 
         ValueError("Cannot find a range that the global rank falls.")
