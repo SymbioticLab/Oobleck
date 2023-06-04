@@ -108,7 +108,9 @@ class Profiler:
         assert dist.is_initialized()
         import copy
 
-        results: List[List[int]] = [[0.0, 0.0, 0.0, 0.0]] * len(self.model.model)
+        results: List[List[int]] = [
+            [0.0, 0.0, 0.0, 0.0] for _ in range(len(self.model.model))
+        ]
         if dist.get_rank() == 0:
             for i in range(num_warmup + 1):
                 logger.info(f"Profiling layer execution ltency: {i} iteration")
@@ -133,11 +135,11 @@ class Profiler:
                     end_mem = torch.cuda.memory_allocated()
                     model_mem = end_mem - start_mem
 
-                    start = time.time()
+                    start = time.time_ns()
                     with torch.no_grad():
                         output = gpu_layer(*input)
                         torch.cuda.synchronize()
-                    end = time.time()
+                    end = time.time_ns()
 
                     end_mem2 = torch.cuda.memory_allocated()
                     activation_mem = end_mem2 - end_mem
@@ -152,7 +154,7 @@ class Profiler:
                     elif isinstance(output, torch.Tensor):
                         input = output.detach().clone()
 
-                    forward = end - start
+                    forward = (end - start) / 1_000_000
 
                     output = None
                     gpu_layer = None
