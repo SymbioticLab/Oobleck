@@ -1,6 +1,7 @@
 import os
 import gc
 import math
+import json
 import time
 import torch
 import torch.distributed as dist
@@ -194,13 +195,13 @@ class Profiler:
         tensor = torch.zeros(numel, dtype=torch.float32, device="cuda")
 
         dist.barrier(process_group)
-        start = time.time()
+        start = time.time_ns()
         dist.all_reduce(tensor, group=process_group)
         dist.barrier(process_group)
-        end = time.time()
+        end = time.time_ns()
 
         del tensor
-        return (end - start) * 1000
+        return (end - start) / 1_000_000
 
     def profile_allreduce_across_nodes(self) -> List[Dict[int, float]]:
         """Profile allreduce latency across nodes,
@@ -327,50 +328,51 @@ def profile(
     os.environ["RANK"] = str(rank)
     os.environ["LOCAL_RANK"] = str(local_rank)
 
-    directory = f"{PROFILE_CACHE}/{model_name}-{model_tag}"
+    directory = Path(f"{PROFILE_CACHE}/{model_name}-{model_tag}")
+    directory.mkdir(parents=True, exist_ok=True)
 
     # assert dist.is_initialized(), "Distributed is not initialized."
     assert not dist.is_initialized(), "Distributed is already initialized."
     dist.init_process_group(backend="nccl")
 
-    os.makedirs(f"{directory}/mb{microbatch_size}", exist_ok=True)
     logger.info("Profiling model %s", model_name)
 
     model = OobleckModel(model_name, sample_inputs, None, model_tag, model_args)
     profiler = Profiler(model)
     # forward/backward execution
 
-    path = f"{directory}/mb{microbatch_size}/layers"
-    if Path(path).exists():
+    path = directory.joinpath(f"mb{microbatch_size}.json")
+    if path.exists():
         logger.info("Skip profiling execution latency.")
     else:
         logger.info("Profiling model execution latency.")
         layer_execution_result = profiler.profile_execution_layers(microbatch_size)
+        # In each node, the first process writes a file.
         if "0" in os.environ["CUDA_VISIBLE_DEVICES"]:
-            with Path(path).open(mode="w") as f:
-                f.write(str(layer_execution_result))
+            with path.open(mode="w") as f:
+                json.dump(layer_execution_result, f)
                 f.flush()
 
-    path = f"{directory}/allreduce_across_nodes"
-    if Path(path).exists():
+    path = directory.joinpath("allreduce_across_nodes.json")
+    if path.exists():
         logger.info("Skip profiling cross-node allreduce latency.")
     else:
         logger.info("Profiling cross-node allreduce latency.")
         allreduce_across_nodes = profiler.profile_allreduce_across_nodes()
         if "0" in os.environ["CUDA_VISIBLE_DEVICES"]:
-            with Path(path).open(mode="w") as f:
-                f.write(str(allreduce_across_nodes))
+            with path.open(mode="w") as f:
+                json.dump(allreduce_across_nodes, f)
                 f.flush()
 
-    path = f"{directory}/allreduce_in_node"
-    if Path(path).exists():
+    path = directory.joinpath("allreduce_in_node.json")
+    if path.exists():
         logger.info("Skip profiling in-node allreduce latency.")
     else:
         logger.info("Profiling in-node allreduce latency.")
         allreduce_in_node = profiler.profile_allreduce_in_node()
         if "0" in os.environ["CUDA_VISIBLE_DEVICES"]:
-            with Path(path).open(mode="w") as f:
-                f.write(str(allreduce_in_node))
+            with path.open(mode="w") as f:
+                json.dump(allreduce_in_node, f)
                 f.flush()
 
     dist.barrier()
