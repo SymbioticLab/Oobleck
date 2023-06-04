@@ -135,9 +135,9 @@ def test_profile(gpt2_model, cleanup_profile):
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="need multiple GPUs")
 def test_profile_in_node_multigpu(gpt2_model):
-    pass
+    assert False, "Not implemented yet"
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="need multiple GPUs")
 def test_profile_across_nodes_multigpu(gpt2_model):
-    pass
+    assert False, "Not implemented yet"
