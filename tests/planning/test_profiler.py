@@ -87,13 +87,12 @@ def test_profile_allreduce_across_nodes(gpt2_model, distributed):
 
 @pytest.fixture
 def cleanup_profile(gpt2_model):
-    yield
     directory = Path(
         f"/tmp/oobleck/profiles/{gpt2_model.model_name}-{gpt2_model.model_tag}"
     )
 
     # remove profiled data
-    shutil.rmtree(directory)
+    shutil.rmtree(directory, ignore_errors=True)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() == 0, reason="need at least one GPU")
@@ -112,7 +111,7 @@ def test_profile(gpt2_model, cleanup_profile):
         local_rank=0,
         microbatch_size=1,
         model_tag=gpt2_model.model_tag,
-        model_args=None,
+        model_args=gpt2_model.model_args.to_dict(),
     )
 
     assert gpt2_model.model_tag == "test"
@@ -130,7 +129,9 @@ def test_profile(gpt2_model, cleanup_profile):
             assert path.is_file()
             with path.open(mode="r") as f:
                 # check the file is json format, otherwise json.load will raise an error
-                json.load(f)
+                data = json.load(f)
+                assert isinstance(data, list)
+                assert len(data) == len(gpt2_model.model)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="need multiple GPUs")
