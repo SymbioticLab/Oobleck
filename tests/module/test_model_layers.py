@@ -29,7 +29,3 @@ def test_layers_param_on_cpu(gpt2_model):
 def test_layer_fx(gpt2_model):
     for layer in gpt2_model.model:
         assert isinstance(layer.layer, torch.fx.GraphModule)
-
-
-def test_forward(gpt2_model):
-    pass
