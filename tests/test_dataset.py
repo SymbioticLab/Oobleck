@@ -18,25 +18,3 @@ def test_init_image_dataset(imagenet_dataset):
     assert isinstance(imagenet_dataset.dataset["train"], Dataset)
     assert isinstance(imagenet_dataset.dataset["validation"], Dataset)
     assert isinstance(imagenet_dataset.tokenizer, BaseImageProcessor)
-
-
-# class TestOobleckDataset(unittest.TestCase):
-#     def test_init_text_dataset(self):
-#         dataset = OobleckDataset("gpt2", "wikitext", "wikitext-2-raw-v1")
-#         self.assertIn("train", dataset.dataset)
-#         self.assertIn("validation", dataset.dataset)
-#         self.assertIsInstance(dataset.dataset["train"], Dataset)
-#         self.assertIsInstance(dataset.dataset["validation"], Dataset)
-#         self.assertIsInstance(dataset.tokenizer, PreTrainedTokenizerBase)
-
-#     def test_init_image_dataset(self):
-#         dataset = OobleckDataset("microsoft/resnet-152", "Maysee/tiny-imagenet")
-#         self.assertIn("train", dataset.dataset)
-#         self.assertIn("validation", dataset.dataset)
-#         self.assertIsInstance(dataset.dataset["train"], Dataset)
-#         self.assertIsInstance(dataset.dataset["validation"], Dataset)
-#         self.assertIsInstance(dataset.tokenizer, BaseImageProcessor)
-
-
-# if __name__ == "__main__":
-#     unittest.main()

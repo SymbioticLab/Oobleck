@@ -19,7 +19,7 @@ def imagenet_dataset():
     return OobleckDataset("microsoft/resnet-152", "Maysee/tiny-imagenet")
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture()
 def dataloaders(wikitext_dataset):
     training_args = TrainingArguments(
         output_dir="/tmp/output",

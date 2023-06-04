@@ -7,13 +7,11 @@ from typing import List
 from tests.conftest import TRAIN_BATCH_SIZE, EVAL_BATCH_SIZE, GRADIENT_ACCUMULATION_STEP
 
 
-@pytest.mark.dependency()
 def test_dataloaders(dataloaders: List[OobleckDataLoader]):
     assert isinstance(dataloaders[0], OobleckDataLoader)
     assert isinstance(dataloaders[1], OobleckDataLoader)
 
 
-@pytest.mark.dependency()
 def test_samplers(dataloaders: List[OobleckDataLoader]):
     # Train dataloader microbatch size should be 8,
     # while eval dataloader microbatch size 4.
@@ -29,7 +27,6 @@ def test_samplers(dataloaders: List[OobleckDataLoader]):
     assert dataloaders[1].batch_sampler.consumed_samples == 0
 
 
-@pytest.mark.dependency(depends=["test_samplers"])
 def test_batch_train_samples(dataloaders):
     assert dataloaders[0].batch_sampler.consumed_samples == 0
     train_inputs = next(iter(dataloaders[0]))
@@ -40,7 +37,6 @@ def test_batch_train_samples(dataloaders):
         assert tensor.size(dim=0) == TRAIN_BATCH_SIZE
 
 
-@pytest.mark.dependency(depends=["test_samplers"])
 def test_batch_eval_samples(dataloaders):
     assert dataloaders[1].batch_sampler.consumed_samples == 0
     eval_inputs = next(iter(dataloaders[1]))
@@ -51,7 +47,6 @@ def test_batch_eval_samples(dataloaders):
         assert tensor.size(dim=0) == EVAL_BATCH_SIZE
 
 
-@pytest.mark.dependency(depends=["test_batch_train_samples", "test_batch_eval_samples"])
 def test_stop_iteration(dataloaders):
     num_iteration = len(dataloaders[0]) * GRADIENT_ACCUMULATION_STEP
     iterator = iter(dataloaders[0])
