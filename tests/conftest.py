@@ -1,5 +1,6 @@
 from oobleck.execution.dataset import OobleckDataset
 from oobleck.execution.dataloader import OobleckDataLoader, LoaderType
+from oobleck.module.model import OobleckModel
 
 from transformers import TrainingArguments
 import pytest
@@ -19,7 +20,7 @@ def imagenet_dataset():
     return OobleckDataset("microsoft/resnet-152", "Maysee/tiny-imagenet")
 
 
-@pytest.fixture()
+@pytest.fixture
 def dataloaders(wikitext_dataset):
     training_args = TrainingArguments(
         output_dir="/tmp/output",
@@ -50,3 +51,16 @@ def dataloaders(wikitext_dataset):
         0,
     )
     return training_dataloader, eval_dataloader
+
+
+@pytest.fixture(scope="session")
+def gpt2_model(wikitext_dataset):
+    # Refer to oobleck/examples/*.py for model arguments
+    # gpt2-medium
+    model_args = {
+        "num_hidden_layers": 24,
+        "n_positions": 1024,
+        "n_embd": 1024,
+        "n_head": 16,
+    }
+    return OobleckModel("gpt2", wikitext_dataset.sample, None, "test", model_args)
