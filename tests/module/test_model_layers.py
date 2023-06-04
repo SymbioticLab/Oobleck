@@ -10,7 +10,7 @@ from oobleck.module.sharding import get_split_points
 def test_gpt_model(gpt2_model):
     assert isinstance(gpt2_model, OobleckModel)
     assert gpt2_model.model_name == "gpt2"
-    assert gpt2_model.model_tag == "medium"
+    assert gpt2_model.model_tag == "test"
 
 
 def test_layers(gpt2_model):
