@@ -21,6 +21,8 @@ dependencies:
   - ninja
   - cmake
   - tbb-devel
+  - pytest
+  - pytest-dependency
   - pip:
     - transformers>=4.26.0
     - deepspeed>=0.8.1
@@ -33,5 +35,3 @@ dependencies:
     - evaluate
     - scikit-learn
     - dill
-    - pytest
-    - pytest-dependency
