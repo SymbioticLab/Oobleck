@@ -1,12 +1,19 @@
 cmake_minimum_required(VERSION 3.13)
 
-project(pipeline_template)
+if (NOT DEFINED ENV{CONDA_PREFIX})
+    message(FATAL_ERROR "CONDA_PREFIX is not defined")
+endif()
+
+# list(APPEND CMAKE_PREFIX_PATH $ENV{CONDA_PREFIX}/share/cmake/pybind11)
+set(pybind11_DIR $ENV{CONDA_PREFIX}/share/cmake/pybind11)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # -O2 has an unknown bug and managing std::shared_ptr reference count returns a segmentation fault.
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O1 -DNDEBUG")
+
+project(pipeline_template)
 
 find_package(pybind11 REQUIRED)
 find_package(TBB REQUIRED)

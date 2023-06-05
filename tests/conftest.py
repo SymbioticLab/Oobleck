@@ -1,6 +1,7 @@
 from oobleck.execution.dataset import OobleckDataset
 from oobleck.execution.dataloader import OobleckDataLoader, LoaderType
 from oobleck.module.model import OobleckModel
+from pipeline_template import PipelineTemplateGenerator
 
 from transformers import TrainingArguments
 import pytest
@@ -64,3 +65,8 @@ def gpt2_model(wikitext_dataset):
         "n_head": 16,
     }
     return OobleckModel("gpt2", wikitext_dataset.sample, None, "test", model_args)
+
+
+@pytest.fixture(scope="module")
+def pipeline_template_generator():
+    return PipelineTemplateGenerator()

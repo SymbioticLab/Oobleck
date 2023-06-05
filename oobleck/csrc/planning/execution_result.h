@@ -51,7 +51,7 @@ class StageExecutionResult {
  public:
   StageExecutionResult(
       const std::shared_ptr<std::vector<LayerExecutionResult>> layer_results,
-      const std::tuple<int, int>& layer_indices,
+      const std::tuple<int, int> layer_indices,
       int device_num)
       : device_num_(device_num) {
     int layer_start_index = std::get<0>(layer_indices);

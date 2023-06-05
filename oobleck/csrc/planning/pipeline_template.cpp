@@ -11,9 +11,9 @@
 #include <ranges>
 #include <string>
 
-#ifdef PYBIND11_MODULE
-#include <pybind11/pybind11.h>
-#endif
+// #ifdef PYBIND11_MODULE
+// #include <pybind11/pybind11.h>
+// #endif
 
 /**
  * Section 4.1.2. GPU-Stage Mapping using divide and conquer algorithm.
@@ -23,8 +23,8 @@
 
 namespace oobleck {
 
-CacheMap PipelineTemplateGenerator::dc_cache_;
-cppcoro::static_thread_pool PipelineTemplateGenerator::thread_pool_;
+// CacheMap PipelineTemplateGenerator::dc_cache_;
+// cppcoro::static_thread_pool PipelineTemplateGenerator::thread_pool_;
 
 std::shared_ptr<std::vector<LayerExecutionResult>>
 PipelineTemplateGenerator::get_profiler_results(const std::string& model_name,
@@ -77,15 +77,15 @@ PipelineTemplateGenerator::get_profiler_results(const std::string& model_name,
 
 std::vector<PipelineTemplate>
 PipelineTemplateGenerator::create_pipeline_templates(
-    const std::string& model_name,
-    const std::string& model_tag,
+    const std::string model_name,
+    const std::string model_tag,
     const int microbatch_size,
     const std::tuple<int, int> num_nodes,
     const int num_gpus_per_node) {
-#ifdef PYBIND11_MODULE
-  // Release GIL
-  pybind11::gil_scoped_release release;
-#endif
+  // #ifdef PYBIND11_MODULE
+  //   // Release GIL
+  //   pybind11::gil_scoped_release release;
+  // #endif
   int min_num_nodes = std::get<0>(num_nodes);
   int max_num_nodes = std::get<1>(num_nodes);
 
@@ -112,15 +112,15 @@ PipelineTemplateGenerator::create_pipeline_templates(
   }
 
   std::vector<PipelineTemplate> pipeline_templates;
-  for (auto num_node_tasks = tasks.begin(); num_node_tasks != tasks.end();
-       // for (auto num_node_tasks = tasks.rbegin(); num_node_tasks !=
-       // tasks.rend();
-       num_node_tasks++) {
-    std::cout << "Waiting for tasks for " << num_node_tasks->first << " nodes"
+  // for (auto num_node_tasks = tasks.rbegin(); num_node_tasks !=
+  // tasks.rend();
+  // for (auto&& num_node_tasks = tasks.begin(); num_node_tasks != tasks.end();
+  //      num_node_tasks++) {
+  for (auto&& num_node_tasks : tasks) {
+    std::cout << "Waiting for tasks for " << num_node_tasks.first << " nodes"
               << std::endl;
     std::vector<std::shared_ptr<DCExecutionResult>> results =
-        cppcoro::sync_wait(
-            cppcoro::when_all(std::move(num_node_tasks->second)));
+        cppcoro::sync_wait(cppcoro::when_all(std::move(num_node_tasks.second)));
     std::cout << "Wait done" << std::endl;
 
     std::cout << "Cache hit: " << cache_hit_.load()
@@ -150,16 +150,16 @@ PipelineTemplateGenerator::create_pipeline_templates(
            optimal_result->get_stages().size() > 0);
     pipeline_templates.emplace_back(
         PipelineTemplate(optimal_result->get_stages(), optimal_result->get_t(),
-                         layer_execution_results->size(), num_node_tasks->first,
+                         layer_execution_results->size(), num_node_tasks.first,
                          num_gpus_per_node));
   }
 
-#ifdef PYBIND11_MODULE
-  // Acquire GIL
-  pybind11::gil_scoped_acquire acquire;
-#endif
+  // #ifdef PYBIND11_MODULE
+  //   // Acquire GIL
+  //   pybind11::gil_scoped_acquire acquire;
+  // #endif
 
-  return std::move(pipeline_templates);
+  return pipeline_templates;
 }
 
 /**
@@ -168,7 +168,7 @@ PipelineTemplateGenerator::create_pipeline_templates(
 cppcoro::task<std::shared_ptr<DCExecutionResult>>
 PipelineTemplateGenerator::divide_and_conquer(
     std::shared_ptr<std::vector<LayerExecutionResult>> layer_execution_results,
-    const std::tuple<int, int>& layer_indices,
+    const std::tuple<int, int> layer_indices,
     const int num_stages,
     const int num_nodes,
     const int num_gpus_per_node) {
@@ -236,7 +236,7 @@ PipelineTemplateGenerator::divide_and_conquer(
 
   // Divide phase
   for (int k : std::ranges::iota_view<int, int>(start_layer_index + 1,
-                                                end_layer_index)) {
+                                                end_layer_index - 1)) {
     if (num_nodes == 1) {
       // Split GPUs in a node
       for (int num_gpus_left :
