@@ -60,6 +60,7 @@ def test_create_pipeline_templates_noderange(gpt2_model, pipeline_template_gener
     )
     assert 0 < len(pipeline_templates) <= len(gpt2_model.model)
     assert 0 < pipeline_templates[0].get_num_nodes() <= len(gpt2_model.model)
+    assert len(pipeline_templates[0].get_stages()) == 1
     assert len(pipeline_templates[-1].get_stages()) == len(gpt2_model.model)
     for pipeline_template in pipeline_templates:
         assert pipeline_templates[0].get_num_gpus_per_node() == 1
@@ -78,7 +79,14 @@ def test_create_pipeline_templates_multimicrobatch(
         (1, len(gpt2_model.model)),  # num nodes range
         1,
     )
-    assert len(pipeline_templates) <= len(gpt2_model.model)
+    assert 0 < len(pipeline_templates) <= len(gpt2_model.model)
+    assert 0 < pipeline_templates[0].get_num_nodes() <= len(gpt2_model.model)
+    assert len(pipeline_templates[0].get_stages()) == 1
+    assert len(pipeline_templates[-1].get_stages()) == len(gpt2_model.model)
+    for pipeline_template in pipeline_templates:
+        assert pipeline_templates[0].get_num_gpus_per_node() == 1
+        assert len(pipeline_template.get_stages()) > 0
+        assert pipeline_template.get_iteration_time() > 0
 
 
 @pytest.mark.skip(reason="TODO")

@@ -59,7 +59,7 @@ def gpt2_model(wikitext_dataset):
     # Refer to oobleck/examples/*.py for model arguments
     # gpt2-medium
     model_args = {
-        "num_hidden_layers": 24,
+        "num_hidden_layers": 32,
         "n_positions": 1024,
         "n_embd": 1024,
         "n_head": 16,
