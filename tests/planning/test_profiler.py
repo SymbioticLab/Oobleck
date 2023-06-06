@@ -85,8 +85,9 @@ def test_profile_allreduce_across_nodes(gpt2_model, distributed):
         assert 1 in layer_result  # key is # nodes
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def cleanup_profile(gpt2_model):
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     directory = Path(
         f"/tmp/oobleck/profiles/{gpt2_model.model_name}-{gpt2_model.model_tag}"
     )
@@ -100,7 +101,6 @@ def test_profile(gpt2_model, cleanup_profile):
     # This test repeats overall profiling but also
     # checks if they are properly written to files.
     # profile initializes process group, so it does not require the fixture.
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     profile(
         model_name=gpt2_model.model_name,
         sample_inputs=gpt2_model.sample_inputs,
@@ -114,7 +114,6 @@ def test_profile(gpt2_model, cleanup_profile):
         model_args=gpt2_model.model_args.to_dict(),
     )
 
-    assert gpt2_model.model_tag == "test"
     directory = Path(
         f"/tmp/oobleck/profiles/{gpt2_model.model_name}-{gpt2_model.model_tag}"
     )
@@ -132,6 +131,29 @@ def test_profile(gpt2_model, cleanup_profile):
                 data = json.load(f)
                 assert isinstance(data, list)
                 assert len(data) == len(gpt2_model.model)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() == 0, reason="need at least one GPU")
+def test_profile_multimicrobatch(gpt2_model, cleanup_profile):
+    directory = Path(
+        f"/tmp/oobleck/profiles/{gpt2_model.model_name}-{gpt2_model.model_tag}"
+    )
+    assert not directory.joinpath("mb4.json").exists()
+
+    profile(
+        model_name=gpt2_model.model_name,
+        sample_inputs=gpt2_model.sample_inputs,
+        master_addr="localhost",
+        master_port=12357,
+        world_size=1,
+        rank=0,
+        local_rank=0,
+        microbatch_size=4,
+        model_tag=gpt2_model.model_tag,
+        model_args=gpt2_model.model_args.to_dict(),
+    )
+
+    assert directory.joinpath("mb4.json").exists()
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="need multiple GPUs")

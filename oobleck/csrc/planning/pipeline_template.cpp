@@ -11,9 +11,9 @@
 #include <ranges>
 #include <string>
 
-// #ifdef PYBIND11_MODULE
-// #include <pybind11/pybind11.h>
-// #endif
+#ifdef PYBIND11_MODULE
+#include <pybind11/pybind11.h>
+#endif
 
 /**
  * Section 4.1.2. GPU-Stage Mapping using divide and conquer algorithm.
@@ -82,10 +82,10 @@ PipelineTemplateGenerator::create_pipeline_templates(
     const int microbatch_size,
     const std::tuple<int, int> num_nodes,
     const int num_gpus_per_node) {
-  // #ifdef PYBIND11_MODULE
-  //   // Release GIL
-  //   pybind11::gil_scoped_release release;
-  // #endif
+#ifdef PYBIND11_MODULE
+  // Release GIL
+  pybind11::gil_scoped_release release;
+#endif
   int min_num_nodes = std::get<0>(num_nodes);
   int max_num_nodes = std::get<1>(num_nodes);
 
@@ -95,13 +95,13 @@ PipelineTemplateGenerator::create_pipeline_templates(
 
   std::map<int, std::vector<cppcoro::task<std::shared_ptr<DCExecutionResult>>>>
       tasks;
-  for (int i = min_num_nodes; i < max_num_nodes; i++) {
+  for (int i = min_num_nodes; i <= max_num_nodes; i++) {
     std::cout << "Creating tasks for " << i << " nodes" << std::endl;
     int min_num_stages = i;
     int max_num_stages = layer_execution_results->size();
     std::vector<cppcoro::task<std::shared_ptr<DCExecutionResult>>>
         num_node_tasks;
-    for (int num_stages = min_num_stages; num_stages < max_num_stages;
+    for (int num_stages = min_num_stages; num_stages <= max_num_stages;
          num_stages++) {
       num_node_tasks.emplace_back(divide_and_conquer(
           layer_execution_results,
@@ -154,10 +154,10 @@ PipelineTemplateGenerator::create_pipeline_templates(
                          num_gpus_per_node));
   }
 
-  // #ifdef PYBIND11_MODULE
-  //   // Acquire GIL
-  //   pybind11::gil_scoped_acquire acquire;
-  // #endif
+#ifdef PYBIND11_MODULE
+  // Acquire GIL
+  pybind11::gil_scoped_acquire acquire;
+#endif
 
   return pipeline_templates;
 }
@@ -211,7 +211,7 @@ PipelineTemplateGenerator::divide_and_conquer(
       infeasible = true;
     }
   } else if (num_nodes > num_stages) {
-    // Two ore more node cannot be assigned to the same stage
+    // Two or more node cannot be assigned to the same stage
     infeasible = true;
   }
 
@@ -236,7 +236,7 @@ PipelineTemplateGenerator::divide_and_conquer(
 
   // Divide phase
   for (int k : std::ranges::iota_view<int, int>(start_layer_index + 1,
-                                                end_layer_index - 1)) {
+                                                end_layer_index)) {
     if (num_nodes == 1) {
       // Split GPUs in a node
       for (int num_gpus_left :
