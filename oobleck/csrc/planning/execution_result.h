@@ -52,8 +52,8 @@ class StageExecutionResult {
   StageExecutionResult(
       const std::shared_ptr<std::vector<LayerExecutionResult>> layer_results,
       const std::tuple<int, int> layer_indices,
-      int device_num)
-      : device_num_(device_num) {
+      const int num_gpus)
+      : num_gpus_(num_gpus) {
     int layer_start_index = std::get<0>(layer_indices);
     int layer_end_index = std::get<1>(layer_indices);
     assert(layer_end_index <= layer_results->size());
@@ -63,9 +63,9 @@ class StageExecutionResult {
       forward_ += (*layer_results)[i].forward_;
       backward_ += (*layer_results)[i].backward_;
 
-      if (device_num_ > 1) {
-        forward_ += (*layer_results)[i].allreduce_in_node_.at(device_num_ - 1);
-        backward_ += (*layer_results)[i].allreduce_in_node_.at(device_num_ - 1);
+      if (num_gpus_ > 1) {
+        forward_ += (*layer_results)[i].allreduce_in_node_.at(num_gpus_ - 1);
+        backward_ += (*layer_results)[i].allreduce_in_node_.at(num_gpus_ - 1);
       }
 
       for (const auto& it : (*layer_results)[i].allreduce_cross_nodes_) {
@@ -76,19 +76,19 @@ class StageExecutionResult {
     }
   }
 
-  int device_num() const { return device_num_; }
-  int memory_consumption() const { return mem_required_ / device_num_; }
+  int get_num_gpus() const { return num_gpus_; }
+  int get_memory_consumption() const { return mem_required_ / num_gpus_; }
   int num_layers() const { return layer_indices_.size(); }
   std::string to_string() const {
     int first_layer_index = layer_indices_.front();
     int last_layer_index = layer_indices_.back();
     return "StageExecutionResult[" + std::to_string(first_layer_index) + ":" +
            std::to_string(last_layer_index) + "] with " +
-           std::to_string(device_num_) + " devices";
+           std::to_string(num_gpus_) + " devices";
   }
 
  private:
-  int device_num_;
+  int num_gpus_;
   std::vector<int> layer_indices_;
   double forward_;
   double backward_;

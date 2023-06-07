@@ -2,147 +2,121 @@ import pyomo.environ as pyomo
 import torch.distributed
 
 from collections import defaultdict
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Optional
 
 from deepspeed import comm as dist
 from deepspeed.utils import logger
 
-from pipeline_template import PipelineTemplate, PipelineTemplateGenerator
+from pipeline_template import PipelineTemplate
 from oobleck.execution.pipeline import OobleckPipeline
-from oobleck.execution.dataloader import OobleckTrainDataLoader
+from oobleck.execution.dataloader import OobleckDataLoader
 from oobleck.module.model import OobleckModel
 from oobleck.planning.profiler import LayerExecutionResult
 
 from transformers import TrainingArguments
 
 
-class HeterogeneousPipelineExecutionPlan:
+class HeterogeneousPipelinesExecutionPlan:
     def __init__(
         self,
-        model_layers: List[LayerExecutionResult],
         pipeline_templates: List[PipelineTemplate],
         num_instances_set: Dict[PipelineTemplate, int],
         num_microbatches_set: Dict[PipelineTemplate, int],
+        allreduce_across_nodes: List[Dict[int, float]],
     ):
-        self.model_layers = model_layers
+        pipeline_templates = [
+            template
+            for template in pipeline_templates
+            if template in num_instances_set and template in num_microbatches_set
+        ]
+        pipeline_templates.sort(key=lambda template: template.get_num_nodes())
+
         self.pipeline_templates = pipeline_templates
         self.num_instances_set = num_instances_set
         self.num_microbatches_set = num_microbatches_set
+        self.allreduce_across_nodes = allreduce_across_nodes
+
         self.num_pipelines = sum(
             num_instances for num_instances in num_instances_set.values()
         )
-        self.num_nodes = sum(
-            pipeline_template.get_num_nodes() * num_instances
-            for pipeline_template, num_instances in num_instances_set.items()
+        self.total_num_microbatches = sum(
+            self.num_instances_set[template] * self.num_microbatches_set[template]
+            for template in self.pipeline_templates
         )
 
     def __repr__(self) -> str:
         result = ""
-        total_num_microbatches = 0
         for template in self.pipeline_templates:
-            if (
-                template not in self.num_instances_set
-                or template not in self.num_microbatches_set
-            ):
-                continue
             result += (
                 f"{self.num_instances_set[template]} x {template} pipelines "
-                f"(num microbatches: {self.num_microbatches_set[template]})\n"
+                f"(b: {self.num_microbatches_set[template]})\n"
             )
-            total_num_microbatches += (
-                self.num_instances_set[template] * self.num_microbatches_set[template]
-            )
-        result += f"total microbatches: {total_num_microbatches}"
+        result += f"B: {self.total_num_microbatches}"
         return result
 
     @property
     def iteration_time(self) -> float:
-        # Insu: pipeline templates are all optimal plans.
-        # Implement getting iteration time in PipelineTemplate into C++ and use it.
+        # TODO: should be divided by number of stages?
         max_iteration_time = max(
-            pipeline_template.get_iteration_time()
-            * num_microbatches
-            / len(pipeline_template.get_stages())
+            pipeline_template.get_iteration_time() * num_microbatches
             for pipeline_template, num_microbatches in self.num_microbatches_set.items()
         )
 
         # FIXME: currently we only consider communication overhead
         # of the first layer, believing communication of other layers
         # can fully be hidden in backward pass computing.
-        synchronization_overhead = self.model_layers[0].allreduce_cross_nodes[
-            self.num_pipelines
-        ]
+        synchronization_overhead = self.allreduce_across_nodes[0][self.num_pipelines]
 
-        logger.debug(
-            f"iteration_time of execution plan {self.num_instances_set}: {max_iteration_time + synchronization_overhead}"
-        )
         return max_iteration_time + synchronization_overhead
 
     @property
-    def average_num_nodes(self) -> float:
-        total_num_nodes = sum(
-            pipeline_template.get_num_nodes() * num_instance
-            for pipeline_template, num_instance in self.num_instances_set.items()
-        )
-        total_num_instances = sum(list(self.num_instances_set.values()))
-        return total_num_nodes / total_num_instances
+    def num_microbatches_of_mine(self) -> int:
+        assert dist.is_initialized()
+        rank = dist.get_rank()
+        assert rank >= 0
 
-    def get_my_number_of_microbatches(self, global_rank: int) -> int:
-        """This is for creating dataloader with number of microbatches.
-
-        Returns:
-            int: number of microbatches for this rank
-        """
         num_ranks_used = 0
-        for pipeline_template in self.pipeline_templates:
-            num_ranks_spec = (
-                pipeline_template.get_num_nodes()
-                * pipeline_template.get_num_gpus_per_node()
-                * self.num_instances_set[pipeline_template]
+        for template, num_instances in self.num_instances_set.items():
+            num_ranks_for_templates = (
+                template.get_num_nodes()
+                * template.get_num_gpus_per_node()
+                * num_instances
             )
-            if global_rank in range(num_ranks_used, num_ranks_used + num_ranks_spec):
-                return self.num_microbatches_set[pipeline_template]
-            num_ranks_used += num_ranks_spec
+            num_ranks_used += num_ranks_for_templates
+            if rank < num_ranks_used:
+                return self.num_microbatches_set[template]
 
-        ValueError("Cannot find a range that the global rank falls.")
+        raise ValueError("Cannot find a range that the global rank falls.")
 
     def instantiate(
         self,
         model: OobleckModel,
-        dataloader: OobleckTrainDataLoader,
+        dataloader: OobleckDataLoader,
         training_args: TrainingArguments,
         step: int = 0,
-    ) -> Tuple[OobleckPipeline, List[List[int]]]:
+    ) -> List[OobleckPipeline]:
         my_pipeline: Optional[OobleckPipeline] = None
-        total_num_nodes_used = 0
+        total_num_gpus_used = 0
 
-        pipeline_ranks: List[List[int]] = []
+        for pipeline_template, num_instances in self.num_instances_set.items():
+            num_gpus_per_template = (
+                pipeline_template.get_num_nodes()
+                * pipeline_template.get_num_gpus_per_node()
+            )
 
-        for pipeline_template in self.pipeline_templates:
-            for _ in range(self.num_instances_set[pipeline_template]):
-                # TODO: implement FSDP by considering spec.num_gpus_per_node
-                ranks_to_layer_map = []
-                ranks = []
-                for stage in pipeline_template.get_stages():
-                    ranks_to_layer_map.extend(
-                        [total_num_nodes_used for _ in stage.num_layers()]
-                    )
-                    ranks.append(total_num_nodes_used)
-                    total_num_nodes_used += 1
-
-                assert len(ranks_to_layer_map) == len(
-                    self.model_layers
-                ), "# ranks does not match to # layers."
-
-                pipeline_ranks.append(ranks_to_layer_map)
-                total_num_nodes_used += pipeline_template.get_num_nodes()
-                process_group = torch.distributed.new_group(ranks)
-
+            for _ in range(num_instances):
                 logger.info(
-                    f"Instantiating a {len(pipeline_template.get_stages())}-stage "
-                    f"pipeline with {pipeline_template.get_num_nodes()} nodes"
+                    f"Instantiating a pipeline "
+                    f"({len(pipeline_template.get_stages())} stages with {pipeline_template.get_num_nodes()}) nodes)"
                 )
 
+                ranks = list(
+                    range(
+                        total_num_gpus_used, total_num_gpus_used + num_gpus_per_template
+                    )
+                )
+                total_num_gpus_used += num_gpus_per_template
+                process_group = torch.distributed.new_group(ranks)
                 if dist.get_rank(process_group) >= 0:
                     assert my_pipeline is None
                     my_pipeline = OobleckPipeline(
@@ -150,22 +124,23 @@ class HeterogeneousPipelineExecutionPlan:
                         model,
                         dataloader,
                         step,
+                        ranks,
                         process_group,
                         training_args,
                     )
 
         assert my_pipeline, "No pipeline has been initiated for this rank"
-        return my_pipeline, pipeline_ranks
+        return my_pipeline
 
 
 class PipelineInstantiator:
     def get_best_execution_plan(
         self,
-        model_layers: List[LayerExecutionResult],
         pipeline_templates: List[PipelineTemplate],
+        allreduce_across_nodes: List[Dict[int, float]],
         num_nodes: int,
         global_num_microbatch: int,
-    ) -> HeterogeneousPipelineExecutionPlan:
+    ) -> HeterogeneousPipelinesExecutionPlan:
         """
         Section 4.2. Pipeline Instantiation implementation
         """
@@ -178,12 +153,12 @@ class PipelineInstantiator:
             for num_instances_set in num_instances_set_list
         ]
 
-        execution_plans: List[HeterogeneousPipelineExecutionPlan] = [
-            HeterogeneousPipelineExecutionPlan(
-                model_layers,
+        execution_plans: List[HeterogeneousPipelinesExecutionPlan] = [
+            HeterogeneousPipelinesExecutionPlan(
                 pipeline_templates,
                 num_instances_set,
                 num_microbatches_set,
+                allreduce_across_nodes,
             )
             for num_instances_set, num_microbatches_set in zip(
                 num_instances_set_list, num_microbatches_set_list
@@ -191,11 +166,11 @@ class PipelineInstantiator:
             if num_instances_set is not None and num_microbatches_set is not None
         ]
 
-        result: HeterogeneousPipelineExecutionPlan = min(
+        result: HeterogeneousPipelinesExecutionPlan = min(
             execution_plans, key=lambda plan: plan.iteration_time
         )
 
-        logger.info(f"Best execution plan: {result.num_instances_set}")
+        logger.info(f"Best execution plan: {result}")
         return result
 
     def _enumerate_instantiation_options(
@@ -217,9 +192,9 @@ class PipelineInstantiator:
             for j in range(1, num_nodes + 1):
                 # (1) in Figure: copy all dicts
                 dp[i][j] = [combo.copy() for combo in dp[i - 1][j]]
-                if pipeline_templates[i - 1].num_nodes <= j:
+                if pipeline_templates[i - 1].get_num_nodes() <= j:
                     # (2) in Figure: copy all dicts with one pipeline_templates[i - 1] added
-                    for combo in dp[i][j - pipeline_templates[i - 1].num_nodes]:
+                    for combo in dp[i][j - pipeline_templates[i - 1].get_num_nodes()]:
                         new_combo = combo.copy()
                         new_combo[pipeline_templates[i - 1]] += 1
 
@@ -256,7 +231,7 @@ class PipelineInstantiator:
         model.I = pyomo.Set(initialize=list(range(len(num_instances_set))))
 
         T = {
-            i: pipeline_template.get_iteration_time() / 10
+            i: pipeline_template.get_iteration_time()
             for i, pipeline_template in enumerate(num_instances_set)
         }
 

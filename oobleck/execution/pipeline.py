@@ -12,7 +12,7 @@ from deepspeed.runtime.pipe import schedule
 from deepspeed.ops.adam import FusedAdam
 from deepspeed.runtime.lr_schedules import WarmupLR
 
-from oobleck.execution.dataloader import OobleckTrainDataLoader
+from oobleck.execution.dataloader import OobleckDataLoader
 from oobleck.module.layer import Layer
 from oobleck.module.model import OobleckModel
 from oobleck.module.layer import is_checkpointable
@@ -107,7 +107,7 @@ class PipelineExecutionMixin(object):
         self,
         model_layers: List[Layer],
         training_args: TrainingArguments,
-        dataloader: OobleckTrainDataLoader,
+        dataloader: OobleckDataLoader,
         step: int,
         **kwargs,
     ):
@@ -493,21 +493,13 @@ INSTRUCTION_MAP = {
 
 
 class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
-    """
-    A realization of :class:`oobleck.planning.pipeline_spec.PipelineSpec`.
-    It includes model to run, communication groups for pipeline execution,
-    required functions for pipeline parallel execution of one pipeline.
-
-    Note that it only communicates within the given process_group with local ranks,
-    not global ranks.
-    """
-
     def __init__(
         self,
         pipeline_template: PipelineTemplate,
         model: OobleckModel,
-        dataloader: OobleckTrainDataLoader,
+        dataloader: OobleckDataLoader,
         step: int,
+        ranks: List[int],
         process_group: ProcessGroup,
         training_args: TrainingArguments,
     ):
