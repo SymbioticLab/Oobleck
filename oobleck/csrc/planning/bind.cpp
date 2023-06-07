@@ -10,6 +10,8 @@ PYBIND11_MODULE(pipeline_template, m) {
   py::class_<oobleck::StageExecutionResult,
              std::shared_ptr<oobleck::StageExecutionResult>>(
       m, "StageExecutionResult")
+      .def("get_layer_indices",
+           &oobleck::StageExecutionResult::get_layer_indices)
       .def("get_num_gpus", &oobleck::StageExecutionResult::get_num_gpus)
       .def("get_memory_consumption",
            &oobleck::StageExecutionResult::get_memory_consumption);

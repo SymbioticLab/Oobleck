@@ -76,6 +76,7 @@ class StageExecutionResult {
     }
   }
 
+  const std::vector<int>& get_layer_indices() const { return layer_indices_; }
   int get_num_gpus() const { return num_gpus_; }
   int get_memory_consumption() const { return mem_required_ / num_gpus_; }
   int num_layers() const { return layer_indices_.size(); }

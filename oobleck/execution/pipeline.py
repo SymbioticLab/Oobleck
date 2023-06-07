@@ -492,6 +492,7 @@ INSTRUCTION_MAP = {
 }
 
 
+# FIXME: all ranks now should be changed to the global rank.
 class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
     def __init__(
         self,
@@ -503,17 +504,22 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         process_group: ProcessGroup,
         training_args: TrainingArguments,
     ):
-        self.layer_spec = spec.layer_spec
+        self.ranks = ranks
         self.model = model
         self.total_num_layers = len(model.model)
         self.timer = OobleckTimer()
 
-        my_rank = dist.get_rank(process_group)
-        model_layers = [
-            layer.to("cuda")
-            for layer, layer_rank in zip(model.model, self.layer_spec)
-            if my_rank == layer_rank
-        ]
+        my_rank = dist.get_rank()
+        for stage in pipeline_template.get_stages():
+            layer_indices = stage.get_layer_indices()
+            if my_rank not in range(layer_indices[0], layer_indices[1]):
+                continue
+
+            model_layers = [
+                layer.to("cuda")
+                for layer in model.model[layer_indices[0] : layer_indices[1]]
+            ]
+        assert model_layers
 
         super().__init__(
             model_layers=model_layers,
