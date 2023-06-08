@@ -2,6 +2,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+import shutil
 
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
@@ -91,6 +92,20 @@ class CmakeBuild(build_ext):
         subprocess.run(
             ["cmake", "--build", ".", *build_args], cwd=build_temp, check=True
         )
+
+    def run(self):
+        # First, run the original build_ext command
+        build_ext.run(self)
+
+        # Then, move the built library to the desired location
+        source = Path(self.build_lib).glob("pipeline_template*.so")
+        if not source:
+            raise RuntimeError("Cannot find built library")
+
+        source: Path = list(source)[0]
+        target_dir = Path.cwd().joinpath("oobleck/csrc/planning")
+        assert target_dir.is_dir()
+        shutil.move(source, target_dir.joinpath(source.name))
 
 
 setup(

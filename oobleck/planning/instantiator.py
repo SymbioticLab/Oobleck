@@ -7,11 +7,10 @@ from typing import List, Dict, Optional
 from deepspeed import comm as dist
 from deepspeed.utils import logger
 
-from pipeline_template import PipelineTemplate
+from oobleck.csrc.planning.pipeline_template import PipelineTemplate
 from oobleck.execution.pipeline import OobleckPipeline
 from oobleck.execution.dataloader import OobleckDataLoader
 from oobleck.module.model import OobleckModel
-from oobleck.planning.profiler import LayerExecutionResult
 
 from transformers import TrainingArguments
 

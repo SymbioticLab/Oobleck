@@ -22,7 +22,7 @@ from oobleck.execution.utils import (
     DTYPE_TO_ID,
     ID_TO_DTYPE,
 )
-from pipeline_template import PipelineTemplate
+from oobleck.csrc.planning.pipeline_template import PipelineTemplate
 from oobleck.utils.timer import OobleckTimer, measure_time
 
 from transformers import TrainingArguments

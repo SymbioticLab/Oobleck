@@ -1,7 +1,7 @@
 from oobleck.execution.dataset import OobleckDataset
 from oobleck.execution.dataloader import OobleckDataLoader, LoaderType
 from oobleck.module.model import OobleckModel
-from pipeline_template import PipelineTemplateGenerator
+from oobleck.csrc.planning.pipeline_template import PipelineTemplateGenerator
 
 from transformers import TrainingArguments
 import pytest
