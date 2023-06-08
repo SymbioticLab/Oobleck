@@ -186,16 +186,14 @@ class PipelineExecution:
 
         if self.pipeline.is_first_stage():
             batch = next(self.data_iterator)
-            self.pipeline.communication.pipe_buffers["inputs"][
-                buffer_id
-            ] = self._prepare_inputs(batch)
+            self.pipeline.pipe_buffers["inputs"][buffer_id] = self._prepare_inputs(
+                batch
+            )
 
     @instrument_w_nvtx
     @measure_time("execution/forward")
     def forward_pass(self, buffer_id: int):
-        inputs: tuple[torch.Tensor] = self.pipeline.communication.pipe_buffers[
-            "inputs"
-        ][buffer_id]
+        inputs: tuple[torch.Tensor] = self.pipeline.pipe_buffers["inputs"][buffer_id]
         zero_grads(inputs)
 
         # XXX Hack
@@ -245,7 +243,7 @@ class PipelineExecution:
                 ]
             )
 
-            self.pipeline.communication.pipe_buffers["outputs"][buffer_id] = outputs
+            self.pipeline.pipe_buffers["outputs"][buffer_id] = outputs
 
     @instrument_w_nvtx
     @measure_time("execution/backward")
@@ -254,9 +252,9 @@ class PipelineExecution:
             loss = self.loss
             loss.backward()
         else:
-            output_tensors: Tuple[
-                torch.Tensor
-            ] = self.pipeline.communication.pipe_buffers["outputs"][buffer_id]
+            output_tensors: Tuple[torch.Tensor] = self.pipeline.pipe_buffers["outputs"][
+                buffer_id
+            ]
             output_tensors = tuple([t for t in output_tensors if t.requires_grad])
             grad_tensors: Tuple[
                 torch.Tensor
@@ -267,7 +265,7 @@ class PipelineExecution:
             torch.autograd.backward(tensors=output_tensors, grad_tensors=grad_tensors)
 
         # Free up memory from the output of forward()
-        self.pipeline.communication.pipe_buffers["outputs"][buffer_id] = None
+        self.pipeline.pipe_buffers["outputs"][buffer_id] = None
         grad_tensors = None
 
     @instrument_w_nvtx
@@ -288,21 +286,10 @@ class PipelineCommunication:
         self,
         pipeline: OobleckPipeline,
         process_group: ProcessGroup,
-        num_pipe_buffers: int,
     ):
         self.pipeline = pipeline
         self.device = torch.device("cuda")
         self.process_group = process_group
-
-        self.pipe_buffers: Dict[str, Tuple[torch.Tensor]] = {
-            "inputs": [
-                None for _ in range(num_pipe_buffers)
-            ],  # batch input and received activations
-            "labels": [
-                None for _ in range(num_pipe_buffers)
-            ],  # labels from batch input
-            "outputs": [None for _ in range(num_pipe_buffers)],  # activations
-        }
 
         self.sent_activation_meta: bool = False
         # initialized in :func:`oobleck.execution.PipelineCommunication.recv_activations`.
@@ -362,7 +349,7 @@ class PipelineCommunication:
                 self._send(send_shape, receiver_rank)
                 self._send(send_req_grad, receiver_rank)
 
-        outputs: Tuple[torch.Tensor] = self.pipe_buffers["outputs"][buffer_id]
+        outputs: Tuple[torch.Tensor] = self.pipeline.pipe_buffers["outputs"][buffer_id]
         if not self.sent_activation_meta:
             _send_activation_meta(outputs, self.pipeline.next_rank)
             self.sent_activation_meta = True
@@ -427,11 +414,11 @@ class PipelineCommunication:
             recvd[idx] = buffer.clone().detach()
             recvd[idx].requires_grad = buffer.requires_grad
 
-        self.pipe_buffers["inputs"][buffer_id] = tuple(recvd)
+        self.pipeline.pipe_buffers["inputs"][buffer_id] = tuple(recvd)
 
     @measure_time("comm/send_gradients")
     def send_gradients(self, buffer_id: int):
-        inputs = self.pipe_buffers["inputs"][buffer_id]
+        inputs = self.pipeline.pipe_buffers["inputs"][buffer_id]
         assert isinstance(inputs, tuple)
 
         for buffer in inputs:
@@ -443,7 +430,7 @@ class PipelineCommunication:
             self._send(buffer.grad, self.pipeline.prev_rank)
 
         # We can free up the input buffer now
-        self.pipe_buffers["inputs"][buffer_id] = None
+        self.pipeline.pipe_buffers["inputs"][buffer_id] = None
 
     @measure_time("comm/recv_gradients")
     def recv_gradients(self, buffer_id: int):
@@ -459,7 +446,7 @@ class PipelineCommunication:
 
             return tuple(buffers)
 
-        outputs = self.pipe_buffers["outputs"][buffer_id]
+        outputs = self.pipeline.pipe_buffers["outputs"][buffer_id]
         assert isinstance(outputs, tuple)
 
         # Allocate gradients if necessary
@@ -542,9 +529,17 @@ class OobleckPipeline:
             stage_index,
         )
 
-        self.communication = PipelineCommunication(
-            self, process_group, self.train_schedule.num_pipe_buffers()
-        )
+        num_pipe_buffers = self.train_schedule.num_pipe_buffers()
+        self.pipe_buffers: Dict[str, Tuple[torch.Tensor]] = {
+            # batch input and received activations
+            "inputs": [None for _ in range(num_pipe_buffers)],
+            # labels from batch input
+            "labels": [None for _ in range(num_pipe_buffers)],
+            # activations to be sent
+            "outputs": [None for _ in range(num_pipe_buffers)],
+        }
+
+        self.communication = PipelineCommunication(self, process_group)
         self.execution = PipelineExecution(self, training_args, dataloader)
 
         self.timer = OobleckTimer()
