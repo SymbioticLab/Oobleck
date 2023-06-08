@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import torch
 import torch.distributed
 import itertools
@@ -13,7 +15,6 @@ from deepspeed.ops.adam import FusedAdam
 from deepspeed.runtime.lr_schedules import WarmupLR
 
 from oobleck.execution.dataloader import OobleckDataLoader
-from oobleck.module.layer import Layer
 from oobleck.module.model import OobleckModel
 from oobleck.module.layer import is_checkpointable
 from oobleck.execution.utils import (
@@ -102,18 +103,14 @@ class OobleckPipelineSchedule(schedule.TrainSchedule):
         return max(2, buffers)
 
 
-class PipelineExecutionMixin(object):
+class PipelineExecution:
     def __init__(
         self,
-        model_layers: List[Layer],
+        pipeline: OobleckPipeline,
         training_args: TrainingArguments,
         dataloader: OobleckDataLoader,
-        step: int,
-        **kwargs,
     ):
-        super().__init__(**kwargs)
-
-        self.model_layers = model_layers
+        self.pipeline = pipeline
         self.training_args = training_args
         self.dataloader = dataloader
         self.device = torch.device("cuda")
@@ -121,7 +118,7 @@ class PipelineExecutionMixin(object):
         self.reset_data_iterator()
 
         # store checkpointability for each layer
-        for layer in self.model_layers:
+        for layer in self.pipeline.model_layers:
             layer.set_checkpointable(is_checkpointable(layer))
 
         # stores the loss for the current microbatch being processed
@@ -131,11 +128,12 @@ class PipelineExecutionMixin(object):
         self.total_loss: Optional[Union[torch.Tensor, Iterable[torch.Tensor]]] = None
 
         self.micro_steps = 0
-        self.global_steps = step
 
-        # TODO: use HF arguments to initialize properly
+        # TODO: use HF arguments to initialize optimizer and LR properly
         parameters = list(
-            itertools.chain(*[list(layer.parameters()) for layer in self.model_layers])
+            itertools.chain(
+                *[list(layer.parameters()) for layer in self.pipeline.model_layers]
+            )
         )
         self.optimizer = FusedAdam(
             parameters,
@@ -180,20 +178,24 @@ class PipelineExecutionMixin(object):
         return tuple(self._prepare_input(t) for _, t in inputs.items())
 
     @instrument_w_nvtx
-    @measure_time("execution_load_microbatch")
+    @measure_time("execution/load_microbatch")
     def load_microbatch(self, buffer_id: int):
         assert (
-            self.is_first_stage() or self.is_last_stage()
+            self.pipeline.is_first_stage() or self.pipeline.is_last_stage()
         ), "load_microatch can only be called at either the first stage or the last stage."
 
-        if self.is_first_stage():
+        if self.pipeline.is_first_stage():
             batch = next(self.data_iterator)
-            self.pipe_buffers["inputs"][buffer_id] = self._prepare_inputs(batch)
+            self.pipeline.communication.pipe_buffers["inputs"][
+                buffer_id
+            ] = self._prepare_inputs(batch)
 
     @instrument_w_nvtx
     @measure_time("execution/forward")
     def forward_pass(self, buffer_id: int):
-        inputs: tuple[torch.Tensor] = self.pipe_buffers["inputs"][buffer_id]
+        inputs: tuple[torch.Tensor] = self.pipeline.communication.pipe_buffers[
+            "inputs"
+        ][buffer_id]
         zero_grads(inputs)
 
         # XXX Hack
@@ -210,13 +212,13 @@ class PipelineExecutionMixin(object):
         )
 
         # Execute forward
-        for layer in self.model_layers:
+        for layer in self.pipeline.model_layers:
             inputs = layer(*inputs)
 
         outputs = inputs
 
         # Optionally compute loss on the last stage
-        if self.is_last_stage():
+        if self.pipeline.is_last_stage():
             self.loss = outputs["loss"]
             del outputs["logits"]
 
@@ -243,27 +245,29 @@ class PipelineExecutionMixin(object):
                 ]
             )
 
-            self.pipe_buffers["outputs"][buffer_id] = outputs
+            self.pipeline.communication.pipe_buffers["outputs"][buffer_id] = outputs
 
     @instrument_w_nvtx
     @measure_time("execution/backward")
     def backward_pass(self, buffer_id: int):
-        if self.is_last_stage():
+        if self.pipeline.is_last_stage():
             loss = self.loss
             loss.backward()
         else:
-            output_tensors: Tuple[torch.Tensor] = self.pipe_buffers["outputs"][
-                buffer_id
-            ]
+            output_tensors: Tuple[
+                torch.Tensor
+            ] = self.pipeline.communication.pipe_buffers["outputs"][buffer_id]
             output_tensors = tuple([t for t in output_tensors if t.requires_grad])
-            grad_tensors: Tuple[torch.Tensor] = self.grad_recv_buf
+            grad_tensors: Tuple[
+                torch.Tensor
+            ] = self.pipeline.communication.grad_recv_buf
 
             # Oobleck sharded model always returns tuple with tensors and torch.Size.
             assert len(output_tensors) == len(grad_tensors)
             torch.autograd.backward(tensors=output_tensors, grad_tensors=grad_tensors)
 
         # Free up memory from the output of forward()
-        self.pipe_buffers["outputs"][buffer_id] = None
+        self.pipeline.communication.pipe_buffers["outputs"][buffer_id] = None
         grad_tensors = None
 
     @instrument_w_nvtx
@@ -279,61 +283,49 @@ class PipelineExecutionMixin(object):
             self.lr_scheduler.step(**(lr_kwargs or {}))
 
 
-class PipelineCommunicationMixin(object):
-    def __init__(self, process_group: ProcessGroup, **kwargs):
-        super().__init__(**kwargs)
-
+class PipelineCommunication:
+    def __init__(
+        self,
+        pipeline: OobleckPipeline,
+        process_group: ProcessGroup,
+        num_pipe_buffers: int,
+    ):
+        self.pipeline = pipeline
         self.device = torch.device("cuda")
         self.process_group = process_group
-        self.my_rank: int = dist.get_rank(self.process_group)
-        self.prev_rank: Optional[int] = None
-        self.next_rank: Optional[int] = None
 
-        self.num_pipe_buffers: int = 0
         self.pipe_buffers: Dict[str, Tuple[torch.Tensor]] = {
-            "inputs": [],  # batch input and received activations
-            "labels": [],  # labels from batch input
-            "outputs": [],  # activations
+            "inputs": [
+                None for _ in range(num_pipe_buffers)
+            ],  # batch input and received activations
+            "labels": [
+                None for _ in range(num_pipe_buffers)
+            ],  # labels from batch input
+            "outputs": [None for _ in range(num_pipe_buffers)],  # activations
         }
 
         self.sent_activation_meta: bool = False
-        # initialized in :func:`oobleck.execution.PipelineCommunicationMixin.recv_activations`.
+        # initialized in :func:`oobleck.execution.PipelineCommunication.recv_activations`.
         self.activation_recv_buf: Optional[Tuple[torch.Tensor]] = None
-        # initialized in :func:`oobleck.execution.PipelineCommunicationMixin.recv_gradients`.
+        # initialized in :func:`oobleck.execution.PipelineCommunication.recv_gradients`.
         self.grad_recv_buf: Optional[Tuple[torch.Tensor]] = None
-
-    def _reserve_pipe_buffers(self, num_buffers):
-        """Ensure that each pipeline buffer has at least ``num_buffers`` slots.
-        This method only reserves slots and does not allocate tensors.
-        Args:
-            num_buffers (int): The number of buffers to reserve.
-        """
-        if self.num_pipe_buffers >= num_buffers:
-            return
-
-        num_added = num_buffers - self.num_pipe_buffers
-        for key in self.pipe_buffers:
-            self.pipe_buffers[key].extend([None] * num_added)
-        self.num_pipe_buffers = num_buffers
 
     def _send(
         self, tensor: torch.Tensor, dest_rank: int, async_op: bool = False
     ) -> Work:
-        dest_global_rank = dist.get_global_rank(self.process_group, dest_rank)
         return (
-            dist.isend(tensor, dest_global_rank, self.process_group)
+            dist.isend(tensor, dest_rank, self.process_group)
             if async_op
-            else dist.send(tensor, dest_global_rank, self.process_group)
+            else dist.send(tensor, dest_rank, self.process_group)
         )
 
     def _recv(
         self, tensor: torch.Tensor, src_rank: int, async_op: bool = False
     ) -> Work:
-        src_global_rank = dist.get_global_rank(self.process_group, src_rank)
         return (
-            dist.irecv(tensor, src_global_rank, self.process_group)
+            dist.irecv(tensor, src_rank, self.process_group)
             if async_op
-            else dist.recv(tensor, src_global_rank, self.process_group)
+            else dist.recv(tensor, src_rank, self.process_group)
         )
 
     @measure_time("comm/send_activations")
@@ -372,13 +364,13 @@ class PipelineCommunicationMixin(object):
 
         outputs: Tuple[torch.Tensor] = self.pipe_buffers["outputs"][buffer_id]
         if not self.sent_activation_meta:
-            _send_activation_meta(outputs, self.next_rank)
+            _send_activation_meta(outputs, self.pipeline.next_rank)
             self.sent_activation_meta = True
 
         assert isinstance(outputs, tuple)
         for buffer in outputs:
             assert isinstance(buffer, torch.Tensor)
-            self._send(buffer, self.next_rank)
+            self._send(buffer, self.pipeline.next_rank)
 
     @measure_time("comm/recv_activations")
     def recv_activations(self, buffer_id: int):
@@ -425,13 +417,13 @@ class PipelineCommunicationMixin(object):
             return tuple(buffers)
 
         if self.activation_recv_buf is None:
-            self.activation_recv_buf = create_receive_buffer(self.prev_rank)
+            self.activation_recv_buf = create_receive_buffer(self.pipeline.prev_rank)
 
         assert isinstance(self.activation_recv_buf, tuple)
         recvd: List[Optional[torch.Tensor]] = [None] * len(self.activation_recv_buf)
         for idx, buffer in enumerate(self.activation_recv_buf):
             assert torch.is_tensor(buffer)
-            self._recv(buffer, self.prev_rank)
+            self._recv(buffer, self.pipeline.prev_rank)
             recvd[idx] = buffer.clone().detach()
             recvd[idx].requires_grad = buffer.requires_grad
 
@@ -448,7 +440,7 @@ class PipelineCommunicationMixin(object):
                 assert buffer.grad is None
                 continue
             assert buffer.grad is not None
-            self._send(buffer.grad, self.prev_rank)
+            self._send(buffer.grad, self.pipeline.prev_rank)
 
         # We can free up the input buffer now
         self.pipe_buffers["inputs"][buffer_id] = None
@@ -475,25 +467,27 @@ class PipelineCommunicationMixin(object):
             self.grad_recv_buf = create_gradients_buffer(outputs)
 
         for buffer in self.grad_recv_buf:
-            self._recv(buffer, self.next_rank)
+            self._recv(buffer, self.pipeline.next_rank)
 
 
 # A map of PipeInstruction types to methods. Each method will be executed with the
 # kwargs provided to the PipeInstruction from the scheduler.
 INSTRUCTION_MAP = {
-    schedule.OptimizerStep: PipelineExecutionMixin.optimizer_step,
-    schedule.LoadMicroBatch: PipelineExecutionMixin.load_microbatch,
-    schedule.ForwardPass: PipelineExecutionMixin.forward_pass,
-    schedule.BackwardPass: PipelineExecutionMixin.backward_pass,
-    schedule.SendActivation: PipelineCommunicationMixin.send_activations,
-    schedule.RecvActivation: PipelineCommunicationMixin.recv_activations,
-    schedule.SendGrad: PipelineCommunicationMixin.send_gradients,
-    schedule.RecvGrad: PipelineCommunicationMixin.recv_gradients,
+    schedule.OptimizerStep: PipelineExecution.optimizer_step,
+    schedule.LoadMicroBatch: PipelineExecution.load_microbatch,
+    schedule.ForwardPass: PipelineExecution.forward_pass,
+    schedule.BackwardPass: PipelineExecution.backward_pass,
+    schedule.SendActivation: PipelineCommunication.send_activations,
+    schedule.RecvActivation: PipelineCommunication.recv_activations,
+    schedule.SendGrad: PipelineCommunication.send_gradients,
+    schedule.RecvGrad: PipelineCommunication.recv_gradients,
 }
 
 
 # FIXME: all ranks now should be changed to the global rank.
-class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
+# TODO: Integrate FSDP.
+# NOTE: it is going to be completely recreated during reconfiguration after failure.
+class OobleckPipeline:
     def __init__(
         self,
         pipeline_template: PipelineTemplate,
@@ -504,85 +498,77 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
         process_group: ProcessGroup,
         training_args: TrainingArguments,
     ):
-        self.ranks = ranks
-        self.model = model
-        self.total_num_layers = len(model.model)
-        self.timer = OobleckTimer()
+        logger.info(f"Creating pipeline ({len(pipeline_template.get_stages())} stages)")
 
-        my_rank = dist.get_rank()
-        for stage in pipeline_template.get_stages():
+        assert dist.is_initialized(), "torch.distributed is not intialized."
+        num_gpus_per_node = pipeline_template.get_num_gpus_per_node()
+        assert (
+            len(ranks) == len(pipeline_template.get_stages()) * num_gpus_per_node
+        ), "Number of ranks must be equal to number of stages * num_gpus_per_node."
+        self.ranks = ranks
+        self.my_rank: dist.get_rank()
+        assert self.my_rank in self.ranks, "My rank is not in the ranks list."
+
+        rank_index = ranks.index(self.my_rank)
+        self.prev_rank: Optional[int] = (
+            ranks[rank_index - num_gpus_per_node]
+            if rank_index >= num_gpus_per_node
+            else None
+        )
+        self.next_rank: Optional[int] = (
+            ranks[rank_index + num_gpus_per_node]
+            if rank_index < len(ranks) - num_gpus_per_node
+            else None
+        )
+
+        self.total_num_layers = len(model.model)
+        # Find the stage I am responsible to execute
+        for stage_index, stage in enumerate(pipeline_template.get_stages()):
             layer_indices = stage.get_layer_indices()
-            if my_rank not in range(layer_indices[0], layer_indices[1]):
+            if self.my_rank not in range(layer_indices[0], layer_indices[1]):
                 continue
 
-            model_layers = [
+            self.model_layers = [
                 layer.to("cuda")
                 for layer in model.model[layer_indices[0] : layer_indices[1]]
             ]
-        assert model_layers
+            self.my_stage_index = stage_index
+            break
+        assert self.model_layers, "Could not find a stage to execute."
 
-        super().__init__(
-            model_layers=model_layers,
-            dataloader=dataloader,
-            training_args=training_args,
-            process_group=process_group,
-            step=step,
+        self.train_schedule = OobleckPipelineSchedule(
+            self.execution.dataloader.num_my_microbatches,
+            len(pipeline_template.get_stages()),
+            stage_index,
         )
 
-        logger.info(
-            f"Creating pipeline ({len(pipeline_template.get_stages())} stages): "
-            f"{pipeline_template.get_stages()}"
+        self.communication = PipelineCommunication(
+            self, process_group, self.train_schedule.num_pipe_buffers()
         )
+        self.execution = PipelineExecution(self, training_args, dataloader)
+
+        self.timer = OobleckTimer()
+        self.global_steps = step
 
     def write_samples_logs(self):
         lr = next(
             iter(
                 [
                     param_group["lr"]
-                    for param_group in self.optimizer.param_groups
+                    for param_group in self.execution.optimizer.param_groups
                     if "lr" in param_group
                 ]
             ),
             0.0,
         )
-        loss = self.total_loss.mean().item() if self.is_last_stage() else -1
-        self.total_loss = None
+        loss = self.execution.total_loss.mean().item() if self.is_last_stage() else -1
+        self.execution.total_loss = None
 
         self.timer.write_events([(f"samples/lr", lr, self.global_steps)])
         self.timer.write_events([(f"samples/train_loss", loss, self.global_steps)])
 
     def train(self):
-        assert (
-            dist.get_rank(self.process_group) >= 0
-        ), "This pipeline is not what I am involved in."
-        unique_ranks = list(dict.fromkeys(self.layer_spec).keys())
-        my_rank_index = unique_ranks.index(self.my_rank)
-        self.train_schedule = OobleckPipelineSchedule(
-            self.dataloader.num_my_microbatches,
-            len(unique_ranks),  # total num stages
-            my_rank_index,
-        )
-        self.prev_rank = my_rank_index - 1
-        self.next_rank = my_rank_index + 1
-
-        self._exec_schedule(self.train_schedule)
-
-        self.global_steps += 1
-        self.write_samples_logs()
-
-    def is_first_stage(self):
-        return self.model_layers[0].index == 0
-
-    def is_last_stage(self):
-        return self.model_layers[-1].index == self.total_num_layers - 1
-
-    def _exec_schedule(self, pipe_schedule: schedule.PipeSchedule):
-        # Reserve and reset buffers.
-        self._reserve_pipe_buffers(pipe_schedule.num_pipe_buffers())
-        self.fwd_outputs = []
-
-        # For each step in the schedule
-        for step_cmds in pipe_schedule:
+        for step_cmds in self.train_schedule:
             # For each instruction in the step
             for cmd in step_cmds:
                 if type(cmd) not in INSTRUCTION_MAP:
@@ -593,3 +579,12 @@ class OobleckPipeline(PipelineExecutionMixin, PipelineCommunicationMixin):
                 # Equivalent to: self._exec_forward_pass(buffer_id=0)
                 _exec_instr = MethodType(INSTRUCTION_MAP[type(cmd)], self)
                 _exec_instr(**cmd.kwargs)
+
+        self.global_steps += 1
+        self.write_samples_logs()
+
+    def is_first_stage(self):
+        return self.model_layers[0].index == 0
+
+    def is_last_stage(self):
+        return self.model_layers[-1].index == self.total_num_layers - 1
