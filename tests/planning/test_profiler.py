@@ -3,8 +3,10 @@ import os
 import json
 from pathlib import Path
 import shutil
+import math
 
 from oobleck.planning.profiler import Profiler, profile
+from oobleck.planning.profiler import LayerExecutionResult, get_profile_results
 import torch
 import torch.distributed as dist
 
@@ -120,8 +122,35 @@ def test_profile(gpt2_model, cleanup_profile):
                 assert len(data) == len(gpt2_model.model)
 
 
-def test_get_profile_results():
-    assert False, "TODO"
+@pytest.mark.order("test_profile")
+def test_get_profile_results(gpt2_model):
+    pytest.mark.skipif(
+        Path(
+            f"/tmp/oobleck/profiles/{gpt2_model.model_name}-{gpt2_model.model_tag}"
+        ).is_dir(),
+        reason="need to run profile first",
+    )
+
+    results = get_profile_results(gpt2_model, 1)
+    assert isinstance(results, list)
+    for result in results:
+        assert isinstance(result, LayerExecutionResult)
+        assert isinstance(result.index, int)
+        assert isinstance(result.forward, float)
+        assert isinstance(result.backward, float)
+        assert isinstance(result.allreduce_in_node, dict)
+        for num_gpus, ar in result.allreduce_in_node.items():
+            assert isinstance(num_gpus, int)
+            assert math.log2(num_gpus).is_integer(), "num_gpus must be a power of 2"
+            assert isinstance(ar, float)
+        assert isinstance(result.allreduce_cross_nodes, dict)
+        for num_nodes, ar in result.allreduce_cross_nodes.items():
+            assert isinstance(num_nodes, int)
+            assert num_nodes > 0
+            assert isinstance(ar, float)
+        assert isinstance(result.mem_required, tuple)
+        for mem in result.mem_required:
+            assert isinstance(mem, int)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() == 0, reason="need at least one GPU")

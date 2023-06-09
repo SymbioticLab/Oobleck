@@ -63,14 +63,13 @@ def get_profile_results(
             file.is_file()
         ), f"Cache {cache_path} does not exist. Run profiler and cache the results."
         logger.debug("Loading cache %s", cache_path)
-        with file.open(mode="r") as f:
-            return literal_eval(f.read())
+        return json.load(file.open(mode="r"))
 
     directory = f"{PROFILE_CACHE}/{model.model_name}-{model.model_tag}"
 
-    layer_execution_result = get_cache(f"{directory}/mb{microbatch_size}/layers")
-    allreduce_across_nodes = get_cache(f"{directory}/allreduce_across_nodes")
-    allreduce_in_node = get_cache(f"{directory}/allreduce_in_node")
+    layer_execution_result = get_cache(f"{directory}/mb{microbatch_size}.json")
+    allreduce_across_nodes = get_cache(f"{directory}/allreduce_across_nodes.json")
+    allreduce_in_node = get_cache(f"{directory}/allreduce_in_node.json")
 
     results: List[LayerExecutionResult] = []
     for layer, execution, ar_in_node, ar_across_nodes in zip(
@@ -79,6 +78,11 @@ def get_profile_results(
         allreduce_in_node,
         allreduce_across_nodes,
     ):
+        ar_in_node = {int(k): v for k, v in ar_in_node.items()}
+        ar_across_nodes = {int(k): v for k, v in ar_across_nodes.items()}
+        assert len(execution["mem_required"]) == 2
+        execution["mem_required"] = tuple([int(m) for m in execution["mem_required"]])
+
         results.append(
             LayerExecutionResult(
                 layer.index,
