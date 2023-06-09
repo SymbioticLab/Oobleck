@@ -12,7 +12,7 @@ def dummy_model():
     num_layers = 32
 
     layers = []
-    allreduce_acorss_nodes = []
+    allreduce_across_nodes = []
     allreduce_in_node = []
     for _ in range(num_layers):
         layers.append(
@@ -22,7 +22,7 @@ def dummy_model():
                 "mem_required": [1024.0, 1024.0],
             }
         )
-        allreduce_acorss_nodes.append(
+        allreduce_across_nodes.append(
             {"1": random.random() * 4, "4": random.random() * 4}
         )
         allreduce_in_node.append({"1": random.random(), "4": random.random()})
@@ -37,7 +37,7 @@ def dummy_model():
     with directory.joinpath("allreduce_in_node.json").open("w") as f:
         json.dump(allreduce_in_node, f)
     with directory.joinpath("allreduce_across_nodes.json").open("w") as f:
-        json.dump(allreduce_acorss_nodes, f)
+        json.dump(allreduce_across_nodes, f)
 
     yield model_name, model_tag, num_layers
 

@@ -2,9 +2,14 @@ from oobleck.execution.dataset import OobleckDataset
 from oobleck.execution.dataloader import OobleckDataLoader, LoaderType
 from oobleck.module.model import OobleckModel
 from oobleck.csrc.planning.pipeline_template import PipelineTemplateGenerator
+from oobleck.planning.profiler import LayerExecutionResult, get_profile_results
 
 from transformers import TrainingArguments
 import pytest
+import os
+import deepspeed.comm as dist
+import random
+from typing import List
 
 TRAIN_BATCH_SIZE = 8
 EVAL_BATCH_SIZE = 4
@@ -70,3 +75,84 @@ def gpt2_model(wikitext_dataset):
 @pytest.fixture(scope="module")
 def pipeline_template_generator():
     return PipelineTemplateGenerator()
+
+
+@pytest.fixture(scope="function")
+def gpt2_dummy_profile_results(gpt2_model):
+    num_layers = len(gpt2_model.model)
+    layers = []
+    allreduce_across_nodes = []
+    allreduce_in_node = []
+    for _ in range(num_layers):
+        layers.append(
+            {
+                "forward": random.random(),
+                "backward": random.random() * 3,
+                "mem_required": [1024, 1024],
+            }
+        )
+
+        # TODO: get argument to set number of nodes
+        ar_across_nodes = {}
+        for i in range(1, 17):
+            ar_across_nodes[i] = random.random() * 4
+
+        allreduce_across_nodes.append(ar_across_nodes)
+        allreduce_in_node.append(
+            {1: random.random(), 2: random.random(), 4: random.random()}
+        )
+
+    results: List[LayerExecutionResult] = []
+    for layer, execution, ar_in_node, ar_across_nodes in zip(
+        gpt2_model.model, layers, allreduce_in_node, allreduce_across_nodes
+    ):
+        results.append(
+            LayerExecutionResult(
+                layer.index,
+                execution["forward"],
+                execution["backward"],
+                ar_in_node,
+                ar_across_nodes,
+                execution["mem_required"],
+            )
+        )
+    return results
+
+
+@pytest.fixture(scope="session")
+def gpt2_profile_results(gpt2_model):
+    return get_profile_results(gpt2_model, 1)
+
+
+@pytest.fixture(scope="function")
+def distributed_conf_one():
+    backup = {
+        "MASTER_ADDR": os.environ.get("MASTER_ADDR"),
+        "MASTER_PORT": os.environ.get("MASTER_PORT"),
+        "WORLD_SIZE": os.environ.get("WORLD_SIZE"),
+        "RANK": os.environ.get("RANK"),
+        "LOCAL_RANK": os.environ.get("LOCAL_RANK"),
+        "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES"),
+    }
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12355"
+    os.environ["WORLD_SIZE"] = "1"
+    os.environ["RANK"] = "0"
+    os.environ["LOCAL_RANK"] = "0"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    yield
+    for key, value in backup.items():
+        if value is None:
+            os.environ.pop(key)
+        else:
+            os.environ[key] = value
+
+
+@pytest.fixture(scope="function")
+def distributed():
+    dist.init_distributed(dist_backend="nccl")
+    assert dist.is_initialized()
+    yield
+    dist.destroy_process_group()
+    dist.cdb = None
+    assert not dist.is_initialized()

@@ -47,6 +47,7 @@ class LayerExecutionResult:
         )
 
 
+# TODO: fix using json
 def get_profile_results(
     model: OobleckModel, microbatch_size: int
 ) -> List[LayerExecutionResult]:
@@ -331,15 +332,13 @@ def profile(
     directory = Path(f"{PROFILE_CACHE}/{model_name}-{model_tag}")
     directory.mkdir(parents=True, exist_ok=True)
 
-    # assert dist.is_initialized(), "Distributed is not initialized."
-    assert not dist.is_initialized(), "Distributed is already initialized."
-    dist.init_process_group(backend="nccl")
-
     logger.info("Profiling model %s", model_name)
 
     model = OobleckModel(model_name, sample_inputs, None, model_tag, model_args)
     profiler = Profiler(model)
-    # forward/backward execution
+
+    assert not dist.is_initialized(), "Distributed is already initialized."
+    dist.init_process_group(backend="nccl")
 
     path = directory.joinpath(f"mb{microbatch_size}.json")
     if path.exists():
@@ -377,3 +376,4 @@ def profile(
 
     dist.barrier()
     dist.destroy_process_group()
+    assert not dist.is_initialized()

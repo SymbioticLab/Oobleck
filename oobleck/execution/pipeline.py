@@ -493,7 +493,7 @@ class OobleckPipeline:
             len(ranks) == len(pipeline_template.get_stages()) * num_gpus_per_node
         ), "Number of ranks must be equal to number of stages * num_gpus_per_node."
         self.ranks = ranks
-        self.my_rank: dist.get_rank()
+        self.my_rank = dist.get_rank()
         assert self.my_rank in self.ranks, "My rank is not in the ranks list."
 
         rank_index = ranks.index(self.my_rank)
@@ -524,7 +524,7 @@ class OobleckPipeline:
         assert self.model_layers, "Could not find a stage to execute."
 
         self.train_schedule = OobleckPipelineSchedule(
-            self.execution.dataloader.num_my_microbatches,
+            dataloader.num_my_microbatches,
             len(pipeline_template.get_stages()),
             stage_index,
         )

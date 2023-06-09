@@ -5,27 +5,12 @@ from pathlib import Path
 import shutil
 
 from oobleck.planning.profiler import Profiler, profile
-import torch.distributed as dist
 import torch
-
-
-@pytest.fixture
-def distributed():
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12355"
-    os.environ["WORLD_SIZE"] = "1"
-    os.environ["RANK"] = "0"
-    os.environ["LOCAL_RANK"] = "0"
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-    dist.init_process_group(backend="nccl")
-    assert dist.is_initialized()
-    yield
-    dist.destroy_process_group()
-    assert not dist.is_initialized()
+import torch.distributed as dist
 
 
 @pytest.mark.skipif(torch.cuda.device_count() == 0, reason="need at least one GPU")
-def test_profile_execution_layers(gpt2_model, distributed):
+def test_profile_execution_layers(gpt2_model, distributed_conf_one, distributed):
     # Profile only. Need torch.distributed initialization.
     profiler = Profiler(gpt2_model)
     results = profiler.profile_execution_layers(1)
@@ -47,14 +32,14 @@ def test_profile_execution_layers(gpt2_model, distributed):
 
 
 @pytest.mark.skipif(torch.cuda.device_count() == 0, reason="need at least one GPU")
-def test_profile_allreduce_layer(gpt2_model, distributed):
+def test_profile_allreduce_layer(gpt2_model, distributed_conf_one, distributed):
     # Profile only. Need torch.distributed initialization.
     for layer in gpt2_model.model:
         assert Profiler.profile_allreduce_layer(layer, dist.group.WORLD) > 0
 
 
 @pytest.mark.skipif(torch.cuda.device_count() == 0, reason="need at least one GPU")
-def test_profile_allreduce_in_node(gpt2_model, distributed):
+def test_profile_allreduce_in_node(gpt2_model, distributed_conf_one, distributed):
     # Profile only. Need torch.distributed initialization.
     profiler = Profiler(gpt2_model)
 
@@ -70,7 +55,7 @@ def test_profile_allreduce_in_node(gpt2_model, distributed):
 
 
 @pytest.mark.skipif(torch.cuda.device_count() == 0, reason="need at least one GPU")
-def test_profile_allreduce_across_nodes(gpt2_model, distributed):
+def test_profile_allreduce_across_nodes(gpt2_model, distributed_conf_one, distributed):
     # Profile only. Need torch.distributed initialization.
     profiler = Profiler(gpt2_model)
 
@@ -101,6 +86,8 @@ def test_profile(gpt2_model, cleanup_profile):
     # This test repeats overall profiling but also
     # checks if they are properly written to files.
     # profile initializes process group, so it does not require the fixture.
+    assert not dist.is_initialized()
+
     profile(
         model_name=gpt2_model.model_name,
         sample_inputs=gpt2_model.sample_inputs,
@@ -131,6 +118,10 @@ def test_profile(gpt2_model, cleanup_profile):
                 data = json.load(f)
                 assert isinstance(data, list)
                 assert len(data) == len(gpt2_model.model)
+
+
+def test_get_profile_results():
+    assert False, "TODO"
 
 
 @pytest.mark.skipif(torch.cuda.device_count() == 0, reason="need at least one GPU")
