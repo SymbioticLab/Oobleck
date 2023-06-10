@@ -10,6 +10,10 @@ from oobleck.csrc.planning.pipeline_template import (
 
 from transformers import TrainingArguments
 
+import deepspeed.comm as dist
+from deepspeed.ops.adam import FusedAdam
+from deepspeed.runtime.lr_schedules import WarmupLR
+
 
 @pytest.fixture
 def singlegpu_pipeline_template(gpt2_model):
@@ -49,6 +53,8 @@ def test_initialize_pipeline(
 ):
     training_args = TrainingArguments(output_dir="/tmp/test_output")
 
+    assert dist.is_initialized()
+
     pg = torch.distributed.new_group()
     pipeline = OobleckPipeline(
         pipeline_template=singlegpu_pipeline_template,
@@ -59,3 +65,12 @@ def test_initialize_pipeline(
         process_group=pg,
         training_args=training_args,
     )
+    assert pipeline.prev_rank is None
+    assert pipeline.next_rank is None
+
+    # Because we only have one rank, it should execute all layers in the model
+    assert len(pipeline.model_layers) == len(gpt2_model.model)
+
+    assert isinstance(pipeline.execution.optimizer, FusedAdam)
+    assert isinstance(pipeline.execution.lr_scheduler, WarmupLR)
+    assert pipeline.global_steps == 0

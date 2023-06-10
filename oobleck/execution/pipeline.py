@@ -510,15 +510,14 @@ class OobleckPipeline:
 
         self.total_num_layers = len(model.model)
         # Find the stage I am responsible to execute
+        num_gpus_used = 0
         for stage_index, stage in enumerate(pipeline_template.get_stages()):
-            layer_indices = stage.get_layer_indices()
-            if self.my_rank not in range(layer_indices[0], layer_indices[1]):
-                continue
+            if rank_index in range(num_gpus_used, num_gpus_used + stage.get_num_gpus()):
+                self.model_layers = [
+                    model.model[index].to("cuda") for index in stage.get_layer_indices()
+                ]
 
-            self.model_layers = [
-                layer.to("cuda")
-                for layer in model.model[layer_indices[0] : layer_indices[1]]
-            ]
+            num_gpus_used += stage.get_num_gpus()
             self.my_stage_index = stage_index
             break
         assert self.model_layers, "Could not find a stage to execute."
