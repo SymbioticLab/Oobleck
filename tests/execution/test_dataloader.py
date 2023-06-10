@@ -1,10 +1,9 @@
-import torch
 import pytest
-
-from oobleck.execution.dataloader import OobleckDataLoader, LoaderType
+import torch
 from transformers import TrainingArguments
 
-from tests.conftest import TRAIN_BATCH_SIZE, EVAL_BATCH_SIZE, GRADIENT_ACCUMULATION_STEP
+from oobleck.execution.dataloader import LoaderType, OobleckDataLoader
+from tests.conftest import EVAL_BATCH_SIZE, GRADIENT_ACCUMULATION_STEP, TRAIN_BATCH_SIZE
 
 
 @pytest.mark.parametrize("dataset", ["wikitext_dataset", "imagenet_dataset"])
@@ -58,15 +57,15 @@ def test_batch_eval_samples(dataloaders):
         assert tensor.size(dim=0) == EVAL_BATCH_SIZE
 
 
-def test_next_batch(dataloaders_function):
-    for dataloader in dataloaders_function:
+def test_next_batch(dataloaders):
+    for dataloader in dataloaders:
         iterator = iter(dataloader)
         sample = next(iterator)
         assert isinstance(sample, dict)
 
 
-def test_stop_iteration(dataloaders_function):
-    for dataloader in dataloaders_function:
+def test_stop_iteration(dataloaders):
+    for dataloader in dataloaders:
         num_iteration = len(dataloader) * GRADIENT_ACCUMULATION_STEP
         iterator = iter(dataloader)
 

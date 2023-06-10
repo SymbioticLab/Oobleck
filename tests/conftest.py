@@ -1,15 +1,16 @@
-from oobleck.execution.dataset import OobleckDataset
-from oobleck.execution.dataloader import OobleckDataLoader, LoaderType
-from oobleck.module.model import OobleckModel
-from oobleck.csrc.planning.pipeline_template import PipelineTemplateGenerator
-from oobleck.planning.profiler import LayerExecutionResult, get_profile_results
-
-from transformers import TrainingArguments
-import pytest
 import os
-import deepspeed.comm as dist
 import random
 from typing import List
+
+import deepspeed.comm as dist
+import pytest
+from transformers import TrainingArguments
+
+from oobleck.csrc.planning.pipeline_template import PipelineTemplateGenerator
+from oobleck.execution.dataloader import LoaderType, OobleckDataLoader
+from oobleck.execution.dataset import OobleckDataset
+from oobleck.module.model import OobleckModel
+from oobleck.planning.profiler import LayerExecutionResult, get_profile_results
 
 TRAIN_BATCH_SIZE = 8
 EVAL_BATCH_SIZE = 4
@@ -32,49 +33,17 @@ def dataset(request: pytest.FixtureRequest):
     return request.getfixturevalue(request.param)
 
 
-@pytest.fixture(scope="function")
-def dataloaders_function(dataset):
-    training_args = TrainingArguments(
-        output_dir="/tmp/output",
-        per_device_train_batch_size=TRAIN_BATCH_SIZE,
-        per_device_eval_batch_size=EVAL_BATCH_SIZE,
-        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEP,
-    )
-
-    training_dataloader = OobleckDataLoader(
-        dataset,
-        training_args,
-        LoaderType.Training,
-        # total number of microbatches.
-        # Currently only have one process, so it should be the same as
-        # gradient_accumulation_steps.
-        training_args.gradient_accumulation_steps,
-        0,
-        0,
-    )
-    eval_dataloader = OobleckDataLoader(
-        dataset,
-        training_args,
-        LoaderType.Evaluation,
-        # total number of microbatches.
-        # Currently only have one process, so it should be the same as
-        # gradient_accumulation_steps.
-        training_args.gradient_accumulation_steps,
-        0,
-        0,
-    )
-    return training_dataloader, eval_dataloader
-
-
-@pytest.fixture(scope="session", params=["wikitext_dataset", "imagenet_dataset"])
+@pytest.fixture(params=["wikitext_dataset", "imagenet_dataset"])
 def dataloaders(request: pytest.FixtureRequest):
     dataset = request.getfixturevalue(request.param)
+    
     training_args = TrainingArguments(
         output_dir="/tmp/output",
         per_device_train_batch_size=TRAIN_BATCH_SIZE,
         per_device_eval_batch_size=EVAL_BATCH_SIZE,
         gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEP,
     )
+
     training_dataloader = OobleckDataLoader(
         dataset,
         training_args,
@@ -97,7 +66,7 @@ def dataloaders(request: pytest.FixtureRequest):
         0,
         0,
     )
-    return training_dataloader, eval_dataloader
+    yield training_dataloader, eval_dataloader
 
 
 def gpt2_model(wikitext_dataset):
