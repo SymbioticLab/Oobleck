@@ -46,6 +46,11 @@ def test_initialize_instantiator(
         )
         == 13
     )
+    # Check all templates use specified node range
+    assert all(
+        template.get_num_nodes() >= 2 and template.get_num_nodes() <= 5
+        for template in execution_plan.pipeline_templates
+    )
     # Check global batch size is correct
     assert (
         sum(
