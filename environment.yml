@@ -9,6 +9,7 @@ channels:
   - nodefaults
 dependencies:
   - python
+  - python-devtools
   - pip
   - pytorch==2.0.0
   - torchvision==0.15.0
@@ -22,7 +23,6 @@ dependencies:
   - cmake
   - tbb-devel
   - pytest
-  - pytest-dependency
   - pip:
     - transformers>=4.26.0
     - deepspeed>=0.8.1
@@ -34,4 +34,3 @@ dependencies:
     - tensorboard
     - evaluate
     - scikit-learn
-    - dill

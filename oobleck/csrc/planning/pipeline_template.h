@@ -59,27 +59,24 @@ class PipelineTemplate {
   const int num_gpus_per_node_;
 };
 
+std::shared_ptr<LayerExecutionResults> get_profiler_results(
+    const std::string& model_name,
+    const std::string& model_tag,
+    const int microbatch_size);
+
 class PipelineTemplateGenerator {
  public:
   CacheMap dc_cache_;
   cppcoro::static_thread_pool thread_pool_;
 
   std::vector<PipelineTemplate> create_pipeline_templates(
-      const std::string model_name,
-      const std::string model_tag,
-      const int microbatch_size,
-      const std::tuple<int, int> num_nodes,
+      std::shared_ptr<LayerExecutionResults> layer_execution_results,
+      const std::tuple<int, int>& num_nodes,
       const int num_gpus_per_node);
 
  private:
-  std::shared_ptr<std::vector<LayerExecutionResult>> get_profiler_results(
-      const std::string& model_name,
-      const std::string& model_tag,
-      const int microbatch_size);
-
   cppcoro::task<std::shared_ptr<DCExecutionResult>> divide_and_conquer(
-      std::shared_ptr<std::vector<LayerExecutionResult>>
-          layer_execution_results,
+      std::shared_ptr<LayerExecutionResults> layer_execution_results,
       const std::tuple<int, int> layer_indices,
       const int num_stages,
       const int num_nodes,

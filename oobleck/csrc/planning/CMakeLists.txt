@@ -27,11 +27,3 @@ target_include_directories(pipeline_template
 PRIVATE ${CMAKE_SOURCE_DIR}/modules/json/single_include
 PRIVATE ${CMAKE_SOURCE_DIR}/modules/cppcoro/include
 PRIVATE $ENV{CONDA_PREFIX}/include)
-
-add_executable(pipeline_template_test pipeline_template.cpp pipeline_template_test.cpp)
-target_compile_options(pipeline_template_test PRIVATE -fcoroutines)
-target_link_libraries(pipeline_template_test PRIVATE cppcoro::cppcoro TBB::tbb)
-target_include_directories(pipeline_template_test
-PRIVATE ${CMAKE_SOURCE_DIR}/modules/json/single_include
-PRIVATE ${CMAKE_SOURCE_DIR}/modules/cppcoro/include
-PRIVATE $ENV{CONDA_PREFIX}/include)

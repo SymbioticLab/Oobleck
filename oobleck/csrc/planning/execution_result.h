@@ -15,13 +15,10 @@ class PipelineTemplate;
  * Execution result of a layer.
  */
 class LayerExecutionResult {
-  friend class StageExecutionResult;
-  friend class PipelineTemplate;
-
  public:
-  LayerExecutionResult(int layer_index,
-                       double forward,
-                       double backward,
+  LayerExecutionResult(const int layer_index,
+                       const double forward,
+                       const double backward,
                        const std::map<int, double>& allreduce_in_node,
                        const std::map<int, double>& allreduce_cross_nodes,
                        const std::tuple<int, int>& mem_required)
@@ -40,6 +37,19 @@ class LayerExecutionResult {
   std::tuple<int, int> mem_required_;
 };
 
+class LayerExecutionResults
+    : public std::enable_shared_from_this<LayerExecutionResults> {
+ public:
+  LayerExecutionResults(std::vector<LayerExecutionResult>&& data)
+      : data_(std::move(data)), size_(data_.size()) {}
+  const LayerExecutionResult& get(const int index) { return data_[index]; }
+  int size() const { return size_; }
+
+ private:
+  const std::vector<LayerExecutionResult> data_;
+  const int size_;
+};
+
 /**
  * Execution result of a stage.
  * Stage consists of multiple layers;
@@ -50,8 +60,8 @@ class StageExecutionResult {
 
  public:
   StageExecutionResult(
-      const std::shared_ptr<std::vector<LayerExecutionResult>> layer_results,
-      const std::tuple<int, int> layer_indices,
+      const std::shared_ptr<LayerExecutionResults> layer_results,
+      const std::tuple<int, int>& layer_indices,
       const int num_gpus)
       : num_gpus_(num_gpus) {
     int layer_start_index = std::get<0>(layer_indices);
@@ -59,20 +69,20 @@ class StageExecutionResult {
     assert(layer_end_index <= layer_results->size());
 
     for (int i = layer_start_index; i < layer_end_index; ++i) {
-      layer_indices_.push_back((*layer_results)[i].layer_index_);
-      forward_ += (*layer_results)[i].forward_;
-      backward_ += (*layer_results)[i].backward_;
+      layer_indices_.push_back(layer_results->get(i).layer_index_);
+      forward_ += layer_results->get(i).forward_;
+      backward_ += layer_results->get(i).backward_;
 
       if (num_gpus_ > 1) {
-        forward_ += (*layer_results)[i].allreduce_in_node_.at(num_gpus_ - 1);
-        backward_ += (*layer_results)[i].allreduce_in_node_.at(num_gpus_ - 1);
+        forward_ += layer_results->get(i).allreduce_in_node_.at(num_gpus_ - 1);
+        backward_ += layer_results->get(i).allreduce_in_node_.at(num_gpus_ - 1);
       }
 
-      for (const auto& it : (*layer_results)[i].allreduce_cross_nodes_) {
+      for (const auto& it : layer_results->get(i).allreduce_cross_nodes_) {
         allreduce_cross_nodes_[it.first] += it.second;
       }
-      mem_required_ += std::get<0>((*layer_results)[i].mem_required_) * 6;
-      mem_required_ += std::get<1>((*layer_results)[i].mem_required_);
+      mem_required_ += std::get<0>(layer_results->get(i).mem_required_) * 6;
+      mem_required_ += std::get<1>(layer_results->get(i).mem_required_);
     }
   }
 

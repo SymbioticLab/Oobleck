@@ -26,10 +26,10 @@ namespace oobleck {
 // CacheMap PipelineTemplateGenerator::dc_cache_;
 // cppcoro::static_thread_pool PipelineTemplateGenerator::thread_pool_;
 
-std::shared_ptr<std::vector<LayerExecutionResult>>
-PipelineTemplateGenerator::get_profiler_results(const std::string& model_name,
-                                                const std::string& model_tag,
-                                                const int microbatch_size) {
+std::shared_ptr<LayerExecutionResults> get_profiler_results(
+    const std::string& model_name,
+    const std::string& model_tag,
+    const int microbatch_size) {
   auto get_cache = [](const std::string& cache_path) -> nlohmann::json {
     std::ifstream ifs(cache_path);
     assert(ifs.is_open());
@@ -52,8 +52,7 @@ PipelineTemplateGenerator::get_profiler_results(const std::string& model_name,
   std::cout << "Loading done. creating layer execution results..." << std::endl;
 
   int num_layers = mb.size();
-  auto layer_execution_results =
-      std::make_shared<std::vector<LayerExecutionResult>>();
+  std::vector<LayerExecutionResult> layer_execution_results;
   for (int i = 0; i < num_layers; i++) {
     std::map<int, double> allreduce_in_node_map;
     for (auto& [key, value] : allreduce_in_node[i].items()) {
@@ -64,7 +63,7 @@ PipelineTemplateGenerator::get_profiler_results(const std::string& model_name,
       allreduce_across_nodes_map[std::stoi(key)] = value;
     }
 
-    layer_execution_results->emplace_back(LayerExecutionResult(
+    layer_execution_results.emplace_back(LayerExecutionResult(
         i, mb[i]["forward"].get<double>(), mb[i]["backward"].get<double>(),
         allreduce_in_node_map, allreduce_across_nodes_map,
         mb[i]["mem_required"].get<std::tuple<int, int>>()));
@@ -72,26 +71,21 @@ PipelineTemplateGenerator::get_profiler_results(const std::string& model_name,
 
   std::cout << "Returning from get_profiler_results" << std::endl;
 
-  return std::move(layer_execution_results);
+  return std::make_shared<LayerExecutionResults>(
+      std::move(layer_execution_results));
 }
 
 std::vector<PipelineTemplate>
 PipelineTemplateGenerator::create_pipeline_templates(
-    const std::string model_name,
-    const std::string model_tag,
-    const int microbatch_size,
-    const std::tuple<int, int> num_nodes,
+    std::shared_ptr<LayerExecutionResults> layer_execution_results,
+    const std::tuple<int, int>& num_nodes,
     const int num_gpus_per_node) {
+  int min_num_nodes = std::get<0>(num_nodes);
+  int max_num_nodes = std::get<1>(num_nodes);
 #ifdef PYBIND11_MODULE
   // Release GIL
   pybind11::gil_scoped_release release;
 #endif
-  int min_num_nodes = std::get<0>(num_nodes);
-  int max_num_nodes = std::get<1>(num_nodes);
-
-  // Load JSON files to create std::vector<LayerExecutionResult>
-  auto layer_execution_results =
-      get_profiler_results(model_name, model_tag, microbatch_size);
 
   std::map<int, std::vector<cppcoro::task<std::shared_ptr<DCExecutionResult>>>>
       tasks;
@@ -167,7 +161,7 @@ PipelineTemplateGenerator::create_pipeline_templates(
  */
 cppcoro::task<std::shared_ptr<DCExecutionResult>>
 PipelineTemplateGenerator::divide_and_conquer(
-    std::shared_ptr<std::vector<LayerExecutionResult>> layer_execution_results,
+    std::shared_ptr<LayerExecutionResults> layer_execution_results,
     const std::tuple<int, int> layer_indices,
     const int num_stages,
     const int num_nodes,
