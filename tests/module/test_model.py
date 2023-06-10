@@ -58,9 +58,26 @@ def test_model_layers_param_on_cpu(model: OobleckModel):
         assert all(p.device == torch.device("cpu") for p in layer.parameters())
 
 
-def test_run_model_on_cpu(model: OobleckModel):
-    input = tuple(model.sample_inputs.values())
-    for layer in model.model:
+@pytest.mark.parametrize("device", ["cpu", "cuda:0"])
+def test_run_model(
+    device: str,
+    model_function: OobleckModel,
+):
+    pytest.mark.skipif(
+        device.startswith("cuda") and not torch.cuda.is_available(),
+        reason="No GPU available",
+    )
+
+    device = torch.device(device)
+
+    input = tuple([i.to(device) for i in model_function.sample_inputs.values()])
+    for layer in model_function.model:
+        layer.to(device)
+        assert all(p.device == device for p in layer.parameters())
+
+    for layer in model_function.model:
         input = layer(*input)
+
     assert "loss" in input
     assert isinstance(input["loss"], torch.Tensor)
+    assert input["loss"].device == device

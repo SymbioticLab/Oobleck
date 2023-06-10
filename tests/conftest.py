@@ -100,7 +100,6 @@ def dataloaders(request: pytest.FixtureRequest):
     return training_dataloader, eval_dataloader
 
 
-@pytest.fixture(scope="session")
 def gpt2_model(wikitext_dataset):
     # Refer to oobleck/examples/*.py for model arguments
     # gpt2-medium
@@ -113,16 +112,34 @@ def gpt2_model(wikitext_dataset):
     return OobleckModel("gpt2", wikitext_dataset.sample, None, "test", model_args)
 
 
-@pytest.fixture(scope="session")
 def resnet_model(imagenet_dataset):
     return OobleckModel(
         "microsoft/resnet-152", imagenet_dataset.sample, None, "test", None
     )
 
 
-@pytest.fixture(scope="session", params=["gpt2_model", "resnet_model"])
+@pytest.fixture(
+    scope="session",
+    params=[
+        (gpt2_model, "wikitext_dataset"),
+        (resnet_model, "imagenet_dataset"),
+    ],
+    ids=["gpt2", "microsoft/resnet-152"],
+)
 def model(request: pytest.FixtureRequest):
-    return request.getfixturevalue(request.param)
+    return request.param[0](request.getfixturevalue(request.param[1]))
+
+
+@pytest.fixture(
+    scope="session",
+    params=[
+        (gpt2_model, "wikitext_dataset"),
+        (resnet_model, "imagenet_dataset"),
+    ],
+    ids=["gpt2", "microsoft/resnet-152"],
+)
+def model_function(request: pytest.FixtureRequest):
+    return request.param[0](request.getfixturevalue(request.param[1]))
 
 
 @pytest.fixture(scope="module")
