@@ -53,5 +53,5 @@ PYBIND11_MODULE(pipeline_template, m) {
       .def("create_pipeline_templates",
            &PipelineTemplateGenerator::create_pipeline_templates);
 
-  m.def("get_profiler_results", &get_profiler_results);
+  m.def("get_profile_results", &get_profile_results);
 }

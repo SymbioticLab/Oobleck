@@ -59,7 +59,7 @@ class PipelineTemplate {
   const int num_gpus_per_node_;
 };
 
-std::shared_ptr<LayerExecutionResults> get_profiler_results(
+std::shared_ptr<LayerExecutionResults> get_profile_results(
     const std::string& model_name,
     const std::string& model_tag,
     const int microbatch_size);

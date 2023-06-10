@@ -26,7 +26,7 @@ namespace oobleck {
 // CacheMap PipelineTemplateGenerator::dc_cache_;
 // cppcoro::static_thread_pool PipelineTemplateGenerator::thread_pool_;
 
-std::shared_ptr<LayerExecutionResults> get_profiler_results(
+std::shared_ptr<LayerExecutionResults> get_profile_results(
     const std::string& model_name,
     const std::string& model_tag,
     const int microbatch_size) {

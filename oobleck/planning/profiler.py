@@ -1,100 +1,21 @@
-import os
 import gc
-import math
 import json
+import math
+import os
 import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
 import torch
 import torch.distributed as dist
-
-from ast import literal_eval
-from pathlib import Path
 from deepspeed.utils.logging import logger
-from typing import List, Dict, Any, Tuple, Optional
 
-from oobleck.module.model import OobleckModel
 from oobleck.module.layer import Layer
-
+from oobleck.module.model import OobleckModel
 
 PROFILE_CACHE = "/tmp/oobleck/profiles"
 num_warmup = 2
 num_iteration = 3
-
-
-class LayerExecutionResult:
-    def __init__(
-        self,
-        layer_index: int,
-        forward: float,
-        backward: float,
-        allreduce_in_node: Dict[int, float],
-        allreduce_cross_nodes: Dict[int, float],
-        mem_required: Tuple[int, int],
-    ):
-        self.index = layer_index
-        self.forward = forward
-        self.backward = backward
-        self.allreduce_in_node = allreduce_in_node
-        self.allreduce_cross_nodes = allreduce_cross_nodes
-        self.mem_required = mem_required
-
-    def __repr__(self) -> str:
-        return (
-            f"LayerExecutionResult(index={self.index}, "
-            f"forward={self.forward}, backward={self.backward}, "
-            f"allreduce_in_node={self.allreduce_in_node}, "
-            f"allreduce_cross_nodes={self.allreduce_cross_nodes}, "
-            f"mem_required={self.mem_required})"
-        )
-
-
-# TODO: fix using json
-def get_profile_results(
-    model: OobleckModel, microbatch_size: int
-) -> List[LayerExecutionResult]:
-    """Get the profiling results.
-
-    Returns:
-        List[LayerExecutionResult]: A list of execution results per layer.
-    """
-
-    def get_cache(cache_path: str):
-        file = Path(cache_path)
-        assert (
-            file.is_file()
-        ), f"Cache {cache_path} does not exist. Run profiler and cache the results."
-        logger.debug("Loading cache %s", cache_path)
-        return json.load(file.open(mode="r"))
-
-    directory = f"{PROFILE_CACHE}/{model.model_name}-{model.model_tag}"
-
-    layer_execution_result = get_cache(f"{directory}/mb{microbatch_size}.json")
-    allreduce_across_nodes = get_cache(f"{directory}/allreduce_across_nodes.json")
-    allreduce_in_node = get_cache(f"{directory}/allreduce_in_node.json")
-
-    results: List[LayerExecutionResult] = []
-    for layer, execution, ar_in_node, ar_across_nodes in zip(
-        model.model,
-        layer_execution_result,
-        allreduce_in_node,
-        allreduce_across_nodes,
-    ):
-        ar_in_node = {int(k): v for k, v in ar_in_node.items()}
-        ar_across_nodes = {int(k): v for k, v in ar_across_nodes.items()}
-        assert len(execution["mem_required"]) == 2
-        execution["mem_required"] = tuple([int(m) for m in execution["mem_required"]])
-
-        results.append(
-            LayerExecutionResult(
-                layer.index,
-                execution["forward"],
-                execution["backward"],
-                ar_in_node,
-                ar_across_nodes,
-                execution["mem_required"],
-            )
-        )
-
-    return results
 
 
 class Profiler:
