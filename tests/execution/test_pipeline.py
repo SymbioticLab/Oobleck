@@ -1,18 +1,13 @@
+import deepspeed.comm as dist
 import pytest
 import torch
 import torch.distributed
-
-from oobleck.execution.pipeline import OobleckPipeline
-
-from oobleck.csrc.planning.pipeline_template import (
-    PipelineTemplateGenerator,
-)
-
-from transformers import TrainingArguments
-
-import deepspeed.comm as dist
 from deepspeed.ops.adam import FusedAdam
 from deepspeed.runtime.lr_schedules import WarmupLR
+from transformers import TrainingArguments
+
+from oobleck.csrc.planning.pipeline_template import PipelineTemplateGenerator
+from oobleck.execution.pipeline import OobleckPipeline
 
 
 @pytest.fixture

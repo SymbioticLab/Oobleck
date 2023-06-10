@@ -1,11 +1,11 @@
 import pytest
 import torch.fx
-
-from oobleck.module.model import OobleckModel
-from oobleck.module.layer import Layer
-from oobleck.module.sharding import get_split_points
-from oobleck.execution.dataset import OobleckDataset
 from transformers import PretrainedConfig
+
+from oobleck.execution.dataset import OobleckDataset
+from oobleck.module.layer import Layer
+from oobleck.module.model import OobleckModel
+from oobleck.module.sharding import get_split_points
 
 
 @pytest.mark.parametrize(

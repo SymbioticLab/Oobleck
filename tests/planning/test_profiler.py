@@ -1,14 +1,15 @@
-import pytest
-import os
 import json
-from pathlib import Path
-import shutil
 import math
+import os
+import shutil
+from pathlib import Path
 
-from oobleck.planning.profiler import Profiler, profile
-from oobleck.planning.profiler import LayerExecutionResult, get_profile_results
+import pytest
 import torch
 import torch.distributed as dist
+
+from oobleck.planning.profiler import (LayerExecutionResult, Profiler,
+                                       get_profile_results, profile)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() == 0, reason="need at least one GPU")

@@ -3,7 +3,8 @@ import torch
 from transformers import TrainingArguments
 
 from oobleck.execution.dataloader import LoaderType, OobleckDataLoader
-from tests.conftest import EVAL_BATCH_SIZE, GRADIENT_ACCUMULATION_STEP, TRAIN_BATCH_SIZE
+from tests.conftest import (EVAL_BATCH_SIZE, GRADIENT_ACCUMULATION_STEP,
+                            TRAIN_BATCH_SIZE)
 
 
 @pytest.mark.parametrize("dataset", ["wikitext_dataset", "imagenet_dataset"])

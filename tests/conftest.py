@@ -36,7 +36,7 @@ def dataset(request: pytest.FixtureRequest):
 @pytest.fixture(params=["wikitext_dataset", "imagenet_dataset"])
 def dataloaders(request: pytest.FixtureRequest):
     dataset = request.getfixturevalue(request.param)
-    
+
     training_args = TrainingArguments(
         output_dir="/tmp/output",
         per_device_train_batch_size=TRAIN_BATCH_SIZE,

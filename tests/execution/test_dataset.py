@@ -1,7 +1,8 @@
-from oobleck.execution.dataset import OobleckDataset
 from datasets import Dataset
-from transformers.tokenization_utils import PreTrainedTokenizerBase
 from transformers.image_processing_utils import BaseImageProcessor
+from transformers.tokenization_utils import PreTrainedTokenizerBase
+
+from oobleck.execution.dataset import OobleckDataset
 
 
 def test_init_text_dataset(wikitext_dataset):
