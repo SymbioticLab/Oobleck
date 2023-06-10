@@ -1,6 +1,5 @@
 import torch
 import pytest
-import itertools
 
 from oobleck.execution.dataloader import OobleckDataLoader, LoaderType
 from transformers import TrainingArguments
@@ -8,14 +7,9 @@ from transformers import TrainingArguments
 from tests.conftest import TRAIN_BATCH_SIZE, EVAL_BATCH_SIZE, GRADIENT_ACCUMULATION_STEP
 
 
-datasets = ["wikitext_dataset", "imagenet_dataset"]
-consumed_samples = [0, 40]
-types = [LoaderType.Training, LoaderType.Evaluation]
-
-params = list(itertools.product(datasets, consumed_samples, types))
-
-
-@pytest.mark.parametrize("dataset,consumed_sample,type", params)
+@pytest.mark.parametrize("dataset", ["wikitext_dataset", "imagenet_dataset"])
+@pytest.mark.parametrize("consumed_sample", [0, 40])
+@pytest.mark.parametrize("type", [LoaderType.Training, LoaderType.Evaluation])
 def test_initialize_dataloader(
     dataset, consumed_sample, type, request: pytest.FixtureRequest
 ):
