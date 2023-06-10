@@ -122,7 +122,7 @@ def test_profile(gpt2_model, cleanup_profile):
                 assert len(data) == len(gpt2_model.model)
 
 
-@pytest.mark.order("test_profile")
+@pytest.mark.order(after="test_profile")
 def test_get_profile_results(gpt2_model):
     pytest.mark.skipif(
         Path(

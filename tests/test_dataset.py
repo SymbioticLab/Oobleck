@@ -5,6 +5,7 @@ from transformers.image_processing_utils import BaseImageProcessor
 
 
 def test_init_text_dataset(wikitext_dataset):
+    assert isinstance(wikitext_dataset, OobleckDataset)
     assert "train" in wikitext_dataset.dataset
     assert "validation" in wikitext_dataset.dataset
     assert isinstance(wikitext_dataset.dataset["train"], Dataset)
@@ -13,6 +14,7 @@ def test_init_text_dataset(wikitext_dataset):
 
 
 def test_init_image_dataset(imagenet_dataset):
+    assert isinstance(imagenet_dataset, OobleckDataset)
     assert "train" in imagenet_dataset.dataset
     assert "validation" in imagenet_dataset.dataset
     assert isinstance(imagenet_dataset.dataset["train"], Dataset)
