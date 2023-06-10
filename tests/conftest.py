@@ -26,6 +26,7 @@ def imagenet_dataset():
     return OobleckDataset("microsoft/resnet-152", "Maysee/tiny-imagenet")
 
 
+# OobleckDataset does not have any states and ok to use for the entire session.
 @pytest.fixture(scope="session", params=["wikitext_dataset", "imagenet_dataset"])
 def dataset(request: pytest.FixtureRequest):
     return request.getfixturevalue(request.param)
