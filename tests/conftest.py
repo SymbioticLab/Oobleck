@@ -26,9 +26,13 @@ def imagenet_dataset():
     return OobleckDataset("microsoft/resnet-152", "Maysee/tiny-imagenet")
 
 
-@pytest.fixture(scope="function", params=["wikitext_dataset", "imagenet_dataset"])
-def dataloaders_function(request: pytest.FixtureRequest):
-    dataset = request.getfixturevalue(request.param)
+@pytest.fixture(scope="session", params=["wikitext_dataset", "imagenet_dataset"])
+def dataset(request: pytest.FixtureRequest):
+    return request.getfixturevalue(request.param)
+
+
+@pytest.fixture(scope="function")
+def dataloaders_function(dataset):
     training_args = TrainingArguments(
         output_dir="/tmp/output",
         per_device_train_batch_size=TRAIN_BATCH_SIZE,
@@ -106,6 +110,18 @@ def gpt2_model(wikitext_dataset):
         "n_head": 16,
     }
     return OobleckModel("gpt2", wikitext_dataset.sample, None, "test", model_args)
+
+
+@pytest.fixture(scope="session")
+def resnet_model(imagenet_dataset):
+    return OobleckModel(
+        "microsoft/resnet-152", imagenet_dataset.sample, None, "test", None
+    )
+
+
+@pytest.fixture(scope="session", params=["gpt2_model", "resnet_model"])
+def model(request: pytest.FixtureRequest):
+    return request.getfixturevalue(request.param)
 
 
 @pytest.fixture(scope="module")
