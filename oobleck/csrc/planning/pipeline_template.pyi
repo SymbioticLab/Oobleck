@@ -25,7 +25,7 @@ class LayerExecutionResults:
 class StageExecutionResult:
     _num_gpus: int
     _layer_indices: List[int]
-    _num_layers: int
+    _size: int
     _mem_required: int
 
 def get_profile_results(
@@ -41,10 +41,10 @@ class PipelineTemplate:
         num_nodes: int,
         num_gpus_per_node: int,
     ): ...
-    def get_iteration_time(self) -> float: ...
-    def get_stages(self) -> List[StageExecutionResult]: ...
-    def get_num_nodes(self) -> int: ...
-    def get_num_gpus_per_node(self) -> int: ...
+    _num_nodes: int
+    _num_gpus_per_node: int
+    _stages: List[StageExecutionResult]
+    _iteration_time: float
 
 class PipelineTemplateGenerator:
     def __init__(self): ...

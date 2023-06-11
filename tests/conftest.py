@@ -1,4 +1,6 @@
+import itertools
 import json
+import math
 import os
 import random
 import shutil
@@ -13,7 +15,9 @@ from transformers import TrainingArguments
 from oobleck.csrc.planning.pipeline_template import (
     LayerExecutionResult,
     LayerExecutionResults,
+    PipelineTemplate,
     PipelineTemplateGenerator,
+    StageExecutionResult,
 )
 from oobleck.execution.dataloader import LoaderType, OobleckDataLoader
 from oobleck.execution.dataset import OobleckDataset
@@ -31,7 +35,7 @@ def wikitext_dataset():
 
 @pytest.fixture(scope="session")
 def imagenet_dataset():
-    return OobleckDataset("microsoft/resnet-152", "Maysee/tiny-imagenet")
+    return OobleckDataset("microsoft/resnet-50", "Maysee/tiny-imagenet")
 
 
 # OobleckDataset does not have any states and ok to use for the entire session.
@@ -90,7 +94,7 @@ def gpt2_model(wikitext_dataset):
 
 def resnet_model(imagenet_dataset):
     return OobleckModel(
-        "microsoft/resnet-152", imagenet_dataset.sample, None, "test", None
+        "microsoft/resnet-50", imagenet_dataset.sample, None, "test", None
     )
 
 
@@ -100,7 +104,7 @@ def resnet_model(imagenet_dataset):
         (gpt2_model, "wikitext_dataset"),
         (resnet_model, "imagenet_dataset"),
     ],
-    ids=["gpt2", "microsoft/resnet-152"],
+    ids=["gpt2", "microsoft/resnet-50"],
 )
 def model(request: pytest.FixtureRequest):
     return request.param[0](request.getfixturevalue(request.param[1]))
@@ -112,18 +116,13 @@ def model(request: pytest.FixtureRequest):
         (gpt2_model, "wikitext_dataset"),
         (resnet_model, "imagenet_dataset"),
     ],
-    ids=["gpt2", "microsoft/resnet-152"],
+    ids=["gpt2", "microsoft/resnet-50"],
 )
 def model_function(no_distributed, request: pytest.FixtureRequest):
     return request.param[0](request.getfixturevalue(request.param[1]))
 
 
-@pytest.fixture(scope="module")
-def pipeline_template_generator():
-    return PipelineTemplateGenerator()
-
-
-@pytest.fixture(scope="function")
+@pytest.fixture(scope="session")
 def dummy_profile_results(model: OobleckModel):
     num_layers = len(model.model)
     layers = []
@@ -186,7 +185,7 @@ def dummy_profile_result_files(
     yield _create_files
 
 
-@pytest.fixture(scope="function")
+@pytest.fixture(scope="session")
 def dummy_layer_execution_results(model: OobleckModel, dummy_profile_results):
     layers, allreduce_across_nodes, allreduce_in_node = dummy_profile_results
 
@@ -256,3 +255,25 @@ def init_distributed():
             os.environ.pop(key)
         else:
             os.environ[key] = value
+
+
+@pytest.fixture(scope="session")
+def dummy_pipeline_template(
+    model: OobleckModel, dummy_layer_execution_results: LayerExecutionResults
+):
+    def divide_layers(
+        layers: List[LayerExecutionResult], num: int
+    ) -> List[List[LayerExecutionResult]]:
+        k, m = divmod(len(layers), num)
+        return [
+            layers[i * k + min(i, m) : (i + 1) * k + min(i + 1, m)] for i in range(num)
+        ]
+
+    def _create_pipeline_template(num_gpus: int) -> PipelineTemplate:
+        layers = divide_layers(dummy_layer_execution_results.get(), num_gpus)
+        stages = [
+            StageExecutionResult(l, (l[0]._index, l[-1]._index), 1) for l in layers
+        ]
+        return PipelineTemplate(stages, 0.1, len(model.model), num_gpus, 1)
+
+    return _create_pipeline_template

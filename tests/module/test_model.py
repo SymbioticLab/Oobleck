@@ -12,7 +12,7 @@ from oobleck.module.sharding import get_split_points
     "model_name,dataset",
     [
         ("gpt2", "wikitext_dataset"),
-        ("microsoft/resnet-152", "imagenet_dataset"),
+        ("microsoft/resnet-50", "imagenet_dataset"),
     ],
 )
 def test_initialize_model(
@@ -36,7 +36,7 @@ def test_initialize_model(
     "model_name,dataset",
     [
         ("gpt2", "wikitext_dataset"),
-        ("microsoft/resnet-152", "imagenet_dataset"),
+        ("microsoft/resnet-50", "imagenet_dataset"),
     ],
 )
 @pytest.mark.skip(reason="Not implemented yet")

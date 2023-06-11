@@ -33,6 +33,8 @@ PYBIND11_MODULE(pipeline_template, m) {
 
   py::class_<StageExecutionResult, std::shared_ptr<StageExecutionResult>>(
       m, "StageExecutionResult")
+      .def(py::init<const std::shared_ptr<LayerExecutionResults>,
+                    const std::tuple<int, int>&, const int>())
       .def_readonly("_num_gpus", &StageExecutionResult::num_gpus_)
       .def_readonly("_layer_indices", &StageExecutionResult::layer_indices_)
       .def_property_readonly("_num_layers", &StageExecutionResult::num_layers)
