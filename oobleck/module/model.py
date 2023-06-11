@@ -1,20 +1,17 @@
-import torch
+from typing import Any, Dict, List, Optional, Type
 
-from deepspeed import comm as dist
-
-from typing import Optional, Dict, Any, List, Type
 from transformers import (
     AutoConfig,
-    AutoModelForPreTraining,
     AutoModelForCausalLM,
     AutoModelForImageClassification,
+    AutoModelForPreTraining,
     PretrainedConfig,
     PreTrainedModel,
+    TrainingArguments,
 )
-from oobleck.module.sharding import get_split_points, shard_model
-from oobleck.module.layer import Layer
 
-from transformers import TrainingArguments
+from oobleck.module.layer import Layer
+from oobleck.module.sharding import get_split_points, shard_model
 
 # Oobleck has been tested only with the following models.
 lang_models = ["gpt2", "t5", "bert", "bloom"]
@@ -51,10 +48,6 @@ class OobleckModel:
         model_tag: Optional[str] = None,
         config_args: Optional[Dict[str, Any]] = None,
     ):
-        assert (
-            not dist.is_initialized()
-        ), "Model initialization must be done before distributed initialization."
-
         if config_args is None:
             config_args = {}
         config_args["use_cache"] = False

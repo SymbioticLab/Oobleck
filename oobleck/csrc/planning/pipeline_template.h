@@ -34,7 +34,7 @@ class PipelineTemplate {
     int num_gpus_used = 0;
     for (auto& stage : stage_execution_results_) {
       std::cout << stage->to_string() << std::endl;
-      num_gpus_used += stage->get_num_gpus();
+      num_gpus_used += stage->num_gpus_;
     }
     assert(num_gpus_used == num_nodes * num_gpus_per_node);
 

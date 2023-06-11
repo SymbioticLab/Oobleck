@@ -50,9 +50,11 @@ class Profiler:
 
                 # Implement a batch
                 if batch_size > 1:
-                    input = tuple(
-                        [input[i].repeat(batch_size, 1) for i in range(len(input))],
-                    )
+                    new_input = []
+                    for i in range(len(input)):
+                        repeat = [batch_size] + [1] * (len(input[i].shape) - 1)
+                        new_input.append(input[i].repeat(repeat))
+                    input = tuple(new_input)
 
                 for idx, layer in enumerate(self.model.model):
                     start_mem = torch.cuda.memory_allocated()

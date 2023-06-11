@@ -1,24 +1,29 @@
 import json
 import math
 import os
-import shutil
 from pathlib import Path
 
 import pytest
 import torch
 import torch.distributed as dist
 
-from oobleck.planning.profiler import (LayerExecutionResult, Profiler,
-                                       get_profile_results, profile)
+from oobleck.csrc.planning.pipeline_template import (
+    LayerExecutionResult,
+    LayerExecutionResults,
+    get_profile_results,
+)
+from oobleck.module.model import OobleckModel
+from oobleck.planning.profiler import Profiler, profile
 
 
-@pytest.mark.skipif(torch.cuda.device_count() == 0, reason="need at least one GPU")
-def test_profile_execution_layers(gpt2_model, distributed_conf_one, distributed):
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="need at least one GPU")
+def test_profile_execution_layers(model: OobleckModel, init_distributed):
     # Profile only. Need torch.distributed initialization.
-    profiler = Profiler(gpt2_model)
+    init_distributed(True)
+    profiler = Profiler(model)
     results = profiler.profile_execution_layers(1)
     assert isinstance(results, list)
-    assert len(results) == len(gpt2_model.model)
+    assert len(results) == len(model.model)
     for layer_result in results:
         assert isinstance(layer_result, dict)
         assert "forward" in layer_result and isinstance(layer_result["forward"], float)
@@ -34,78 +39,71 @@ def test_profile_execution_layers(gpt2_model, distributed_conf_one, distributed)
         )
 
 
-@pytest.mark.skipif(torch.cuda.device_count() == 0, reason="need at least one GPU")
-def test_profile_allreduce_layer(gpt2_model, distributed_conf_one, distributed):
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="need at least one GPU")
+def test_profile_allreduce_layer(model: OobleckModel, init_distributed):
     # Profile only. Need torch.distributed initialization.
-    for layer in gpt2_model.model:
+    init_distributed(True)
+    for layer in model.model:
         assert Profiler.profile_allreduce_layer(layer, dist.group.WORLD) > 0
 
 
-@pytest.mark.skipif(torch.cuda.device_count() == 0, reason="need at least one GPU")
-def test_profile_allreduce_in_node(gpt2_model, distributed_conf_one, distributed):
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="need at least one GPU")
+def test_profile_allreduce_in_node(model: OobleckModel, init_distributed):
     # Profile only. Need torch.distributed initialization.
-    profiler = Profiler(gpt2_model)
+    init_distributed(True)
+    profiler = Profiler(model)
 
     # test allreduce between GPUs in node
     # unittest only uses 1 GPU
     results_in_node = profiler.profile_allreduce_in_node()
     assert isinstance(results_in_node, list)
-    assert len(results_in_node) == len(gpt2_model.model)
+    assert len(results_in_node) == len(model.model)
     for layer_result in results_in_node:
         assert isinstance(layer_result, dict)
         assert len(list(layer_result.keys())) == 1
         assert 1 in layer_result  # key is # GPUs in a node
 
 
-@pytest.mark.skipif(torch.cuda.device_count() == 0, reason="need at least one GPU")
-def test_profile_allreduce_across_nodes(gpt2_model, distributed_conf_one, distributed):
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="need at least one GPU")
+def test_profile_allreduce_across_nodes(model: OobleckModel, init_distributed):
     # Profile only. Need torch.distributed initialization.
-    profiler = Profiler(gpt2_model)
+    init_distributed(True)
+    profiler = Profiler(model)
 
     # test allreduce across nodes
     # unittest only uses 1 node
     results_across_nodes = profiler.profile_allreduce_across_nodes()
     assert isinstance(results_across_nodes, list)
-    assert len(results_across_nodes) == len(gpt2_model.model)
+    assert len(results_across_nodes) == len(model.model)
     for layer_result in results_across_nodes:
         assert isinstance(layer_result, dict)
         assert len(list(layer_result.keys())) == 1
         assert 1 in layer_result  # key is # nodes
 
 
-@pytest.fixture(scope="session")
-def cleanup_profile(gpt2_model):
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="need at least one GPU")
+def test_profile_singlemicrobatch(
+    no_distributed, model: OobleckModel, new_profile_directory: str
+):
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-    directory = Path(
-        f"/tmp/oobleck/profiles/{gpt2_model.model_name}-{gpt2_model.model_tag}"
-    )
-
-    # remove profiled data
-    shutil.rmtree(directory, ignore_errors=True)
-
-
-@pytest.mark.skipif(torch.cuda.device_count() == 0, reason="need at least one GPU")
-def test_profile(gpt2_model, cleanup_profile):
     # This test repeats overall profiling but also
     # checks if they are properly written to files.
     # profile initializes process group, so it does not require the fixture.
-    assert not dist.is_initialized()
-
     profile(
-        model_name=gpt2_model.model_name,
-        sample_inputs=gpt2_model.sample_inputs,
+        model_name=model.model_name,
+        sample_inputs=model.sample_inputs,
         master_addr="localhost",
-        master_port=12356,
+        master_port=0,
         world_size=1,
         rank=0,
         local_rank=0,
         microbatch_size=1,
-        model_tag=gpt2_model.model_tag,
-        model_args=gpt2_model.model_args.to_dict(),
+        model_tag=new_profile_directory,
+        model_args=model.model_args.to_dict(),
     )
 
     directory = Path(
-        f"/tmp/oobleck/profiles/{gpt2_model.model_name}-{gpt2_model.model_tag}"
+        f"/tmp/oobleck/profiles/{model.model_name}-{new_profile_directory}"
     )
     assert directory.is_dir()
 
@@ -120,68 +118,83 @@ def test_profile(gpt2_model, cleanup_profile):
                 # check the file is json format, otherwise json.load will raise an error
                 data = json.load(f)
                 assert isinstance(data, list)
-                assert len(data) == len(gpt2_model.model)
+                assert len(data) == len(model.model)
 
 
-@pytest.mark.order(after="test_profile")
-def test_get_profile_results(gpt2_model):
-    pytest.mark.skipif(
-        Path(
-            f"/tmp/oobleck/profiles/{gpt2_model.model_name}-{gpt2_model.model_tag}"
-        ).is_dir(),
-        reason="need to run profile first",
-    )
-
-    results = get_profile_results(gpt2_model, 1)
-    assert isinstance(results, list)
-    for result in results:
-        assert isinstance(result, LayerExecutionResult)
-        assert isinstance(result.index, int)
-        assert isinstance(result.forward, float)
-        assert isinstance(result.backward, float)
-        assert isinstance(result.allreduce_in_node, dict)
-        for num_gpus, ar in result.allreduce_in_node.items():
-            assert isinstance(num_gpus, int)
-            assert math.log2(num_gpus).is_integer(), "num_gpus must be a power of 2"
-            assert isinstance(ar, float)
-        assert isinstance(result.allreduce_cross_nodes, dict)
-        for num_nodes, ar in result.allreduce_cross_nodes.items():
-            assert isinstance(num_nodes, int)
-            assert num_nodes > 0
-            assert isinstance(ar, float)
-        assert isinstance(result.mem_required, tuple)
-        for mem in result.mem_required:
-            assert isinstance(mem, int)
-
-
-@pytest.mark.skipif(torch.cuda.device_count() == 0, reason="need at least one GPU")
-def test_profile_multimicrobatch(gpt2_model, cleanup_profile):
-    directory = Path(
-        f"/tmp/oobleck/profiles/{gpt2_model.model_name}-{gpt2_model.model_tag}"
-    )
-    assert not directory.joinpath("mb4.json").exists()
-
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="need at least one GPU")
+def test_profile_multimicrobatch(
+    no_distributed, model: OobleckModel, new_profile_directory: str
+):
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    # This test repeats overall profiling but also
+    # checks if they are properly written to files.
+    # profile initializes process group, so it does not require the fixture.
     profile(
-        model_name=gpt2_model.model_name,
-        sample_inputs=gpt2_model.sample_inputs,
+        model_name=model.model_name,
+        sample_inputs=model.sample_inputs,
         master_addr="localhost",
-        master_port=12357,
+        master_port=0,
         world_size=1,
         rank=0,
         local_rank=0,
         microbatch_size=4,
-        model_tag=gpt2_model.model_tag,
-        model_args=gpt2_model.model_args.to_dict(),
+        model_tag=new_profile_directory,
+        model_args=model.model_args.to_dict(),
     )
 
-    assert directory.joinpath("mb4.json").exists()
+    directory = Path(
+        f"/tmp/oobleck/profiles/{model.model_name}-{new_profile_directory}"
+    )
+    assert directory.is_dir()
+
+    for filename in [
+        "mb4.json",
+        "allreduce_in_node.json",
+        "allreduce_across_nodes.json",
+    ]:
+        with directory.joinpath(filename) as path:
+            assert path.is_file()
+            with path.open(mode="r") as f:
+                # check the file is json format, otherwise json.load will raise an error
+                data = json.load(f)
+                assert isinstance(data, list)
+                assert len(data) == len(model.model)
+
+
+def test_get_profile_results(
+    model: OobleckModel, new_profile_directory, dummy_profile_result_files
+):
+    dummy_profile_result_files(microbatch_size=1)
+
+    results = get_profile_results(
+        model_name=model.model_name, model_tag=new_profile_directory, microbatch_size=1
+    )
+    assert isinstance(results, LayerExecutionResults)
+    for result in results.get():
+        assert isinstance(result, LayerExecutionResult)
+        assert isinstance(result._index, int)
+        assert isinstance(result._forward, float)
+        assert isinstance(result._backward, float)
+        assert isinstance(result._allreduce_in_node, dict)
+        for num_gpus, ar in result._allreduce_in_node.items():
+            assert isinstance(num_gpus, int)
+            assert math.log2(num_gpus).is_integer(), "num_gpus must be a power of 2"
+            assert isinstance(ar, float)
+        assert isinstance(result._allreduce_across_nodes, dict)
+        for num_nodes, ar in result._allreduce_across_nodes.items():
+            assert isinstance(num_nodes, int)
+            assert num_nodes > 0
+            assert isinstance(ar, float)
+        assert isinstance(result._mem_required, tuple)
+        for mem in result._mem_required:
+            assert isinstance(mem, int)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="need multiple GPUs")
-def test_profile_in_node_multigpu(gpt2_model):
+def test_profile_in_node_multigpu(model):
     assert False, "Not implemented yet"
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="need multiple GPUs")
-def test_profile_across_nodes_multigpu(gpt2_model):
+def test_profile_across_nodes_multigpu(model):
     assert False, "Not implemented yet"

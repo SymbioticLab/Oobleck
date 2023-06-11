@@ -1,16 +1,23 @@
+import json
 import os
 import random
+import shutil
+import string
+from pathlib import Path
 from typing import List
 
 import deepspeed.comm as dist
 import pytest
 from transformers import TrainingArguments
 
-from oobleck.csrc.planning.pipeline_template import PipelineTemplateGenerator
+from oobleck.csrc.planning.pipeline_template import (
+    LayerExecutionResult,
+    PipelineTemplateGenerator,
+    get_profile_results,
+)
 from oobleck.execution.dataloader import LoaderType, OobleckDataLoader
 from oobleck.execution.dataset import OobleckDataset
 from oobleck.module.model import OobleckModel
-from oobleck.planning.profiler import LayerExecutionResult, get_profile_results
 
 TRAIN_BATCH_SIZE = 8
 EVAL_BATCH_SIZE = 4
@@ -100,14 +107,14 @@ def model(request: pytest.FixtureRequest):
 
 
 @pytest.fixture(
-    scope="session",
+    scope="function",
     params=[
         (gpt2_model, "wikitext_dataset"),
         (resnet_model, "imagenet_dataset"),
     ],
     ids=["gpt2", "microsoft/resnet-152"],
 )
-def model_function(request: pytest.FixtureRequest):
+def model_function(no_distributed, request: pytest.FixtureRequest):
     return request.param[0](request.getfixturevalue(request.param[1]))
 
 
@@ -117,8 +124,8 @@ def pipeline_template_generator():
 
 
 @pytest.fixture(scope="function")
-def gpt2_dummy_profile_results(gpt2_model):
-    num_layers = len(gpt2_model.model)
+def dummy_profile_results(model: OobleckModel):
+    num_layers = len(model.model)
     layers = []
     allreduce_across_nodes = []
     allreduce_in_node = []
@@ -141,9 +148,51 @@ def gpt2_dummy_profile_results(gpt2_model):
             {1: random.random(), 2: random.random(), 4: random.random()}
         )
 
+    return layers, allreduce_across_nodes, allreduce_in_node
+
+
+@pytest.fixture(scope="function")
+def new_profile_directory(model):
+    # This fixture is used to clean up the files created by profile.
+    exist = True
+    while exist:
+        random_tag = "".join(random.choices(string.ascii_letters, k=8))
+        path = Path(f"/tmp/oobleck/profiles/{model.model_name}-{random_tag}")
+        exist = path.exists()
+    yield random_tag
+    shutil.rmtree(path, ignore_errors=True)
+
+
+@pytest.fixture(scope="function")
+def dummy_profile_result_files(
+    model: OobleckModel, dummy_profile_results, new_profile_directory
+):
+    directory = Path(
+        f"/tmp/oobleck/profiles/{model.model_name}-{new_profile_directory}"
+    )
+    directory.mkdir(parents=True, exist_ok=False)
+
+    def _create_files(microbatch_size: int):
+        filenames = [
+            f"mb{microbatch_size}.json",
+            "allreduce_across_nodes.json",
+            "allreduce_in_node.json",
+        ]
+        for filename, result in zip(filenames, dummy_profile_results):
+            with directory.joinpath(filename).open(mode="w") as f:
+                json.dump(result, f)
+                f.flush()
+
+    yield _create_files
+
+
+@pytest.fixture(scope="function")
+def dummy_layer_execution_results(model: OobleckModel, dummy_profile_results):
+    layers, allreduce_across_nodes, allreduce_in_node = dummy_profile_results
+
     results: List[LayerExecutionResult] = []
     for layer, execution, ar_in_node, ar_across_nodes in zip(
-        gpt2_model.model, layers, allreduce_in_node, allreduce_across_nodes
+        model.model, layers, allreduce_in_node, allreduce_across_nodes
     ):
         results.append(
             LayerExecutionResult(
@@ -158,40 +207,52 @@ def gpt2_dummy_profile_results(gpt2_model):
     return results
 
 
-@pytest.fixture(scope="session")
-def gpt2_profile_results(gpt2_model):
-    return get_profile_results(gpt2_model, 1)
+@pytest.fixture(scope="function")
+def no_distributed():
+    original_env = dict(os.environ)
+    os.environ.pop("MASTER_ADDR", None)
+    os.environ.pop("MASTER_PORT", None)
+    os.environ.pop("WORLD_SIZE", None)
+    os.environ.pop("RANK", None)
+    os.environ.pop("LOCAL_RANK", None)
+    yield
+    os.environ.clear()
+    os.environ.update(original_env)
 
 
 @pytest.fixture(scope="function")
-def distributed_conf_one():
+def init_distributed():
     backup = {
         "MASTER_ADDR": os.environ.get("MASTER_ADDR"),
         "MASTER_PORT": os.environ.get("MASTER_PORT"),
         "WORLD_SIZE": os.environ.get("WORLD_SIZE"),
         "RANK": os.environ.get("RANK"),
         "LOCAL_RANK": os.environ.get("LOCAL_RANK"),
-        "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES"),
     }
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12355"
+    os.environ["MASTER_PORT"] = "0"
     os.environ["WORLD_SIZE"] = "1"
     os.environ["RANK"] = "0"
     os.environ["LOCAL_RANK"] = "0"
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-    yield
+
+    def _distributed(init_required: bool):
+        if init_required:
+            if dist.is_initialized():
+                return
+
+            dist.init_distributed(dist_backend="nccl", dist_init_required=True)
+            assert dist.is_initialized()
+        else:
+            assert not dist.is_initialized()
+
+    yield _distributed
+
+    if dist.is_initialized():
+        dist.destroy_process_group()
+        dist.cdb = None
+    assert not dist.is_initialized()
     for key, value in backup.items():
         if value is None:
             os.environ.pop(key)
         else:
             os.environ[key] = value
-
-
-@pytest.fixture(scope="function")
-def distributed():
-    dist.init_distributed(dist_backend="nccl")
-    assert dist.is_initialized()
-    yield
-    dist.destroy_process_group()
-    dist.cdb = None
-    assert not dist.is_initialized()

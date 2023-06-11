@@ -20,20 +20,20 @@ class LayerExecutionResult {
                        const double forward,
                        const double backward,
                        const std::map<int, double>& allreduce_in_node,
-                       const std::map<int, double>& allreduce_cross_nodes,
+                       const std::map<int, double>& allreduce_across_nodes,
                        const std::tuple<int, int>& mem_required)
       : layer_index_(layer_index),
         forward_(forward),
         backward_(backward),
         allreduce_in_node_(allreduce_in_node),
-        allreduce_cross_nodes_(allreduce_cross_nodes),
+        allreduce_across_nodes_(allreduce_across_nodes),
         mem_required_(mem_required) {}
 
   int layer_index_;
   double forward_;
   double backward_;
   std::map<int, double> allreduce_in_node_;
-  std::map<int, double> allreduce_cross_nodes_;
+  std::map<int, double> allreduce_across_nodes_;
   std::tuple<int, int> mem_required_;
 };
 
@@ -42,7 +42,8 @@ class LayerExecutionResults
  public:
   LayerExecutionResults(std::vector<LayerExecutionResult>&& data)
       : data_(std::move(data)), size_(data_.size()) {}
-  const LayerExecutionResult& get(const int index) { return data_[index]; }
+  const std::vector<LayerExecutionResult>& get() const { return data_; }
+  const LayerExecutionResult& at(const int index) const { return data_[index]; }
   int size() const { return size_; }
 
  private:
@@ -56,8 +57,6 @@ class LayerExecutionResults
  * StageExecutionResult is the aggregation of LayerExecutionResults.
  */
 class StageExecutionResult {
-  friend class DCExecutionResult;
-
  public:
   StageExecutionResult(
       const std::shared_ptr<LayerExecutionResults> layer_results,
@@ -69,26 +68,23 @@ class StageExecutionResult {
     assert(layer_end_index <= layer_results->size());
 
     for (int i = layer_start_index; i < layer_end_index; ++i) {
-      layer_indices_.push_back(layer_results->get(i).layer_index_);
-      forward_ += layer_results->get(i).forward_;
-      backward_ += layer_results->get(i).backward_;
+      layer_indices_.push_back(layer_results->at(i).layer_index_);
+      forward_ += layer_results->at(i).forward_;
+      backward_ += layer_results->at(i).backward_;
 
       if (num_gpus_ > 1) {
-        forward_ += layer_results->get(i).allreduce_in_node_.at(num_gpus_ - 1);
-        backward_ += layer_results->get(i).allreduce_in_node_.at(num_gpus_ - 1);
+        forward_ += layer_results->at(i).allreduce_in_node_.at(num_gpus_ - 1);
+        backward_ += layer_results->at(i).allreduce_in_node_.at(num_gpus_ - 1);
       }
 
-      for (const auto& it : layer_results->get(i).allreduce_cross_nodes_) {
-        allreduce_cross_nodes_[it.first] += it.second;
+      for (const auto& it : layer_results->at(i).allreduce_across_nodes_) {
+        allreduce_across_nodes_[it.first] += it.second;
       }
-      mem_required_ += std::get<0>(layer_results->get(i).mem_required_) * 6;
-      mem_required_ += std::get<1>(layer_results->get(i).mem_required_);
+      mem_required_ += std::get<0>(layer_results->at(i).mem_required_) * 6;
+      mem_required_ += std::get<1>(layer_results->at(i).mem_required_);
     }
   }
 
-  const std::vector<int>& get_layer_indices() const { return layer_indices_; }
-  int get_num_gpus() const { return num_gpus_; }
-  int get_memory_consumption() const { return mem_required_ / num_gpus_; }
   int num_layers() const { return layer_indices_.size(); }
   std::string to_string() const {
     int first_layer_index = layer_indices_.front();
@@ -98,12 +94,11 @@ class StageExecutionResult {
            std::to_string(num_gpus_) + " devices";
   }
 
- private:
   int num_gpus_;
   std::vector<int> layer_indices_;
   double forward_;
   double backward_;
-  std::map<int, double> allreduce_cross_nodes_;
+  std::map<int, double> allreduce_across_nodes_;
   int mem_required_;
 };
 
