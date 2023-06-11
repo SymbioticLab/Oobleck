@@ -53,8 +53,8 @@ def test_model_layers_type(model: OobleckModel):
         assert layer.index == index
 
 
-def test_model_layers_param_on_cpu(model: OobleckModel):
-    for layer in model.model:
+def test_model_layers_param_on_cpu(model_function: OobleckModel):
+    for layer in model_function.model:
         assert all(p.device == torch.device("cpu") for p in layer.parameters())
 
 
