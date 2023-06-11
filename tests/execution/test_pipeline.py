@@ -1,4 +1,3 @@
-import deepspeed.comm as dist
 import pytest
 import torch
 import torch.distributed
@@ -7,7 +6,6 @@ from deepspeed.runtime.lr_schedules import WarmupLR
 from transformers import TrainingArguments
 
 from oobleck.execution.pipeline import OobleckPipeline
-from oobleck.module.model import OobleckModel
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
