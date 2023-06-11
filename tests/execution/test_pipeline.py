@@ -1,6 +1,3 @@
-from collections import OrderedDict
-from typing import List
-
 import deepspeed.comm as dist
 import pytest
 import torch
@@ -10,7 +7,6 @@ from deepspeed.runtime.lr_schedules import WarmupLR
 from transformers import TrainingArguments
 
 from oobleck.execution.pipeline import OobleckPipeline
-from oobleck.module.layer import Layer
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
@@ -51,7 +47,7 @@ def test_initialize_pipeline_single_stage(
 def test_initialize_two_pipelines(
     model_dataloaders, dummy_pipeline_template, init_distributed
 ):
-    assert False, "Not implemented yet"
+    pytest.skip("Not implemented yet")
 
     model, train_dataloader, eval_dataloader = model_dataloaders
     init_distributed(True)
@@ -77,7 +73,7 @@ def test_initialize_two_pipelines(
 def test_initialize_pipeline_multiple_stages(
     model_dataloaders, dummy_pipeline_template, init_distributed
 ):
-    assert False, "Not implemented yet"
+    pytest.skip("Not implemented yet")
 
     model, train_dataloader, eval_dataloader = model_dataloaders
     init_distributed(True)

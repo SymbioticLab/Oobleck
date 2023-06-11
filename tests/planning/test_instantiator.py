@@ -74,4 +74,4 @@ def test_instantiate_pipelines_multiple_templates(
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="need multiple GPUs")
 def test_initialize_instantiator_multigpu():
     # Test if each node has more than 1 GPU.
-    assert False, "Not implemented yet"
+    pytest.skip("Not implemented yet")

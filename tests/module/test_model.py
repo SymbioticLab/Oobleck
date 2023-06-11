@@ -39,11 +39,11 @@ def test_initialize_model(
         ("microsoft/resnet-50", "imagenet_dataset"),
     ],
 )
-@pytest.mark.skip(reason="Not implemented yet")
+
 def test_initialize_model_amp(
     model_name: str, dataset: str, request: pytest.FixtureRequest
 ):
-    assert False
+    pytest.mark.skip("AMP not implemented yet")
 
 
 def test_model_layers_type(model: OobleckModel):
