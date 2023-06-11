@@ -1,12 +1,10 @@
-import itertools
 import json
-import math
 import os
 import random
 import shutil
 import string
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
 import deepspeed.comm as dist
 import pytest
@@ -16,7 +14,6 @@ from oobleck.csrc.planning.pipeline_template import (
     LayerExecutionResult,
     LayerExecutionResults,
     PipelineTemplate,
-    PipelineTemplateGenerator,
     StageExecutionResult,
 )
 from oobleck.execution.dataloader import LoaderType, OobleckDataLoader
@@ -139,7 +136,7 @@ def dummy_profile_results(model: OobleckModel):
 
         # TODO: get argument to set number of nodes
         ar_across_nodes = {}
-        for i in range(1, 17):
+        for i in range(1, 33):
             ar_across_nodes[i] = random.random() * 4
 
         allreduce_across_nodes.append(ar_across_nodes)
@@ -258,9 +255,7 @@ def init_distributed():
 
 
 @pytest.fixture(scope="session")
-def dummy_pipeline_template(
-    model: OobleckModel, dummy_layer_execution_results: LayerExecutionResults
-):
+def dummy_pipeline_template(dummy_layer_execution_results: LayerExecutionResults):
     def get_layer_split_indices(
         layers: List[LayerExecutionResult], num: int
     ) -> List[List[LayerExecutionResult]]:
@@ -274,6 +269,7 @@ def dummy_pipeline_template(
             StageExecutionResult(layer_results, indices, 1)
             for indices in zip([0] + indices, indices + [len(layers)])
         ]
+
         return PipelineTemplate(stages, 0.1, len(layers), num_gpus, 1)
 
     return _create_pipeline_template

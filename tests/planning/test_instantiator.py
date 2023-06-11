@@ -40,19 +40,27 @@ def test_instantiate_pipelines_multiple_templates(
 ):
     allreduce_across_nodes = dummy_profile_results[1]
     pipeline_templates: List[PipelineTemplate] = [
-        dummy_pipeline_template(num_gpus=i) for i in range(1, 6)
+        dummy_pipeline_template(num_gpus=i) for i in range(2, 6)
     ]
     instantiator = PipelineInstantiator()
     execution_plan = instantiator.get_best_execution_plan(
         pipeline_templates=pipeline_templates,
         allreduce_across_nodes=allreduce_across_nodes,
-        num_nodes=16,
+        num_nodes=13,  # no single pipeline template can cover this # nodes.
         global_num_microbatch=512,
     )
     assert isinstance(execution_plan, HeterogeneousPipelinesExecutionPlan)
-    assert len(execution_plan.pipeline_templates) <= 5
+    assert 1 < len(execution_plan.pipeline_templates) < 6
     assert all(t in pipeline_templates for t in execution_plan.pipeline_templates)
-    assert sum(execution_plan.num_instances_set.values()) == 16
+    assert (
+        sum(
+            pipeline_template._num_nodes
+            * pipeline_template._num_gpus_per_node
+            * num_instances
+            for pipeline_template, num_instances in execution_plan.num_instances_set.items()
+        )
+        == 13
+    )
     assert all(mb > 0 for mb in execution_plan.num_microbatches_set.values())
     assert (
         sum(
