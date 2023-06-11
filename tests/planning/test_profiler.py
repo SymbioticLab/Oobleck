@@ -162,7 +162,9 @@ def test_profile_multimicrobatch(
 
 
 def test_get_profile_results(
-    model: OobleckModel, new_profile_directory, dummy_profile_result_files
+    model: OobleckModel,
+    new_profile_directory,
+    dummy_profile_result_files,
 ):
     dummy_profile_result_files(microbatch_size=1)
 
@@ -188,6 +190,27 @@ def test_get_profile_results(
         assert isinstance(result._mem_required, tuple)
         for mem in result._mem_required:
             assert isinstance(mem, int)
+
+
+def test_validate_profile_results_file(
+    model: OobleckModel,
+    new_profile_directory,
+    dummy_profile_result_files,
+    dummy_layer_execution_results: LayerExecutionResults,
+):
+    dummy_profile_result_files(microbatch_size=1)
+    results_from_file = get_profile_results(
+        model_name=model.model_name, model_tag=new_profile_directory, microbatch_size=1
+    )
+    
+    # rff: result from file, rfd: result from dummy
+    for rff, rfd in zip(results_from_file.get(), dummy_layer_execution_results.get()):
+        assert rff._index == rfd._index
+        assert rff._forward == rfd._forward
+        assert rff._backward == rfd._backward
+        assert rff._allreduce_in_node == rfd._allreduce_in_node
+        assert rff._allreduce_across_nodes == rfd._allreduce_across_nodes
+        assert rff._mem_required == rfd._mem_required
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="need multiple GPUs")

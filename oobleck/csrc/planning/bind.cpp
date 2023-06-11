@@ -26,6 +26,7 @@ PYBIND11_MODULE(pipeline_template, m) {
 
   py::class_<LayerExecutionResults, std::shared_ptr<LayerExecutionResults>>(
       m, "LayerExecutionResults")
+      .def(py::init<std::vector<LayerExecutionResult>&&>())
       .def("get", &LayerExecutionResults::get)
       .def("at", &LayerExecutionResults::at, py::arg("index"))
       .def_property_readonly("_size", &LayerExecutionResults::size);

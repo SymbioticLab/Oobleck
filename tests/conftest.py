@@ -12,8 +12,8 @@ from transformers import TrainingArguments
 
 from oobleck.csrc.planning.pipeline_template import (
     LayerExecutionResult,
+    LayerExecutionResults,
     PipelineTemplateGenerator,
-    get_profile_results,
 )
 from oobleck.execution.dataloader import LoaderType, OobleckDataLoader
 from oobleck.execution.dataset import OobleckDataset
@@ -204,7 +204,7 @@ def dummy_layer_execution_results(model: OobleckModel, dummy_profile_results):
                 execution["mem_required"],
             )
         )
-    return results
+    return LayerExecutionResults(results)
 
 
 @pytest.fixture(scope="function")
