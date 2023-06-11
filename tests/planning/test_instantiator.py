@@ -1,7 +1,25 @@
 import pytest
 import torch
 
+from oobleck.csrc.planning.pipeline_template import PipelineTemplate
+from oobleck.module.model import OobleckModel
 from oobleck.planning.instantiator import PipelineInstantiator
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="need at least one GPU")
+def test_instantiate_pipelines(
+    model: OobleckModel, dummy_profile_results, dummy_pipeline_template
+):
+    allreduce_across_nodes = dummy_profile_results[1]
+    pipeline_template: PipelineTemplate = dummy_pipeline_template(num_gpus=1)
+    instantiator = PipelineInstantiator()
+    execution_plan = instantiator.get_best_execution_plan(
+        pipeline_templates=[pipeline_template],
+        allreduce_across_nodes=allreduce_across_nodes,
+        num_nodes=4,
+        global_num_microbatch=512,
+    )
+    assert execution_plan is not None
 
 
 def test_initialize_instantiator(

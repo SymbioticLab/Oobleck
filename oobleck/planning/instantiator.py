@@ -1,18 +1,16 @@
+from collections import defaultdict
+from typing import Dict, List, Optional
+
 import pyomo.environ as pyomo
 import torch.distributed
-
-from collections import defaultdict
-from typing import List, Dict, Optional
-
 from deepspeed import comm as dist
 from deepspeed.utils import logger
+from transformers import TrainingArguments
 
 from oobleck.csrc.planning.pipeline_template import PipelineTemplate
-from oobleck.execution.pipeline import OobleckPipeline
 from oobleck.execution.dataloader import OobleckDataLoader
+from oobleck.execution.pipeline import OobleckPipeline
 from oobleck.module.model import OobleckModel
-
-from transformers import TrainingArguments
 
 
 class HeterogeneousPipelinesExecutionPlan:
@@ -28,7 +26,7 @@ class HeterogeneousPipelinesExecutionPlan:
             for template in pipeline_templates
             if template in num_instances_set and template in num_microbatches_set
         ]
-        pipeline_templates.sort(key=lambda template: template.get_num_nodes())
+        pipeline_templates.sort(key=lambda template: template._num_nodes)
 
         self.pipeline_templates = pipeline_templates
         self.num_instances_set = num_instances_set
@@ -57,7 +55,7 @@ class HeterogeneousPipelinesExecutionPlan:
     def iteration_time(self) -> float:
         # TODO: should be divided by number of stages?
         max_iteration_time = max(
-            pipeline_template.get_iteration_time() * num_microbatches
+            pipeline_template._iteration_time * num_microbatches
             for pipeline_template, num_microbatches in self.num_microbatches_set.items()
         )
 
@@ -77,9 +75,7 @@ class HeterogeneousPipelinesExecutionPlan:
         num_ranks_used = 0
         for template, num_instances in self.num_instances_set.items():
             num_ranks_for_templates = (
-                template.get_num_nodes()
-                * template.get_num_gpus_per_node()
-                * num_instances
+                template._num_nodes * template._num_gpus_per_node * num_instances
             )
             num_ranks_used += num_ranks_for_templates
             if rank < num_ranks_used:
@@ -99,14 +95,13 @@ class HeterogeneousPipelinesExecutionPlan:
 
         for pipeline_template, num_instances in self.num_instances_set.items():
             num_gpus_per_template = (
-                pipeline_template.get_num_nodes()
-                * pipeline_template.get_num_gpus_per_node()
+                pipeline_template._num_nodes * pipeline_template._num_gpus_per_node
             )
 
             for _ in range(num_instances):
                 logger.info(
                     f"Instantiating a pipeline "
-                    f"({len(pipeline_template.get_stages())} stages with {pipeline_template.get_num_nodes()}) nodes)"
+                    f"({len(pipeline_template._stages)} stages with {pipeline_template._num_nodes}) nodes)"
                 )
 
                 ranks = list(
@@ -191,9 +186,9 @@ class PipelineInstantiator:
             for j in range(1, num_nodes + 1):
                 # (1) in Figure: copy all dicts
                 dp[i][j] = [combo.copy() for combo in dp[i - 1][j]]
-                if pipeline_templates[i - 1].get_num_nodes() <= j:
+                if pipeline_templates[i - 1]._num_nodes <= j:
                     # (2) in Figure: copy all dicts with one pipeline_templates[i - 1] added
-                    for combo in dp[i][j - pipeline_templates[i - 1].get_num_nodes()]:
+                    for combo in dp[i][j - pipeline_templates[i - 1]._num_nodes]:
                         new_combo = combo.copy()
                         new_combo[pipeline_templates[i - 1]] += 1
 
@@ -230,7 +225,7 @@ class PipelineInstantiator:
         model.I = pyomo.Set(initialize=list(range(len(num_instances_set))))
 
         T = {
-            i: pipeline_template.get_iteration_time()
+            i: pipeline_template._iteration_time
             for i, pipeline_template in enumerate(num_instances_set)
         }
 
@@ -238,7 +233,7 @@ class PipelineInstantiator:
             i: instance_num for i, instance_num in enumerate(num_instances_set.values())
         }
         s = {
-            i: len(pipeline_template.get_stages())
+            i: len(pipeline_template._stages)
             for i, pipeline_template in enumerate(num_instances_set.keys())
         }
 

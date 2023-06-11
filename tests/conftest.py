@@ -272,7 +272,10 @@ def dummy_pipeline_template(
     def _create_pipeline_template(num_gpus: int) -> PipelineTemplate:
         layers = divide_layers(dummy_layer_execution_results.get(), num_gpus)
         stages = [
-            StageExecutionResult(l, (l[0]._index, l[-1]._index), 1) for l in layers
+            StageExecutionResult(
+                LayerExecutionResults(l), (l[0]._index, l[-1]._index), 1
+            )
+            for l in layers
         ]
         return PipelineTemplate(stages, 0.1, len(model.model), num_gpus, 1)
 
