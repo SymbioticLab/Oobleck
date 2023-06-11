@@ -1,11 +1,11 @@
 from datetime import datetime
-from typing import List, Tuple, Any, Callable
+from typing import Any, Callable, List, Tuple
 
 from deepspeed import comm as dist
+from deepspeed.monitor.config import get_monitor_config
+from deepspeed.monitor.monitor import MonitorMaster
 from deepspeed.utils.logging import logger
 from deepspeed.utils.timer import SynchronizedWallClockTimer
-from deepspeed.monitor.monitor import MonitorMaster
-from deepspeed.monitor.config import get_monitor_config
 
 from oobleck.utils.singleton import Singleton
 
@@ -90,6 +90,8 @@ class OobleckTimer:
 def measure_time(timer_name: str):
     def inner(func: Callable):
         def wrapper(s, *args, **kwargs):
+            # TODO: restore timer later.
+            return func(s, *args, **kwargs)
             assert hasattr(
                 s, "timer"
             ), "Assign self.timer = OobleckTime() to measure time."

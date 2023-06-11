@@ -187,7 +187,9 @@ class PipelineExecution:
     @instrument_w_nvtx
     @measure_time("execution/forward")
     def forward_pass(self, buffer_id: int):
-        inputs: tuple[torch.Tensor] = self.pipeline.pipe_buffers["inputs"][buffer_id]
+        inputs: tuple[torch.Tensor, ...] = self.pipeline.pipe_buffers["inputs"][
+            buffer_id
+        ]
         zero_grads(inputs)
 
         # XXX Hack

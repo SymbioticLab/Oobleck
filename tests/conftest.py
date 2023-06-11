@@ -4,10 +4,12 @@ import random
 import shutil
 import string
 from pathlib import Path
-from typing import Dict, List
+from typing import List
 
 import deepspeed.comm as dist
 import pytest
+import torch
+import torch.distributed
 from transformers import TrainingArguments
 
 from oobleck.csrc.planning.pipeline_template import (
@@ -18,6 +20,7 @@ from oobleck.csrc.planning.pipeline_template import (
 )
 from oobleck.execution.dataloader import LoaderType, OobleckDataLoader
 from oobleck.execution.dataset import OobleckDataset
+from oobleck.execution.pipeline import OobleckPipeline
 from oobleck.module.model import OobleckModel
 
 TRAIN_BATCH_SIZE = 8
@@ -94,7 +97,7 @@ def dataloaders(model: OobleckModel, request: pytest.FixtureRequest):
     dataset = request.getfixturevalue(_model_datasets[model.model_name])
 
     training_args = TrainingArguments(
-        output_dir="/tmp/output",
+        output_dir="/tmp/test_output",
         per_device_train_batch_size=TRAIN_BATCH_SIZE,
         per_device_eval_batch_size=EVAL_BATCH_SIZE,
         gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEP,
@@ -285,3 +288,60 @@ def dummy_pipeline_template(dummy_layer_execution_results: LayerExecutionResults
         return PipelineTemplate(stages, 0.1, len(layers), num_gpus, 1)
 
     return _create_pipeline_template
+
+
+@pytest.fixture(scope="function")
+def dummy_pipeline(model_dataloaders, dummy_pipeline_template, init_distributed):
+    def _create_pipelines(
+        num_gpus_per_pipeline: int, ranks: List[int]
+    ) -> List[OobleckPipeline]:
+        assert len(ranks) % num_gpus_per_pipeline == 0, "Invalid number of ranks"
+        assert len(ranks) <= torch.cuda.device_count(), "Too many ranks"
+
+        model, train_dataloader, eval_dataloader = model_dataloaders
+        init_distributed(True)
+        training_args = TrainingArguments(
+            output_dir="/tmp/test_output",
+            per_device_train_batch_size=TRAIN_BATCH_SIZE,
+            per_device_eval_batch_size=EVAL_BATCH_SIZE,
+            gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEP,
+        )
+
+        pipeline_template = dummy_pipeline_template(num_gpus=num_gpus_per_pipeline)
+
+        rank_groups = [
+            ranks[i:num_gpus_per_pipeline]
+            for i in range(0, len(ranks), num_gpus_per_pipeline)
+        ]
+
+        pipelines = [
+            OobleckPipeline(
+                pipeline_template=pipeline_template,
+                model=model,
+                dataloader=train_dataloader,
+                step=0,
+                ranks=rank_group,
+                process_group=torch.distributed.new_group(ranks=rank_group),
+                training_args=training_args,
+            )
+            for rank_group in rank_groups
+        ]
+
+        for pipeline in pipelines:
+            assert all(
+                all(p.is_cuda for p in layer.parameters())
+                for layer in pipeline.model_layers
+            )
+            assert pipeline.is_first_stage() and pipeline.is_last_stage()
+
+            num_pipe_buffers = pipeline.train_schedule.num_pipe_buffers()
+            for buffer_name in ["inputs", "labels", "outputs"]:
+                assert buffer_name in pipeline.pipe_buffers
+                assert len(pipeline.pipe_buffers[buffer_name]) == num_pipe_buffers
+                assert all(
+                    buffer is None for buffer in pipeline.pipe_buffers[buffer_name]
+                )
+
+        return pipelines
+
+    return _create_pipelines
