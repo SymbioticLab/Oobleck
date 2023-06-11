@@ -1,31 +1,25 @@
 from __future__ import annotations
 
+import itertools
+from types import MethodType
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
+
 import torch
 import torch.distributed
-import itertools
-
-from types import MethodType
-from typing import Union, Any, Dict, Mapping, Tuple, List, Optional, Iterable
-
-from torch.distributed import ProcessGroup, Work
 from deepspeed import comm as dist
-from deepspeed.utils import logger, instrument_w_nvtx
-from deepspeed.runtime.pipe import schedule
 from deepspeed.ops.adam import FusedAdam
 from deepspeed.runtime.lr_schedules import WarmupLR
-
-from oobleck.execution.dataloader import OobleckDataLoader
-from oobleck.module.model import OobleckModel
-from oobleck.module.layer import is_checkpointable
-from oobleck.execution.utils import (
-    zero_grads,
-    DTYPE_TO_ID,
-    ID_TO_DTYPE,
-)
-from oobleck.csrc.planning.pipeline_template import PipelineTemplate
-from oobleck.utils.timer import OobleckTimer, measure_time
-
+from deepspeed.runtime.pipe import schedule
+from deepspeed.utils import instrument_w_nvtx, logger
+from torch.distributed import ProcessGroup, Work
 from transformers import TrainingArguments
+
+from oobleck.csrc.planning.pipeline_template import PipelineTemplate
+from oobleck.execution.dataloader import OobleckDataLoader
+from oobleck.execution.utils import DTYPE_TO_ID, ID_TO_DTYPE, zero_grads
+from oobleck.module.layer import is_checkpointable
+from oobleck.module.model import OobleckModel
+from oobleck.utils.timer import OobleckTimer, measure_time
 
 
 # Applied patch https://github.com/microsoft/DeepSpeed/pull/2862
@@ -485,12 +479,12 @@ class OobleckPipeline:
         process_group: ProcessGroup,
         training_args: TrainingArguments,
     ):
-        logger.info(f"Creating pipeline ({len(pipeline_template.get_stages())} stages)")
+        logger.info(f"Creating pipeline ({len(pipeline_template._stages)} stages)")
 
         assert dist.is_initialized(), "torch.distributed is not intialized."
-        num_gpus_per_node = pipeline_template.get_num_gpus_per_node()
+        num_gpus_per_node = pipeline_template._num_gpus_per_node
         assert (
-            len(ranks) == len(pipeline_template.get_stages()) * num_gpus_per_node
+            len(ranks) == len(pipeline_template._stages) * num_gpus_per_node
         ), "Number of ranks must be equal to number of stages * num_gpus_per_node."
         self.ranks = ranks
         self.my_rank = dist.get_rank()
@@ -511,20 +505,20 @@ class OobleckPipeline:
         self.total_num_layers = len(model.model)
         # Find the stage I am responsible to execute
         num_gpus_used = 0
-        for stage_index, stage in enumerate(pipeline_template.get_stages()):
-            if rank_index in range(num_gpus_used, num_gpus_used + stage.get_num_gpus()):
+        for stage_index, stage in enumerate(pipeline_template._stages):
+            if rank_index in range(num_gpus_used, num_gpus_used + stage._num_gpus):
                 self.model_layers = [
-                    model.model[index].to("cuda") for index in stage.get_layer_indices()
+                    model.model[index].to("cuda") for index in stage._layer_indices
                 ]
 
-            num_gpus_used += stage.get_num_gpus()
+            num_gpus_used += stage._num_gpus
             self.my_stage_index = stage_index
             break
         assert self.model_layers, "Could not find a stage to execute."
 
         self.train_schedule = OobleckPipelineSchedule(
             dataloader.num_my_microbatches,
-            len(pipeline_template.get_stages()),
+            len(pipeline_template._stages),
             stage_index,
         )
 
