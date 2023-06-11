@@ -261,22 +261,19 @@ def init_distributed():
 def dummy_pipeline_template(
     model: OobleckModel, dummy_layer_execution_results: LayerExecutionResults
 ):
-    def divide_layers(
+    def get_layer_split_indices(
         layers: List[LayerExecutionResult], num: int
     ) -> List[List[LayerExecutionResult]]:
-        k, m = divmod(len(layers), num)
-        return [
-            layers[i * k + min(i, m) : (i + 1) * k + min(i + 1, m)] for i in range(num)
-        ]
+        return [round(len(layers) * i / num) for i in range(1, num)]
 
     def _create_pipeline_template(num_gpus: int) -> PipelineTemplate:
-        layers = divide_layers(dummy_layer_execution_results.get(), num_gpus)
+        layers = dummy_layer_execution_results.get()
+        layer_results = LayerExecutionResults(layers)
+        indices = get_layer_split_indices(layers, num_gpus)
         stages = [
-            StageExecutionResult(
-                LayerExecutionResults(l), (l[0]._index, l[-1]._index), 1
-            )
-            for l in layers
+            StageExecutionResult(layer_results, indices, 1)
+            for indices in zip([0] + indices, indices + [len(layers)])
         ]
-        return PipelineTemplate(stages, 0.1, len(model.model), num_gpus, 1)
+        return PipelineTemplate(stages, 0.1, len(layers), num_gpus, 1)
 
     return _create_pipeline_template
