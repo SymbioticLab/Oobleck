@@ -85,7 +85,6 @@ def test_profile_allreduce_across_nodes(model: OobleckModel, init_distributed):
 def test_profile_singlemicrobatch(
     no_distributed, model: OobleckModel, new_profile_directory: str
 ):
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     # This test repeats overall profiling but also
     # checks if they are properly written to files.
     # profile initializes process group, so it does not require the fixture.
@@ -125,7 +124,6 @@ def test_profile_singlemicrobatch(
 def test_profile_multimicrobatch(
     no_distributed, model: OobleckModel, new_profile_directory: str
 ):
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     # This test repeats overall profiling but also
     # checks if they are properly written to files.
     # profile initializes process group, so it does not require the fixture.

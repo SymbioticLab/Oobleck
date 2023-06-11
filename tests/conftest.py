@@ -226,32 +226,38 @@ def no_distributed():
     os.environ.pop("WORLD_SIZE", None)
     os.environ.pop("RANK", None)
     os.environ.pop("LOCAL_RANK", None)
+    next(set_number_of_gpus(1))
     yield
     os.environ.clear()
     os.environ.update(original_env)
 
+def set_number_of_gpus(num_gpus: int = 1):
+    # Hack to make torch.cuda.device_count() return # GPUs specified in env
+    func = torch.cuda.device_count
+    torch.cuda.device_count = lambda: num_gpus
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join([str(i) for i in range(0, num_gpus)])
+    yield
+    torch.cuda.device_count = func
+    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+
 
 @pytest.fixture(scope="function")
 def init_distributed():
-    backup = {
-        "MASTER_ADDR": os.environ.get("MASTER_ADDR"),
-        "MASTER_PORT": os.environ.get("MASTER_PORT"),
-        "WORLD_SIZE": os.environ.get("WORLD_SIZE"),
-        "RANK": os.environ.get("RANK"),
-        "LOCAL_RANK": os.environ.get("LOCAL_RANK"),
-    }
+    original_env = dict(os.environ)
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "0"
     os.environ["WORLD_SIZE"] = "1"
     os.environ["RANK"] = "0"
     os.environ["LOCAL_RANK"] = "0"
 
+    set_number_of_gpus(1)
+
     def _distributed(init_required: bool):
         if init_required:
             if dist.is_initialized():
                 return
 
-            dist.init_distributed(dist_backend="nccl", dist_init_required=True)
+            dist.init_distributed(dist_backend="nccl", dist_init_required=True, rank=0, world_size=1)
             assert dist.is_initialized()
         else:
             assert not dist.is_initialized()
@@ -262,11 +268,9 @@ def init_distributed():
         dist.destroy_process_group()
         dist.cdb = None
     assert not dist.is_initialized()
-    for key, value in backup.items():
-        if value is None:
-            os.environ.pop(key)
-        else:
-            os.environ[key] = value
+    
+    os.environ.clear()
+    os.environ.update(original_env)
 
 
 @pytest.fixture(scope="session")
