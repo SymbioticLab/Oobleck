@@ -36,7 +36,7 @@ class Model:
 
 models_to_test: Dict[str, Model] = {
     "gpt2": Model("gpt2", "wikitext", "wikitext-2-raw-v1"),
-    "microsoft/resnet-50": Model("microsoft/resnet-50", "Maysee/tiny-iamgenet"),
+    "microsoft/resnet-50": Model("microsoft/resnet-50", "Maysee/tiny-imagenet"),
 }
 
 # Add model arguments here, if it is needed.
@@ -50,8 +50,8 @@ model_args: Dict[str, Optional[Dict[str, int]]] = {
 }
 
 
-@pytest.fixture(scope="session", params=list(models_to_test.keys()))
-def models_to_test(request: pytest.FixtureRequest) -> str:
+@pytest.fixture(scope="class", params=list(models_to_test.keys()))
+def model_name_fixture(request: pytest.FixtureRequest) -> str:
     return request.param
 
 
@@ -80,7 +80,9 @@ class OobleckStaticClassFactory:
     def get_dataset(self) -> OobleckDataset:
         if not self._dataset:
             self._dataset = OobleckDataset(
-                self._model_data.model_name, self._model_data.dataset_path
+                self._model_data.model_name,
+                self._model_data.dataset_path,
+                self._model_data.dataset_name,
             )
         return self._dataset
 
@@ -96,6 +98,8 @@ class OobleckStaticClassFactory:
 
         return self._model
 
+    # TODO: move it to dynamic class factory
+    # Dataloader has its state and is subject to change.
     def get_dataloader(self) -> OobleckDataLoader:
         self.get_dataset()
         self.get_model()
@@ -167,6 +171,37 @@ class OobleckStaticClassFactory:
             )
 
         return self._pipeline_template
+
+
+class OobleckSingleProcessTestCase:
+    """
+    A base class for Oobleck test cases that run in a single process.
+    Test cases for functionalities of static classes will inherit this class.
+    """
+
+    factory: OobleckStaticClassFactory
+
+    @classmethod
+    @pytest.fixture(scope="class", autouse=True)
+    def setup_class(
+        cls,
+        model_name_fixture: str,
+        tmpdir_factory: pytest.TempdirFactory,
+        request: pytest.FixtureRequest,
+    ):
+        tmpdir = tmpdir_factory.mktemp("oobleck")
+        request.cls.factory = OobleckStaticClassFactory(
+            model_name_fixture, tmpdir.dirpath()
+        )
+
+
+class OobleckMultiProcessTestCase:
+    """
+    A base class for Oobleck test cases that run in multiple processes in parallel.
+    Test cases for functionalities of dynamic classes will inherit this class.
+    """
+
+    pass
 
 
 @pytest.fixture(scope="function")
