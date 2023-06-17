@@ -7,7 +7,7 @@ import shutil
 import string
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import deepspeed.comm as dist
 import pytest
@@ -74,6 +74,7 @@ class OobleckClassFactory:
         self._dataset: Optional[OobleckDataset] = None
         self._model: Optional[OobleckModel] = None
         self._dataloader: Optional[OobleckDataLoader] = None
+        self._profile: Optional[Tuple[List, List, List]] = None
 
     def get_dataset(self) -> OobleckDataset:
         if not self._dataset:
@@ -85,20 +86,22 @@ class OobleckClassFactory:
     def get_model(self) -> OobleckModel:
         self.get_dataset()
 
-        self._model = OobleckModel(
-            self._model_data.model_name,
-            self._dataset.sample,
-            self._training_args,
-            "test",
-            model_args.get(self._model_data.model_name, None),
-        )
+        if not self._model:
+            self._model = OobleckModel(
+                self._model_data.model_name,
+                self._dataset.sample,
+                self._training_args,
+                "test",
+                model_args.get(self._model_data.model_name, None),
+            )
+
         return self._model
 
     def get_dataloader(self) -> OobleckDataLoader:
-        if not self._dataloader:
-            self.get_dataset()
-            self.get_model()
+        self.get_dataset()
+        self.get_model()
 
+        if not self._dataloader:
             self._dataloader = OobleckDataLoader(
                 self._dataset,
                 self._training_args,
@@ -107,91 +110,39 @@ class OobleckClassFactory:
                 0,
                 0,
             )
+
         return self._dataloader
 
+    def get_dummy_profile(self) -> Tuple[List, List, List]:
+        self.get_model()
 
-@pytest.fixture(scope="session")
-def dummy_profile_results(model: OobleckModel):
-    num_layers = len(model.model)
-    layers = []
-    allreduce_across_nodes = []
-    allreduce_in_node = []
-    for _ in range(num_layers):
-        layers.append(
-            {
-                "forward": random.random(),
-                "backward": random.random() * 3,
-                "mem_required": [1024, 1024],
-            }
-        )
+        if not self._profile:
+            num_layers = len(self._model.model)
+            layers = []
+            allreduce_across_nodes = []
+            allreduce_in_node = []
+            for _ in range(num_layers):
+                layers.append(
+                    {
+                        "forward": random.random(),
+                        "backward": random.random() * 3,
+                        "mem_required": [1024, 1024],
+                    }
+                )
 
-        # TODO: get argument to set number of nodes
-        ar_across_nodes = {}
-        for i in range(1, 33):
-            ar_across_nodes[i] = random.random() * 4
+                # TODO: get argument to set number of nodes
+                ar_across_nodes = {}
+                for i in range(64):  # up to 64 nodes
+                    ar_across_nodes[i + 1] = random.random() * 4
 
-        allreduce_across_nodes.append(ar_across_nodes)
-        allreduce_in_node.append(
-            {1: random.random(), 2: random.random(), 4: random.random()}
-        )
+                allreduce_across_nodes.append(ar_across_nodes)
+                allreduce_in_node.append(
+                    {1: random.random(), 2: random.random(), 4: random.random()}
+                )
 
-    return layers, allreduce_across_nodes, allreduce_in_node
+                self._profile = (layers, allreduce_across_nodes, allreduce_in_node)
 
-
-@pytest.fixture(scope="function")
-def new_profile_directory(model):
-    # This fixture is used to clean up the files created by profile.
-    exist = True
-    while exist:
-        random_tag = "".join(random.choices(string.ascii_letters, k=8))
-        path = Path(f"/tmp/oobleck/profiles/{model.model_name}-{random_tag}")
-        exist = path.exists()
-    yield random_tag
-    shutil.rmtree(path, ignore_errors=True)
-
-
-@pytest.fixture(scope="function")
-def dummy_profile_result_files(
-    model: OobleckModel, dummy_profile_results, new_profile_directory
-):
-    directory = Path(
-        f"/tmp/oobleck/profiles/{model.model_name}-{new_profile_directory}"
-    )
-    directory.mkdir(parents=True, exist_ok=False)
-
-    def _create_files(microbatch_size: int):
-        filenames = [
-            f"mb{microbatch_size}.json",
-            "allreduce_across_nodes.json",
-            "allreduce_in_node.json",
-        ]
-        for filename, result in zip(filenames, dummy_profile_results):
-            with directory.joinpath(filename).open(mode="w") as f:
-                json.dump(result, f)
-                f.flush()
-
-    yield _create_files
-
-
-@pytest.fixture(scope="session")
-def dummy_layer_execution_results(model: OobleckModel, dummy_profile_results):
-    layers, allreduce_across_nodes, allreduce_in_node = dummy_profile_results
-
-    results: List[LayerExecutionResult] = []
-    for layer, execution, ar_in_node, ar_across_nodes in zip(
-        model.model, layers, allreduce_in_node, allreduce_across_nodes
-    ):
-        results.append(
-            LayerExecutionResult(
-                layer.index,
-                execution["forward"],
-                execution["backward"],
-                ar_in_node,
-                ar_across_nodes,
-                execution["mem_required"],
-            )
-        )
-    return LayerExecutionResults(results)
+        return self._profile
 
 
 @pytest.fixture(scope="function")
