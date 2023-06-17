@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import os
 import random
@@ -58,10 +60,12 @@ def models_to_test(request: pytest.FixtureRequest) -> str:
 
 
 class OobleckClassFactory:
-    def __init__(self, model_name: str):
+    # This should be used via getfixturevalue in multiprocessing tests.
+
+    def __init__(self, model_name: str, test_directory: str):
         self._model_data: Model = models_to_test[model_name]
         self._training_args = TrainingArguments(
-            output_dir="/tmp/test_output",
+            output_dir=test_directory,
             per_device_train_batch_size=TRAIN_BATCH_SIZE,
             per_device_eval_batch_size=EVAL_BATCH_SIZE,
             gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEP,
@@ -104,112 +108,6 @@ class OobleckClassFactory:
                 0,
             )
         return self._dataloader
-
-
-@pytest.fixture(scope="session")
-def wikitext_dataset():
-    return OobleckDataset("gpt2", "wikitext", "wikitext-2-raw-v1")
-
-
-@pytest.fixture(scope="session")
-def imagenet_dataset():
-    return OobleckDataset("microsoft/resnet-50", "Maysee/tiny-imagenet")
-
-
-# OobleckDataset does not have any states and ok to use for the entire session.
-@pytest.fixture(scope="session", params=["wikitext_dataset", "imagenet_dataset"])
-def dataset(request: pytest.FixtureRequest):
-    return request.getfixturevalue(request.param)
-
-
-def gpt2_model(wikitext_dataset):
-    # Refer to oobleck/examples/*.py for model arguments
-    # gpt2-medium
-    model_args = {
-        "num_hidden_layers": 32,
-        "n_positions": 1024,
-        "n_embd": 1024,
-        "n_head": 16,
-    }
-    return OobleckModel("gpt2", wikitext_dataset.sample, None, "test", model_args)
-
-
-def resnet_model(imagenet_dataset):
-    return OobleckModel(
-        "microsoft/resnet-50", imagenet_dataset.sample, None, "test", None
-    )
-
-
-@pytest.fixture(
-    scope="session",
-    params=[
-        (gpt2_model, "wikitext_dataset"),
-        (resnet_model, "imagenet_dataset"),
-    ],
-    ids=["gpt2", "microsoft/resnet-50"],
-)
-def model(request: pytest.FixtureRequest):
-    return request.param[0](request.getfixturevalue(request.param[1]))
-
-
-@pytest.fixture(
-    scope="function",
-    params=[
-        (gpt2_model, "wikitext_dataset"),
-        (resnet_model, "imagenet_dataset"),
-    ],
-    ids=["gpt2", "microsoft/resnet-50"],
-)
-def model_function(no_distributed, request: pytest.FixtureRequest):
-    return request.param[0](request.getfixturevalue(request.param[1]))
-
-
-_model_datasets = {
-    "gpt2": "wikitext_dataset",
-    "microsoft/resnet-50": "imagenet_dataset",
-}
-
-
-@pytest.fixture(scope="session")
-def dataloaders(model: OobleckModel, request: pytest.FixtureRequest):
-    dataset = request.getfixturevalue(_model_datasets[model.model_name])
-
-    training_args = TrainingArguments(
-        output_dir="/tmp/test_output",
-        per_device_train_batch_size=TRAIN_BATCH_SIZE,
-        per_device_eval_batch_size=EVAL_BATCH_SIZE,
-        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEP,
-    )
-
-    training_dataloader = OobleckDataLoader(
-        dataset,
-        training_args,
-        LoaderType.Training,
-        # total number of microbatches.
-        # Currently only have one process, so it should be the same as
-        # gradient_accumulation_steps.
-        training_args.gradient_accumulation_steps,
-        0,
-        0,
-    )
-    eval_dataloader = OobleckDataLoader(
-        dataset,
-        training_args,
-        LoaderType.Evaluation,
-        # total number of microbatches.
-        # Currently only have one process, so it should be the same as
-        # gradient_accumulation_steps.
-        training_args.gradient_accumulation_steps,
-        0,
-        0,
-    )
-    return training_dataloader, eval_dataloader
-
-
-@pytest.fixture(scope="session")
-def model_dataloaders(model: OobleckModel, request: pytest.FixtureRequest):
-    loaders = request.getfixturevalue("dataloaders")
-    return model, loaders[0], loaders[1]
 
 
 @pytest.fixture(scope="session")
