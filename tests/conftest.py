@@ -1,13 +1,9 @@
 from __future__ import annotations
 
-import json
 import os
 import random
-import shutil
-import string
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import deepspeed.comm as dist
 import pytest
@@ -59,8 +55,12 @@ def models_to_test(request: pytest.FixtureRequest) -> str:
     return request.param
 
 
-class OobleckClassFactory:
-    # This should be used via getfixturevalue in multiprocessing tests.
+class OobleckStaticClassFactory:
+    """
+    Oobleck Class Factory that create classes for testing.
+    "Static" here means that it is not relevant to Oobleck dynamic reconfiguration
+    and fixed once a class object is created.
+    """
 
     def __init__(self, model_name: str, test_directory: str):
         self._model_data: Model = models_to_test[model_name]
@@ -74,7 +74,8 @@ class OobleckClassFactory:
         self._dataset: Optional[OobleckDataset] = None
         self._model: Optional[OobleckModel] = None
         self._dataloader: Optional[OobleckDataLoader] = None
-        self._profile: Optional[Tuple[List, List, List]] = None
+        self._profile: Optional[LayerExecutionResults] = None
+        self._pipeline_template: Optional[PipelineTemplate] = None
 
     def get_dataset(self) -> OobleckDataset:
         if not self._dataset:
@@ -84,8 +85,6 @@ class OobleckClassFactory:
         return self._dataset
 
     def get_model(self) -> OobleckModel:
-        self.get_dataset()
-
         if not self._model:
             self._model = OobleckModel(
                 self._model_data.model_name,
@@ -113,36 +112,61 @@ class OobleckClassFactory:
 
         return self._dataloader
 
-    def get_dummy_profile(self) -> Tuple[List, List, List]:
+    def get_dummy_profile(self) -> LayerExecutionResults:
         self.get_model()
 
         if not self._profile:
             num_layers = len(self._model.model)
-            layers = []
-            allreduce_across_nodes = []
-            allreduce_in_node = []
-            for _ in range(num_layers):
-                layers.append(
-                    {
-                        "forward": random.random(),
-                        "backward": random.random() * 3,
-                        "mem_required": [1024, 1024],
-                    }
+
+            results: List[LayerExecutionResult] = []
+            for index in range(num_layers):
+                results.append(
+                    LayerExecutionResult(
+                        layer_index=index,
+                        forward=random.random(),
+                        backward=random.random() * 3,
+                        allreduce_in_node={i + 1: random.random() for i in range(8)},
+                        allreduce_across_nodes={
+                            i + 1: random.random() * 4 for i in range(64)
+                        },
+                        mem_required=[1024, 1024],
+                    )
                 )
 
-                # TODO: get argument to set number of nodes
-                ar_across_nodes = {}
-                for i in range(64):  # up to 64 nodes
-                    ar_across_nodes[i + 1] = random.random() * 4
-
-                allreduce_across_nodes.append(ar_across_nodes)
-                allreduce_in_node.append(
-                    {1: random.random(), 2: random.random(), 4: random.random()}
-                )
-
-                self._profile = (layers, allreduce_across_nodes, allreduce_in_node)
+            self._profile = LayerExecutionResults(results)
 
         return self._profile
+
+    def get_dummpy_pipeline_template(self, num_gpus: int) -> PipelineTemplate:
+        def slice_layers(lst: List[Any], num_chunks: int) -> List[Tuple[int, int]]:
+            if num_chunks > len(lst):
+                raise ValueError(
+                    f"Cannot slice {len(list)} layers into {num_chunks} chunks."
+                )
+
+            slice_points = sorted(random.sample(range(1, len(lst)), num_chunks - 1))
+            slice_points = [0] + slice_points + [None]
+            return [(slice_points[i], slice_points[i + 1]) for i in range(num_chunks)]
+
+        if not self._pipeline_template:
+            # TODO: take user argument for it
+            num_gpus_per_stage = 1
+
+            layer_results = self.get_dummy_profile()
+            layer_indices = slice_layers(layer_results.get(), num_gpus)
+
+            stages = [
+                StageExecutionResult(
+                    layer_results, layer_indices[i], num_gpus_per_stage
+                )
+                for i in range(layer_indices)
+            ]
+
+            self._pipeline_template = PipelineTemplate(
+                stages, 0.1, layer_results.size(), num_gpus, num_gpus_per_stage
+            )
+
+        return self._pipeline_template
 
 
 @pytest.fixture(scope="function")

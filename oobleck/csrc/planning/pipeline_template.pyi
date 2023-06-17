@@ -23,6 +23,12 @@ class LayerExecutionResults:
     def size(self) -> int: ...
 
 class StageExecutionResult:
+    def __init__(
+        self,
+        LayerExecutionResults,
+        layer_indices: Tuple[int, int],
+        num_gpus: int,
+    ): ...
     _num_gpus: int
     _layer_indices: List[int]
     _size: int
