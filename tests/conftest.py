@@ -87,6 +87,8 @@ class OobleckStaticClassFactory:
         return self._dataset
 
     def get_model(self) -> OobleckModel:
+        self.get_dataset()
+
         if not self._model:
             self._model = OobleckModel(
                 self._model_data.model_name,
