@@ -3,14 +3,15 @@ import os
 import random
 import shutil
 import string
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import Dict, List, Optional
 
 import deepspeed.comm as dist
 import pytest
 import torch
 import torch.distributed
-from transformers import TrainingArguments
+from transformers.training_args import TrainingArguments
 
 from oobleck.csrc.planning.pipeline_template import (
     LayerExecutionResult,
@@ -26,6 +27,83 @@ from oobleck.module.model import OobleckModel
 TRAIN_BATCH_SIZE = 8
 EVAL_BATCH_SIZE = 4
 GRADIENT_ACCUMULATION_STEP = 2
+
+
+@dataclass
+class Model:
+    model_name: str
+    dataset_path: str
+    dataset_name: Optional[str] = None
+
+
+models_to_test: Dict[str, Model] = {
+    "gpt2": Model("gpt2", "wikitext", "wikitext-2-raw-v1"),
+    "microsoft/resnet-50": Model("microsoft/resnet-50", "Maysee/tiny-iamgenet"),
+}
+
+# Add model arguments here, if it is needed.
+model_args: Dict[str, Optional[Dict[str, int]]] = {
+    "gpt2": {
+        "num_hidden_layers": 32,
+        "n_positions": 1024,
+        "n_embd": 1024,
+        "n_head": 16,
+    },
+}
+
+
+@pytest.fixture(scope="session", params=list(models_to_test.keys()))
+def models_to_test(request: pytest.FixtureRequest) -> str:
+    return request.param
+
+
+class OobleckClassFactory:
+    def __init__(self, model_name: str):
+        self._model_data: Model = models_to_test[model_name]
+        self._training_args = TrainingArguments(
+            output_dir="/tmp/test_output",
+            per_device_train_batch_size=TRAIN_BATCH_SIZE,
+            per_device_eval_batch_size=EVAL_BATCH_SIZE,
+            gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEP,
+        )
+
+        self._dataset: Optional[OobleckDataset] = None
+        self._model: Optional[OobleckModel] = None
+        self._dataloader: Optional[OobleckDataLoader] = None
+
+    def get_dataset(self) -> OobleckDataset:
+        if not self._dataset:
+            self._dataset = OobleckDataset(
+                self._model_data.model_name, self._model_data.dataset_path
+            )
+        return self._dataset
+
+    def get_model(self) -> OobleckModel:
+        self.get_dataset()
+
+        self._model = OobleckModel(
+            self._model_data.model_name,
+            self._dataset.sample,
+            self._training_args,
+            "test",
+            model_args.get(self._model_data.model_name, None),
+        )
+        return self._model
+
+    def get_dataloader(self) -> OobleckDataLoader:
+        if not self._dataloader:
+            self.get_dataset()
+            self.get_model()
+
+            self._dataloader = OobleckDataLoader(
+                self._dataset,
+                self._training_args,
+                LoaderType.Training,
+                self._training_args.gradient_accumulation_steps,
+                0,
+                0,
+            )
+        return self._dataloader
 
 
 @pytest.fixture(scope="session")
@@ -231,6 +309,7 @@ def no_distributed():
     os.environ.clear()
     os.environ.update(original_env)
 
+
 def set_number_of_gpus(num_gpus: int = 1):
     # Hack to make torch.cuda.device_count() return # GPUs specified in env
     func = torch.cuda.device_count
@@ -257,7 +336,9 @@ def init_distributed():
             if dist.is_initialized():
                 return
 
-            dist.init_distributed(dist_backend="nccl", dist_init_required=True, rank=0, world_size=1)
+            dist.init_distributed(
+                dist_backend="nccl", dist_init_required=True, rank=0, world_size=1
+            )
             assert dist.is_initialized()
         else:
             assert not dist.is_initialized()
@@ -268,7 +349,7 @@ def init_distributed():
         dist.destroy_process_group()
         dist.cdb = None
     assert not dist.is_initialized()
-    
+
     os.environ.clear()
     os.environ.update(original_env)
 
