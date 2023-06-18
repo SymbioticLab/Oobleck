@@ -281,7 +281,6 @@ class OobleckMultiProcessTestCase:
     def _worker_init(
         queue: mp.Queue,
         rank: int,
-        virtual_node_size: int,
         world_size: int,
         model_name: str,
         directory: Path,
@@ -296,14 +295,14 @@ class OobleckMultiProcessTestCase:
         # After that, create dynamic class factory since it requires distributed configuration.
         try:
             os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
+            torch.cuda.device_count = lambda: 1
 
-            torch.cuda.device_count = lambda: virtual_node_size
             factory = OobleckStaticClassFactory(model_name, directory)
 
             os.environ["RANK"] = str(rank)
             os.environ["WORLD_SIZE"] = str(world_size)
             store = torch.distributed.FileStore(
-                str(directory.joinpath("test_init")), world_size
+                str(directory.joinpath("store")), world_size
             )
             torch.distributed.init_process_group(
                 backend="nccl", store=store, rank=rank, world_size=world_size
@@ -313,15 +312,23 @@ class OobleckMultiProcessTestCase:
             dynamic_factory = OobleckDynamicClassFactory(factory, rank, world_size)
 
             result = test(factory, dynamic_factory, *args)
+
             queue.put({"success": (result if result is not None else "")})
-        except Exception:
-            queue.put({"error": traceback.format_exc()})
+        except Exception as e:
+            queue.put({"error": str(e) + "\n" + traceback.format_exc()})
+        finally:
+            torch.distributed.barrier()
+            torch.distributed.destroy_process_group()
+            # Make sure to remove FileStore after each test.
+            directory.joinpath("store").unlink(missing_ok=True)
 
     def run_in_parallel(
         self, num_processes: int, func: Callable, *args
     ) -> List[Union[str, None]]:
         ctx = mp.get_context("spawn")
         queue = ctx.Queue()
+
+        self.directory.joinpath("store").unlink(missing_ok=True)
 
         processes: List[mp.Process] = []
         for rank in range(num_processes):
@@ -330,7 +337,6 @@ class OobleckMultiProcessTestCase:
                 args=(
                     queue,
                     rank,
-                    1,
                     num_processes,
                     self.model_name,
                     self.directory,
@@ -341,7 +347,7 @@ class OobleckMultiProcessTestCase:
             p.start()
             processes.append(p)
 
-        results: List[Union[str, None]] = []
+        results: List[Any] = []
 
         try:
             for _ in range(len(processes)):
