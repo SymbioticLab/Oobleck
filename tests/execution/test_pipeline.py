@@ -277,8 +277,3 @@ class TestMultiStagePipeline(OobleckMultiProcessTestCase):
     def test_distributed_execution(self, func_name):
         func = getattr(TestMultiStagePipeline, func_name)
         self.run_in_parallel(num_processes=4, func=func)
-
-
-class TestMultiStageDataParallelPipeline(OobleckMultiProcessTestCase):
-    def test_two_stages_data_parallel_pipelines(self):
-        pytest.skip("Not implemented yet")
