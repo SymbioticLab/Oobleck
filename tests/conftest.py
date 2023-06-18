@@ -144,6 +144,8 @@ class OobleckStaticClassFactory:
         return self._profile
 
     def get_dummpy_pipeline_template(self, num_gpus: int) -> PipelineTemplate:
+        self.get_dummy_profile()
+
         def slice_layers(lst: List[Any], num_chunks: int) -> List[Tuple[int, int]]:
             if num_chunks > len(lst):
                 raise ValueError(
@@ -158,18 +160,17 @@ class OobleckStaticClassFactory:
             # TODO: take user argument for it
             num_gpus_per_stage = 1
 
-            layer_results = self.get_dummy_profile()
-            layer_indices = slice_layers(layer_results.get(), num_gpus)
+            layer_indices = slice_layers(self._profile.get(), num_gpus)
 
             stages = [
                 StageExecutionResult(
-                    layer_results, layer_indices[i], num_gpus_per_stage
+                    self._profile, layer_indices[i], num_gpus_per_stage
                 )
                 for i in range(layer_indices)
             ]
 
             self._pipeline_template = PipelineTemplate(
-                stages, 0.1, layer_results.size(), num_gpus, num_gpus_per_stage
+                stages, 0.1, self._profile.size(), num_gpus, num_gpus_per_stage
             )
 
         return self._pipeline_template
@@ -183,6 +184,31 @@ class OobleckSingleProcessTestCase:
 
     factory: OobleckStaticClassFactory
 
+    @pytest.fixture(scope="function", autouse=False)
+    def distributed(self, model: OobleckModel, request: pytest.FixtureRequest):
+        assert not dist.is_initialized() and not torch.distributed.is_initialized()
+
+        # envs required by deepspeed.comm
+        os.environ["RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+        # Initialize a single process torch.distributed group.
+        store = torch.distributed.HashStore()
+        torch.distributed.init_process_group(
+            backend="nccl", store=store, rank=0, world_size=1
+        )
+        dist.init_distributed(dist_backend="nccl", dist_init_required=False)
+        assert torch.distributed.is_initialized()
+        assert dist.is_initialized()
+
+        yield
+
+        dist.destroy_process_group()
+        dist.cdb = None
+        assert not torch.distributed.is_initialized()
+        assert not dist.is_initialized()
+        os.environ.pop("RANK")
+        os.environ.pop("WORLD_SIZE")
+
     @classmethod
     @pytest.fixture(scope="class", autouse=True)
     def setup_class(
@@ -191,10 +217,19 @@ class OobleckSingleProcessTestCase:
         tmpdir_factory: pytest.TempdirFactory,
         request: pytest.FixtureRequest,
     ):
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+        device_count_backup = torch.cuda.device_count
+        torch.cuda.device_count = lambda: 1
+
         tmpdir = tmpdir_factory.mktemp("oobleck")
         request.cls.factory = OobleckStaticClassFactory(
             model_name_fixture, tmpdir.dirpath()
         )
+
+        yield
+
+        os.environ.pop("CUDA_VISIBLE_DEVICES")
+        torch.cuda.device_count = device_count_backup
 
 
 class OobleckMultiProcessTestCase:

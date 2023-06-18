@@ -148,11 +148,11 @@ class Profiler:
         )
 
         num_gpus_per_node = torch.cuda.device_count()
-        ranks = list(range(0, dist.get_world_size(), num_gpus_per_node))
+        ranks = list(range(0, dist.get_world_size()))
 
         process_groups: List[Tuple(bool, dist.ProcessGroup)] = []
-        for i in range(1, len(ranks) + 1):
-            pg_ranks = ranks[:i]
+        for i in range(0, len(ranks), num_gpus_per_node):
+            pg_ranks = ranks[i : i + num_gpus_per_node]
             process_groups.append(
                 (dist.get_rank() in pg_ranks, dist.new_group(pg_ranks))
             )
