@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import math
+import multiprocessing as mp
 import os
 import random
+import traceback
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import deepspeed.comm as dist
 import pytest
@@ -100,24 +104,6 @@ class OobleckStaticClassFactory:
 
         return self._model
 
-    # TODO: move it to dynamic class factory
-    # Dataloader has its state and is subject to change.
-    def get_dataloader(self) -> OobleckDataLoader:
-        self.get_dataset()
-        self.get_model()
-
-        if not self._dataloader:
-            self._dataloader = OobleckDataLoader(
-                self._dataset,
-                self._training_args,
-                LoaderType.Training,
-                self._training_args.gradient_accumulation_steps,
-                0,
-                0,
-            )
-
-        return self._dataloader
-
     def get_dummy_profile(self) -> LayerExecutionResults:
         self.get_model()
 
@@ -152,9 +138,12 @@ class OobleckStaticClassFactory:
                     f"Cannot slice {len(list)} layers into {num_chunks} chunks."
                 )
 
-            slice_points = sorted(random.sample(range(1, len(lst)), num_chunks - 1))
-            slice_points = sorted([0, len(lst)] + slice_points)
-            return [(slice_points[i], slice_points[i + 1]) for i in range(num_chunks)]
+            length_chunk = math.ceil(len(lst) / num_chunks)
+            slicing_points: List[Tuple[int, int]] = []
+            for i in range(0, len(lst), length_chunk):
+                end = i + length_chunk if i + length_chunk < len(lst) else len(lst)
+                slicing_points.append((i, end))
+            return slicing_points
 
         if num_gpus not in self._pipeline_templates:
             # TODO: take user argument for it
@@ -172,6 +161,64 @@ class OobleckStaticClassFactory:
             )
 
         return self._pipeline_templates[num_gpus]
+
+
+class OobleckDynamicClassFactory:
+    """
+    Oobleck Class Factory that create classes for testing.
+    "Dynamic" here means that the internal states are changed during training.
+    Thus its scope should be carefully managed.
+    """
+
+    def __init__(
+        self, static_factory: OobleckStaticClassFactory, my_rank: int, ranks: List[int]
+    ):
+        assert dist.is_initialized()
+        assert torch.distributed.is_initialized()
+
+        self._static_factory = static_factory
+        self._my_rank = my_rank
+        self._ranks = ranks
+        self._dataloader: Optional[OobleckDataLoader] = None
+        self._pipeline: Optional[OobleckPipeline] = None
+
+    # TODO: move it to dynamic class factory
+    # Dataloader has its state and is subject to change.
+    def get_dataloader(self) -> OobleckDataLoader:
+        dataset = self._static_factory.get_dataset()
+        training_args = self._static_factory._training_args
+
+        if not self._dataloader:
+            self._dataloader = OobleckDataLoader(
+                dataset,
+                training_args,
+                LoaderType.Training,
+                training_args.gradient_accumulation_steps,
+                0,
+                0,
+            )
+
+        return self._dataloader
+
+    def get_dummy_pipeline(self, num_gpus: int) -> OobleckPipeline:
+        model = self._static_factory.get_model()
+        template = self._static_factory.get_dummy_pipeline_template(num_gpus)
+        training_args = self._static_factory._training_args
+        dataloaer = self.get_dataloader()
+
+        if not self._pipeline:
+            pg = torch.distributed.new_group(self._ranks)
+            self._pipeline = OobleckPipeline(
+                pipeline_template=template,
+                model=model,
+                dataloader=dataloaer,
+                step=0,
+                ranks=self._ranks,
+                process_group=pg,
+                training_args=training_args,
+            )
+
+        return self._pipeline
 
 
 class OobleckSingleProcessTestCase:
@@ -212,17 +259,14 @@ class OobleckSingleProcessTestCase:
     def setup_class(
         cls,
         model_name_fixture: str,
-        tmpdir_factory: pytest.TempdirFactory,
+        tmp_path_factory: pytest.TempPathFactory,
         request: pytest.FixtureRequest,
     ):
         os.environ["CUDA_VISIBLE_DEVICES"] = "0"
         device_count_backup = torch.cuda.device_count
         torch.cuda.device_count = lambda: 1
-
-        tmpdir = tmpdir_factory.mktemp("oobleck")
-        request.cls.factory = OobleckStaticClassFactory(
-            model_name_fixture, tmpdir.dirpath()
-        )
+        directory = tmp_path_factory.getbasetemp()
+        request.cls.factory = OobleckStaticClassFactory(model_name_fixture, directory)
 
         yield
 
@@ -230,146 +274,114 @@ class OobleckSingleProcessTestCase:
         torch.cuda.device_count = device_count_backup
 
 
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="requires 4 GPUs")
 class OobleckMultiProcessTestCase:
     """
     A base class for Oobleck test cases that run in multiple processes in parallel.
     Test cases for functionalities of dynamic classes will inherit this class.
     """
 
-    pass
+    @staticmethod
+    def _worker_init(
+        queue: mp.Queue,
+        rank: int,
+        world_size: int,
+        model_name: str,
+        directory: Path,
+        test: Callable,
+        *args,
+    ):
+        # Very careful initialization dependency due to too many third-party libraries.
+        # As we use torch.distributed.FileStore for distributed initialization, it doesn't require
+        # os envs (MASTER_ADDR, MASTER_PORT), while deepspeed and HuggingFace by default use them.
+        # Thus, initialize StaticClassFactory (which relies on HF) first without the envs.
+        # Then, initialize distributed and deepspeed.
+        # After that, create dynamic class factory since it requires distributed configuration.
+        try:
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
+            torch.cuda.device_count = lambda: 1
 
+            factory = OobleckStaticClassFactory(model_name, directory)
 
-@pytest.fixture(scope="function")
-def no_distributed():
-    original_env = dict(os.environ)
-    os.environ.pop("MASTER_ADDR", None)
-    os.environ.pop("MASTER_PORT", None)
-    os.environ.pop("WORLD_SIZE", None)
-    os.environ.pop("RANK", None)
-    os.environ.pop("LOCAL_RANK", None)
-    next(set_number_of_gpus(1))
-    yield
-    os.environ.clear()
-    os.environ.update(original_env)
-
-
-def set_number_of_gpus(num_gpus: int = 1):
-    # Hack to make torch.cuda.device_count() return # GPUs specified in env
-    func = torch.cuda.device_count
-    torch.cuda.device_count = lambda: num_gpus
-    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join([str(i) for i in range(0, num_gpus)])
-    yield
-    torch.cuda.device_count = func
-    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-
-
-@pytest.fixture(scope="function")
-def init_distributed():
-    original_env = dict(os.environ)
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "0"
-    os.environ["WORLD_SIZE"] = "1"
-    os.environ["RANK"] = "0"
-    os.environ["LOCAL_RANK"] = "0"
-
-    set_number_of_gpus(1)
-
-    def _distributed(init_required: bool):
-        if init_required:
-            if dist.is_initialized():
-                return
-
-            dist.init_distributed(
-                dist_backend="nccl", dist_init_required=True, rank=0, world_size=1
+            os.environ["RANK"] = str(rank)
+            os.environ["WORLD_SIZE"] = str(world_size)
+            store = torch.distributed.FileStore(
+                str(directory.joinpath("store")), world_size
             )
-            assert dist.is_initialized()
-        else:
-            assert not dist.is_initialized()
-
-    yield _distributed
-
-    if dist.is_initialized():
-        dist.destroy_process_group()
-        dist.cdb = None
-    assert not dist.is_initialized()
-
-    os.environ.clear()
-    os.environ.update(original_env)
-
-
-@pytest.fixture(scope="session")
-def dummy_pipeline_template(dummy_layer_execution_results: LayerExecutionResults):
-    def get_layer_split_indices(
-        layers: List[LayerExecutionResult], num: int
-    ) -> List[List[LayerExecutionResult]]:
-        return [round(len(layers) * i / num) for i in range(1, num)]
-
-    def _create_pipeline_template(num_gpus: int) -> PipelineTemplate:
-        layers = dummy_layer_execution_results.get()
-        layer_results = LayerExecutionResults(layers)
-        indices = get_layer_split_indices(layers, num_gpus)
-        stages = [
-            StageExecutionResult(layer_results, indices, 1)
-            for indices in zip([0] + indices, indices + [len(layers)])
-        ]
-
-        return PipelineTemplate(stages, 0.1, len(layers), num_gpus, 1)
-
-    return _create_pipeline_template
-
-
-@pytest.fixture(scope="function")
-def dummy_pipeline(model_dataloaders, dummy_pipeline_template, init_distributed):
-    def _create_pipelines(
-        num_gpus_per_pipeline: int, ranks: List[int]
-    ) -> List[OobleckPipeline]:
-        assert len(ranks) % num_gpus_per_pipeline == 0, "Invalid number of ranks"
-        assert len(ranks) <= torch.cuda.device_count(), "Too many ranks"
-
-        model, train_dataloader, eval_dataloader = model_dataloaders
-        init_distributed(True)
-        training_args = TrainingArguments(
-            output_dir="/tmp/test_output",
-            per_device_train_batch_size=TRAIN_BATCH_SIZE,
-            per_device_eval_batch_size=EVAL_BATCH_SIZE,
-            gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEP,
-        )
-
-        pipeline_template = dummy_pipeline_template(num_gpus=num_gpus_per_pipeline)
-
-        rank_groups = [
-            ranks[i:num_gpus_per_pipeline]
-            for i in range(0, len(ranks), num_gpus_per_pipeline)
-        ]
-
-        pipelines = [
-            OobleckPipeline(
-                pipeline_template=pipeline_template,
-                model=model,
-                dataloader=train_dataloader,
-                step=0,
-                ranks=rank_group,
-                process_group=torch.distributed.new_group(ranks=rank_group),
-                training_args=training_args,
+            torch.distributed.init_process_group(
+                backend="nccl", store=store, rank=rank, world_size=world_size
             )
-            for rank_group in rank_groups
-        ]
+            dist.init_distributed(dist_backend="nccl", dist_init_required=False)
 
-        for pipeline in pipelines:
-            assert all(
-                all(p.is_cuda for p in layer.parameters())
-                for layer in pipeline.model_layers
+            dynamic_factory = OobleckDynamicClassFactory(
+                factory, rank, list(range(world_size))
             )
-            assert pipeline.is_first_stage() and pipeline.is_last_stage()
 
-            num_pipe_buffers = pipeline.train_schedule.num_pipe_buffers()
-            for buffer_name in ["inputs", "labels", "outputs"]:
-                assert buffer_name in pipeline.pipe_buffers
-                assert len(pipeline.pipe_buffers[buffer_name]) == num_pipe_buffers
-                assert all(
-                    buffer is None for buffer in pipeline.pipe_buffers[buffer_name]
-                )
+            result = test(factory, dynamic_factory, *args)
 
-        return pipelines
+            queue.put({"success": (result if result is not None else "")})
+        except Exception as e:
+            queue.put({"error": str(e) + "\n" + traceback.format_exc()})
+        finally:
+            torch.distributed.barrier()
+            torch.distributed.destroy_process_group()
+            # Make sure to remove FileStore after each test.
+            directory.joinpath("store").unlink(missing_ok=True)
 
-    return _create_pipelines
+    def run_in_parallel(
+        self, num_processes: int, func: Callable, *args
+    ) -> List[Union[str, None]]:
+        ctx = mp.get_context("spawn")
+        queue = ctx.Queue()
+
+        self.directory.joinpath("store").unlink(missing_ok=True)
+
+        processes: List[mp.Process] = []
+        for rank in range(num_processes):
+            p = ctx.Process(
+                target=OobleckMultiProcessTestCase._worker_init,
+                args=(
+                    queue,
+                    rank,
+                    num_processes,
+                    self.model_name,
+                    self.directory,
+                    func,
+                    *args,
+                ),
+            )
+            p.start()
+            processes.append(p)
+
+        results: List[Any] = []
+
+        try:
+            for _ in range(len(processes)):
+                result = queue.get(timeout=60)
+                if "error" in result:
+                    for process in processes:
+                        process.terminate()
+                    pytest.fail(result["error"])
+
+                results.append(result["success"])
+        except TimeoutError as e:
+            for process in processes:
+                process.terminate()
+            pytest.fail(e)
+
+        for process in processes:
+            process.join()
+
+        return results
+
+    @classmethod
+    @pytest.fixture(scope="class", autouse=True)
+    def setup_class(
+        cls,
+        model_name_fixture: str,
+        tmp_path_factory: pytest.TempPathFactory,
+        request: pytest.FixtureRequest,
+    ):
+        request.cls.model_name = model_name_fixture
+        directory = tmp_path_factory.getbasetemp()
+        request.cls.directory = directory
