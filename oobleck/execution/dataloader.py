@@ -1,12 +1,12 @@
-import torch
+from enum import Enum
+from typing import Iterator, List
 
+import torch
+from datasets import Dataset
 from torch.utils.data import BatchSampler, DataLoader
 from torch.utils.data.dataloader import _collate_fn_t
-from typing import Iterator, List
-from enum import Enum
+from transformers.training_args import TrainingArguments
 
-from transformers import TrainingArguments
-from datasets import Dataset
 from oobleck.execution.dataset import OobleckDataset
 
 
@@ -49,6 +49,11 @@ class OobleckSampler(BatchSampler):
         else:
             indices = list(range(self.num_samples))
 
+        """
+        Microbatches for one iteration are contiguous for each data parallel pipeline.
+        Once an iteration is done, it jumps to the next contiguous microbatch
+        that is not consumed by other data parallel pipelines.
+        """
         while self.consumed_samples < self.num_samples:
             if self.num_samples - self.consumed_samples < self.total_bucket_size:
                 # Last batch if not complete will be dropped.
@@ -57,6 +62,10 @@ class OobleckSampler(BatchSampler):
             for i in range(self.num_microbatches):
                 self.consumed_samples += self.microbatch_size
                 yield indices[i * self.microbatch_size : (i + 1) * self.microbatch_size]
+
+            self.consumed_samples += self.microbatch_size * (
+                self.num_total_microbatches - self.num_microbatches
+            )
 
     def __len__(self) -> int:
         return self.num_samples // self.total_bucket_size
@@ -76,6 +85,7 @@ class OobleckDataLoader(DataLoader):
         num_total_microbatches: int,
         consumed_samples: int,
         epoch: int,
+        shuffle: bool = True,
     ):
         assert isinstance(
             datasets, OobleckDataset
@@ -98,6 +108,7 @@ class OobleckDataLoader(DataLoader):
             self.num_my_microbatches,
             consumed_samples,
             epoch,
+            shuffle,
         )
 
         super().__init__(

@@ -1,83 +1,78 @@
 import pytest
 import torch
-from transformers import TrainingArguments
 
-from oobleck.execution.dataloader import LoaderType, OobleckDataLoader
+from oobleck.execution.dataloader import LoaderType, OobleckDataLoader, OobleckSampler
 from tests.conftest import (
     EVAL_BATCH_SIZE,
     GRADIENT_ACCUMULATION_STEP,
     TRAIN_BATCH_SIZE,
+    OobleckDynamicClassFactory,
     OobleckMultiProcessTestCase,
+    OobleckStaticClassFactory,
 )
 
 
-@pytest.mark.skip(
-    reason="Must be implemented using MultiProcessTestCase since it modifies internal states"
-)
 class TestOobleckDataloader(OobleckMultiProcessTestCase):
-    pass
+    @staticmethod
+    def _attributes(
+        factory: OobleckStaticClassFactory,
+        dfactory: OobleckDynamicClassFactory,
+        total_num_microbatches: int,
+        consumed_samples: int,
+    ):
+        dataloader = dfactory.get_dataloader(total_num_microbatches, consumed_samples)
+        sampler: OobleckSampler = dataloader.batch_sampler
+        assert sampler.microbatch_size == TRAIN_BATCH_SIZE
+        assert sampler.consumed_samples == consumed_samples
+        assert sampler.num_microbatches == GRADIENT_ACCUMULATION_STEP
+        assert sampler.num_total_microbatches == total_num_microbatches
 
+    @pytest.mark.parametrize("consumed_samples", [0, 40])
+    def test_attributes_type(self, consumed_samples):
+        self.run_in_parallel(
+            4,
+            TestOobleckDataloader._attributes,
+            4 * TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEP,
+            consumed_samples,
+        )
 
-@pytest.mark.parametrize("dataset", ["wikitext_dataset", "imagenet_dataset"])
-@pytest.mark.parametrize("consumed_sample", [0, 40])
-@pytest.mark.parametrize("type", [LoaderType.Training, LoaderType.Evaluation])
-def test_initialize_dataloader(
-    dataset, consumed_sample, type, request: pytest.FixtureRequest
-):
-    dataset = request.getfixturevalue(dataset)
-    training_args = TrainingArguments(
-        output_dir="/tmp/output",
-        per_device_train_batch_size=TRAIN_BATCH_SIZE,
-        per_device_eval_batch_size=EVAL_BATCH_SIZE,
-        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEP,
-    )
-    dataloader = OobleckDataLoader(
-        datasets=dataset,
-        args=training_args,
-        dataloader_type=type,
-        num_total_microbatches=TRAIN_BATCH_SIZE,
-        consumed_samples=consumed_sample,
-        epoch=0,
-    )
-    assert isinstance(dataloader, OobleckDataLoader)
-    assert (
-        dataloader.batch_sampler.microbatch_size == TRAIN_BATCH_SIZE
-        if type == LoaderType.Training
-        else EVAL_BATCH_SIZE
-    )
-    assert dataloader.batch_sampler.num_microbatches == GRADIENT_ACCUMULATION_STEP
-    assert dataloader.batch_sampler.consumed_samples == consumed_sample
+    @staticmethod
+    def _batch(
+        factory: OobleckStaticClassFactory,
+        dfactory: OobleckDynamicClassFactory,
+        total_num_microbatches: int,
+    ):
+        dataloader = dfactory.get_dataloader(total_num_microbatches)
+        sampler: OobleckSampler = dataloader.batch_sampler
+        assert sampler.consumed_samples == 0
 
+        inputs = next(iter(dataloader))
+        assert sampler.consumed_samples == TRAIN_BATCH_SIZE
+        assert isinstance(inputs, dict)
+        for tensor in inputs.values():
+            assert isinstance(tensor, torch.Tensor)
+            assert tensor.size(dim=0) == TRAIN_BATCH_SIZE
 
-def test_batch_train_samples(dataloaders):
-    assert dataloaders[0].batch_sampler.consumed_samples == 0
-    train_inputs = next(iter(dataloaders[0]))
-    assert dataloaders[0].batch_sampler.consumed_samples == TRAIN_BATCH_SIZE
-    assert isinstance(train_inputs, dict)
-    for tensor in train_inputs.values():
-        assert isinstance(tensor, torch.Tensor)
-        assert tensor.size(dim=0) == TRAIN_BATCH_SIZE
+    def test_batch_samples(self):
+        self.run_in_parallel(
+            1,
+            TestOobleckDataloader._batch,
+            TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEP,
+        )
 
+    def test_distributed_batch_samples(self):
+        pass
 
-def test_batch_eval_samples(dataloaders):
-    assert dataloaders[1].batch_sampler.consumed_samples == 0
-    eval_inputs = next(iter(dataloaders[1]))
-    assert dataloaders[1].batch_sampler.consumed_samples == EVAL_BATCH_SIZE
-    assert isinstance(eval_inputs, dict)
-    for tensor in eval_inputs.values():
-        assert isinstance(tensor, torch.Tensor)
-        assert tensor.size(dim=0) == EVAL_BATCH_SIZE
+    @staticmethod
+    def run_until_stop(
+        factory: OobleckStaticClassFactory,
+        dfactory: OobleckDynamicClassFactory,
+        total_num_microbatches: int,
+    ):
+        dataloader = dfactory.get_dataloader(total_num_microbatches)
+        sampler: OobleckSampler = dataloader.batch_sampler
+        assert sampler.consumed_samples == 0
 
-
-def test_next_batch(dataloaders):
-    for dataloader in dataloaders:
-        iterator = iter(dataloader)
-        sample = next(iterator)
-        assert isinstance(sample, dict)
-
-
-def test_stop_iteration(dataloaders):
-    for dataloader in dataloaders:
         num_iteration = len(dataloader) * GRADIENT_ACCUMULATION_STEP
         iterator = iter(dataloader)
 
@@ -85,7 +80,18 @@ def test_stop_iteration(dataloaders):
             for _ in range(num_iteration):
                 next(iterator)
         except StopIteration:
-            assert False, "StopIteration raised before the last iteration."
+            raise AssertionError("StopIteration raised before the last iteration.")
 
-        with pytest.raises(StopIteration):
+        try:
             next(iterator)
+        except StopIteration:
+            return
+
+        raise AssertionError("StopIteration not raised after the last iteration.")
+
+    def test_stop_iteration(self):
+        self.run_in_parallel(
+            1,
+            TestOobleckDataloader.run_until_stop,
+            TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEP,
+        )

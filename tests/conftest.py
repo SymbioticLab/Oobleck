@@ -167,7 +167,7 @@ class OobleckDynamicClassFactory:
     """
     Oobleck Class Factory that create classes for testing.
     "Dynamic" here means that the internal states are changed during training.
-    Thus its scope should be carefully managed.
+    Thus the class object should be created every time a new state is needed.
     """
 
     def __init__(
@@ -179,26 +179,22 @@ class OobleckDynamicClassFactory:
         self._static_factory = static_factory
         self._my_rank = my_rank
         self._ranks = ranks
-        self._dataloader: Optional[OobleckDataLoader] = None
-        self._pipeline: Optional[OobleckPipeline] = None
 
-    # TODO: move it to dynamic class factory
-    # Dataloader has its state and is subject to change.
-    def get_dataloader(self) -> OobleckDataLoader:
+    def get_dataloader(
+        self, total_num_microbatches: int, consumed_samples: int = 0
+    ) -> OobleckDataLoader:
         dataset = self._static_factory.get_dataset()
         training_args = self._static_factory._training_args
 
-        if not self._dataloader:
-            self._dataloader = OobleckDataLoader(
-                dataset,
-                training_args,
-                LoaderType.Training,
-                training_args.gradient_accumulation_steps,
-                0,
-                0,
-            )
-
-        return self._dataloader
+        return OobleckDataLoader(
+            datasets=dataset,
+            args=training_args,
+            dataloader_type=LoaderType.Training,
+            num_total_microbatches=total_num_microbatches,
+            consumed_samples=consumed_samples,
+            epoch=0,
+            shuffle=False,
+        )
 
     def get_dummy_pipeline(self, num_gpus: int) -> OobleckPipeline:
         model = self._static_factory.get_model()
@@ -206,19 +202,16 @@ class OobleckDynamicClassFactory:
         training_args = self._static_factory._training_args
         dataloaer = self.get_dataloader()
 
-        if not self._pipeline:
-            pg = torch.distributed.new_group(self._ranks)
-            self._pipeline = OobleckPipeline(
-                pipeline_template=template,
-                model=model,
-                dataloader=dataloaer,
-                step=0,
-                ranks=self._ranks,
-                process_group=pg,
-                training_args=training_args,
-            )
-
-        return self._pipeline
+        pg = torch.distributed.new_group(self._ranks)
+        return OobleckPipeline(
+            pipeline_template=template,
+            model=model,
+            dataloader=dataloaer,
+            step=0,
+            ranks=self._ranks,
+            process_group=pg,
+            training_args=training_args,
+        )
 
 
 class OobleckSingleProcessTestCase:
