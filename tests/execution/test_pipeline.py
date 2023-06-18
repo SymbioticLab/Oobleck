@@ -37,7 +37,7 @@ class TestOobleckSingleStagePipeline(OobleckMultiProcessTestCase):
         for layer in pipeline.model_layers:
             assert all(p.is_cuda for p in layer.parameters())
 
-    def test_attribute_type(self):
+    def test_attributes_type(self):
         self.run_in_parallel(
             num_processes=1,
             func=TestOobleckSingleStagePipeline._test_attributes_type,
@@ -170,7 +170,7 @@ class TestMultiStagePipeline(OobleckMultiProcessTestCase):
 
         return (len(pipeline.model_layers), len(model.model))
 
-    def test_four_stages_pipeline(self):
+    def tst_attributes_type(self):
         results = self.run_in_parallel(
             num_processes=4, func=TestMultiStagePipeline._four_stages
         )
@@ -274,7 +274,7 @@ class TestMultiStagePipeline(OobleckMultiProcessTestCase):
             "send_recv_in_backward",
         ],
     )
-    def test_communication(self, func_name):
+    def test_distributed_execution(self, func_name):
         func = getattr(TestMultiStagePipeline, func_name)
         self.run_in_parallel(num_processes=4, func=func)
 
