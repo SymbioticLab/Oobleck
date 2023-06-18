@@ -3,8 +3,10 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import random
+import traceback
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import deepspeed.comm as dist
 import pytest
@@ -20,7 +22,6 @@ from oobleck.csrc.planning.pipeline_template import (
 )
 from oobleck.execution.dataloader import LoaderType, OobleckDataLoader
 from oobleck.execution.dataset import OobleckDataset
-from oobleck.execution.pipeline import OobleckPipeline
 from oobleck.module.model import OobleckModel
 
 TRAIN_BATCH_SIZE = 8
@@ -213,19 +214,118 @@ class OobleckSingleProcessTestCase:
     def setup_class(
         cls,
         model_name_fixture: str,
-        tmpdir_factory: pytest.TempdirFactory,
+        tmp_path_factory: pytest.TempPathFactory,
         request: pytest.FixtureRequest,
     ):
         os.environ["CUDA_VISIBLE_DEVICES"] = "0"
         device_count_backup = torch.cuda.device_count
         torch.cuda.device_count = lambda: 1
-
-        tmpdir = tmpdir_factory.mktemp("oobleck")
-        request.cls.factory = OobleckStaticClassFactory(
-            model_name_fixture, tmpdir.dirpath()
-        )
+        directory = tmp_path_factory.getbasetemp()
+        request.cls.factory = OobleckStaticClassFactory(model_name_fixture, directory)
 
         yield
 
         os.environ.pop("CUDA_VISIBLE_DEVICES")
         torch.cuda.device_count = device_count_backup
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="requires 4 GPUs")
+class OobleckMultiProcessTestCase:
+    """
+    A base class for Oobleck test cases that run in multiple processes in parallel.
+    Test cases for functionalities of dynamic classes will inherit this class.
+    """
+
+    @pytest.fixture(scope="function", autouse=False)
+    def distributed(self):
+        pass
+
+    @staticmethod
+    def _worker_init(
+        queue: mp.Queue,
+        rank: int,
+        virtual_node_size: int,
+        world_size: int,
+        model_name: str,
+        directory: Path,
+        test: Callable,
+        *args,
+    ):
+        try:
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
+
+            store = torch.distributed.FileStore(
+                str(directory.joinpath("test_init")), world_size
+            )
+            torch.distributed.init_process_group(
+                backend="nccl", store=store, rank=rank, world_size=world_size
+            )
+
+            torch.cuda.device_count = lambda: virtual_node_size
+
+            factory = OobleckStaticClassFactory(model_name, directory)
+
+            os.environ["RANK"] = str(rank)
+            os.environ["WORLD_SIZE"] = str(world_size)
+
+            result = test(factory, *args)
+            queue.put({"success": (result if result is not None else "")})
+        except Exception:
+            queue.put({"error": traceback.format_exc()})
+
+    def run_in_parallel(
+        self, num_processes: int, func: Callable, *args
+    ) -> List[Union[str, None]]:
+        ctx = mp.get_context("spawn")
+        queue = ctx.Queue()
+
+        processes: List[mp.Process] = []
+        for rank in range(num_processes):
+            p = ctx.Process(
+                target=OobleckMultiProcessTestCase._worker_init,
+                args=(
+                    queue,
+                    rank,
+                    1,
+                    num_processes,
+                    self.model_name,
+                    self.directory,
+                    func,
+                    *args,
+                ),
+            )
+            p.start()
+            processes.append(p)
+
+        results: List[Union[str, None]] = []
+
+        try:
+            for _ in range(len(processes)):
+                result = queue.get(timeout=60)
+                if "error" in result:
+                    for process in processes:
+                        process.terminate()
+                    pytest.fail(result["error"])
+
+                results.append(result["success"])
+        except TimeoutError as e:
+            for process in processes:
+                process.terminate()
+            pytest.fail(e)
+
+        for process in processes:
+            process.join()
+
+        return results
+
+    @classmethod
+    @pytest.fixture(scope="class", autouse=True)
+    def setup_class(
+        cls,
+        model_name_fixture: str,
+        tmp_path_factory: pytest.TempPathFactory,
+        request: pytest.FixtureRequest,
+    ):
+        request.cls.model_name = model_name_fixture
+        directory = tmp_path_factory.getbasetemp()
+        request.cls.directory = directory
