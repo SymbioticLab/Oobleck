@@ -1,16 +1,15 @@
-import json
+from __future__ import annotations
+
 import os
 import random
-import shutil
-import string
-from pathlib import Path
-from typing import List
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
 import deepspeed.comm as dist
 import pytest
 import torch
 import torch.distributed
-from transformers import TrainingArguments
+from transformers.training_args import TrainingArguments
 
 from oobleck.csrc.planning.pipeline_template import (
     LayerExecutionResult,
@@ -28,194 +27,216 @@ EVAL_BATCH_SIZE = 4
 GRADIENT_ACCUMULATION_STEP = 2
 
 
-@pytest.fixture(scope="session")
-def wikitext_dataset():
-    return OobleckDataset("gpt2", "wikitext", "wikitext-2-raw-v1")
+@dataclass
+class Model:
+    model_name: str
+    dataset_path: str
+    dataset_name: Optional[str] = None
 
 
-@pytest.fixture(scope="session")
-def imagenet_dataset():
-    return OobleckDataset("microsoft/resnet-50", "Maysee/tiny-imagenet")
+models_to_test: Dict[str, Model] = {
+    "gpt2": Model("gpt2", "wikitext", "wikitext-2-raw-v1"),
+    "microsoft/resnet-50": Model("microsoft/resnet-50", "Maysee/tiny-imagenet"),
+}
 
-
-# OobleckDataset does not have any states and ok to use for the entire session.
-@pytest.fixture(scope="session", params=["wikitext_dataset", "imagenet_dataset"])
-def dataset(request: pytest.FixtureRequest):
-    return request.getfixturevalue(request.param)
-
-
-def gpt2_model(wikitext_dataset):
-    # Refer to oobleck/examples/*.py for model arguments
-    # gpt2-medium
-    model_args = {
+# Add model arguments here, if it is needed.
+model_args: Dict[str, Optional[Dict[str, int]]] = {
+    "gpt2": {
         "num_hidden_layers": 32,
         "n_positions": 1024,
         "n_embd": 1024,
         "n_head": 16,
-    }
-    return OobleckModel("gpt2", wikitext_dataset.sample, None, "test", model_args)
-
-
-def resnet_model(imagenet_dataset):
-    return OobleckModel(
-        "microsoft/resnet-50", imagenet_dataset.sample, None, "test", None
-    )
-
-
-@pytest.fixture(
-    scope="session",
-    params=[
-        (gpt2_model, "wikitext_dataset"),
-        (resnet_model, "imagenet_dataset"),
-    ],
-    ids=["gpt2", "microsoft/resnet-50"],
-)
-def model(request: pytest.FixtureRequest):
-    return request.param[0](request.getfixturevalue(request.param[1]))
-
-
-@pytest.fixture(
-    scope="function",
-    params=[
-        (gpt2_model, "wikitext_dataset"),
-        (resnet_model, "imagenet_dataset"),
-    ],
-    ids=["gpt2", "microsoft/resnet-50"],
-)
-def model_function(no_distributed, request: pytest.FixtureRequest):
-    return request.param[0](request.getfixturevalue(request.param[1]))
-
-
-_model_datasets = {
-    "gpt2": "wikitext_dataset",
-    "microsoft/resnet-50": "imagenet_dataset",
+    },
 }
 
 
-@pytest.fixture(scope="session")
-def dataloaders(model: OobleckModel, request: pytest.FixtureRequest):
-    dataset = request.getfixturevalue(_model_datasets[model.model_name])
-
-    training_args = TrainingArguments(
-        output_dir="/tmp/test_output",
-        per_device_train_batch_size=TRAIN_BATCH_SIZE,
-        per_device_eval_batch_size=EVAL_BATCH_SIZE,
-        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEP,
-    )
-
-    training_dataloader = OobleckDataLoader(
-        dataset,
-        training_args,
-        LoaderType.Training,
-        # total number of microbatches.
-        # Currently only have one process, so it should be the same as
-        # gradient_accumulation_steps.
-        training_args.gradient_accumulation_steps,
-        0,
-        0,
-    )
-    eval_dataloader = OobleckDataLoader(
-        dataset,
-        training_args,
-        LoaderType.Evaluation,
-        # total number of microbatches.
-        # Currently only have one process, so it should be the same as
-        # gradient_accumulation_steps.
-        training_args.gradient_accumulation_steps,
-        0,
-        0,
-    )
-    return training_dataloader, eval_dataloader
+@pytest.fixture(scope="class", params=list(models_to_test.keys()))
+def model_name_fixture(request: pytest.FixtureRequest) -> str:
+    return request.param
 
 
-@pytest.fixture(scope="session")
-def model_dataloaders(model: OobleckModel, request: pytest.FixtureRequest):
-    loaders = request.getfixturevalue("dataloaders")
-    return model, loaders[0], loaders[1]
+class OobleckStaticClassFactory:
+    """
+    Oobleck Class Factory that create classes for testing.
+    "Static" here means that it is not relevant to Oobleck dynamic reconfiguration
+    and fixed once a class object is created.
+    """
 
-
-@pytest.fixture(scope="session")
-def dummy_profile_results(model: OobleckModel):
-    num_layers = len(model.model)
-    layers = []
-    allreduce_across_nodes = []
-    allreduce_in_node = []
-    for _ in range(num_layers):
-        layers.append(
-            {
-                "forward": random.random(),
-                "backward": random.random() * 3,
-                "mem_required": [1024, 1024],
-            }
+    def __init__(self, model_name: str, test_directory: str):
+        self._model_data: Model = models_to_test[model_name]
+        self._training_args = TrainingArguments(
+            output_dir=test_directory,
+            per_device_train_batch_size=TRAIN_BATCH_SIZE,
+            per_device_eval_batch_size=EVAL_BATCH_SIZE,
+            gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEP,
         )
 
-        # TODO: get argument to set number of nodes
-        ar_across_nodes = {}
-        for i in range(1, 33):
-            ar_across_nodes[i] = random.random() * 4
+        self._dataset: Optional[OobleckDataset] = None
+        self._model: Optional[OobleckModel] = None
+        self._dataloader: Optional[OobleckDataLoader] = None
+        self._profile: Optional[LayerExecutionResults] = None
+        self._pipeline_templates: Dict[int, PipelineTemplate] = {}
 
-        allreduce_across_nodes.append(ar_across_nodes)
-        allreduce_in_node.append(
-            {1: random.random(), 2: random.random(), 4: random.random()}
-        )
-
-    return layers, allreduce_across_nodes, allreduce_in_node
-
-
-@pytest.fixture(scope="function")
-def new_profile_directory(model):
-    # This fixture is used to clean up the files created by profile.
-    exist = True
-    while exist:
-        random_tag = "".join(random.choices(string.ascii_letters, k=8))
-        path = Path(f"/tmp/oobleck/profiles/{model.model_name}-{random_tag}")
-        exist = path.exists()
-    yield random_tag
-    shutil.rmtree(path, ignore_errors=True)
-
-
-@pytest.fixture(scope="function")
-def dummy_profile_result_files(
-    model: OobleckModel, dummy_profile_results, new_profile_directory
-):
-    directory = Path(
-        f"/tmp/oobleck/profiles/{model.model_name}-{new_profile_directory}"
-    )
-    directory.mkdir(parents=True, exist_ok=False)
-
-    def _create_files(microbatch_size: int):
-        filenames = [
-            f"mb{microbatch_size}.json",
-            "allreduce_across_nodes.json",
-            "allreduce_in_node.json",
-        ]
-        for filename, result in zip(filenames, dummy_profile_results):
-            with directory.joinpath(filename).open(mode="w") as f:
-                json.dump(result, f)
-                f.flush()
-
-    yield _create_files
-
-
-@pytest.fixture(scope="session")
-def dummy_layer_execution_results(model: OobleckModel, dummy_profile_results):
-    layers, allreduce_across_nodes, allreduce_in_node = dummy_profile_results
-
-    results: List[LayerExecutionResult] = []
-    for layer, execution, ar_in_node, ar_across_nodes in zip(
-        model.model, layers, allreduce_in_node, allreduce_across_nodes
-    ):
-        results.append(
-            LayerExecutionResult(
-                layer.index,
-                execution["forward"],
-                execution["backward"],
-                ar_in_node,
-                ar_across_nodes,
-                execution["mem_required"],
+    def get_dataset(self) -> OobleckDataset:
+        if not self._dataset:
+            self._dataset = OobleckDataset(
+                self._model_data.model_name,
+                self._model_data.dataset_path,
+                self._model_data.dataset_name,
             )
+        return self._dataset
+
+    def get_model(self) -> OobleckModel:
+        self.get_dataset()
+
+        if not self._model:
+            self._model = OobleckModel(
+                self._model_data.model_name,
+                self._dataset.sample,
+                self._training_args,
+                "test",
+                model_args.get(self._model_data.model_name, None),
+            )
+
+        return self._model
+
+    # TODO: move it to dynamic class factory
+    # Dataloader has its state and is subject to change.
+    def get_dataloader(self) -> OobleckDataLoader:
+        self.get_dataset()
+        self.get_model()
+
+        if not self._dataloader:
+            self._dataloader = OobleckDataLoader(
+                self._dataset,
+                self._training_args,
+                LoaderType.Training,
+                self._training_args.gradient_accumulation_steps,
+                0,
+                0,
+            )
+
+        return self._dataloader
+
+    def get_dummy_profile(self) -> LayerExecutionResults:
+        self.get_model()
+
+        if not self._profile:
+            num_layers = len(self._model.model)
+
+            results: List[LayerExecutionResult] = []
+            for index in range(num_layers):
+                results.append(
+                    LayerExecutionResult(
+                        layer_index=index,
+                        forward=random.random(),
+                        backward=random.random() * 3,
+                        allreduce_in_node={i + 1: random.random() for i in range(8)},
+                        allreduce_across_nodes={
+                            i + 1: random.random() * 4 for i in range(64)
+                        },
+                        mem_required=(1024, 1024),
+                    )
+                )
+
+            self._profile = LayerExecutionResults(results)
+
+        return self._profile
+
+    def get_dummy_pipeline_template(self, num_gpus: int) -> PipelineTemplate:
+        self.get_dummy_profile()
+
+        def slice_layers(lst: List[Any], num_chunks: int) -> List[Tuple[int, int]]:
+            if num_chunks > len(lst):
+                raise ValueError(
+                    f"Cannot slice {len(list)} layers into {num_chunks} chunks."
+                )
+
+            slice_points = sorted(random.sample(range(1, len(lst)), num_chunks - 1))
+            slice_points = sorted([0, len(lst)] + slice_points)
+            return [(slice_points[i], slice_points[i + 1]) for i in range(num_chunks)]
+
+        if num_gpus not in self._pipeline_templates:
+            # TODO: take user argument for it
+            num_gpus_per_stage = 1
+
+            layer_indices = slice_layers(self._profile.get(), num_gpus)
+
+            stages = [
+                StageExecutionResult(self._profile, indices, num_gpus_per_stage)
+                for indices in layer_indices
+            ]
+
+            self._pipeline_templates[num_gpus] = PipelineTemplate(
+                stages, 0.1, self._profile.size, num_gpus, num_gpus_per_stage
+            )
+
+        return self._pipeline_templates[num_gpus]
+
+
+class OobleckSingleProcessTestCase:
+    """
+    A base class for Oobleck test cases that run in a single process.
+    Test cases for functionalities of static classes will inherit this class.
+    """
+
+    factory: OobleckStaticClassFactory
+
+    @pytest.fixture(scope="function", autouse=False)
+    def distributed(self, model: OobleckModel, request: pytest.FixtureRequest):
+        assert not dist.is_initialized() and not torch.distributed.is_initialized()
+
+        # envs required by deepspeed.comm
+        os.environ["RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+        # Initialize a single process torch.distributed group.
+        store = torch.distributed.HashStore()
+        torch.distributed.init_process_group(
+            backend="nccl", store=store, rank=0, world_size=1
         )
-    return LayerExecutionResults(results)
+        dist.init_distributed(dist_backend="nccl", dist_init_required=False)
+        assert torch.distributed.is_initialized()
+        assert dist.is_initialized()
+
+        yield
+
+        dist.destroy_process_group()
+        dist.cdb = None
+        assert not torch.distributed.is_initialized()
+        assert not dist.is_initialized()
+        os.environ.pop("RANK")
+        os.environ.pop("WORLD_SIZE")
+
+    @classmethod
+    @pytest.fixture(scope="class", autouse=True)
+    def setup_class(
+        cls,
+        model_name_fixture: str,
+        tmpdir_factory: pytest.TempdirFactory,
+        request: pytest.FixtureRequest,
+    ):
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+        device_count_backup = torch.cuda.device_count
+        torch.cuda.device_count = lambda: 1
+
+        tmpdir = tmpdir_factory.mktemp("oobleck")
+        request.cls.factory = OobleckStaticClassFactory(
+            model_name_fixture, tmpdir.dirpath()
+        )
+
+        yield
+
+        os.environ.pop("CUDA_VISIBLE_DEVICES")
+        torch.cuda.device_count = device_count_backup
+
+
+class OobleckMultiProcessTestCase:
+    """
+    A base class for Oobleck test cases that run in multiple processes in parallel.
+    Test cases for functionalities of dynamic classes will inherit this class.
+    """
+
+    pass
 
 
 @pytest.fixture(scope="function")
@@ -230,6 +251,7 @@ def no_distributed():
     yield
     os.environ.clear()
     os.environ.update(original_env)
+
 
 def set_number_of_gpus(num_gpus: int = 1):
     # Hack to make torch.cuda.device_count() return # GPUs specified in env
@@ -257,7 +279,9 @@ def init_distributed():
             if dist.is_initialized():
                 return
 
-            dist.init_distributed(dist_backend="nccl", dist_init_required=True, rank=0, world_size=1)
+            dist.init_distributed(
+                dist_backend="nccl", dist_init_required=True, rank=0, world_size=1
+            )
             assert dist.is_initialized()
         else:
             assert not dist.is_initialized()
@@ -268,7 +292,7 @@ def init_distributed():
         dist.destroy_process_group()
         dist.cdb = None
     assert not dist.is_initialized()
-    
+
     os.environ.clear()
     os.environ.update(original_env)
 

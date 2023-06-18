@@ -14,7 +14,10 @@ PYBIND11_MODULE(pipeline_template, m) {
   py::class_<LayerExecutionResult>(m, "LayerExecutionResult")
       .def(py::init<const int, const double, const double,
                     const std::map<int, double>&, const std::map<int, double>&,
-                    const std::tuple<int, int>&>())
+                    const std::tuple<int, int>&>(),
+           py::arg("layer_index"), py::arg("forward"), py::arg("backward"),
+           py::arg("allreduce_in_node"), py::arg("allreduce_across_nodes"),
+           py::arg("mem_required"))
       .def_readonly("_index", &LayerExecutionResult::layer_index_)
       .def_readonly("_forward", &LayerExecutionResult::forward_)
       .def_readonly("_backward", &LayerExecutionResult::backward_)
@@ -29,7 +32,7 @@ PYBIND11_MODULE(pipeline_template, m) {
       .def(py::init<std::vector<LayerExecutionResult>&&>())
       .def("get", &LayerExecutionResults::get)
       .def("at", &LayerExecutionResults::at, py::arg("index"))
-      .def_property_readonly("_size", &LayerExecutionResults::size);
+      .def_property_readonly("size", &LayerExecutionResults::size);
 
   py::class_<StageExecutionResult, std::shared_ptr<StageExecutionResult>>(
       m, "StageExecutionResult")
