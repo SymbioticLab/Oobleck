@@ -135,7 +135,7 @@ class OobleckStaticClassFactory:
                         allreduce_across_nodes={
                             i + 1: random.random() * 4 for i in range(64)
                         },
-                        mem_required=[1024, 1024],
+                        mem_required=(1024, 1024),
                     )
                 )
 

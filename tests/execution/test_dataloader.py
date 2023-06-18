@@ -3,8 +3,19 @@ import torch
 from transformers import TrainingArguments
 
 from oobleck.execution.dataloader import LoaderType, OobleckDataLoader
-from tests.conftest import (EVAL_BATCH_SIZE, GRADIENT_ACCUMULATION_STEP,
-                            TRAIN_BATCH_SIZE)
+from tests.conftest import (
+    EVAL_BATCH_SIZE,
+    GRADIENT_ACCUMULATION_STEP,
+    TRAIN_BATCH_SIZE,
+    OobleckMultiProcessTestCase,
+)
+
+
+@pytest.mark.skip(
+    reason="Must be implemented using MultiProcessTestCase since it modifies internal states"
+)
+class TestOobleckDataloader(OobleckMultiProcessTestCase):
+    pass
 
 
 @pytest.mark.parametrize("dataset", ["wikitext_dataset", "imagenet_dataset"])
