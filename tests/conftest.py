@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import multiprocessing as mp
 import os
 import random
@@ -137,9 +138,12 @@ class OobleckStaticClassFactory:
                     f"Cannot slice {len(list)} layers into {num_chunks} chunks."
                 )
 
-            slice_points = sorted(random.sample(range(1, len(lst)), num_chunks - 1))
-            slice_points = sorted([0, len(lst)] + slice_points)
-            return [(slice_points[i], slice_points[i + 1]) for i in range(num_chunks)]
+            length_chunk = math.ceil(len(lst) / num_chunks)
+            slicing_points: List[Tuple[int, int]] = []
+            for i in range(0, len(lst), length_chunk):
+                end = i + length_chunk if i + length_chunk < len(lst) else len(lst)
+                slicing_points.append((i, end))
+            return slicing_points
 
         if num_gpus not in self._pipeline_templates:
             # TODO: take user argument for it
