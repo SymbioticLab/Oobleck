@@ -75,7 +75,7 @@ class OobleckStaticClassFactory:
         self._model: Optional[OobleckModel] = None
         self._dataloader: Optional[OobleckDataLoader] = None
         self._profile: Optional[LayerExecutionResults] = None
-        self._pipeline_template: Optional[PipelineTemplate] = None
+        self._pipeline_templates: Dict[int, PipelineTemplate] = {}
 
     def get_dataset(self) -> OobleckDataset:
         if not self._dataset:
@@ -143,7 +143,7 @@ class OobleckStaticClassFactory:
 
         return self._profile
 
-    def get_dummpy_pipeline_template(self, num_gpus: int) -> PipelineTemplate:
+    def get_dummy_pipeline_template(self, num_gpus: int) -> PipelineTemplate:
         self.get_dummy_profile()
 
         def slice_layers(lst: List[Any], num_chunks: int) -> List[Tuple[int, int]]:
@@ -153,27 +153,25 @@ class OobleckStaticClassFactory:
                 )
 
             slice_points = sorted(random.sample(range(1, len(lst)), num_chunks - 1))
-            slice_points = [0] + slice_points + [None]
+            slice_points = sorted([0, len(lst)] + slice_points)
             return [(slice_points[i], slice_points[i + 1]) for i in range(num_chunks)]
 
-        if not self._pipeline_template:
+        if num_gpus not in self._pipeline_templates:
             # TODO: take user argument for it
             num_gpus_per_stage = 1
 
             layer_indices = slice_layers(self._profile.get(), num_gpus)
 
             stages = [
-                StageExecutionResult(
-                    self._profile, layer_indices[i], num_gpus_per_stage
-                )
-                for i in range(layer_indices)
+                StageExecutionResult(self._profile, indices, num_gpus_per_stage)
+                for indices in layer_indices
             ]
 
-            self._pipeline_template = PipelineTemplate(
-                stages, 0.1, self._profile.size(), num_gpus, num_gpus_per_stage
+            self._pipeline_templates[num_gpus] = PipelineTemplate(
+                stages, 0.1, self._profile.size, num_gpus, num_gpus_per_stage
             )
 
-        return self._pipeline_template
+        return self._pipeline_templates[num_gpus]
 
 
 class OobleckSingleProcessTestCase:
