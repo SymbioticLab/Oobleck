@@ -512,11 +512,14 @@ class OobleckPipeline:
                 self.model_layers = [
                     model.model[index].to("cuda") for index in stage._layer_indices
                 ]
+                self.my_stage_index = stage_index
+                break
 
             num_gpus_used += stage._num_gpus
-            self.my_stage_index = stage_index
-            break
-        assert self.model_layers, "Could not find a stage to execute."
+
+        assert hasattr(
+            self, "model_layers"
+        ), f"[rank {self.my_rank}] Could not find a stage to execute."
 
         self.train_schedule = OobleckPipelineSchedule(
             dataloader.num_my_microbatches,

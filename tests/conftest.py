@@ -309,7 +309,9 @@ class OobleckMultiProcessTestCase:
             )
             dist.init_distributed(dist_backend="nccl", dist_init_required=False)
 
-            dynamic_factory = OobleckDynamicClassFactory(factory, rank, world_size)
+            dynamic_factory = OobleckDynamicClassFactory(
+                factory, rank, list(range(world_size))
+            )
 
             result = test(factory, dynamic_factory, *args)
 

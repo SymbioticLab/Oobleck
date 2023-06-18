@@ -7,40 +7,64 @@ from deepspeed.runtime.lr_schedules import WarmupLR
 from transformers import TrainingArguments
 
 from oobleck.execution.pipeline import OobleckPipeline
+from tests.conftest import (
+    OobleckDynamicClassFactory,
+    OobleckMultiProcessTestCase,
+    OobleckStaticClassFactory,
+)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
-def test_initialize_pipeline_single_stage(
-    model_dataloaders, dummy_pipeline_template, init_distributed
-):
-    model, train_dataloader, eval_dataloader = model_dataloaders
-    init_distributed(True)
-    training_args = TrainingArguments(output_dir="/tmp/test_output")
+class TestOobleckPipeline(OobleckMultiProcessTestCase):
+    @staticmethod
+    def _single_stage(
+        factory: OobleckStaticClassFactory,
+        dfactory: OobleckDynamicClassFactory,
+    ):
+        model = factory.get_model()
+        pipeline = dfactory.get_dummy_pipeline(1)
+        assert pipeline.prev_rank is None
+        assert pipeline.next_rank is None
 
-    pipeline_template = dummy_pipeline_template(num_gpus=1)
+        # Because we only have one rank, it should execute all layers in the model
+        assert len(pipeline.model_layers) == len(model.model)
 
-    pg = torch.distributed.new_group()
-    pipeline = OobleckPipeline(
-        pipeline_template=pipeline_template,
-        model=model,
-        dataloader=train_dataloader,
-        step=0,
-        ranks=[0],
-        process_group=pg,
-        training_args=training_args,
-    )
-    assert pipeline.prev_rank is None
-    assert pipeline.next_rank is None
+        assert isinstance(pipeline.execution.optimizer, FusedAdam)
+        assert isinstance(pipeline.execution.lr_scheduler, WarmupLR)
+        assert pipeline.global_steps == 0
 
-    # Because we only have one rank, it should execute all layers in the model
-    assert len(pipeline.model_layers) == len(model.model)
+        for layer in pipeline.model_layers:
+            assert all(p.is_cuda for p in layer.parameters())
 
-    assert isinstance(pipeline.execution.optimizer, FusedAdam)
-    assert isinstance(pipeline.execution.lr_scheduler, WarmupLR)
-    assert pipeline.global_steps == 0
+    def test_single_stage_pipeline(self):
+        self.run_in_parallel(num_processes=1, func=TestOobleckPipeline._single_stage)
 
-    for layer in pipeline.model_layers:
-        assert all(p.is_cuda for p in layer.parameters())
+    @staticmethod
+    def _four_stages(
+        factory: OobleckStaticClassFactory,
+        dfactory: OobleckDynamicClassFactory,
+    ):
+        model = factory.get_model()
+        pipeline = dfactory.get_dummy_pipeline(4)
+        assert pipeline.prev_rank == (
+            None if dfactory._my_rank == 0 else dfactory._my_rank - 1
+        )
+        assert pipeline.next_rank == (
+            None if dfactory._my_rank == 3 else dfactory._my_rank + 1
+        )
+
+        assert len(pipeline.model_layers) < len(model.model)
+
+        for layer in pipeline.model_layers:
+            assert all(p.is_cuda for p in layer.parameters())
+
+        return (len(pipeline.model_layers), len(model.model))
+
+    def test_four_stages_pipeline(self):
+        results = self.run_in_parallel(
+            num_processes=4, func=TestOobleckPipeline._four_stages
+        )
+        assert len(results) == 4
+        assert sum(r[0] for r in results) == results[0][1]
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="at least 2 GPUs required")
@@ -189,6 +213,7 @@ class TestOneStagePipeline:
             for index, layer in enumerate(self.pipeline.model_layers)
         )
 
+
 class TestTwoStagesPipeline:
     @pytest.fixture(autouse=True)
     def setup_method_fixture(
@@ -201,5 +226,3 @@ class TestTwoStagesPipeline:
         self.pipeline: OobleckPipeline = dummy_pipeline(
             num_gpus_per_pipeline=self.num_gpus_per_pipeline, ranks=[0, 1]
         )[0]
-
-    
