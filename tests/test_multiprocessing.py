@@ -4,12 +4,18 @@ import os
 import torch
 import torch.distributed as dist
 
-from .conftest import OobleckMultiProcessTestCase, OobleckStaticClassFactory
+from .conftest import (
+    OobleckDynamicClassFactory,
+    OobleckMultiProcessTestCase,
+    OobleckStaticClassFactory,
+)
 
 
 class TestMultiProcess(OobleckMultiProcessTestCase):
     @staticmethod
-    def _test_noargs(factory: OobleckStaticClassFactory):
+    def _test_noargs(
+        factory: OobleckStaticClassFactory, dynamic_factory: OobleckDynamicClassFactory
+    ):
         return factory._model_data.model_name
 
     def test_launch_single_process_noargs(self):
@@ -20,7 +26,12 @@ class TestMultiProcess(OobleckMultiProcessTestCase):
         assert results[0] == self.model_name
 
     @staticmethod
-    def _test_args(factory: OobleckStaticClassFactory, arg1: int, arg2: float):
+    def _test_args(
+        factory: OobleckStaticClassFactory,
+        dynamic_factory: OobleckDynamicClassFactory,
+        arg1: int,
+        arg2: float,
+    ):
         return (factory._model_data.model_name, arg1, arg2)
 
     def test_launch_single_process_echo_args(self):
@@ -34,7 +45,9 @@ class TestMultiProcess(OobleckMultiProcessTestCase):
         assert results[2] == 2.345
 
     @staticmethod
-    def _test_multiple_processes(factory: OobleckStaticClassFactory):
+    def _test_multiple_processes(
+        factory: OobleckStaticClassFactory, dynamic_factory: OobleckDynamicClassFactory
+    ):
         return (factory._model_data.model_name, int(os.environ["RANK"]))
 
     def test_launch_multi_processes(self):
@@ -48,7 +61,9 @@ class TestMultiProcess(OobleckMultiProcessTestCase):
         assert ranks == [0, 1, 2, 3]
 
     @staticmethod
-    def _test_allreduce_tensor(factory: OobleckStaticClassFactory):
+    def _test_allreduce_tensor(
+        factory: OobleckStaticClassFactory, dynamic_factory: OobleckDynamicClassFactory
+    ):
         tensor = torch.ones(1, dtype=torch.int32, device="cuda")
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         return tensor.item()

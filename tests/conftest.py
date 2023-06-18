@@ -22,6 +22,7 @@ from oobleck.csrc.planning.pipeline_template import (
 )
 from oobleck.execution.dataloader import LoaderType, OobleckDataLoader
 from oobleck.execution.dataset import OobleckDataset
+from oobleck.execution.pipeline import OobleckPipeline
 from oobleck.module.model import OobleckModel
 
 TRAIN_BATCH_SIZE = 8
@@ -102,24 +103,6 @@ class OobleckStaticClassFactory:
 
         return self._model
 
-    # TODO: move it to dynamic class factory
-    # Dataloader has its state and is subject to change.
-    def get_dataloader(self) -> OobleckDataLoader:
-        self.get_dataset()
-        self.get_model()
-
-        if not self._dataloader:
-            self._dataloader = OobleckDataLoader(
-                self._dataset,
-                self._training_args,
-                LoaderType.Training,
-                self._training_args.gradient_accumulation_steps,
-                0,
-                0,
-            )
-
-        return self._dataloader
-
     def get_dummy_profile(self) -> LayerExecutionResults:
         self.get_model()
 
@@ -174,6 +157,64 @@ class OobleckStaticClassFactory:
             )
 
         return self._pipeline_templates[num_gpus]
+
+
+class OobleckDynamicClassFactory:
+    """
+    Oobleck Class Factory that create classes for testing.
+    "Dynamic" here means that the internal states are changed during training.
+    Thus its scope should be carefully managed.
+    """
+
+    def __init__(
+        self, static_factory: OobleckStaticClassFactory, my_rank: int, ranks: List[int]
+    ):
+        assert dist.is_initialized()
+        assert torch.distributed.is_initialized()
+
+        self._static_factory = static_factory
+        self._my_rank = my_rank
+        self._ranks = ranks
+        self._dataloader: Optional[OobleckDataLoader] = None
+        self._pipeline: Optional[OobleckPipeline] = None
+
+    # TODO: move it to dynamic class factory
+    # Dataloader has its state and is subject to change.
+    def get_dataloader(self) -> OobleckDataLoader:
+        dataset = self._static_factory.get_dataset()
+        training_args = self._static_factory._training_args
+
+        if not self._dataloader:
+            self._dataloader = OobleckDataLoader(
+                dataset,
+                training_args,
+                LoaderType.Training,
+                training_args.gradient_accumulation_steps,
+                0,
+                0,
+            )
+
+        return self._dataloader
+
+    def get_dummy_pipeline(self, num_gpus: int) -> OobleckPipeline:
+        model = self._static_factory.get_model()
+        template = self._static_factory.get_dummy_pipeline_template(num_gpus)
+        training_args = self._static_factory._training_args
+        dataloaer = self.get_dataloader()
+
+        if not self._pipeline:
+            pg = torch.distributed.new_group(self._ranks)
+            self._pipeline = OobleckPipeline(
+                pipeline_template=template,
+                model=model,
+                dataloader=dataloaer,
+                step=0,
+                ranks=self._ranks,
+                process_group=pg,
+                training_args=training_args,
+            )
+
+        return self._pipeline
 
 
 class OobleckSingleProcessTestCase:
@@ -236,10 +277,6 @@ class OobleckMultiProcessTestCase:
     Test cases for functionalities of dynamic classes will inherit this class.
     """
 
-    @pytest.fixture(scope="function", autouse=False)
-    def distributed(self):
-        pass
-
     @staticmethod
     def _worker_init(
         queue: mp.Queue,
@@ -251,24 +288,31 @@ class OobleckMultiProcessTestCase:
         test: Callable,
         *args,
     ):
+        # Very careful initialization dependency due to too many third-party libraries.
+        # As we use torch.distributed.FileStore for distributed initialization, it doesn't require
+        # os envs (MASTER_ADDR, MASTER_PORT), while deepspeed and HuggingFace by default use them.
+        # Thus, initialize StaticClassFactory (which relies on HF) first without the envs.
+        # Then, initialize distributed and deepspeed.
+        # After that, create dynamic class factory since it requires distributed configuration.
         try:
             os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
 
+            torch.cuda.device_count = lambda: virtual_node_size
+            factory = OobleckStaticClassFactory(model_name, directory)
+
+            os.environ["RANK"] = str(rank)
+            os.environ["WORLD_SIZE"] = str(world_size)
             store = torch.distributed.FileStore(
                 str(directory.joinpath("test_init")), world_size
             )
             torch.distributed.init_process_group(
                 backend="nccl", store=store, rank=rank, world_size=world_size
             )
+            dist.init_distributed(dist_backend="nccl", dist_init_required=False)
 
-            torch.cuda.device_count = lambda: virtual_node_size
+            dynamic_factory = OobleckDynamicClassFactory(factory, rank, world_size)
 
-            factory = OobleckStaticClassFactory(model_name, directory)
-
-            os.environ["RANK"] = str(rank)
-            os.environ["WORLD_SIZE"] = str(world_size)
-
-            result = test(factory, *args)
+            result = test(factory, dynamic_factory, *args)
             queue.put({"success": (result if result is not None else "")})
         except Exception:
             queue.put({"error": traceback.format_exc()})
