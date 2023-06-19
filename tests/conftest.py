@@ -316,7 +316,12 @@ class OobleckMultiProcessTestCase:
 
             result = test(factory, dynamic_factory, *args)
 
-            queue.put({"success": (result if result is not None else "")})
+            queue.put(
+                {
+                    "success": (result if result is not None else ""),
+                    "rank": rank,
+                }
+            )
         except Exception as e:
             queue.put({"error": str(e) + "\n" + traceback.format_exc()})
         finally:
@@ -350,7 +355,7 @@ class OobleckMultiProcessTestCase:
             p.start()
             processes.append(p)
 
-        results: List[Any] = []
+        results: List[Any] = [None] * len(processes)
 
         try:
             for _ in range(len(processes)):
@@ -360,7 +365,7 @@ class OobleckMultiProcessTestCase:
                         process.terminate()
                     pytest.fail(result["error"])
 
-                results.append(result["success"])
+                results[result["rank"]] = result["success"]
         except TimeoutError as e:
             for process in processes:
                 process.terminate()
