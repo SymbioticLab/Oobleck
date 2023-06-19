@@ -167,7 +167,7 @@ class OobleckDynamicClassFactory:
     """
     Oobleck Class Factory that create classes for testing.
     "Dynamic" here means that the internal states are changed during training.
-    Thus its scope should be carefully managed.
+    Thus the class object should be created every time a new state is needed.
     """
 
     def __init__(
@@ -179,46 +179,43 @@ class OobleckDynamicClassFactory:
         self._static_factory = static_factory
         self._my_rank = my_rank
         self._ranks = ranks
-        self._dataloader: Optional[OobleckDataLoader] = None
-        self._pipeline: Optional[OobleckPipeline] = None
 
-    # TODO: move it to dynamic class factory
-    # Dataloader has its state and is subject to change.
-    def get_dataloader(self) -> OobleckDataLoader:
+    def get_dataloader(
+        self,
+        pipeline_index: int,
+        num_microbatches: List[int],
+        num_iterations: int = 0,
+    ) -> OobleckDataLoader:
         dataset = self._static_factory.get_dataset()
         training_args = self._static_factory._training_args
 
-        if not self._dataloader:
-            self._dataloader = OobleckDataLoader(
-                dataset,
-                training_args,
-                LoaderType.Training,
-                training_args.gradient_accumulation_steps,
-                0,
-                0,
-            )
-
-        return self._dataloader
+        return OobleckDataLoader(
+            args=training_args,
+            datasets=dataset,
+            dataloader_type=LoaderType.Training,
+            pipeline_index=pipeline_index,
+            num_microbatches=num_microbatches,
+            num_iterations_done=num_iterations,
+            epoch=0,
+            shuffle=False,
+        )
 
     def get_dummy_pipeline(self, num_gpus: int) -> OobleckPipeline:
         model = self._static_factory.get_model()
         template = self._static_factory.get_dummy_pipeline_template(num_gpus)
         training_args = self._static_factory._training_args
-        dataloaer = self.get_dataloader()
+        dataloaer = self.get_dataloader(0, [training_args.gradient_accumulation_steps])
 
-        if not self._pipeline:
-            pg = torch.distributed.new_group(self._ranks)
-            self._pipeline = OobleckPipeline(
-                pipeline_template=template,
-                model=model,
-                dataloader=dataloaer,
-                step=0,
-                ranks=self._ranks,
-                process_group=pg,
-                training_args=training_args,
-            )
-
-        return self._pipeline
+        pg = torch.distributed.new_group(self._ranks)
+        return OobleckPipeline(
+            pipeline_template=template,
+            model=model,
+            dataloader=dataloaer,
+            step=0,
+            ranks=self._ranks,
+            process_group=pg,
+            training_args=training_args,
+        )
 
 
 class OobleckSingleProcessTestCase:
@@ -319,7 +316,12 @@ class OobleckMultiProcessTestCase:
 
             result = test(factory, dynamic_factory, *args)
 
-            queue.put({"success": (result if result is not None else "")})
+            queue.put(
+                {
+                    "success": (result if result is not None else ""),
+                    "rank": rank,
+                }
+            )
         except Exception as e:
             queue.put({"error": str(e) + "\n" + traceback.format_exc()})
         finally:
@@ -353,17 +355,17 @@ class OobleckMultiProcessTestCase:
             p.start()
             processes.append(p)
 
-        results: List[Any] = []
+        results: List[Any] = [None] * len(processes)
 
         try:
             for _ in range(len(processes)):
-                result = queue.get(timeout=60)
+                result = queue.get()
                 if "error" in result:
                     for process in processes:
                         process.terminate()
                     pytest.fail(result["error"])
 
-                results.append(result["success"])
+                results[result["rank"]] = result["success"]
         except TimeoutError as e:
             for process in processes:
                 process.terminate()
