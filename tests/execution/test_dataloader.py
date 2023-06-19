@@ -1,5 +1,5 @@
 import os
-from typing import List
+from typing import List, Tuple
 
 import pytest
 import torch
@@ -68,6 +68,38 @@ class TestOobleckDataloader(OobleckMultiProcessTestCase):
         )
 
     @staticmethod
+    def _run_iterator_twice(
+        factory: OobleckStaticClassFactory,
+        dfactory: OobleckDynamicClassFactory,
+        num_microbatches: List[int],
+    ):
+        rank = int(os.environ["RANK"])
+        dataloader: OobleckDataLoader = dfactory.get_dataloader(rank, num_microbatches)
+        sampler: OobleckSampler = dataloader.batch_sampler
+        assert sampler.num_iterations_done == 0
+
+        iterator = iter(sampler)
+        batch1 = next(iterator)
+        assert sampler.num_iterations_done == 0
+
+        # reinitialize iterator
+        iterator = iter(sampler)
+        batch2 = next(iterator)
+
+        # should not increase iteration as it is reset
+        assert sampler.num_iterations_done == 0
+
+        # should be the same
+        assert batch1 == batch2
+
+    def test_batch_deterministric(self):
+        self.run_in_parallel(
+            1,
+            TestOobleckDataloader._run_iterator_twice,
+            [2],
+        )
+
+    @staticmethod
     def _iteration(
         factory: OobleckStaticClassFactory,
         dfactory: OobleckDynamicClassFactory,
@@ -78,7 +110,7 @@ class TestOobleckDataloader(OobleckMultiProcessTestCase):
         sampler: OobleckSampler = dataloader.batch_sampler
         assert sampler.num_iterations_done == 0
 
-        iterator = iter(dataloader)
+        iterator = iter(sampler)
 
         # Get a set of batches for one iteration
         # Within the iteration they should be contiguous
@@ -94,13 +126,94 @@ class TestOobleckDataloader(OobleckMultiProcessTestCase):
             [GRADIENT_ACCUMULATION_STEP] * 4,
         )
 
-    @pytest.mark.skip(reason="Not implemented yet")
-    def test_unique_batches_per_index(self):
-        pass
+    @staticmethod
+    def _distributed_batch_samples(
+        factory: OobleckStaticClassFactory,
+        dfactory: OobleckDynamicClassFactory,
+        num_microbatches: List[int],
+    ):
+        rank = int(os.environ["RANK"])
+        dataloader: OobleckDataLoader = dfactory.get_dataloader(rank, num_microbatches)
+        sampler: OobleckSampler = dataloader.batch_sampler
+        iterator = iter(sampler)
 
-    @pytest.mark.skip(reason="Not implemented yet")
-    def test_batch_deterministric(self):
-        pass
+        results = []
+        for _ in range(num_microbatches[rank]):
+            results.extend(next(iterator))
+        assert sampler.num_iterations_done == 1
+
+        return results
+
+    @pytest.mark.parametrize(
+        "num_microbatches",
+        [
+            ([GRADIENT_ACCUMULATION_STEP] * 4),
+            ([GRADIENT_ACCUMULATION_STEP + i for i in range(4)]),
+        ],
+        ids=["equal", "heterogeneous"],
+    )
+    def test_unique_batches_per_index(self, num_microbatches: List[int]):
+        results = self.run_in_parallel(
+            4,
+            TestOobleckDataloader._distributed_batch_samples,
+            num_microbatches,
+        )
+
+        assert len(results) == 4
+        # merge lists
+        results = results[0] + results[1] + results[2] + results[3]
+
+        # check that all batches are unique
+        assert len(set(results)) == len(results)
+
+    @staticmethod
+    def _jump_batch(
+        factory: OobleckStaticClassFactory,
+        dfactory: OobleckDynamicClassFactory,
+        num_microbatches: List[int],
+    ):
+        rank = int(os.environ["RANK"])
+        dataloader: OobleckDataLoader = dfactory.get_dataloader(rank, num_microbatches)
+        sampler: OobleckSampler = dataloader.batch_sampler
+        iterator = iter(sampler)
+
+        results = []
+        # Get a set of batches for one iteration
+        for i in range(num_microbatches[rank]):
+            batch = next(iterator)
+            if i == 0:
+                results.append(batch)
+        assert sampler.num_iterations_done == 1
+        results.append(next(iterator))
+
+        return results
+
+    @pytest.mark.parametrize(
+        "num_microbatches",
+        [
+            ([GRADIENT_ACCUMULATION_STEP] * 4),
+            ([GRADIENT_ACCUMULATION_STEP + i for i in range(4)]),
+        ],
+        ids=["equal", "heterogeneous"],
+    )
+    def test_jump_batch(self, num_microbatches: List[int]):
+        results: Tuple[List, List] = self.run_in_parallel(
+            4,
+            TestOobleckDataloader._jump_batch,
+            num_microbatches,
+        )
+
+        target_jump_size = TRAIN_BATCH_SIZE * sum(num_microbatches)
+
+        assert len(results) == 4
+        for result in results:
+            assert len(result) == 2
+            # Second iteration batch should jump target size
+            # so that within the same iteration batches are unique
+            assert all(
+                result[1][i] == result[0][i] + target_jump_size
+                for i in range(len(results))
+            )
 
     @staticmethod
     def _run_until_stop(

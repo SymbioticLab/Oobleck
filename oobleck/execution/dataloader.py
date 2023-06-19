@@ -56,10 +56,21 @@ class OobleckSampler(BatchSampler):
         """
         num_iterations_per_epoch = len(self)
 
-        for iter_index in range(num_iterations_per_epoch):
-            # For each iteration, it should jump this amount of microbatches
-            num_jump_microbatches = self.microbatch_size * sum(self.num_microbatches)
+        """
+        N == len(num_microbatches)
+        n == num_microbatches[rank]
+                <-----> microbatch_size
+        <------------microbatch_offset---------------> (e.g. if my rank is 2)
+        <-------------------------num_jump_microbatches-------------------------->
+        [r0mb0|r0mb1|...|r0mbn|r1mb0|r1mb1|...|r1mbn'|...|rNmb0|rNmb1|...|rNmbn'']
+        """
+        # For each iteration, it should jump this amount of microbatches
+        num_jump_microbatches = self.microbatch_size * sum(self.num_microbatches)
+        microbatches_offset = (
+            sum(self.num_microbatches[: self.pipeline_index]) * self.microbatch_size
+        )
 
+        for iter_index in range(num_iterations_per_epoch):
             if (
                 self.num_samples - iter_index * num_jump_microbatches
                 < self.total_bucket_size
@@ -75,8 +86,10 @@ class OobleckSampler(BatchSampler):
                 # TODO:adjust indices corresponding to my pipeline index
                 yield indices[
                     iter_index * num_jump_microbatches
-                    + mb * self.microbatch_size : iter_index * num_jump_microbatches
+                    + mb * self.microbatch_size
+                    + microbatches_offset : iter_index * num_jump_microbatches
                     + (mb + 1) * self.microbatch_size
+                    + microbatches_offset
                 ]
 
         # After one epoch is done, adjust epoch and num iterations done
