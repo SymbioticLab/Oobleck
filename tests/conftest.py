@@ -181,17 +181,21 @@ class OobleckDynamicClassFactory:
         self._ranks = ranks
 
     def get_dataloader(
-        self, total_num_microbatches: int, consumed_samples: int = 0
+        self,
+        pipeline_index: int,
+        num_microbatches: List[int],
+        num_iterations: int = 0,
     ) -> OobleckDataLoader:
         dataset = self._static_factory.get_dataset()
         training_args = self._static_factory._training_args
 
         return OobleckDataLoader(
-            datasets=dataset,
             args=training_args,
+            datasets=dataset,
             dataloader_type=LoaderType.Training,
-            num_total_microbatches=total_num_microbatches,
-            consumed_samples=consumed_samples,
+            pipeline_index=pipeline_index,
+            num_microbatches=num_microbatches,
+            num_iterations_done=num_iterations,
             epoch=0,
             shuffle=False,
         )
@@ -200,7 +204,7 @@ class OobleckDynamicClassFactory:
         model = self._static_factory.get_model()
         template = self._static_factory.get_dummy_pipeline_template(num_gpus)
         training_args = self._static_factory._training_args
-        dataloaer = self.get_dataloader()
+        dataloaer = self.get_dataloader(0, [training_args.gradient_accumulation_steps])
 
         pg = torch.distributed.new_group(self._ranks)
         return OobleckPipeline(
@@ -350,7 +354,7 @@ class OobleckMultiProcessTestCase:
 
         try:
             for _ in range(len(processes)):
-                result = queue.get(timeout=60)
+                result = queue.get()
                 if "error" in result:
                     for process in processes:
                         process.terminate()

@@ -21,26 +21,26 @@ class OobleckSampler(BatchSampler):
         self,
         dataset: Dataset,
         microbatch_size: int,
-        num_total_microbatches: int,
-        num_my_microbatches: int,
-        consumed_samples: int = 0,
+        pipeline_index: int,
+        num_microbatches: List[int],
+        num_iterations_done,
         epoch: int = 0,
         shuffle: bool = True,
         seed: int = 0,
     ):
         self.num_samples = len(dataset)
         self.microbatch_size = microbatch_size
-        self.num_microbatches = num_my_microbatches
-        self.num_total_microbatches = num_total_microbatches
-        self.total_bucket_size = self.microbatch_size * self.num_total_microbatches
-        self.consumed_samples = consumed_samples
+        self.pipeline_index = pipeline_index
+        self.num_microbatches = num_microbatches
+        self.num_iterations_done = num_iterations_done
         self.epoch = epoch
-
         self.shuffle = shuffle
         self.seed = seed
 
+        assert self.pipeline_index < len(self.num_microbatches)
+        self.total_bucket_size = self.microbatch_size * sum(self.num_microbatches)
+
     def __iter__(self) -> Iterator[List[int]]:
-        self.consumed_samples = 0
         if self.shuffle:
             # deterministically shuffle based on epoch and seed
             g = torch.Generator()
@@ -54,18 +54,34 @@ class OobleckSampler(BatchSampler):
         Once an iteration is done, it jumps to the next contiguous microbatch
         that is not consumed by other data parallel pipelines.
         """
-        while self.consumed_samples < self.num_samples:
-            if self.num_samples - self.consumed_samples < self.total_bucket_size:
+        num_iterations_per_epoch = len(self)
+
+        for iter_index in range(num_iterations_per_epoch):
+            # For each iteration, it should jump this amount of microbatches
+            num_jump_microbatches = self.microbatch_size * sum(self.num_microbatches)
+
+            if (
+                self.num_samples - iter_index * num_jump_microbatches
+                < self.total_bucket_size
+            ):
                 # Last batch if not complete will be dropped.
                 break
 
-            for i in range(self.num_microbatches):
-                self.consumed_samples += self.microbatch_size
-                yield indices[i * self.microbatch_size : (i + 1) * self.microbatch_size]
+            for mb in range(self.num_microbatches[self.pipeline_index]):
+                # increase num iteraion done if it is the last microbatch
+                if mb == self.num_microbatches[self.pipeline_index] - 1:
+                    self.num_iterations_done += 1
 
-            self.consumed_samples += self.microbatch_size * (
-                self.num_total_microbatches - self.num_microbatches
-            )
+                # TODO:adjust indices corresponding to my pipeline index
+                yield indices[
+                    iter_index * num_jump_microbatches
+                    + mb * self.microbatch_size : iter_index * num_jump_microbatches
+                    + (mb + 1) * self.microbatch_size
+                ]
+
+        # After one epoch is done, adjust epoch and num iterations done
+        self.num_iterations_done = 0
+        self.epoch += 1
 
     def __len__(self) -> int:
         return self.num_samples // self.total_bucket_size
@@ -79,11 +95,12 @@ class LoaderType(Enum):
 class OobleckDataLoader(DataLoader):
     def __init__(
         self,
-        datasets: OobleckDataset,
         args: TrainingArguments,
+        datasets: OobleckDataset,
         dataloader_type: LoaderType,
-        num_total_microbatches: int,
-        consumed_samples: int,
+        pipeline_index: int,
+        num_microbatches: List[int],
+        num_iterations_done: int,
         epoch: int,
         shuffle: bool = True,
     ):
@@ -91,22 +108,19 @@ class OobleckDataLoader(DataLoader):
             datasets, OobleckDataset
         ), f"dataset type must be OobleckDataset. Given: {type(dataset)}"
 
-        self.num_total_microbatches = num_total_microbatches
-        self.num_my_microbatches = args.gradient_accumulation_steps
-
         if dataloader_type == LoaderType.Training:
             dataset = datasets.dataset["train"]
-            batch_size = args.per_device_train_batch_size
+            microbatch_size = args.per_device_train_batch_size
         else:
             dataset = datasets.dataset["validation"]
-            batch_size = args.per_device_eval_batch_size
+            microbatch_size = args.per_device_eval_batch_size
 
         sampler = OobleckSampler(
             dataset,
-            batch_size,
-            self.num_total_microbatches,
-            self.num_my_microbatches,
-            consumed_samples,
+            microbatch_size,
+            pipeline_index,
+            num_microbatches,
+            num_iterations_done,
             epoch,
             shuffle,
         )
