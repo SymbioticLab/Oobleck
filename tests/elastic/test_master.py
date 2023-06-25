@@ -72,3 +72,36 @@ class TestOobleckMasterDaemonClass:
 
         assert daemon._job
         assert daemon._job.name == job.name
+
+    @pytest.mark.asyncio
+    async def test_get_dist_info_fail_no_job(
+        self,
+        conns: Tuple[asyncio.StreamReader, asyncio.StreamWriter],
+    ):
+        r, w = conns
+
+        w.write(RequestType.GET_DIST_INFO.value.to_bytes(1, "little"))
+        await w.drain()
+
+        result = Response(int.from_bytes(await r.readexactly(1), "little"))
+        assert result == Response.FAILURE
+
+    @pytest.mark.asyncio
+    async def test_get_dist_info(
+        self,
+        daemon: OobleckMasterDaemon,
+        conns: Tuple[asyncio.StreamReader, asyncio.StreamWriter],
+    ):
+        r, w = conns
+
+        daemon._job = Job("test", [], 1)
+
+        w.write(RequestType.GET_DIST_INFO.value.to_bytes(1, "little"))
+        await w.drain()
+
+        result = Response(int.from_bytes(await r.readexactly(1), "little"))
+        assert result == Response.SUCCESS
+
+        job: Job = pickle.loads(await r.read())
+
+        assert job.name == daemon._job.name

@@ -103,6 +103,7 @@ class OobleckMasterDaemon:
 
         w.write(Response.SUCCESS.value.to_bytes(1, "little"))
         w.write(pickle.dumps(self._job))
+        w.write_eof()
         pass
 
     async def register_agent_handler(
