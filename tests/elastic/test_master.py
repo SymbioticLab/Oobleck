@@ -130,3 +130,36 @@ class TestOobleckMasterDaemonClass:
 
         with pytest.raises(asyncio.TimeoutError):
             await message_util.recv_response(r)
+
+    @pytest.mark.asyncio
+    async def test_get_dist_info_by_multiple_clients(
+        self,
+        daemon: OobleckMasterDaemon,
+        conns: Tuple[asyncio.StreamReader, asyncio.StreamWriter],
+        sample_job: Job,
+    ):
+        r, w = conns
+
+        sample_job: Job = copy.deepcopy(sample_job)
+        sample_job.agent_info = [
+            AgentInfo("127.0.0.1", [0]),
+            AgentInfo("127.0.0.2", [1]),
+        ]
+
+        daemon._job = sample_job
+
+        # First client
+        asyncio.create_task(
+            message_util.send_request_type(w, message_util.RequestType.GET_DIST_INFO)
+        )
+
+        # Second client
+        r2, w2 = await asyncio.open_connection("localhost", daemon._port)
+        await message_util.send_request_type(w2, message_util.RequestType.GET_DIST_INFO)
+        assert (await message_util.recv_response(r2)) == message_util.Response.SUCCESS
+        agent_info: list[AgentInfo] = await message_util.recv(r2, need_pickle=True)
+
+        assert agent_info == sample_job.agent_info
+
+        w2.close()
+        await w2.wait_closed()
