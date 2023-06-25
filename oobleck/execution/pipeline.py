@@ -7,15 +7,15 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 import torch
 import torch.distributed
 from deepspeed import comm as dist
-from deepspeed.ops.adam import FusedAdam
 from deepspeed.runtime.lr_schedules import WarmupLR
 from deepspeed.runtime.pipe import schedule
 from deepspeed.utils import instrument_w_nvtx, logger
 from torch.distributed import ProcessGroup, Work
+from torch.optim import AdamW
 from transformers.training_args import TrainingArguments
 
 from oobleck.csrc.planning.pipeline_template import PipelineTemplate
-from oobleck.execution.dataloader import OobleckDataLoader
+from oobleck.execution.dataloader import OobleckDataLoader, OobleckSampler
 from oobleck.execution.utils import DTYPE_TO_ID, ID_TO_DTYPE, zero_grads
 from oobleck.module.layer import is_checkpointable
 from oobleck.module.model import OobleckModel
@@ -129,12 +129,12 @@ class PipelineExecution:
                 *[list(layer.parameters()) for layer in self.pipeline.model_layers]
             )
         )
-        self.optimizer = FusedAdam(
+        self.optimizer = AdamW(
             parameters,
-            self.training_args.learning_rate,
+            lr=self.training_args.learning_rate,
             betas=(self.training_args.adam_beta1, self.training_args.adam_beta2),
             eps=self.training_args.adam_epsilon,
-            adam_w_mode=True,
+            fused=True,
         )
         num_training_steps = len(self.dataloader)
         self.lr_scheduler = WarmupLR(
@@ -476,7 +476,7 @@ class OobleckPipeline:
         pipeline_template: PipelineTemplate,
         model: OobleckModel,
         dataloader: OobleckDataLoader,
-        num_microbatch: int,
+        pipeline_id: int,
         step: int,
         ranks: List[int],
         process_group: ProcessGroup,
@@ -491,7 +491,7 @@ class OobleckPipeline:
         ), "Number of ranks must be equal to number of stages * num_gpus_per_node."
         self.ranks = ranks
         self.my_rank = dist.get_rank()
-        self.my_num_microbatch = num_microbatch
+        self.pipeline_id = pipeline_id
         assert self.my_rank in self.ranks, "My rank is not in the ranks list."
 
         rank_index = ranks.index(self.my_rank)
@@ -523,8 +523,9 @@ class OobleckPipeline:
             self, "model_layers"
         ), f"[rank {self.my_rank}] Could not find a stage to execute."
 
+        sampler: OobleckSampler = dataloader.batch_sampler
         self.train_schedule = OobleckPipelineSchedule(
-            self.my_num_microbatch,
+            sampler.num_microbatches[self.pipeline_id],
             len(pipeline_template._stages),
             stage_index,
         )

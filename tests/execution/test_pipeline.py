@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import time
-
 import pytest
 import torch
 import torch.distributed
@@ -148,7 +146,6 @@ class TestOobleckSingleStagePipeline(OobleckMultiProcessTestCase):
         self.run_in_parallel(num_processes=1, func=func)
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="Requires 4 GPUs")
 class TestMultiStagePipeline(OobleckMultiProcessTestCase):
     @staticmethod
     def _four_stages(

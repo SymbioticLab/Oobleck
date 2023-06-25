@@ -204,14 +204,14 @@ class OobleckDynamicClassFactory:
         model = self._static_factory.get_model()
         template = self._static_factory.get_dummy_pipeline_template(num_gpus)
         training_args = self._static_factory._training_args
-        dataloaer = self.get_dataloader(0, [training_args.gradient_accumulation_steps])
+        dataloader = self.get_dataloader(0, [training_args.gradient_accumulation_steps])
 
         pg = torch.distributed.new_group(self._ranks)
         return OobleckPipeline(
             pipeline_template=template,
             model=model,
-            dataloader=dataloaer,
-            num_microbatch=GRADIENT_ACCUMULATION_STEP,
+            dataloader=dataloader,
+            pipeline_id=0,
             step=0,
             ranks=self._ranks,
             process_group=pg,
@@ -326,8 +326,9 @@ class OobleckMultiProcessTestCase:
         except Exception as e:
             queue.put({"error": str(e) + "\n" + traceback.format_exc()})
         finally:
-            torch.distributed.barrier()
-            torch.distributed.destroy_process_group()
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+                torch.distributed.destroy_process_group()
             # Make sure to remove FileStore after each test.
             directory.joinpath("store").unlink(missing_ok=True)
 
@@ -360,7 +361,7 @@ class OobleckMultiProcessTestCase:
 
         try:
             for _ in range(len(processes)):
-                result = queue.get(timeout=60)
+                result = queue.get()
 
                 if "error" in result:
                     # If any process get an error,
