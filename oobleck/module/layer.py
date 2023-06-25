@@ -1,18 +1,15 @@
+from typing import List, Tuple, Type
+
 import torch
 import torch.fx
-
-from typing import Type, Tuple, List
-
 from deepspeed import comm as dist
 from deepspeed.runtime.engine import (
     MEMORY_OPT_ALLREDUCE_SIZE,
     split_half_float_double_sparse,
 )
-from deepspeed.ops.op_builder.utils import UtilsBuilder
-
-from torch.utils.checkpoint import checkpoint as checkpoint_fn
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from torch.distributed import ProcessGroup
-
+from torch.utils.checkpoint import checkpoint as checkpoint_fn
 from transformers import TrainingArguments
 
 
@@ -39,9 +36,8 @@ class Layer(torch.nn.Module):
         self.training_args = training_args
 
         # Load pre-installed or JIT compile (un)flatten ops
-        util_ops = UtilsBuilder().load(verbose=False)
-        self.flatten = util_ops.flatten
-        self.unflatten = util_ops.unflatten
+        self.flatten = _flatten_dense_tensors
+        self.unflatten = _unflatten_dense_tensors
 
     def set_checkpointable(self, checkpointable: bool):
         self.checkpointable = checkpointable
