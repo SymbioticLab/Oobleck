@@ -221,18 +221,23 @@ class TestOobleckDataloader(OobleckMultiProcessTestCase):
         dfactory: OobleckDynamicClassFactory,
         num_microbatches: List[int],
     ):
-        rank = int(os.environ["RANK"])
+        assert len(num_microbatches) == 1
+        pipeline_id = 0
 
-        dataloader: OobleckDataLoader = dfactory.get_dataloader(rank, num_microbatches)
+        dataloader: OobleckDataLoader = dfactory.get_dataloader(
+            pipeline_id, num_microbatches
+        )
         sampler: OobleckSampler = dataloader.batch_sampler
         iterator = iter(dataloader)
         assert sampler.num_iterations_done == 0
         assert sampler.epoch == 0
 
+        assert sampler.num_microbatches[pipeline_id] == num_microbatches[pipeline_id]
+
         try:
             for iter_num in range(len(dataloader)):
                 assert sampler.num_iterations_done == iter_num
-                for _ in range(num_microbatches[rank]):
+                for _ in range(num_microbatches[pipeline_id]):
                     next(iterator)
                 assert sampler.num_iterations_done == iter_num + 1
         except StopIteration:

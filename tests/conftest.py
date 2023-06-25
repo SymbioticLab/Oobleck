@@ -369,15 +369,15 @@ class OobleckMultiProcessTestCase:
                     raise RuntimeError(result["error"])
                 else:
                     results[result["rank"]] = result["success"]
+
+            # Here, all processes are successfully finished.
+            for process in processes:
+                process.join()
         except Exception as e:
             for process in processes:
                 process.kill()
-            pytest.fail(e)
-        finally:
-            for process in processes:
                 process.join()
-
-        return results
+            pytest.fail(e)
 
     @classmethod
     @pytest.fixture(scope="class", autouse=True)
