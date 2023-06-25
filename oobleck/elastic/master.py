@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
-import signal
+import pickle
+from dataclasses import dataclass
+from typing import List
 
 
 class RequestType(enum.Enum):
@@ -15,6 +17,13 @@ class RequestType(enum.Enum):
 class Response(enum.Enum):
     SUCCESS = 1
     FAILURE = 2
+
+
+@dataclass
+class Job:
+    name: str
+    node_ips: List[str]
+    init_worker_num: str
 
 
 class OobleckMasterDaemon:
@@ -34,6 +43,7 @@ class OobleckMasterDaemon:
     def __init__(self):
         self._server: asyncio.Server | None = None
         self._port: int | None = None
+        self._job: Job | None = None
 
     @property
     def port(self) -> int:
@@ -58,13 +68,41 @@ class OobleckMasterDaemon:
     async def request_job_handler(
         self, r: asyncio.StreamReader, w: asyncio.StreamWriter
     ):
-        logging.info("Received job request.")
-        w.write(Response.SUCCESS.value.to_bytes(1, "little"))
+        """
+        Temporary request handler without maintaining the connection.
+        Store job information and launch agents.
+        """
+        result: Response
+        try:
+            if self._job:
+                logging.warning("Job already exists.")
+                result = Response.FAILURE
+            else:
+                self._job = pickle.loads(await asyncio.wait_for(r.read(), 10))
+                # TODO: Implement job launch.
+                result = Response.SUCCESS
+        except Exception as e:
+            result = Response.FAILURE
+        finally:
+            w.write(result.value.to_bytes(1, "little"))
+            await w.drain()
+            w.close()
+            await w.wait_closed()
 
     async def get_dist_info_handler(
         self, r: asyncio.StreamReader, w: asyncio.StreamWriter
     ):
-        logging.info("Received distributed information request.")
+        """
+        Temporary request handler without maintaining the connection.
+        Return distributed information stored in job launch.
+        """
+        if not self._job:
+            logging.warning("No job exists.")
+            w.write(Response.FAILURE.value.to_bytes(1, "little"))
+            return
+
+        w.write(Response.SUCCESS.value.to_bytes(1, "little"))
+        w.write(pickle.dumps(self._job))
         pass
 
     async def register_agent_handler(
