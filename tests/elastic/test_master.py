@@ -6,7 +6,8 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 
-from oobleck.elastic.master import Job, OobleckMasterDaemon, RequestType, Response
+import oobleck.elastic.message_util as message_util
+from oobleck.elastic.master import Job, OobleckMasterDaemon
 
 
 class TestOobleckMasterDaemonClass:
@@ -40,12 +41,11 @@ class TestOobleckMasterDaemonClass:
         daemon.request_job_handler = AsyncMock(wraps=daemon.request_job_handler)
         daemon.request_job_handler.assert_not_awaited()
 
-        w.write(RequestType.LAUNCH_JOB.value.to_bytes(1, "little"))
-        await w.drain()
+        await message_util.send_request_type(w, message_util.RequestType.LAUNCH_JOB)
 
-        # Not providing job information within 10 seconds should return failure.
-        result = Response(int.from_bytes(await r.readexactly(1), "little"))
-        assert result == Response.FAILURE
+        # Not providing job information within 5 seconds should return failure.
+        result = message_util.Response(int.from_bytes(await r.readexactly(1), "little"))
+        assert result == message_util.Response.FAILURE
 
         daemon.request_job_handler.assert_called_once()
 
@@ -59,13 +59,11 @@ class TestOobleckMasterDaemonClass:
 
         job = Job("test", [], 1)
 
-        w.write(RequestType.LAUNCH_JOB.value.to_bytes(1, "little"))
-        w.write(pickle.dumps(job))
-        w.write_eof()
-        await w.drain()
+        await message_util.send_request_type(w, message_util.RequestType.LAUNCH_JOB)
+        await message_util.send(w, job, need_pickle=True, close=False)
 
-        result = Response(int.from_bytes(await r.readexactly(1), "little"))
-        assert result == Response.SUCCESS
+        result = await message_util.recv_response(r)
+        assert result == message_util.Response.SUCCESS
 
         w.close()
         await w.wait_closed()
@@ -80,11 +78,10 @@ class TestOobleckMasterDaemonClass:
     ):
         r, w = conns
 
-        w.write(RequestType.GET_DIST_INFO.value.to_bytes(1, "little"))
-        await w.drain()
+        await message_util.send_request_type(w, message_util.RequestType.GET_DIST_INFO)
 
-        result = Response(int.from_bytes(await r.readexactly(1), "little"))
-        assert result == Response.FAILURE
+        result = await message_util.recv_response(r)
+        assert result == message_util.Response.FAILURE
 
     @pytest.mark.asyncio
     async def test_get_dist_info(
@@ -96,12 +93,12 @@ class TestOobleckMasterDaemonClass:
 
         daemon._job = Job("test", [], 1)
 
-        w.write(RequestType.GET_DIST_INFO.value.to_bytes(1, "little"))
-        await w.drain()
+        await message_util.send_request_type(w, message_util.RequestType.GET_DIST_INFO)
+        await message_util.send(w, daemon._job, need_pickle=True, close=False)
 
-        result = Response(int.from_bytes(await r.readexactly(1), "little"))
-        assert result == Response.SUCCESS
+        result = await message_util.recv_response(r)
+        assert result == message_util.Response.SUCCESS
 
-        job: Job = pickle.loads(await r.read())
+        job: Job = await message_util.recv(r, need_pickle=True)
 
         assert job.name == daemon._job.name

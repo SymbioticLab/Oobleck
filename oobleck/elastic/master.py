@@ -1,22 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import enum
 import logging
-import pickle
 from dataclasses import dataclass
 from typing import List
 
-
-class RequestType(enum.Enum):
-    LAUNCH_JOB = 1
-    GET_DIST_INFO = 2
-    REGISTER_AGENT = 3
-
-
-class Response(enum.Enum):
-    SUCCESS = 1
-    FAILURE = 2
+import oobleck.elastic.message_util as message_util
 
 
 @dataclass
@@ -24,6 +13,12 @@ class Job:
     name: str
     node_ips: List[str]
     init_worker_num: str
+
+
+@dataclass
+class DistributionInfo:
+    ips: List[str]
+    ranks: List[List[int]]
 
 
 class OobleckMasterDaemon:
@@ -72,22 +67,19 @@ class OobleckMasterDaemon:
         Temporary request handler without maintaining the connection.
         Store job information and launch agents.
         """
-        result: Response
+        result: message_util.Response
         try:
             if self._job:
                 logging.warning("Job already exists.")
-                result = Response.FAILURE
+                result = message_util.Response.FAILURE
             else:
-                self._job = pickle.loads(await asyncio.wait_for(r.read(), 10))
+                self._job = await message_util.recv(r, need_pickle=True)
                 # TODO: Implement job launch.
-                result = Response.SUCCESS
+                result = message_util.Response.SUCCESS
         except Exception as e:
-            result = Response.FAILURE
+            result = message_util.Response.FAILURE
         finally:
-            w.write(result.value.to_bytes(1, "little"))
-            await w.drain()
-            w.close()
-            await w.wait_closed()
+            await message_util.send_response(w, result)
 
     async def get_dist_info_handler(
         self, r: asyncio.StreamReader, w: asyncio.StreamWriter
@@ -98,13 +90,11 @@ class OobleckMasterDaemon:
         """
         if not self._job:
             logging.warning("No job exists.")
-            w.write(Response.FAILURE.value.to_bytes(1, "little"))
+            await message_util.send_response(w, message_util.Response.FAILURE)
             return
 
-        w.write(Response.SUCCESS.value.to_bytes(1, "little"))
-        w.write(pickle.dumps(self._job))
-        w.write_eof()
-        pass
+        await message_util.send_response(w, message_util.Response.SUCCESS, close=False)
+        await message_util.send(w, self._job, close=True)
 
     async def register_agent_handler(
         self, r: asyncio.StreamReader, w: asyncio.StreamWriter
@@ -117,16 +107,14 @@ class OobleckMasterDaemon:
         Callback function when any process (either agent or user) connects to the master.
         """
         try:
-            request_type: RequestType = RequestType(
-                int.from_bytes(await r.readexactly(1), "little")
-            )
+            request_type = await message_util.recv_request_type(r)
             loop = self._server.get_loop()
 
-            if request_type == RequestType.LAUNCH_JOB:
+            if request_type == message_util.RequestType.LAUNCH_JOB:
                 loop.create_task(self.request_job_handler(r, w))
-            elif request_type == RequestType.GET_DIST_INFO:
+            elif request_type == message_util.RequestType.GET_DIST_INFO:
                 loop.create_task(self.get_dist_info_handler(r, w))
-            elif request_type == RequestType.REGISTER_AGENT:
+            elif request_type == message_util.RequestType.REGISTER_AGENT:
                 loop.create_task(self.register_agent_handler(r, w))
             else:
                 logging.warning(f"Unknown request type: {request_type}")
