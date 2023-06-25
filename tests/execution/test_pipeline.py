@@ -3,8 +3,8 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.distributed
-from torch.optim import AdamW
 from deepspeed.runtime.lr_schedules import WarmupLR
+from torch.optim import AdamW
 
 from tests.conftest import (
     TRAIN_BATCH_SIZE,
@@ -275,3 +275,8 @@ class TestMultiStagePipeline(OobleckMultiProcessTestCase):
     def test_distributed_execution(self, func_name):
         func = getattr(TestMultiStagePipeline, func_name)
         self.run_in_parallel(num_processes=4, func=func)
+
+    @pytest.mark.skip(reason="TODO")
+    def test_pipeline_train(self):
+        # TODO: test train() method with mock spy
+        pass
