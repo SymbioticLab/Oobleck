@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import List
 
 import oobleck.elastic.message_util as message_util
 
@@ -11,14 +10,13 @@ import oobleck.elastic.message_util as message_util
 @dataclass
 class Job:
     name: str
-    node_ips: List[str]
-    init_worker_num: str
+    agent_info: list[AgentInfo]
 
 
 @dataclass
-class DistributionInfo:
-    ips: List[str]
-    ranks: List[List[int]]
+class AgentInfo:
+    ip: str
+    ranks: list[int]
 
 
 class OobleckMasterDaemon:
@@ -39,6 +37,8 @@ class OobleckMasterDaemon:
         self._server: asyncio.Server | None = None
         self._port: int | None = None
         self._job: Job | None = None
+
+        self._nodes_to_rendezvous: set[asyncio.StreamWriter] = set()
 
     @property
     def port(self) -> int:
@@ -93,8 +93,19 @@ class OobleckMasterDaemon:
             await message_util.send_response(w, message_util.Response.FAILURE)
             return
 
-        await message_util.send_response(w, message_util.Response.SUCCESS, close=False)
-        await message_util.send(w, self._job, close=True)
+        # put client into waiting list
+        self._nodes_to_rendezvous.add(w)
+
+        # if all clients are waiting, send dist info
+        if len(self._nodes_to_rendezvous) == len(self._job.agent_info):
+            for w in self._nodes_to_rendezvous:
+                await message_util.send_response(
+                    w, message_util.Response.SUCCESS, close=False
+                )
+                await message_util.send(
+                    w, self._job.agent_info, need_pickle=True, close=True
+                )
+            self._nodes_to_rendezvous.clear()
 
     async def register_agent_handler(
         self, r: asyncio.StreamReader, w: asyncio.StreamWriter

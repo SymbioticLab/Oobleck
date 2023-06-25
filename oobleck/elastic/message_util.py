@@ -61,17 +61,19 @@ async def send_response(
         await w.wait_closed()
 
 
-async def recv_response(r: asyncio.StreamReader) -> Response:
+async def recv_response(r: asyncio.StreamReader, timeout=TIMEOUT) -> Response:
     return Response(
         int.from_bytes(
-            await asyncio.wait_for(r.readexactly(1), timeout=TIMEOUT), "little"
+            await asyncio.wait_for(r.readexactly(1), timeout=timeout), "little"
         )
     )
 
 
-async def recv(r: asyncio.StreamReader, need_pickle: bool = True) -> Any:
+async def recv(
+    r: asyncio.StreamReader, need_pickle: bool = True, timeout=TIMEOUT
+) -> Any:
     len = int.from_bytes(
-        await asyncio.wait_for(r.readexactly(4), timeout=TIMEOUT), "little"
+        await asyncio.wait_for(r.readexactly(4), timeout=timeout), "little"
     )
-    msg = await asyncio.wait_for(r.readexactly(len), timeout=TIMEOUT)
+    msg = await asyncio.wait_for(r.readexactly(len), timeout=timeout)
     return pickle.loads(msg) if need_pickle else msg
