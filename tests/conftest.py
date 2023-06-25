@@ -361,7 +361,7 @@ class OobleckMultiProcessTestCase:
 
         try:
             for _ in range(len(processes)):
-                result = queue.get()
+                result = queue.get(timeout=60)
 
                 if "error" in result:
                     # If any process get an error,
