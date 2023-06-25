@@ -148,6 +148,7 @@ class TestOobleckSingleStagePipeline(OobleckMultiProcessTestCase):
         self.run_in_parallel(num_processes=1, func=func)
 
 
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="Requires 4 GPUs")
 class TestMultiStagePipeline(OobleckMultiProcessTestCase):
     @staticmethod
     def _four_stages(
@@ -170,7 +171,7 @@ class TestMultiStagePipeline(OobleckMultiProcessTestCase):
 
         return (len(pipeline.model_layers), len(model.model))
 
-    def tst_attributes_type(self):
+    def test_attributes_type(self):
         results = self.run_in_parallel(
             num_processes=4, func=TestMultiStagePipeline._four_stages
         )

@@ -12,7 +12,7 @@ from deepspeed.runtime.lr_schedules import WarmupLR
 from deepspeed.runtime.pipe import schedule
 from deepspeed.utils import instrument_w_nvtx, logger
 from torch.distributed import ProcessGroup, Work
-from transformers import TrainingArguments
+from transformers.training_args import TrainingArguments
 
 from oobleck.csrc.planning.pipeline_template import PipelineTemplate
 from oobleck.execution.dataloader import OobleckDataLoader
@@ -476,6 +476,7 @@ class OobleckPipeline:
         pipeline_template: PipelineTemplate,
         model: OobleckModel,
         dataloader: OobleckDataLoader,
+        num_microbatch: int,
         step: int,
         ranks: List[int],
         process_group: ProcessGroup,
@@ -490,6 +491,7 @@ class OobleckPipeline:
         ), "Number of ranks must be equal to number of stages * num_gpus_per_node."
         self.ranks = ranks
         self.my_rank = dist.get_rank()
+        self.my_num_microbatch = num_microbatch
         assert self.my_rank in self.ranks, "My rank is not in the ranks list."
 
         rank_index = ranks.index(self.my_rank)
@@ -522,7 +524,7 @@ class OobleckPipeline:
         ), f"[rank {self.my_rank}] Could not find a stage to execute."
 
         self.train_schedule = OobleckPipelineSchedule(
-            dataloader.num_my_microbatches,
+            self.my_num_microbatch,
             len(pipeline_template._stages),
             stage_index,
         )

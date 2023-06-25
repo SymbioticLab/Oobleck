@@ -211,6 +211,7 @@ class OobleckDynamicClassFactory:
             pipeline_template=template,
             model=model,
             dataloader=dataloaer,
+            num_microbatch=GRADIENT_ACCUMULATION_STEP,
             step=0,
             ranks=self._ranks,
             process_group=pg,
@@ -359,20 +360,21 @@ class OobleckMultiProcessTestCase:
 
         try:
             for _ in range(len(processes)):
-                result = queue.get()
+                result = queue.get(timeout=60)
+
                 if "error" in result:
-                    for process in processes:
-                        process.terminate()
-                    pytest.fail(result["error"])
-
-                results[result["rank"]] = result["success"]
-        except TimeoutError as e:
+                    # If any process get an error,
+                    # immediately abort the test.
+                    raise RuntimeError(result["error"])
+                else:
+                    results[result["rank"]] = result["success"]
+        except Exception as e:
             for process in processes:
-                process.terminate()
+                process.kill()
             pytest.fail(e)
-
-        for process in processes:
-            process.join()
+        finally:
+            for process in processes:
+                process.join()
 
         return results
 
