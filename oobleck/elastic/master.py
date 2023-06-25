@@ -12,6 +12,11 @@ class RequestType(enum.Enum):
     REGISTER_AGENT = 3
 
 
+class Response(enum.Enum):
+    SUCCESS = 1
+    FAILURE = 2
+
+
 class OobleckMasterDaemon:
     """
     Master daemon process that manages the Oobleck cluster.
@@ -54,7 +59,7 @@ class OobleckMasterDaemon:
         self, r: asyncio.StreamReader, w: asyncio.StreamWriter
     ):
         logging.info("Received job request.")
-        pass
+        w.write(Response.SUCCESS.value.to_bytes(1, "little"))
 
     async def get_dist_info_handler(
         self, r: asyncio.StreamReader, w: asyncio.StreamWriter
