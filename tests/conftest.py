@@ -332,6 +332,8 @@ class OobleckMultiProcessTestCase:
             # Make sure to remove FileStore after each test.
             directory.joinpath("store").unlink(missing_ok=True)
 
+        return result
+
     def run_in_parallel(
         self, num_processes: int, func: Callable, *args
     ) -> List[Union[str, None]]:
@@ -378,6 +380,8 @@ class OobleckMultiProcessTestCase:
                 process.kill()
                 process.join()
             pytest.fail(e)
+
+        return results
 
     @classmethod
     @pytest.fixture(scope="class", autouse=True)
