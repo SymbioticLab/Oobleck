@@ -149,17 +149,27 @@ class TestOobleckMasterDaemonClass:
         daemon._job = sample_job
 
         # First client
-        asyncio.create_task(
-            message_util.send_request_type(w, message_util.RequestType.GET_DIST_INFO)
-        )
+        await message_util.send_request_type(w, message_util.RequestType.GET_DIST_INFO)
+        task = asyncio.create_task(message_util.recv_response(r))
+
+        await asyncio.sleep(2)
+        assert len(daemon._nodes_to_rendezvous) == 1
+        assert not task.done()
 
         # Second client
         r2, w2 = await asyncio.open_connection("localhost", daemon._port)
         await message_util.send_request_type(w2, message_util.RequestType.GET_DIST_INFO)
-        assert (await message_util.recv_response(r2)) == message_util.Response.SUCCESS
-        agent_info: list[AgentInfo] = await message_util.recv(r2, need_pickle=True)
 
-        assert agent_info == sample_job.agent_info
+        # Both must succeed
+        while not task.done():
+            await asyncio.sleep(0.1)
+        assert task.result() == message_util.Response.SUCCESS
+        assert (await message_util.recv_response(r2)) == message_util.Response.SUCCESS
+
+        # Both must receive the same information
+        agent_info: list[AgentInfo] = await message_util.recv(r, need_pickle=True)
+        agent_info2: list[AgentInfo] = await message_util.recv(r2, need_pickle=True)
+        assert agent_info == agent_info2 == daemon._job.agent_info
 
         w2.close()
         await w2.wait_closed()
@@ -174,8 +184,8 @@ class TestOobleckMasterDaemonClass:
         r, w = conns
         daemon._job = sample_job
 
-        assert daemon._job.agent_info[0].connected is False
+        assert daemon._job.agent_info[0].streams is None
 
         await message_util.send_request_type(w, message_util.RequestType.REGISTER_AGENT)
         assert (await message_util.recv_response(r)) == message_util.Response.SUCCESS
-        assert daemon._job.agent_info[0].connected is True
+        assert daemon._job.agent_info[0].streams

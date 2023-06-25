@@ -23,7 +23,7 @@ class AgentInfo:
 
     ip: str
     ranks: list[int]
-    connected: bool = False
+    streams: tuple[asyncio.StreamReader, asyncio.StreamWriter] | None = None
 
 
 class OobleckMasterDaemon:
@@ -131,8 +131,8 @@ class OobleckMasterDaemon:
             )
             return
 
-        agent_info.connected = True
-        await message_util.send_response(w, message_util.Response.SUCCESS, close=True)
+        agent_info.streams = (r, w)
+        await message_util.send_response(w, message_util.Response.SUCCESS, close=False)
 
     async def on_connected(self, r: asyncio.StreamReader, w: asyncio.StreamWriter):
         """
@@ -148,6 +148,10 @@ class OobleckMasterDaemon:
                 loop.create_task(self.get_dist_info_handler(r, w))
             elif request_type == message_util.RequestType.REGISTER_AGENT:
                 loop.create_task(self.register_agent_handler(r, w))
+            elif request_type == message_util.RequestType.PING:
+                await message_util.send_response(
+                    w, message_util.Response.PONG, close=False
+                )
             else:
                 logging.warning(f"Unknown request type: {request_type}")
                 w.close()
