@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.distributed
-from deepspeed.ops.adam import FusedAdam
+from torch.optim import AdamW
 from deepspeed.runtime.lr_schedules import WarmupLR
 
 from tests.conftest import (
@@ -28,7 +28,7 @@ class TestOobleckSingleStagePipeline(OobleckMultiProcessTestCase):
         # Because we only have one rank, it should execute all layers in the model
         assert len(pipeline.model_layers) == len(model.model)
 
-        assert isinstance(pipeline.execution.optimizer, FusedAdam)
+        assert isinstance(pipeline.execution.optimizer, AdamW)
         assert isinstance(pipeline.execution.lr_scheduler, WarmupLR)
         assert pipeline.global_steps == 0
 
