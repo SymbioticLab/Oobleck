@@ -1,6 +1,5 @@
 import asyncio
 import copy
-from typing import Tuple
 from unittest.mock import AsyncMock
 
 import pytest
@@ -38,7 +37,7 @@ class TestOobleckMasterDaemonClass:
     async def test_request_job_fail(
         self,
         daemon: OobleckMasterDaemon,
-        conns: Tuple[asyncio.StreamReader, asyncio.StreamWriter],
+        conns: tuple[asyncio.StreamReader, asyncio.StreamWriter],
     ):
         r, w = conns
 
@@ -48,8 +47,9 @@ class TestOobleckMasterDaemonClass:
         await message_util.send_request_type(w, message_util.RequestType.LAUNCH_JOB)
 
         # Not providing job information within 5 seconds should return failure.
-        result = message_util.recv_response(r, timeout=10)
-        assert result == message_util.Response.FAILURE
+        assert (
+            await message_util.recv_response(r, timeout=None)
+        ) == message_util.Response.FAILURE
 
         daemon.request_job_handler.assert_called_once()
 
@@ -57,7 +57,7 @@ class TestOobleckMasterDaemonClass:
     async def test_request_job(
         self,
         daemon: OobleckMasterDaemon,
-        conns: Tuple[asyncio.StreamReader, asyncio.StreamWriter],
+        conns: tuple[asyncio.StreamReader, asyncio.StreamWriter],
         sample_job: Job,
     ):
         r, w = conns
@@ -77,7 +77,7 @@ class TestOobleckMasterDaemonClass:
     @pytest.mark.asyncio
     async def test_get_dist_info_fail_no_job(
         self,
-        conns: Tuple[asyncio.StreamReader, asyncio.StreamWriter],
+        conns: tuple[asyncio.StreamReader, asyncio.StreamWriter],
     ):
         r, w = conns
 
@@ -90,7 +90,7 @@ class TestOobleckMasterDaemonClass:
     async def test_get_dist_info(
         self,
         daemon: OobleckMasterDaemon,
-        conns: Tuple[asyncio.StreamReader, asyncio.StreamWriter],
+        conns: tuple[asyncio.StreamReader, asyncio.StreamWriter],
         sample_job: Job,
     ):
         r, w = conns
@@ -111,7 +111,7 @@ class TestOobleckMasterDaemonClass:
     async def test_get_dist_info_blocked(
         self,
         daemon: OobleckMasterDaemon,
-        conns: Tuple[asyncio.StreamReader, asyncio.StreamWriter],
+        conns: tuple[asyncio.StreamReader, asyncio.StreamWriter],
         sample_job: Job,
     ):
         r, w = conns
@@ -135,7 +135,7 @@ class TestOobleckMasterDaemonClass:
     async def test_get_dist_info_by_multiple_clients(
         self,
         daemon: OobleckMasterDaemon,
-        conns: Tuple[asyncio.StreamReader, asyncio.StreamWriter],
+        conns: tuple[asyncio.StreamReader, asyncio.StreamWriter],
         sample_job: Job,
     ):
         r, w = conns
@@ -168,7 +168,7 @@ class TestOobleckMasterDaemonClass:
     async def test_register_agent(
         self,
         daemon: OobleckMasterDaemon,
-        conns: Tuple[asyncio.StreamReader, asyncio.StreamWriter],
+        conns: tuple[asyncio.StreamReader, asyncio.StreamWriter],
         sample_job: Job,
     ):
         r, w = conns
