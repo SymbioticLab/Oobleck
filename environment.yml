@@ -8,11 +8,12 @@ channels:
   # be listed explicitly here.
   - nodefaults
 dependencies:
-  - python
+  - python==3.10
   - python-devtools
   - pip
   - pytorch==2.0.0
   - torchvision==0.15.0
+  - torchaudio==2.0.0
   - pytorch-cuda=11.7
   - cyipopt
   - glpk
@@ -21,16 +22,18 @@ dependencies:
   - pybind11
   - ninja
   - cmake
+  - cxx-compiler
   - tbb-devel
-  - pytest
   - pip:
     - transformers>=4.26.0
     - deepspeed>=0.8.1
     - accelerate
     - datasets
-    - redis[hiredis]
     - rpyc
     - psutil
     - tensorboard
     - evaluate
     - scikit-learn
+    - pytest
+    - pytest-asyncio
+    - pytest-mock
