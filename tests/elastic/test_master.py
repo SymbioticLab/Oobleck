@@ -163,3 +163,19 @@ class TestOobleckMasterDaemonClass:
 
         w2.close()
         await w2.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_register_agent(
+        self,
+        daemon: OobleckMasterDaemon,
+        conns: Tuple[asyncio.StreamReader, asyncio.StreamWriter],
+        sample_job: Job,
+    ):
+        r, w = conns
+        daemon._job = sample_job
+
+        assert daemon._job.agent_info[0].connected is False
+
+        await message_util.send_request_type(w, message_util.RequestType.REGISTER_AGENT)
+        assert (await message_util.recv_response(r)) == message_util.Response.SUCCESS
+        assert daemon._job.agent_info[0].connected is True

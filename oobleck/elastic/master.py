@@ -15,8 +15,15 @@ class Job:
 
 @dataclass
 class AgentInfo:
+    """
+    OobleckAgent information.
+    A list of agent information is generated when a user requests a job to be launched.
+    First connected is set False, but will be set True when the agent connects to the master.
+    """
+
     ip: str
     ranks: list[int]
+    connected: bool = False
 
 
 class OobleckMasterDaemon:
@@ -110,8 +117,22 @@ class OobleckMasterDaemon:
     async def register_agent_handler(
         self, r: asyncio.StreamReader, w: asyncio.StreamWriter
     ):
-        logging.info("Received agent registration request.")
-        pass
+        client_ip = w.get_extra_info("peername")[0]
+        try:
+            agent_info: AgentInfo = next(
+                agent_info
+                for agent_info in self._job.agent_info
+                if agent_info.ip == client_ip
+            )
+        except StopIteration:
+            logging.warning(f"Unknown agent: {client_ip}")
+            await message_util.send_response(
+                w, message_util.Response.FAILURE, close=True
+            )
+            return
+
+        agent_info.connected = True
+        await message_util.send_response(w, message_util.Response.SUCCESS, close=True)
 
     async def on_connected(self, r: asyncio.StreamReader, w: asyncio.StreamWriter):
         """
