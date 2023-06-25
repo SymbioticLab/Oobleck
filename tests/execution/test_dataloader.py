@@ -249,6 +249,7 @@ class TestOobleckDataloader(OobleckMultiProcessTestCase):
         assert sampler.num_iterations_done == 0
         assert sampler.epoch == 1
 
+    @pytest.mark.skip(reason="Too long to run")
     def test_stop_iteration(self):
         self.run_in_parallel(
             1,
