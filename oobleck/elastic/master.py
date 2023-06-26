@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 from dataclasses import dataclass
 
@@ -119,10 +120,8 @@ class OobleckMasterDaemon:
     ):
         client_ip = w.get_extra_info("peername")[0]
         try:
-            agent_info: AgentInfo = next(
-                agent_info
-                for agent_info in self._job.agent_info
-                if agent_info.ip == client_ip
+            agent: AgentInfo = next(
+                agent for agent in self._job.agent_info if agent.ip == client_ip
             )
         except StopIteration:
             logging.warning(f"Unknown agent: {client_ip}")
@@ -131,8 +130,46 @@ class OobleckMasterDaemon:
             )
             return
 
-        agent_info.streams = (r, w)
+        # TODO: register callback on agent reader disconnection
+        agent.streams = (r, w)
+        logging.info("Registering agent stream")
+
+        self._server.get_loop().create_task(self.agent_handler(agent))
+
+        # self._server.get_loop().create_task(self.on_agent_callback(agent))
         await message_util.send_response(w, message_util.Response.SUCCESS, close=False)
+
+    async def pong(self, w: asyncio.StreamWriter):
+        try:
+            agent: AgentInfo = next(
+                agent
+                for agent in self._job.agent_info
+                if agent.streams and agent.streams[1] == w
+            )
+            logging.info("Sending pong")
+            await message_util.send_response(
+                agent.streams[1], message_util.Response.PONG, close=False
+            )
+        except (AttributeError, StopIteration) as e:
+            logging.warning(f"Unknown agent: {w.get_extra_info('peername')[0]}")
+            w.close()
+            await w.wait_closed()
+
+    async def agent_handler(self, agent: AgentInfo):
+        r, w = agent.streams
+        try:
+            while True:
+                request_type = await message_util.recv_request_type(r)
+
+                if request_type == message_util.RequestType.PING:
+                    await self.pong(w)
+                else:
+                    # TODO: use close_agent() method
+                    logging.warning(f"Unknown request type: {request_type}")
+                    w.close()
+                    await w.wait_closed()
+        except asyncio.IncompleteReadError:
+            logging.warning("Agent disconnected")
 
     async def on_connected(self, r: asyncio.StreamReader, w: asyncio.StreamWriter):
         """
@@ -148,10 +185,6 @@ class OobleckMasterDaemon:
                 loop.create_task(self.get_dist_info_handler(r, w))
             elif request_type == message_util.RequestType.REGISTER_AGENT:
                 loop.create_task(self.register_agent_handler(r, w))
-            elif request_type == message_util.RequestType.PING:
-                await message_util.send_response(
-                    w, message_util.Response.PONG, close=False
-                )
             else:
                 logging.warning(f"Unknown request type: {request_type}")
                 w.close()

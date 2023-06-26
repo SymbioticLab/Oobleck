@@ -10,11 +10,13 @@ class RequestType(enum.Enum):
     LAUNCH_JOB = 1
     GET_DIST_INFO = 2
     REGISTER_AGENT = 3
+    PING = 4
 
 
 class Response(enum.Enum):
     SUCCESS = 1
     FAILURE = 2
+    PONG = 3
 
 
 async def send(

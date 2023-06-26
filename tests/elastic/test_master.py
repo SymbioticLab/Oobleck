@@ -189,3 +189,44 @@ class TestOobleckMasterDaemonClass:
         await message_util.send_request_type(w, message_util.RequestType.REGISTER_AGENT)
         assert (await message_util.recv_response(r)) == message_util.Response.SUCCESS
         assert daemon._job.agent_info[0].streams
+
+    @pytest.mark.asyncio
+    async def test_ping_fail(
+        self,
+        daemon: OobleckMasterDaemon,
+        conns: tuple[asyncio.StreamReader, asyncio.StreamWriter],
+        sample_job: Job,
+    ):
+        r, w = conns
+        daemon._job = sample_job
+
+        # Check agent is not registered
+        assert not daemon._job.agent_info[0].streams
+
+        await message_util.send_request_type(w, message_util.RequestType.PING)
+
+        # Without agent registration, expected to fail
+        with pytest.raises(asyncio.IncompleteReadError):
+            await message_util.recv_response(r)
+
+    @pytest.mark.asyncio
+    async def test_ping(
+        self,
+        daemon: OobleckMasterDaemon,
+        conns: tuple[asyncio.StreamReader, asyncio.StreamWriter],
+        sample_job: Job,
+    ):
+        r, w = conns
+        daemon._job = sample_job
+
+        # Register agent then ping
+        await message_util.send_request_type(w, message_util.RequestType.REGISTER_AGENT)
+        assert (await message_util.recv_response(r)) == message_util.Response.SUCCESS
+
+        assert daemon._job.agent_info[0].streams
+
+        # Reuse the connection
+        await message_util.send_request_type(w, message_util.RequestType.PING)
+        assert (
+            await message_util.recv_response(r, timeout=10)
+        ) == message_util.Response.PONG
