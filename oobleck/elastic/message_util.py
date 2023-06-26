@@ -17,6 +17,7 @@ class Response(enum.Enum):
     SUCCESS = 1
     FAILURE = 2
     PONG = 3
+    RECONFIGURATION = 4
 
 
 async def send(

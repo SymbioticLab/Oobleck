@@ -118,6 +118,7 @@ class OobleckMasterDaemon:
     async def register_agent_handler(
         self, r: asyncio.StreamReader, w: asyncio.StreamWriter
     ):
+        # TODO: find another unique identifier than IP address.
         client_ip = w.get_extra_info("peername")[0]
         try:
             agent: AgentInfo = next(
@@ -138,6 +139,19 @@ class OobleckMasterDaemon:
 
         # self._server.get_loop().create_task(self.on_agent_callback(agent))
         await message_util.send_response(w, message_util.Response.SUCCESS, close=False)
+
+    async def close_agent(self, agent: AgentInfo):
+        _, w = agent.streams
+        w.close()
+        await w.wait_closed()
+        self._job.agent_info.remove(agent)
+
+        # Broadcast reconfiguration event
+        for agent in self._job.agent_info:
+            if agent.streams:
+                await message_util.send_response(
+                    agent.streams[1], message_util.Response.RECONFIGURATION, close=False
+                )
 
     async def pong(self, w: asyncio.StreamWriter):
         try:
@@ -164,12 +178,11 @@ class OobleckMasterDaemon:
                 if request_type == message_util.RequestType.PING:
                     await self.pong(w)
                 else:
-                    # TODO: use close_agent() method
                     logging.warning(f"Unknown request type: {request_type}")
-                    w.close()
-                    await w.wait_closed()
+                    continue
         except asyncio.IncompleteReadError:
             logging.warning("Agent disconnected")
+            await self.close_agent(agent)
 
     async def on_connected(self, r: asyncio.StreamReader, w: asyncio.StreamWriter):
         """

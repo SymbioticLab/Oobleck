@@ -230,3 +230,46 @@ class TestOobleckMasterDaemonClass:
         assert (
             await message_util.recv_response(r, timeout=10)
         ) == message_util.Response.PONG
+
+    @pytest.mark.asyncio
+    async def test_agent_disconnect(
+        self,
+        daemon: OobleckMasterDaemon,
+        conns: tuple[asyncio.StreamReader, asyncio.StreamWriter],
+        sample_job: Job,
+    ):
+        r, w = conns
+        daemon._job = sample_job
+        daemon._job.agent_info.append(AgentInfo("127.0.0.1", [1]))
+
+        daemon.agent_handler = AsyncMock(wraps=daemon.agent_handler)
+        daemon.close_agent = AsyncMock(wraps=daemon.close_agent)
+
+        # Register agent streams (technically same with registering agent)
+        await message_util.send_request_type(w, message_util.RequestType.REGISTER_AGENT)
+        assert (await message_util.recv_response(r)) == message_util.Response.SUCCESS
+
+        # FIXME: currently daemon uses IP for identifier, thus always the first `AgentInfo``
+        # will be chosen during registration.
+        # For simulating two agents are registered, move streams to the second AgentInfo.
+        daemon._job.agent_info[1].streams = daemon._job.agent_info[0].streams
+        daemon._job.agent_info[0].streams = None
+
+        # create another agent
+        r2, w2 = await asyncio.open_connection("localhost", daemon._port)
+        await message_util.send_request_type(
+            w2, message_util.RequestType.REGISTER_AGENT
+        )
+        assert (await message_util.recv_response(r2)) == message_util.Response.SUCCESS
+
+        second_agent = daemon._job.agent_info[0]
+
+        # Disconnect an agent
+        w2.close()
+        await w2.wait_closed()
+
+        assert (
+            await message_util.recv_response(r, timeout=None)
+        ) == message_util.Response.RECONFIGURATION
+        daemon.close_agent.assert_called_once_with(second_agent)
+        assert len(daemon._job.agent_info) == 1
