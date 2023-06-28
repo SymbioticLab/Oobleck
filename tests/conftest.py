@@ -332,6 +332,8 @@ class OobleckMultiProcessTestCase:
             # Make sure to remove FileStore after each test.
             directory.joinpath("store").unlink(missing_ok=True)
 
+        return result
+
     def run_in_parallel(
         self, num_processes: int, func: Callable, *args
     ) -> List[Union[str, None]]:
@@ -369,13 +371,15 @@ class OobleckMultiProcessTestCase:
                     raise RuntimeError(result["error"])
                 else:
                     results[result["rank"]] = result["success"]
+
+            # Here, all processes are successfully finished.
+            for process in processes:
+                process.join()
         except Exception as e:
             for process in processes:
                 process.kill()
-            pytest.fail(e)
-        finally:
-            for process in processes:
                 process.join()
+            pytest.fail(e)
 
         return results
 
