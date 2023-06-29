@@ -87,10 +87,8 @@ class TestOobleckMasterDaemonClass:
 
         await message_util.send_request_type(w, message_util.RequestType.GET_DIST_INFO)
 
-        assert await message_util.recv_response(r) == (
-            message_util.Response.FAILURE,
-            message_util.RequestType.GET_DIST_INFO,
-        )
+        with pytest.raises(asyncio.IncompleteReadError):
+            await message_util.recv_response(r)
 
     @pytest.mark.asyncio
     async def test_get_dist_info(
@@ -102,6 +100,8 @@ class TestOobleckMasterDaemonClass:
         r, w = conns
 
         daemon._job = sample_job
+        await message_util.send_request_type(w, message_util.RequestType.REGISTER_AGENT)
+        await message_util.recv_response(r)
 
         await message_util.send_request_type(w, message_util.RequestType.GET_DIST_INFO)
 
@@ -110,10 +110,12 @@ class TestOobleckMasterDaemonClass:
             message_util.RequestType.GET_DIST_INFO,
         )
 
-        agent_info: list[_AgentInfo] = await message_util.recv(r, need_pickle=True)
-        assert len(agent_info) == 1
-        assert agent_info[0].ip == "127.0.0.1"
-        assert agent_info[0].ranks == [0]
+        dist_info: message_util.DistributionInfo = await message_util.recv(
+            r, need_pickle=True
+        )
+        assert len(dist_info.agent_ips) == 1
+        assert dist_info.agent_ips[0] == "127.0.0.1"
+        assert dist_info.world_size == 1
 
     @pytest.mark.asyncio
     async def test_get_dist_info_blocked(
@@ -133,7 +135,10 @@ class TestOobleckMasterDaemonClass:
         ]
 
         daemon._job = sample_job
+        await message_util.send_request_type(w, message_util.RequestType.REGISTER_AGENT)
+        await message_util.recv_response(r)
 
+        # The node calling get_dist_info() should be blocked
         await message_util.send_request_type(w, message_util.RequestType.GET_DIST_INFO)
 
         with pytest.raises(asyncio.TimeoutError):
@@ -155,6 +160,14 @@ class TestOobleckMasterDaemonClass:
         ]
 
         daemon._job = sample_job
+        await message_util.send_request_type(w, message_util.RequestType.REGISTER_AGENT)
+        await message_util.recv_response(r)
+
+        r2, w2 = await asyncio.open_connection("localhost", daemon.port)
+        await message_util.send_request_type(
+            w2, message_util.RequestType.REGISTER_AGENT
+        )
+        await message_util.recv_response(r2)
 
         # First client
         await message_util.send_request_type(w, message_util.RequestType.GET_DIST_INFO)
@@ -162,10 +175,9 @@ class TestOobleckMasterDaemonClass:
 
         await asyncio.sleep(2)
         assert len(daemon._nodes_to_rendezvous) == 1
-        assert not task.done()
+        assert not task.done(), "First client must be blocked."
 
         # Second client
-        r2, w2 = await asyncio.open_connection("localhost", daemon._port)
         await message_util.send_request_type(w2, message_util.RequestType.GET_DIST_INFO)
 
         # Both must succeed
@@ -181,9 +193,13 @@ class TestOobleckMasterDaemonClass:
         )
 
         # Both must receive the same information
-        agent_info: list[_AgentInfo] = await message_util.recv(r, need_pickle=True)
-        agent_info2: list[_AgentInfo] = await message_util.recv(r2, need_pickle=True)
-        assert agent_info == agent_info2 == daemon._job.agent_info
+        dist_info: message_util.DistributionInfo = await message_util.recv(
+            r, need_pickle=True
+        )
+        dist_info2: message_util.DistributionInfo = await message_util.recv(
+            r2, need_pickle=True
+        )
+        assert dist_info == dist_info2
 
         w2.close()
         await w2.wait_closed()
