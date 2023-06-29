@@ -11,11 +11,11 @@ import oobleck.elastic.message_util as message_util
 @dataclass
 class Job:
     name: str
-    agent_info: list[AgentInfo]
+    agent_info: list[_AgentInfo]
 
 
 @dataclass
-class AgentInfo:
+class _AgentInfo:
     """
     OobleckAgent information.
     A list of agent information is generated when a user requests a job to be launched.
@@ -110,8 +110,21 @@ class OobleckMasterDaemon:
         # put client into waiting list
         self._nodes_to_rendezvous.add(w)
 
+        logging.debug(
+            f"Putting agent into waiting list "
+            f"({len(self._nodes_to_rendezvous)} / {len(self._job.agent_info)})"
+        )
+
         # if all clients are waiting, send dist info
         if len(self._nodes_to_rendezvous) == len(self._job.agent_info):
+            logging.debug("Sending distributed information to agents")
+
+            dist_info = message_util.DistributionInfo(
+                agent_ips=[agent.ip for agent in self._job.agent_info],
+                world_size=len(self._job.agent_info)
+                * len(self._job.agent_info[0].ranks),
+            )
+
             for w in self._nodes_to_rendezvous:
                 await message_util.send_response(
                     w,
@@ -119,9 +132,7 @@ class OobleckMasterDaemon:
                     message_util.Response.SUCCESS,
                     close=False,
                 )
-                await message_util.send(
-                    w, self._job.agent_info, need_pickle=True, close=True
-                )
+                await message_util.send(w, dist_info, need_pickle=True, close=False)
             self._nodes_to_rendezvous.clear()
 
     async def register_agent_handler(
@@ -129,14 +140,17 @@ class OobleckMasterDaemon:
     ):
         # TODO: find another unique identifier than IP address.
         client_ip = w.get_extra_info("peername")[0]
-        try:
-            agent: AgentInfo = next(
-                agent for agent in self._job.agent_info if agent.ip == client_ip
-            )
-        except StopIteration:
+        agent: _AgentInfo = next(
+            (agent for agent in self._job.agent_info if agent.ip == client_ip), None
+        )
+
+        if agent is None:
             logging.warning(f"Unknown agent: {client_ip}")
             await message_util.send_response(
-                w, message_util.Response.FAILURE, close=True
+                w,
+                message_util.RequestType.REGISTER_AGENT,
+                message_util.Response.FAILURE,
+                close=True,
             )
             return
 
@@ -154,7 +168,7 @@ class OobleckMasterDaemon:
             close=False,
         )
 
-    async def close_agent(self, agent: AgentInfo):
+    async def close_agent(self, agent: _AgentInfo):
         _, w = agent.streams
         w.close()
         await w.wait_closed()
@@ -172,7 +186,7 @@ class OobleckMasterDaemon:
 
     async def pong(self, w: asyncio.StreamWriter):
         try:
-            agent: AgentInfo = next(
+            agent: _AgentInfo = next(
                 agent
                 for agent in self._job.agent_info
                 if agent.streams and agent.streams[1] == w
@@ -189,14 +203,17 @@ class OobleckMasterDaemon:
             w.close()
             await w.wait_closed()
 
-    async def agent_handler(self, agent: AgentInfo):
+    async def agent_handler(self, agent: _AgentInfo):
         r, w = agent.streams
+        loop = self._server.get_loop()
         try:
             while True:
                 request_type = await message_util.recv_request_type(r)
 
                 if request_type == message_util.RequestType.PING:
                     await self.pong(w)
+                elif request_type == message_util.RequestType.GET_DIST_INFO:
+                    loop.create_task(self.get_dist_info_handler(r, w))
                 else:
                     logging.warning(f"Unknown request type: {request_type}")
                     continue
@@ -212,10 +229,10 @@ class OobleckMasterDaemon:
             request_type = await message_util.recv_request_type(r)
             loop = self._server.get_loop()
 
+            logging.info(f"Received request: {request_type}")
+
             if request_type == message_util.RequestType.LAUNCH_JOB:
                 loop.create_task(self.request_job_handler(r, w))
-            elif request_type == message_util.RequestType.GET_DIST_INFO:
-                loop.create_task(self.get_dist_info_handler(r, w))
             elif request_type == message_util.RequestType.REGISTER_AGENT:
                 loop.create_task(self.register_agent_handler(r, w))
             else:

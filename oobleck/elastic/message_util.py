@@ -1,9 +1,16 @@
 import asyncio
 import enum
 import pickle
+from dataclasses import dataclass
 from typing import Any
 
 TIMEOUT = 5
+
+
+@dataclass
+class DistributionInfo:
+    agent_ips: list[str]
+    world_size: int
 
 
 class RequestType(enum.Enum):
@@ -48,11 +55,7 @@ async def send_request_type(w: asyncio.StreamWriter, type: RequestType):
 
 
 async def recv_request_type(r: asyncio.StreamReader) -> RequestType:
-    return RequestType(
-        int.from_bytes(
-            await asyncio.wait_for(r.readexactly(1), timeout=TIMEOUT), "little"
-        )
-    )
+    return RequestType(int.from_bytes(await r.readexactly(1), "little"))
 
 
 async def send_response(
