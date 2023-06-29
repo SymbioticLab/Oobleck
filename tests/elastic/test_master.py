@@ -6,7 +6,7 @@ import pytest
 import pytest_asyncio
 
 import oobleck.elastic.message_util as message_util
-from oobleck.elastic.master import AgentInfo, Job, OobleckMasterDaemon
+from oobleck.elastic.master import OobleckMasterDaemon, _AgentInfo, _Job
 
 
 class TestOobleckMasterDaemonClass:
@@ -23,8 +23,8 @@ class TestOobleckMasterDaemonClass:
         await daemon._server.wait_closed()
 
     @pytest.fixture
-    def sample_job(self) -> Job:
-        return Job("test", [AgentInfo("127.0.0.1", [0])])
+    def sample_job(self) -> _Job:
+        return _Job("test", [_AgentInfo("127.0.0.1", [0])])
 
     @pytest_asyncio.fixture(autouse=True)
     async def conns(self, daemon: OobleckMasterDaemon):
@@ -59,7 +59,7 @@ class TestOobleckMasterDaemonClass:
         self,
         daemon: OobleckMasterDaemon,
         conns: tuple[asyncio.StreamReader, asyncio.StreamWriter],
-        sample_job: Job,
+        sample_job: _Job,
     ):
         r, w = conns
 
@@ -97,7 +97,7 @@ class TestOobleckMasterDaemonClass:
         self,
         daemon: OobleckMasterDaemon,
         conns: tuple[asyncio.StreamReader, asyncio.StreamWriter],
-        sample_job: Job,
+        sample_job: _Job,
     ):
         r, w = conns
 
@@ -110,7 +110,7 @@ class TestOobleckMasterDaemonClass:
             message_util.RequestType.GET_DIST_INFO,
         )
 
-        agent_info: list[AgentInfo] = await message_util.recv(r, need_pickle=True)
+        agent_info: list[_AgentInfo] = await message_util.recv(r, need_pickle=True)
         assert len(agent_info) == 1
         assert agent_info[0].ip == "127.0.0.1"
         assert agent_info[0].ranks == [0]
@@ -120,16 +120,16 @@ class TestOobleckMasterDaemonClass:
         self,
         daemon: OobleckMasterDaemon,
         conns: tuple[asyncio.StreamReader, asyncio.StreamWriter],
-        sample_job: Job,
+        sample_job: _Job,
     ):
         r, w = conns
 
         # Make ips have two to simulate two nodes must call get_dist_info()
         # to get information.
-        sample_job: Job = copy.deepcopy(sample_job)
+        sample_job: _Job = copy.deepcopy(sample_job)
         sample_job.agent_info = [
-            AgentInfo("127.0.0.1", [0]),
-            AgentInfo("127.0.0.2", [1]),
+            _AgentInfo("127.0.0.1", [0]),
+            _AgentInfo("127.0.0.2", [1]),
         ]
 
         daemon._job = sample_job
@@ -144,14 +144,14 @@ class TestOobleckMasterDaemonClass:
         self,
         daemon: OobleckMasterDaemon,
         conns: tuple[asyncio.StreamReader, asyncio.StreamWriter],
-        sample_job: Job,
+        sample_job: _Job,
     ):
         r, w = conns
 
-        sample_job: Job = copy.deepcopy(sample_job)
+        sample_job: _Job = copy.deepcopy(sample_job)
         sample_job.agent_info = [
-            AgentInfo("127.0.0.1", [0]),
-            AgentInfo("127.0.0.2", [1]),
+            _AgentInfo("127.0.0.1", [0]),
+            _AgentInfo("127.0.0.2", [1]),
         ]
 
         daemon._job = sample_job
@@ -181,8 +181,8 @@ class TestOobleckMasterDaemonClass:
         )
 
         # Both must receive the same information
-        agent_info: list[AgentInfo] = await message_util.recv(r, need_pickle=True)
-        agent_info2: list[AgentInfo] = await message_util.recv(r2, need_pickle=True)
+        agent_info: list[_AgentInfo] = await message_util.recv(r, need_pickle=True)
+        agent_info2: list[_AgentInfo] = await message_util.recv(r2, need_pickle=True)
         assert agent_info == agent_info2 == daemon._job.agent_info
 
         w2.close()
@@ -193,7 +193,7 @@ class TestOobleckMasterDaemonClass:
         self,
         daemon: OobleckMasterDaemon,
         conns: tuple[asyncio.StreamReader, asyncio.StreamWriter],
-        sample_job: Job,
+        sample_job: _Job,
     ):
         r, w = conns
         daemon._job = sample_job
@@ -212,7 +212,7 @@ class TestOobleckMasterDaemonClass:
         self,
         daemon: OobleckMasterDaemon,
         conns: tuple[asyncio.StreamReader, asyncio.StreamWriter],
-        sample_job: Job,
+        sample_job: _Job,
     ):
         r, w = conns
         daemon._job = sample_job
@@ -231,7 +231,7 @@ class TestOobleckMasterDaemonClass:
         self,
         daemon: OobleckMasterDaemon,
         conns: tuple[asyncio.StreamReader, asyncio.StreamWriter],
-        sample_job: Job,
+        sample_job: _Job,
     ):
         r, w = conns
         daemon._job = sample_job
@@ -257,11 +257,11 @@ class TestOobleckMasterDaemonClass:
         self,
         daemon: OobleckMasterDaemon,
         conns: tuple[asyncio.StreamReader, asyncio.StreamWriter],
-        sample_job: Job,
+        sample_job: _Job,
     ):
         r, w = conns
         daemon._job = sample_job
-        daemon._job.agent_info.append(AgentInfo("127.0.0.1", [1]))
+        daemon._job.agent_info.append(_AgentInfo("127.0.0.1", [1]))
 
         daemon.agent_handler = AsyncMock(wraps=daemon.agent_handler)
         daemon.close_agent = AsyncMock(wraps=daemon.close_agent)
@@ -273,9 +273,9 @@ class TestOobleckMasterDaemonClass:
             message_util.RequestType.REGISTER_AGENT,
         )
 
-        # FIXME: currently daemon uses IP for identifier, thus always the first `AgentInfo``
+        # FIXME: currently daemon uses IP for identifier, thus always the first `_AgentInfo``
         # will be chosen during registration.
-        # For simulating two agents are registered, move streams to the second AgentInfo.
+        # For simulating two agents are registered, move streams to the second _AgentInfo.
         daemon._job.agent_info[1].streams = daemon._job.agent_info[0].streams
         daemon._job.agent_info[0].streams = None
 

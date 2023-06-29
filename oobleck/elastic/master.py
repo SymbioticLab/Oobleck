@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import functools
 import logging
 from dataclasses import dataclass
 
@@ -9,7 +8,7 @@ import oobleck.elastic.message_util as message_util
 
 
 @dataclass
-class Job:
+class _Job:
     name: str
     agent_info: list[_AgentInfo]
 
@@ -44,7 +43,7 @@ class OobleckMasterDaemon:
     def __init__(self):
         self._server: asyncio.Server | None = None
         self._port: int | None = None
-        self._job: Job | None = None
+        self._job: _Job | None = None
 
         self._nodes_to_rendezvous: set[asyncio.StreamWriter] = set()
 
