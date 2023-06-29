@@ -87,7 +87,9 @@ class OobleckMasterDaemon:
         except Exception as e:
             result = message_util.Response.FAILURE
         finally:
-            await message_util.send_response(w, result)
+            await message_util.send_response(
+                w, message_util.RequestType.LAUNCH_JOB, result
+            )
 
     async def get_dist_info_handler(
         self, r: asyncio.StreamReader, w: asyncio.StreamWriter
@@ -98,7 +100,11 @@ class OobleckMasterDaemon:
         """
         if not self._job:
             logging.warning("No job exists.")
-            await message_util.send_response(w, message_util.Response.FAILURE)
+            await message_util.send_response(
+                w,
+                message_util.RequestType.GET_DIST_INFO,
+                message_util.Response.FAILURE,
+            )
             return
 
         # put client into waiting list
@@ -108,7 +114,10 @@ class OobleckMasterDaemon:
         if len(self._nodes_to_rendezvous) == len(self._job.agent_info):
             for w in self._nodes_to_rendezvous:
                 await message_util.send_response(
-                    w, message_util.Response.SUCCESS, close=False
+                    w,
+                    message_util.RequestType.GET_DIST_INFO,
+                    message_util.Response.SUCCESS,
+                    close=False,
                 )
                 await message_util.send(
                     w, self._job.agent_info, need_pickle=True, close=True
@@ -138,7 +147,12 @@ class OobleckMasterDaemon:
         self._server.get_loop().create_task(self.agent_handler(agent))
 
         # self._server.get_loop().create_task(self.on_agent_callback(agent))
-        await message_util.send_response(w, message_util.Response.SUCCESS, close=False)
+        await message_util.send_response(
+            w,
+            message_util.RequestType.REGISTER_AGENT,
+            message_util.Response.SUCCESS,
+            close=False,
+        )
 
     async def close_agent(self, agent: AgentInfo):
         _, w = agent.streams
@@ -150,7 +164,10 @@ class OobleckMasterDaemon:
         for agent in self._job.agent_info:
             if agent.streams:
                 await message_util.send_response(
-                    agent.streams[1], message_util.Response.RECONFIGURATION, close=False
+                    agent.streams[1],
+                    message_util.RequestType.UNDEFINED,
+                    message_util.Response.RECONFIGURATION,
+                    close=False,
                 )
 
     async def pong(self, w: asyncio.StreamWriter):
@@ -162,7 +179,10 @@ class OobleckMasterDaemon:
             )
             logging.info("Sending pong")
             await message_util.send_response(
-                agent.streams[1], message_util.Response.PONG, close=False
+                agent.streams[1],
+                message_util.RequestType.PING,
+                message_util.Response.PONG,
+                close=False,
             )
         except (AttributeError, StopIteration) as e:
             logging.warning(f"Unknown agent: {w.get_extra_info('peername')[0]}")

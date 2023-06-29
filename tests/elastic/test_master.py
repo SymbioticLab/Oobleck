@@ -47,9 +47,10 @@ class TestOobleckMasterDaemonClass:
         await message_util.send_request_type(w, message_util.RequestType.LAUNCH_JOB)
 
         # Not providing job information within 5 seconds should return failure.
-        assert (
-            await message_util.recv_response(r, timeout=None)
-        ) == message_util.Response.FAILURE
+        assert (await message_util.recv_response(r, timeout=None)) == (
+            message_util.Response.FAILURE,
+            message_util.RequestType.LAUNCH_JOB,
+        )
 
         daemon.request_job_handler.assert_called_once()
 
@@ -66,7 +67,10 @@ class TestOobleckMasterDaemonClass:
         await message_util.send(w, sample_job, need_pickle=True, close=False)
 
         result = await message_util.recv_response(r)
-        assert result == message_util.Response.SUCCESS
+        assert result == (
+            message_util.Response.SUCCESS,
+            message_util.RequestType.LAUNCH_JOB,
+        )
 
         w.close()
         await w.wait_closed()
@@ -83,8 +87,10 @@ class TestOobleckMasterDaemonClass:
 
         await message_util.send_request_type(w, message_util.RequestType.GET_DIST_INFO)
 
-        result = await message_util.recv_response(r)
-        assert result == message_util.Response.FAILURE
+        assert await message_util.recv_response(r) == (
+            message_util.Response.FAILURE,
+            message_util.RequestType.GET_DIST_INFO,
+        )
 
     @pytest.mark.asyncio
     async def test_get_dist_info(
@@ -99,8 +105,10 @@ class TestOobleckMasterDaemonClass:
 
         await message_util.send_request_type(w, message_util.RequestType.GET_DIST_INFO)
 
-        result = await message_util.recv_response(r)
-        assert result == message_util.Response.SUCCESS
+        assert await message_util.recv_response(r) == (
+            message_util.Response.SUCCESS,
+            message_util.RequestType.GET_DIST_INFO,
+        )
 
         agent_info: list[AgentInfo] = await message_util.recv(r, need_pickle=True)
         assert len(agent_info) == 1
@@ -163,8 +171,14 @@ class TestOobleckMasterDaemonClass:
         # Both must succeed
         while not task.done():
             await asyncio.sleep(0.1)
-        assert task.result() == message_util.Response.SUCCESS
-        assert (await message_util.recv_response(r2)) == message_util.Response.SUCCESS
+        assert task.result() == (
+            message_util.Response.SUCCESS,
+            message_util.RequestType.GET_DIST_INFO,
+        )
+        assert (await message_util.recv_response(r2)) == (
+            message_util.Response.SUCCESS,
+            message_util.RequestType.GET_DIST_INFO,
+        )
 
         # Both must receive the same information
         agent_info: list[AgentInfo] = await message_util.recv(r, need_pickle=True)
@@ -187,7 +201,10 @@ class TestOobleckMasterDaemonClass:
         assert daemon._job.agent_info[0].streams is None
 
         await message_util.send_request_type(w, message_util.RequestType.REGISTER_AGENT)
-        assert (await message_util.recv_response(r)) == message_util.Response.SUCCESS
+        assert await message_util.recv_response(r) == (
+            message_util.Response.SUCCESS,
+            message_util.RequestType.REGISTER_AGENT,
+        )
         assert daemon._job.agent_info[0].streams
 
     @pytest.mark.asyncio
@@ -221,15 +238,19 @@ class TestOobleckMasterDaemonClass:
 
         # Register agent then ping
         await message_util.send_request_type(w, message_util.RequestType.REGISTER_AGENT)
-        assert (await message_util.recv_response(r)) == message_util.Response.SUCCESS
+        assert (await message_util.recv_response(r)) == (
+            message_util.Response.SUCCESS,
+            message_util.RequestType.REGISTER_AGENT,
+        )
 
         assert daemon._job.agent_info[0].streams
 
         # Reuse the connection
         await message_util.send_request_type(w, message_util.RequestType.PING)
-        assert (
-            await message_util.recv_response(r, timeout=10)
-        ) == message_util.Response.PONG
+        assert (await message_util.recv_response(r, timeout=10)) == (
+            message_util.Response.PONG,
+            message_util.RequestType.PING,
+        )
 
     @pytest.mark.asyncio
     async def test_agent_disconnect(
@@ -247,7 +268,10 @@ class TestOobleckMasterDaemonClass:
 
         # Register agent streams (technically same with registering agent)
         await message_util.send_request_type(w, message_util.RequestType.REGISTER_AGENT)
-        assert (await message_util.recv_response(r)) == message_util.Response.SUCCESS
+        assert await message_util.recv_response(r) == (
+            message_util.Response.SUCCESS,
+            message_util.RequestType.REGISTER_AGENT,
+        )
 
         # FIXME: currently daemon uses IP for identifier, thus always the first `AgentInfo``
         # will be chosen during registration.
@@ -260,7 +284,10 @@ class TestOobleckMasterDaemonClass:
         await message_util.send_request_type(
             w2, message_util.RequestType.REGISTER_AGENT
         )
-        assert (await message_util.recv_response(r2)) == message_util.Response.SUCCESS
+        assert await message_util.recv_response(r2) == (
+            message_util.Response.SUCCESS,
+            message_util.RequestType.REGISTER_AGENT,
+        )
 
         second_agent = daemon._job.agent_info[0]
 
@@ -268,8 +295,9 @@ class TestOobleckMasterDaemonClass:
         w2.close()
         await w2.wait_closed()
 
-        assert (
-            await message_util.recv_response(r, timeout=None)
-        ) == message_util.Response.RECONFIGURATION
+        assert (await message_util.recv_response(r, timeout=None)) == (
+            message_util.Response.RECONFIGURATION,
+            message_util.RequestType.UNDEFINED,
+        )
         daemon.close_agent.assert_called_once_with(second_agent)
         assert len(daemon._job.agent_info) == 1
