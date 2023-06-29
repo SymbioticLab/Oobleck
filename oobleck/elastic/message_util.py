@@ -7,6 +7,7 @@ TIMEOUT = 5
 
 
 class RequestType(enum.Enum):
+    UNDEFINED = 0
     LAUNCH_JOB = 1
     GET_DIST_INFO = 2
     REGISTER_AGENT = 3
@@ -55,20 +56,25 @@ async def recv_request_type(r: asyncio.StreamReader) -> RequestType:
 
 
 async def send_response(
-    w: asyncio.StreamWriter, response: Response, close: bool = True
+    w: asyncio.StreamWriter,
+    request: RequestType,
+    response: Response,
+    close: bool = True,
 ):
     w.write(response.value.to_bytes(1, "little"))
+    w.write(request.value.to_bytes(1, "little"))
     await w.drain()
     if close:
         w.close()
         await w.wait_closed()
 
 
-async def recv_response(r: asyncio.StreamReader, timeout=TIMEOUT) -> Response:
-    return Response(
-        int.from_bytes(
-            await asyncio.wait_for(r.readexactly(1), timeout=timeout), "little"
-        )
+async def recv_response(
+    r: asyncio.StreamReader, timeout=TIMEOUT
+) -> tuple[Response, RequestType]:
+    response = await asyncio.wait_for(r.readexactly(2), timeout=timeout)
+    return Response(int.from_bytes(response[:1], "little")), RequestType(
+        int.from_bytes(response[1:], "little")
     )
 
 
