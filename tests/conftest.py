@@ -8,7 +8,7 @@ import random
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any
 
 import deepspeed.comm as dist
 import pytest
@@ -39,22 +39,28 @@ GRADIENT_ACCUMULATION_STEP = 2
 class Model:
     model_name: str
     dataset_path: str
-    dataset_name: Optional[str] = None
+    dataset_name: str | None = None
 
 
-models_to_test: Dict[str, Model] = {
+datasets: dict[str, tuple[str, (str | None)]] = {
+    "gpt2": ("wikitext-2-raw-v1", "wikitext-2-raw-v1"),
+    "microsoft/resnet-50": ("Maysee/tiny-imagenet", None),
+}
+
+models_to_test: dict[str, Model] = {
     "gpt2": Model("gpt2", "wikitext", "wikitext-2-raw-v1"),
     "microsoft/resnet-50": Model("microsoft/resnet-50", "Maysee/tiny-imagenet"),
 }
 
 # Add model arguments here, if it is needed.
-model_args: Dict[str, Optional[Dict[str, int]]] = {
+model_args: dict[str, dict[str, int] | None] = {
     "gpt2": {
         "num_hidden_layers": 32,
         "n_positions": 1024,
         "n_embd": 1024,
         "n_head": 16,
     },
+    "microsoft/resnet-50": None,
 }
 
 
@@ -79,11 +85,11 @@ class OobleckStaticClassFactory:
             gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEP,
         )
 
-        self._dataset: Optional[OobleckDataset] = None
-        self._model: Optional[OobleckModel] = None
-        self._dataloader: Optional[OobleckDataLoader] = None
-        self._profile: Optional[LayerExecutionResults] = None
-        self._pipeline_templates: Dict[int, PipelineTemplate] = {}
+        self._dataset: OobleckDataset | None = None
+        self._model: OobleckModel | None = None
+        self._dataloader: OobleckDataLoader | None = None
+        self._profile: LayerExecutionResults | None = None
+        self._pipeline_templates: dict[int, PipelineTemplate] = {}
 
     def get_dataset(self) -> OobleckDataset:
         if not self._dataset:
@@ -114,7 +120,7 @@ class OobleckStaticClassFactory:
         if not self._profile:
             num_layers = len(self._model.model)
 
-            results: List[LayerExecutionResult] = []
+            results: list[LayerExecutionResult] = []
             for index in range(num_layers):
                 results.append(
                     LayerExecutionResult(
@@ -136,14 +142,14 @@ class OobleckStaticClassFactory:
     def get_dummy_pipeline_template(self, num_gpus: int) -> PipelineTemplate:
         self.get_dummy_profile()
 
-        def slice_layers(lst: List[Any], num_chunks: int) -> List[Tuple[int, int]]:
+        def slice_layers(lst: list[Any], num_chunks: int) -> list[tuple[int, int]]:
             if num_chunks > len(lst):
                 raise ValueError(
                     f"Cannot slice {len(list)} layers into {num_chunks} chunks."
                 )
 
             length_chunk = math.ceil(len(lst) / num_chunks)
-            slicing_points: List[Tuple[int, int]] = []
+            slicing_points: list[tuple[int, int]] = []
             for i in range(0, len(lst), length_chunk):
                 end = i + length_chunk if i + length_chunk < len(lst) else len(lst)
                 slicing_points.append((i, end))
@@ -175,7 +181,7 @@ class OobleckDynamicClassFactory:
     """
 
     def __init__(
-        self, static_factory: OobleckStaticClassFactory, my_rank: int, ranks: List[int]
+        self, static_factory: OobleckStaticClassFactory, my_rank: int, ranks: list[int]
     ):
         assert dist.is_initialized()
         assert torch.distributed.is_initialized()
@@ -187,7 +193,7 @@ class OobleckDynamicClassFactory:
     def get_dataloader(
         self,
         pipeline_index: int,
-        num_microbatches: List[int],
+        num_microbatches: list[int],
         num_iterations: int = 0,
     ) -> OobleckDataLoader:
         dataset = self._static_factory.get_dataset()
@@ -290,7 +296,7 @@ class OobleckMultiProcessTestCase:
         world_size: int,
         model_name: str,
         directory: Path,
-        test: Callable,
+        test: callable,
         *args,
     ):
         # Very careful initialization dependency due to too many third-party libraries.
@@ -339,14 +345,14 @@ class OobleckMultiProcessTestCase:
         return result
 
     def run_in_parallel(
-        self, num_processes: int, func: Callable, *args
-    ) -> List[Union[str, None]]:
+        self, num_processes: int, func: callable, *args
+    ) -> list[str | None]:
         ctx = mp.get_context("spawn")
         queue = ctx.Queue()
 
         self.directory.joinpath("store").unlink(missing_ok=True)
 
-        processes: List[mp.Process] = []
+        processes: list[mp.Process] = []
         for rank in range(num_processes):
             p = ctx.Process(
                 target=OobleckMultiProcessTestCase._worker_init,
@@ -363,7 +369,7 @@ class OobleckMultiProcessTestCase:
             p.start()
             processes.append(p)
 
-        results: List[Any] = [None] * len(processes)
+        results: list[Any] = [None] * len(processes)
 
         try:
             for _ in range(len(processes)):
