@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import multiprocessing
 from multiprocessing import connection
-from unittest.mock import MagicMock, patch
 
 import pytest
 import torch.distributed
+from pytest_mock import MockerFixture
 
-import oobleck.execution.engine as engine_module
 from oobleck.elastic.training_util import TrainingArguments as OobleckArguments
 from oobleck.execution.engine import OobleckEngine
 from tests.conftest import (
@@ -38,21 +37,13 @@ class TestOobleckEngineClass(OobleckElasticTestCase):
             model_tag="test",
             dataset_path=dataset[0],
             dataset_name=dataset[1],
-            model_args=model_args[model_name_fixture],
         )
 
     @classmethod
     @pytest.fixture(scope="class", autouse=True)
-    @patch("engine_module.OobleckDataset")
-    @patch("engine_module.OobleckModel")
-    @patch("engine_module.get_profile_results")
-    @patch("engine_module.PipelineTemplateGenerator.create_pipeline_templates")
     def setup_class(
         cls,
-        mock_oobleck_dataset: MagicMock,
-        mock_oobleck_model: MagicMock,
-        mock_get_profile_results: MagicMock,
-        mock_create_pipeline_templates: MagicMock,
+        class_mocker: MockerFixture,
         pipe: tuple(connection.Connection, connection.Connection),
         model_name_fixture: str,
         tmp_path_factory: pytest.TempPathFactory,
@@ -63,13 +54,25 @@ class TestOobleckEngineClass(OobleckElasticTestCase):
         directory = tmp_path_factory.getbasetemp()
         request.cls.factory = OobleckStaticClassFactory(model_name_fixture, directory)
 
-        mock_oobleck_dataset.return_value = cls.factory.get_dataset()
-        mock_oobleck_model.return_value = cls.factory.get_model()
-        mock_get_profile_results.return_value = cls.factory.get_dummy_profile()
-        mock_create_pipeline_templates.return_value = [
-            cls.factory.get_dummy_pipeline_template(num_gpus + 1)
-            for num_gpus in range(4)
-        ]
+        class_mocker.patch(
+            "oobleck.execution.engine.OobleckDataset",
+            return_value=cls.factory.get_dataset(),
+        )
+        class_mocker.patch(
+            "oobleck.execution.engine.OobleckModel",
+            return_value=cls.factory.get_model(),
+        )
+        class_mocker.patch(
+            "oobleck.execution.engine.get_profile_results",
+            return_value=cls.factory.get_dummy_profile(),
+        )
+        class_mocker.patch(
+            "oobleck.execution.engine.PipelineTemplateGenerator.create_pipeline_templates",
+            return_value=[
+                cls.factory.get_dummy_pipeline_template(num_gpus + 1)
+                for num_gpus in range(4)
+            ],
+        )
 
         yield
 

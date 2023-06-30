@@ -43,7 +43,7 @@ class Model:
 
 
 datasets: dict[str, tuple[str, (str | None)]] = {
-    "gpt2": ("wikitext-2-raw-v1", "wikitext-2-raw-v1"),
+    "gpt2": ("wikitext", "wikitext-2-raw-v1"),
     "microsoft/resnet-50": ("Maysee/tiny-imagenet", None),
 }
 
