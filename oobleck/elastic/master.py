@@ -134,11 +134,22 @@ class OobleckMasterDaemon:
                 await message_util.send(w, dist_info, need_pickle=True, close=False)
             self._nodes_to_rendezvous.clear()
 
+    async def forward_rank0_port_handler(
+        self, r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ):
+        port: int = await message_util.recv(r, need_pickle=True)
+        logging.debug(f"Received rank0 port: {port}")
+        for agent in self._job.agent_info:
+            await message_util.send(
+                agent.streams[1], port, need_pickle=True, close=False
+            )
+
     async def register_agent_handler(
         self, r: asyncio.StreamReader, w: asyncio.StreamWriter
     ):
         # TODO: find another unique identifier than IP address.
         client_ip = w.get_extra_info("peername")[0]
+
         agent: _AgentInfo = next(
             (agent for agent in self._job.agent_info if agent.ip == client_ip), None
         )
@@ -213,6 +224,8 @@ class OobleckMasterDaemon:
                     await self.pong(w)
                 elif request_type == message_util.RequestType.GET_DIST_INFO:
                     loop.create_task(self.get_dist_info_handler(r, w))
+                elif request_type == message_util.RequestType.FORWARD_RANK0_PORT:
+                    loop.create_task(self.forward_rank0_port_handler(r, w))
                 else:
                     logging.warning(f"Unknown request type: {request_type}")
                     continue

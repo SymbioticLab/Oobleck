@@ -1,9 +1,11 @@
 import asyncio
+import concurrent.futures
 import logging
 import multiprocessing as mp
 import os
 import signal
 from dataclasses import dataclass
+from multiprocessing import connection
 from pathlib import Path
 
 import simple_parsing
@@ -17,7 +19,7 @@ from oobleck.elastic.worker import worker_main
 
 @dataclass
 class Worker:
-    queue: mp.Queue
+    pipe: connection.Connection
     process: SpawnProcess
 
 
@@ -71,20 +73,50 @@ class OobleckAgent:
         asyncio.create_task(self.ping())
         asyncio.create_task(self.on_receive_response())
 
-    def launch_workers(self, num_workers: int, training_args: Path):
+    # TODO: change Path to serialized object.
+    # It is not scalable if we use multiple nodes.
+    async def launch_workers(self, num_workers: int, training_args: Path):
         context = mp.get_context("spawn")
+        loop = asyncio.get_running_loop()
         for _ in range(num_workers):
             # TODO: add all arguments. Arguments should be passed from the master
             # via command line arguments.
-            queue = context.Queue()
+            pipe, child_pipe = context.Pipe()
             worker = context.Process(
-                target=worker_main, args=(queue, training_args), daemon=False
+                target=worker_main, args=(child_pipe, training_args), daemon=False
             )
             worker.start()
-            self.workers_.append(Worker(queue, worker))
+            self.workers_.append(Worker(pipe, worker))
 
-            # TODO: detect worker failure and report it to the master.
-            # For now only consider node failure, not worker failure.
+        with concurrent.futures.ThreadPoolExecutor(num_workers) as pool:
+            for worker in self.workers_:
+                loop.run_in_executor(pool, self.forward_worker_port, worker.pipe)
+
+        await self.get_dist_info()
+
+        # TODO: detect worker failure and report it to the master.
+        # For now only consider node failure, not worker failure.
+
+    async def forward_worker_port(self, pipe: connection.Connection):
+        r, w = self.conn_
+        loop = asyncio.get_running_loop()
+        try:
+            while loop.is_running():
+                port: int = pipe.recv()
+                await message_util.send_request_type(
+                    w, message_util.RequestType.FORWARD_RANK0_PORT
+                )
+                await message_util.send(
+                    w, port, need_pickle=True, drain=True, close=False
+                )
+        except asyncio.CancelledError:
+            pass
+
+    async def on_receive_worker_port(self):
+        r, w = self.conn_
+        port: int = await message_util.recv(r, need_pickle=True)
+        for worker in self.workers_:
+            worker.pipe.send(port)
 
     async def send_request(
         self,
@@ -117,8 +149,9 @@ class OobleckAgent:
         agent_info: message_util.DistributionInfo = await message_util.recv(
             self.conn_[0], need_pickle=True
         )
+
         for worker in self.workers_:
-            worker.queue.put(agent_info)
+            worker.pipe.send(agent_info)
 
     async def on_receive_reconfiguration(self):
         logging.debug("reconfiguration request received")
@@ -186,7 +219,7 @@ async def main():
     agent = OobleckAgent()
     await agent.connect_to_master(args.master_ip, args.master_port)
     await agent.register_agent()
-    agent.launch_workers(args.num_workers, args.training_args)
+    agent.launch_workers(args.num_workers, args)
     await agent.get_dist_info()
 
 

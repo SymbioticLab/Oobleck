@@ -19,6 +19,7 @@ class RequestType(enum.Enum):
     GET_DIST_INFO = 2
     REGISTER_AGENT = 3
     PING = 4
+    FORWARD_RANK0_PORT = 5
 
 
 class Response(enum.Enum):
@@ -26,6 +27,7 @@ class Response(enum.Enum):
     FAILURE = 2
     PONG = 3
     RECONFIGURATION = 4
+    FORWARD_RANK0_PORT = 5
 
 
 async def send(
