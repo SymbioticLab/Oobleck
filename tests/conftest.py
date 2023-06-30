@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import math
 import multiprocessing as mp
 import os
@@ -11,6 +12,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import deepspeed.comm as dist
 import pytest
+import pytest_asyncio
 import torch
 import torch.distributed
 from transformers.training_args import TrainingArguments
@@ -21,6 +23,8 @@ from oobleck.csrc.planning.pipeline_template import (
     PipelineTemplate,
     StageExecutionResult,
 )
+from oobleck.elastic.agent import OobleckAgent
+from oobleck.elastic.master import OobleckMasterDaemon, _AgentInfo, _Job
 from oobleck.execution.dataloader import LoaderType, OobleckDataLoader
 from oobleck.execution.dataset import OobleckDataset
 from oobleck.execution.pipeline import OobleckPipeline
@@ -394,3 +398,27 @@ class OobleckMultiProcessTestCase:
         request.cls.model_name = model_name_fixture
         directory = tmp_path_factory.getbasetemp()
         request.cls.directory = directory
+
+
+class OobleckElasticTestCase:
+    @pytest_asyncio.fixture(autouse=True)
+    async def daemon(self, event_loop: asyncio.AbstractEventLoop):
+        daemon = await OobleckMasterDaemon.create()
+        event_loop.create_task(daemon.run())
+
+        yield daemon
+
+        if not daemon._server.is_serving():
+            return
+        daemon._server.close()
+        await daemon._server.wait_closed()
+
+    @pytest_asyncio.fixture
+    async def agent(self, daemon: OobleckMasterDaemon):
+        daemon._job = _Job("test", [_AgentInfo("127.0.0.1", [0])])
+
+        agent = OobleckAgent()
+        await agent.connect_to_master("localhost", daemon.port)
+        yield agent
+        agent.conn_[1].close()
+        await agent.conn_[1].wait_closed()

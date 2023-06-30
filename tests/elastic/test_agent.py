@@ -7,34 +7,14 @@ import pytest_asyncio
 import oobleck.elastic.message_util as message_util
 from oobleck.elastic.agent import OobleckAgent
 from oobleck.elastic.master import OobleckMasterDaemon, _AgentInfo, _Job
+from tests.conftest import OobleckElasticTestCase
 
 
 class TestOobleckAgentClassWithNoDaemon:
     pass
 
 
-class TestOobleckAgentClass:
-    @pytest_asyncio.fixture(autouse=True)
-    async def daemon(self, event_loop: asyncio.AbstractEventLoop):
-        daemon = await OobleckMasterDaemon.create()
-        daemon._job = _Job("test", [_AgentInfo("127.0.0.1", [0])])
-        event_loop.create_task(daemon.run())
-
-        yield daemon
-
-        if not daemon._server.is_serving():
-            return
-        daemon._server.close()
-        await daemon._server.wait_closed()
-
-    @pytest_asyncio.fixture
-    async def agent(self, daemon: OobleckMasterDaemon):
-        agent = OobleckAgent()
-        await agent.connect_to_master("localhost", daemon.port)
-        yield agent
-        agent.conn_[1].close()
-        await agent.conn_[1].wait_closed()
-
+class TestOobleckAgentClass(OobleckElasticTestCase):
     @pytest.mark.asyncio
     async def test_register_agent(self, agent: OobleckAgent):
         agent.send_request = AsyncMock(wraps=agent.send_request)
