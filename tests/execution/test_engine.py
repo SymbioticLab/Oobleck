@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import multiprocessing
 from multiprocessing import connection
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch.distributed
@@ -43,8 +43,16 @@ class TestOobleckEngineClass(OobleckElasticTestCase):
 
     @classmethod
     @pytest.fixture(scope="class", autouse=True)
+    @patch("engine_module.OobleckDataset")
+    @patch("engine_module.OobleckModel")
+    @patch("engine_module.get_profile_results")
+    @patch("engine_module.PipelineTemplateGenerator.create_pipeline_templates")
     def setup_class(
         cls,
+        mock_oobleck_dataset: MagicMock,
+        mock_oobleck_model: MagicMock,
+        mock_get_profile_results: MagicMock,
+        mock_create_pipeline_templates: MagicMock,
         pipe: tuple(connection.Connection, connection.Connection),
         model_name_fixture: str,
         tmp_path_factory: pytest.TempPathFactory,
@@ -54,18 +62,16 @@ class TestOobleckEngineClass(OobleckElasticTestCase):
 
         directory = tmp_path_factory.getbasetemp()
         request.cls.factory = OobleckStaticClassFactory(model_name_fixture, directory)
-        engine_module.OobleckDataset = MagicMock(return_value=cls.factory.get_dataset())
-        engine_module.OobleckModel = MagicMock(return_value=cls.factory.get_model())
-        engine_module.get_profile_results = MagicMock(
-            return_value=cls.factory.get_dummy_profile()
-        )
-        engine_module.PipelineTemplateGenerator.create_pipeline_templates = MagicMock(
-            spec=["layer_execution_results", "num_nodes", "num_gpus_per_node"],
-            return_value=[
-                cls.factory.get_dummy_pipeline_template(num_gpus + 1)
-                for num_gpus in range(4)
-            ],
-        )
+
+        mock_oobleck_dataset.return_value = cls.factory.get_dataset()
+        mock_oobleck_model.return_value = cls.factory.get_model()
+        mock_get_profile_results.return_value = cls.factory.get_dummy_profile()
+        mock_create_pipeline_templates.return_value = [
+            cls.factory.get_dummy_pipeline_template(num_gpus + 1)
+            for num_gpus in range(4)
+        ]
+
+        yield
 
     def test_init_engine(
         self,
@@ -74,3 +80,4 @@ class TestOobleckEngineClass(OobleckElasticTestCase):
     ):
         engine = OobleckEngine(pipe[1], sample_args)
         assert not torch.distributed.is_initialized()
+        assert len(engine._pipeline_templates) == 4
