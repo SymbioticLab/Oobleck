@@ -408,7 +408,9 @@ class OobleckMultiProcessTestCase:
 
 class OobleckElasticTestCase:
     @pytest_asyncio.fixture(autouse=True)
-    async def daemon(self, event_loop: asyncio.AbstractEventLoop):
+    async def daemon(
+        self, event_loop: asyncio.AbstractEventLoop
+    ) -> OobleckMasterDaemon:
         daemon = await OobleckMasterDaemon.create()
         event_loop.create_task(daemon.run())
 
@@ -420,7 +422,7 @@ class OobleckElasticTestCase:
         await daemon._server.wait_closed()
 
     @pytest_asyncio.fixture
-    async def agent(self, daemon: OobleckMasterDaemon):
+    async def agent(self, daemon: OobleckMasterDaemon) -> OobleckAgent:
         daemon._job = _Job("test", [_AgentInfo("127.0.0.1", [0])])
 
         agent = OobleckAgent()
