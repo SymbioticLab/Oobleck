@@ -5,7 +5,7 @@ import pyomo.environ as pyomo
 import torch.distributed
 from deepspeed import comm as dist
 from deepspeed.utils import logger
-from transformers import TrainingArguments
+from transformers.training_args import TrainingArguments
 
 from oobleck.csrc.planning.pipeline_template import PipelineTemplate
 from oobleck.execution.dataloader import OobleckDataLoader
@@ -33,7 +33,7 @@ class HeterogeneousPipelinesExecutionPlan:
         self.num_microbatches_set = num_microbatches_set
         self.allreduce_across_nodes = allreduce_across_nodes
 
-        self.num_pipelines = sum(
+        self.total_num_pipelines = sum(
             num_instances for num_instances in num_instances_set.values()
         )
         self.total_num_microbatches = sum(
@@ -62,26 +62,46 @@ class HeterogeneousPipelinesExecutionPlan:
         # FIXME: currently we only consider communication overhead
         # of the first layer, believing communication of other layers
         # can fully be hidden in backward pass computing.
-        synchronization_overhead = self.allreduce_across_nodes[0][self.num_pipelines]
+        synchronization_overhead = self.allreduce_across_nodes[0][
+            self.total_num_pipelines
+        ]
 
         return max_iteration_time + synchronization_overhead
 
     @property
-    def num_microbatches_of_mine(self) -> int:
-        assert dist.is_initialized()
-        rank = dist.get_rank()
-        assert rank >= 0
+    def my_pipeline_index(self) -> int:
+        all_ranks = self.all_pipeline_ranks()
+        my_rank = dist.get_rank()
+        for index, ranks in enumerate(all_ranks):
+            if my_rank in ranks:
+                return index
+        raise RuntimeError("This rank is not in any pipeline")
 
-        num_ranks_used = 0
-        for template, num_instances in self.num_instances_set.items():
-            num_ranks_for_templates = (
-                template._num_nodes * template._num_gpus_per_node * num_instances
+    @property
+    def num_microbatches(self) -> list[int]:
+        results: list[int] = []
+        for pipeline_template in self.pipeline_templates:
+            results.extend(
+                [self.num_microbatches_set[pipeline_template]]
+                * self.num_instances_set[pipeline_template]
             )
-            num_ranks_used += num_ranks_for_templates
-            if rank < num_ranks_used:
-                return self.num_microbatches_set[template]
+        return results
 
-        raise ValueError("Cannot find a range that the global rank falls.")
+    def all_pipeline_ranks(self) -> list[list[int]]:
+        results: list[list[int]] = []
+        num_gpus_used = 0
+        for pipeline_template in self.pipeline_templates:
+            num_gpus_per_template = (
+                pipeline_template._num_nodes * pipeline_template._num_gpus_per_node
+            )
+
+            for _ in range(self.num_instances_set[pipeline_template]):
+                results.append(
+                    list(range(num_gpus_used, num_gpus_used + num_gpus_per_template))
+                )
+                num_gpus_used += num_gpus_per_template
+
+        return results
 
     def instantiate(
         self,
@@ -89,9 +109,35 @@ class HeterogeneousPipelinesExecutionPlan:
         dataloader: OobleckDataLoader,
         training_args: TrainingArguments,
         step: int = 0,
-    ) -> List[OobleckPipeline]:
+    ) -> OobleckPipeline:
         my_pipeline: Optional[OobleckPipeline] = None
-        total_num_gpus_used = 0
+        pipeline_index: int = 0
+
+        for pipeline_template in self.pipeline_templates:
+            num_instances = self.num_instances_set[pipeline_template]
+            for _ in range(num_instances):
+                logger.info(
+                    f"Instantiating a pipeline "
+                    f"({len(pipeline_template._stages)} stages with {pipeline_template._num_nodes}) nodes)"
+                )
+
+                ranks: list[int] = self.all_pipeline_ranks()[pipeline_index]
+                process_group = torch.distributed.new_group(ranks)
+                if dist.get_rank() in ranks:
+                    assert my_pipeline is None
+                    my_pipeline = OobleckPipeline(
+                        pipeline_template=pipeline_template,
+                        model=model,
+                        dataloader=dataloader,
+                        ranks=ranks,
+                        training_args=training_args,
+                        process_group=process_group,
+                        step=step,
+                    )
+                pipeline_index += 1
+
+        assert my_pipeline is not None
+        return my_pipeline
 
         for pipeline_template, num_instances in self.num_instances_set.items():
             num_gpus_per_template = (

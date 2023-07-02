@@ -15,8 +15,14 @@ from oobleck.csrc.planning.pipeline_template import (
 )
 from oobleck.elastic.message_util import DistributionInfo
 from oobleck.elastic.training_util import TrainingArguments as OobleckArguments
+from oobleck.execution.dataloader import LoaderType, OobleckDataLoader
 from oobleck.execution.dataset import OobleckDataset
+from oobleck.execution.pipeline import OobleckPipeline
 from oobleck.module.model import OobleckModel
+from oobleck.planning.instantiator import (
+    HeterogeneousPipelinesExecutionPlan,
+    PipelineInstantiator,
+)
 
 
 class OobleckEngine:
@@ -42,13 +48,21 @@ class OobleckEngine:
         self._dataset: OobleckDataset
         self._model: OobleckModel
         self._pipeline_templates: list[PipelineTemplate]
-        self._dataset, self._model, self._pipeline_templates = self.initialize_engine(
-            self._max_num_gpus
-        )
+        (
+            self._dataset,
+            self._model,
+            self._profile_results,
+            self._pipeline_templates,
+        ) = self.initialize_engine(self._max_num_gpus)
 
     def initialize_engine(
         self, max_num_gpus: int
-    ) -> tuple[OobleckDataset, OobleckModel, list[PipelineTemplate]]:
+    ) -> tuple[
+        OobleckDataset,
+        OobleckModel,
+        LayerExecutionResults,
+        list[PipelineTemplate],
+    ]:
         dataset = OobleckDataset(
             self._args.model_name,
             self._args.dataset_path,
@@ -82,7 +96,7 @@ class OobleckEngine:
             profile_results, (1, max_num_gpus), num_gpus_per_node
         )
 
-        return dataset, model, pipeline_templates
+        return dataset, model, profile_results, pipeline_templates
 
     def initialize_distributed(self):
         if dist.is_initialized():
@@ -96,10 +110,14 @@ class OobleckEngine:
         my_ip: str = socket.gethostbyname(socket.gethostname())
         assert my_ip in dist_info.agent_ips, "My IP is not in dist info."
 
-        local_rank = int(os.environ["CUDA_VISIBLE_DEVICES"])
-        rank = dist_info.agent_ips.index(my_ip) * torch.cuda.device_count() + local_rank
+        self._num_nodes = len(dist_info.agent_ips)
+        self._world_size = dist_info.world_size
+        self._local_rank = int(os.environ["CUDA_VISIBLE_DEVICES"])
+        self._rank = (
+            dist_info.agent_ips.index(my_ip) * torch.cuda.device_count() + local_rank
+        )
 
-        if rank == 0:
+        if self._rank == 0:
             store = torch.distributed.TCPStore(
                 host_name=my_ip,
                 port=0,
@@ -123,10 +141,41 @@ class OobleckEngine:
         torch.distributed.init_process_group(
             backend="nccl",
             store=store,
-            rank=rank,
+            rank=self._rank,
             world_size=dist_info.world_size,
         )
         dist.init_distributed(dist_backend="nccl", dist_init_required=False)
         assert torch.distributed.is_initialized() and dist.is_initialized()
 
         # TODO: create pipeline and continue training
+
+    def instantiate_pipelines(self):
+        instantiator = PipelineInstantiator()
+        execution_plan: HeterogeneousPipelinesExecutionPlan = (
+            instantiator.get_best_execution_plan(
+                self._pipeline_templates,
+                [
+                    layer._allreduce_across_nodes
+                    for layer in self._profile_results.get()
+                ],
+                self._num_nodes,
+            )
+        )
+
+        # TODO: get current iteration progress
+        self._dataloader: OobleckDataLoader = OobleckDataLoader(
+            args=self._hf_training_args,
+            datasets=self._dataset,
+            dataloader_type=LoaderType.Training,
+            pipeline_index=execution_plan.my_pipeline_index,
+            num_microbatches=execution_plan.num_microbatches,
+            num_iterations_done=0,
+            epoch=0,
+        )
+
+        self._pipeline: OobleckPipeline = execution_plan.instantiate(
+            model=self._model,
+            dataloader=self._dataloader,
+            training_args=self._hf_training_args,
+            step=0,
+        )

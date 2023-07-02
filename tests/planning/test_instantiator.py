@@ -1,7 +1,7 @@
 from typing import List
 
 import pytest
-import torch
+from pytest_mock import MockerFixture
 
 from oobleck.csrc.planning.pipeline_template import (
     LayerExecutionResults,
@@ -19,10 +19,13 @@ class TestPipelineInstantiator(OobleckSingleProcessTestCase):
     def profile(self):
         return self.factory.get_dummy_profile()
 
-    def test_create_pipelines_one_template(self, profile: LayerExecutionResults):
+    @pytest.mark.parametrize("num_gpus", [1, 2, 4])
+    def test_create_pipelines_one_template(
+        self, num_gpus: int, profile: LayerExecutionResults
+    ):
         # Get a dummy template for 1 GPU and instantiate pipelines with it.
         # Expected result is to have 4 identical pipelines instantiated from the template.
-        template = self.factory.get_dummy_pipeline_template(num_gpus=1)
+        template = self.factory.get_dummy_pipeline_template(num_gpus=num_gpus)
         allreduce_across_nodes = [
             profile.at(i)._allreduce_across_nodes for i in range(profile.size)
         ]
@@ -36,7 +39,7 @@ class TestPipelineInstantiator(OobleckSingleProcessTestCase):
         assert isinstance(execution_plan, HeterogeneousPipelinesExecutionPlan)
         assert len(execution_plan.pipeline_templates) == 1
         assert execution_plan.pipeline_templates[0] == template
-        assert execution_plan.num_instances_set[template] == 4
+        assert execution_plan.num_instances_set[template] == 4 // num_gpus
         assert (
             execution_plan.num_instances_set[template]
             * execution_plan.num_microbatches_set[template]
@@ -87,3 +90,28 @@ class TestPipelineInstantiator(OobleckSingleProcessTestCase):
         self, profile: LayerExecutionResults
     ):
         pass
+
+    @pytest.mark.parametrize("num_gpus", [1, 2, 4], ids=lambda x: f"{x} GPUs")
+    @pytest.mark.parametrize("rank", [0, 5, 10, 15], ids=lambda x: f"rank{x}")
+    def test_pipeline_rank_index(
+        self,
+        num_gpus: int,
+        rank: int,
+        profile: LayerExecutionResults,
+        mocker: MockerFixture,
+    ):
+        world_size = 16
+        templates = self.factory.get_dummy_pipeline_template(num_gpus=num_gpus)
+        allreduce_across_nodes = [l._allreduce_across_nodes for l in profile.get()]
+        instantiator = PipelineInstantiator()
+        plan = instantiator.get_best_execution_plan(
+            pipeline_templates=[templates],
+            allreduce_across_nodes=allreduce_across_nodes,
+            num_nodes=world_size,
+            global_num_microbatch=512,
+        )
+
+        mocker.patch("deepspeed.comm.is_initialized", return_value=True)
+        with mocker.patch("deepspeed.comm.get_rank", return_value=rank):
+            assert plan.my_pipeline_index == rank // num_gpus
+            assert rank in plan.all_pipeline_ranks()[plan.my_pipeline_index]
