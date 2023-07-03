@@ -8,6 +8,7 @@
 #include <cppcoro/task.hpp>
 #include <iostream>
 #include <memory>
+#include <numeric>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -51,6 +52,16 @@ class PipelineTemplate {
   }
   int get_num_nodes() const { return num_nodes_; }
   int get_num_gpus_per_node() const { return num_gpus_per_node_; }
+  const std::vector<std::vector<int>> get_ranks(int start_rank) const {
+    std::vector<std::vector<int>> ranks;
+    for (auto& stage : stage_execution_results_) {
+      std::vector<int> stage_ranks(stage->num_gpus_);
+      std::iota(stage_ranks.begin(), stage_ranks.end(), start_rank);
+      ranks.push_back(std::move(stage_ranks));
+    }
+
+    return ranks;
+  }
 
  private:
   std::vector<std::shared_ptr<StageExecutionResult>> stage_execution_results_;
