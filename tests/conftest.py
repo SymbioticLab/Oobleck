@@ -15,6 +15,7 @@ import pytest
 import pytest_asyncio
 import torch
 import torch.distributed
+from pytest_mock import MockerFixture
 from transformers.training_args import TrainingArguments
 
 from oobleck.csrc.planning.pipeline_template import (
@@ -241,26 +242,26 @@ class OobleckSingleProcessTestCase:
     def distributed(self, model: OobleckModel, request: pytest.FixtureRequest):
         assert not dist.is_initialized() and not torch.distributed.is_initialized()
 
-        # envs required by deepspeed.comm
-        os.environ["RANK"] = "0"
-        os.environ["WORLD_SIZE"] = "1"
-        # Initialize a single process torch.distributed group.
-        store = torch.distributed.HashStore()
-        torch.distributed.init_process_group(
-            backend="nccl", store=store, rank=0, world_size=1
-        )
-        dist.init_distributed(dist_backend="nccl", dist_init_required=False)
-        assert torch.distributed.is_initialized()
-        assert dist.is_initialized()
+        with pytest.MonkeyPatch().context() as m:
+            # envs required by deepspeed.comm
+            m.setenv("RANK", "0")
+            m.setenv("WORLD_SIZE", "1")
 
-        yield
+            # Initialize a single process torch.distributed group.
+            store = torch.distributed.HashStore()
+            torch.distributed.init_process_group(
+                backend="nccl", store=store, rank=0, world_size=1
+            )
+            dist.init_distributed(dist_backend="nccl", dist_init_required=False)
+            assert torch.distributed.is_initialized()
+            assert dist.is_initialized()
 
-        dist.destroy_process_group()
-        dist.cdb = None
-        assert not torch.distributed.is_initialized()
-        assert not dist.is_initialized()
-        os.environ.pop("RANK")
-        os.environ.pop("WORLD_SIZE")
+            yield
+
+            dist.destroy_process_group()
+            dist.cdb = None
+            assert not torch.distributed.is_initialized()
+            assert not dist.is_initialized()
 
     @classmethod
     @pytest.fixture(scope="class", autouse=True)
@@ -269,17 +270,18 @@ class OobleckSingleProcessTestCase:
         model_name_fixture: str,
         tmp_path_factory: pytest.TempPathFactory,
         request: pytest.FixtureRequest,
+        mocker: MockerFixture,
     ):
-        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-        device_count_backup = torch.cuda.device_count
-        torch.cuda.device_count = lambda: 1
-        directory = tmp_path_factory.getbasetemp()
-        request.cls.factory = OobleckStaticClassFactory(model_name_fixture, directory)
+        mocker.patch("torch.cuda.device_count", return_value=1)
 
-        yield
+        with pytest.MonkeyPatch().context() as m:
+            m.setenv("CUDA_VISIBLE_DEVICES", "0")
+            directory = tmp_path_factory.getbasetemp()
+            request.cls.factory = OobleckStaticClassFactory(
+                model_name_fixture, directory
+            )
 
-        os.environ.pop("CUDA_VISIBLE_DEVICES")
-        torch.cuda.device_count = device_count_backup
+            yield
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="requires 4 GPUs")
