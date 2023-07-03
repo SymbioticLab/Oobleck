@@ -139,39 +139,6 @@ class HeterogeneousPipelinesExecutionPlan:
         assert my_pipeline is not None
         return my_pipeline
 
-        for pipeline_template, num_instances in self.num_instances_set.items():
-            num_gpus_per_template = (
-                pipeline_template._num_nodes * pipeline_template._num_gpus_per_node
-            )
-
-            for _ in range(num_instances):
-                logger.info(
-                    f"Instantiating a pipeline "
-                    f"({len(pipeline_template._stages)} stages with {pipeline_template._num_nodes}) nodes)"
-                )
-
-                ranks = list(
-                    range(
-                        total_num_gpus_used, total_num_gpus_used + num_gpus_per_template
-                    )
-                )
-                total_num_gpus_used += num_gpus_per_template
-                process_group = torch.distributed.new_group(ranks)
-                if dist.get_rank(process_group) >= 0:
-                    assert my_pipeline is None
-                    my_pipeline = OobleckPipeline(
-                        pipeline_template,
-                        model,
-                        dataloader,
-                        step,
-                        ranks,
-                        process_group,
-                        training_args,
-                    )
-
-        assert my_pipeline, "No pipeline has been initiated for this rank"
-        return my_pipeline
-
 
 class PipelineInstantiator:
     def get_best_execution_plan(
