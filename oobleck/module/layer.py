@@ -10,7 +10,7 @@ from deepspeed.runtime.engine import (
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from torch.distributed import ProcessGroup
 from torch.utils.checkpoint import checkpoint as checkpoint_fn
-from transformers import TrainingArguments
+from transformers.training_args import TrainingArguments
 
 
 def is_checkpointable(layer: torch.fx.GraphModule) -> bool:
