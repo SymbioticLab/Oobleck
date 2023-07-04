@@ -270,9 +270,9 @@ class OobleckSingleProcessTestCase:
         model_name_fixture: str,
         tmp_path_factory: pytest.TempPathFactory,
         request: pytest.FixtureRequest,
-        mocker: MockerFixture,
+        class_mocker: MockerFixture,
     ):
-        mocker.patch("torch.cuda.device_count", return_value=1)
+        class_mocker.patch("torch.cuda.device_count", return_value=1)
 
         with pytest.MonkeyPatch().context() as m:
             m.setenv("CUDA_VISIBLE_DEVICES", "0")
