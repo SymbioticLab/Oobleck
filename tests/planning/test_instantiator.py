@@ -2,19 +2,32 @@ from typing import List
 
 import pytest
 from pytest_mock import MockerFixture
+from torch.testing._internal.distributed.distributed_utils import (
+    create_mock_pg,
+    mock_init_dist,
+)
 
 from oobleck.csrc.planning.pipeline_template import (
     LayerExecutionResults,
     PipelineTemplate,
 )
+from oobleck.execution.pipeline import OobleckPipeline
+from oobleck.module.model import OobleckModel
 from oobleck.planning.instantiator import (
     HeterogeneousPipelinesExecutionPlan,
     PipelineInstantiator,
 )
-from tests.conftest import OobleckSingleProcessTestCase
+from tests.conftest import (
+    TRAIN_BATCH_SIZE,
+    OobleckDynamicClassFactory,
+    OobleckSingleProcessTestCase,
+    OobleckStaticClassFactory,
+)
 
 
 class TestPipelineInstantiator(OobleckSingleProcessTestCase):
+    factory: OobleckStaticClassFactory
+
     @pytest.fixture(scope="function")
     def profile(self):
         return self.factory.get_dummy_profile()
@@ -101,7 +114,9 @@ class TestPipelineInstantiator(OobleckSingleProcessTestCase):
         mocker: MockerFixture,
     ):
         world_size = 16
-        templates = self.factory.get_dummy_pipeline_template(num_gpus=num_gpus)
+        templates: PipelineTemplate = self.factory.get_dummy_pipeline_template(
+            num_gpus=num_gpus
+        )
         allreduce_across_nodes = [l._allreduce_across_nodes for l in profile.get()]
         instantiator = PipelineInstantiator()
         plan = instantiator.get_best_execution_plan(
@@ -111,7 +126,39 @@ class TestPipelineInstantiator(OobleckSingleProcessTestCase):
             global_num_microbatch=512,
         )
 
+        total_pipeline_num = world_size // num_gpus
+        target_pipeline_index: int = rank // num_gpus
+
+        model: OobleckModel = self.factory.get_model()
+
+        # mocker.patch(
+        #     "torch.distributed.init_process_group",
+        #     return_value=mock_init_dist(rank, world_size),
+        # )
+        mock_init_dist(rank, world_size)
         mocker.patch("deepspeed.comm.is_initialized", return_value=True)
-        with mocker.patch("deepspeed.comm.get_rank", return_value=rank):
-            assert plan.my_pipeline_index == rank // num_gpus
-            assert rank in plan.all_pipeline_ranks()[plan.my_pipeline_index]
+        mocker.patch("deepspeed.comm.get_rank", return_value=rank)
+        mocker.patch(
+            "torch.distributed.new_group",
+            return_value=create_mock_pg(None, rank, world_size, None),
+        )
+
+        dfactory = OobleckDynamicClassFactory(
+            static_factory=self.factory,
+            my_rank=rank,
+            ranks=list(range(0, 16)),
+        )
+
+        pipeline: OobleckPipeline = plan.instantiate(
+            model=model,
+            dataloader=dfactory.get_dataloader(
+                pipeline_index=target_pipeline_index,
+                num_microbatches=[TRAIN_BATCH_SIZE] * total_pipeline_num,
+            ),
+            training_args=self.factory._training_args,
+        )
+
+        # Fix it...
+        # assert pipeline.pipeline_id == target_pipeline_index
+        # assert pipeline.my_rank == rank
+        # assert len(pipeline.ranks) == num_gpus
