@@ -26,9 +26,9 @@ from oobleck.execution.dataset import OobleckDataset
 from oobleck.execution.pipeline import OobleckPipeline
 from oobleck.module.model import OobleckModel
 
-TRAIN_BATCH_SIZE = 8
-EVAL_BATCH_SIZE = 4
-GRADIENT_ACCUMULATION_STEP = 2
+TRAIN_BATCH_SIZE = 1
+EVAL_BATCH_SIZE = 2
+GRADIENT_ACCUMULATION_STEP = 4
 
 
 @dataclass
@@ -212,11 +212,18 @@ class OobleckDynamicClassFactory:
             shuffle=False,
         )
 
-    def get_dummy_pipeline(self, num_gpus: int) -> OobleckPipeline:
+    def get_dummy_pipeline(
+        self,
+        num_stages: int,
+        num_nodes: int,
+        num_gpus_per_node: int = 1,
+    ) -> OobleckPipeline:
         model = self._static_factory.get_model()
         # TODO: make this more flexible
         template = self._static_factory.get_dummy_pipeline_template(
-            num_stages=num_gpus, num_nodes=num_gpus, num_gpus_per_node=1
+            num_stages=num_stages,
+            num_nodes=num_nodes,
+            num_gpus_per_node=num_gpus_per_node,
         )
         training_args = self._static_factory._training_args
         dataloader = self.get_dataloader(0, [training_args.gradient_accumulation_steps])

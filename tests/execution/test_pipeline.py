@@ -19,9 +19,12 @@ class TestOobleckSingleStagePipeline(OobleckMultiProcessTestCase):
     def _test_attributes_type(
         factory: OobleckStaticClassFactory,
         dfactory: OobleckDynamicClassFactory,
+        num_gpus_per_node: int,
     ):
         model = factory.get_model()
-        pipeline = dfactory.get_dummy_pipeline(1)
+        pipeline = dfactory.get_dummy_pipeline(
+            num_stages=1, num_nodes=1, num_gpus_per_node=num_gpus_per_node
+        )
         assert pipeline.prev_rank is None
         assert pipeline.next_rank is None
 
@@ -35,18 +38,25 @@ class TestOobleckSingleStagePipeline(OobleckMultiProcessTestCase):
         for layer in pipeline.model_layers:
             assert all(p.is_cuda for p in layer.parameters())
 
-    def test_attributes_type(self):
+    @pytest.mark.parametrize(
+        "num_gpus_per_node", [1, 2, 4], ids=["1gpu/node", "2gpus/node", "4gpus/node"]
+    )
+    def test_attributes_type(self, num_gpus_per_node: int):
         self.run_in_parallel(
-            num_processes=1,
-            func=TestOobleckSingleStagePipeline._test_attributes_type,
+            num_gpus_per_node,
+            TestOobleckSingleStagePipeline._test_attributes_type,
+            num_gpus_per_node,
         )
 
     @staticmethod
     def load_microbatch(
         factory: OobleckStaticClassFactory,
         dfactory: OobleckDynamicClassFactory,
+        num_gpus_per_node: int,
     ):
-        pipeline = dfactory.get_dummy_pipeline(1)
+        pipeline = dfactory.get_dummy_pipeline(
+            num_stages=1, num_nodes=1, num_gpus_per_node=num_gpus_per_node
+        )
 
         assert pipeline.pipe_buffers["inputs"][0] is None
         pipeline.execution.load_microbatch(buffer_id=0)
@@ -65,8 +75,11 @@ class TestOobleckSingleStagePipeline(OobleckMultiProcessTestCase):
     def forward(
         factory: OobleckStaticClassFactory,
         dfactory: OobleckDynamicClassFactory,
+        num_gpus_per_node: int,
     ):
-        pipeline = dfactory.get_dummy_pipeline(1)
+        pipeline = dfactory.get_dummy_pipeline(
+            num_stages=1, num_nodes=1, num_gpus_per_node=num_gpus_per_node
+        )
         pipeline.execution.load_microbatch(buffer_id=0)
 
         assert pipeline.pipe_buffers["outputs"][0] is None
@@ -83,8 +96,11 @@ class TestOobleckSingleStagePipeline(OobleckMultiProcessTestCase):
     def backward(
         factory: OobleckStaticClassFactory,
         dfactory: OobleckDynamicClassFactory,
+        num_gpus_per_node: int,
     ):
-        pipeline = dfactory.get_dummy_pipeline(1)
+        pipeline = dfactory.get_dummy_pipeline(
+            num_stages=1, num_nodes=1, num_gpus_per_node=num_gpus_per_node
+        )
         pipeline.execution.load_microbatch(buffer_id=0)
         pipeline.execution.forward_pass(buffer_id=0)
 
@@ -116,8 +132,11 @@ class TestOobleckSingleStagePipeline(OobleckMultiProcessTestCase):
     def optimizer_step(
         factory: OobleckStaticClassFactory,
         dfactory: OobleckDynamicClassFactory,
+        num_gpus_per_node: int,
     ):
-        pipeline = dfactory.get_dummy_pipeline(1)
+        pipeline = dfactory.get_dummy_pipeline(
+            num_stages=1, num_nodes=1, num_gpus_per_node=num_gpus_per_node
+        )
         pipeline.execution.load_microbatch(buffer_id=0)
         pipeline.execution.forward_pass(buffer_id=0)
         pipeline.execution.backward_pass(buffer_id=0)
@@ -141,9 +160,12 @@ class TestOobleckSingleStagePipeline(OobleckMultiProcessTestCase):
             "optimizer_step",
         ],
     )
-    def test_execution(self, func_name: str):
+    @pytest.mark.parametrize(
+        "num_gpus_per_node", [1, 2, 4], ids=["1gpu/node", "2gpus/node", "4gpus/node"]
+    )
+    def test_execution(self, func_name: str, num_gpus_per_node: int):
         func = getattr(TestOobleckSingleStagePipeline, func_name)
-        self.run_in_parallel(num_processes=1, func=func)
+        self.run_in_parallel(num_gpus_per_node, func, num_gpus_per_node)
 
 
 class TestMultiStagePipeline(OobleckMultiProcessTestCase):
