@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import itertools
+from collections.abc import Iterable, Mapping
 from types import MethodType
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
+from typing import Any
 
 import torch
 import torch.distributed
@@ -116,10 +117,10 @@ class PipelineExecution:
             layer.set_checkpointable(is_checkpointable(layer))
 
         # stores the loss for the current microbatch being processed
-        self.loss: Optional[Union[torch.Tensor, Iterable[torch.Tensor]]] = None
+        self.loss: torch.Tensor | Iterable[torch.Tensor] | None = None
 
         # stores the loss for the entire batch
-        self.total_loss: Optional[Union[torch.Tensor, Iterable[torch.Tensor]]] = None
+        self.total_loss: torch.Tensor | Iterable[torch.Tensor] | None = None
 
         self.micro_steps = 0
 
@@ -145,9 +146,7 @@ class PipelineExecution:
         self.data_iterator = iter(self.dataloader)
 
     # https://github.com/huggingface/transformers/blob/v4.26.1/src/transformers/trainer.py#L2454
-    def _prepare_input(
-        self, data: Union[torch.Tensor, Any]
-    ) -> Union[torch.Tensor, Any]:
+    def _prepare_input(self, data: torch.Tensor | Any) -> torch.Tensor | Any:
         """
         Prepares one `data` before feeding it to the model, be it a tensor or a nested list/dictionary of tensors.
         """
@@ -163,8 +162,8 @@ class PipelineExecution:
 
     # https://github.com/huggingface/transformers/blob/v4.26.1/src/transformers/trainer.py#L2472
     def _prepare_inputs(
-        self, inputs: Dict[str, Union[torch.Tensor, Any]]
-    ) -> Tuple[Union[torch.Tensor, Any]]:
+        self, inputs: dict[str, torch.Tensor | Any]
+    ) -> tuple[torch.Tensor | Any]:
         """
         Prepare `inputs` before feeding them to the model, converting them to tensors if they are not already and
         handling potential state.
@@ -195,7 +194,7 @@ class PipelineExecution:
         # XXX Hack
         # Some tensor might be converted from torch.Size().
         # Convert it to torch.Size so that forward can be executed
-        inputs: tuple[Union[torch.Size, torch.Tensor]] = tuple(
+        inputs: tuple[torch.Size | torch.Tensor] = tuple(
             [
                 torch.Size(input.tolist())
                 if input.dim() == 1
@@ -248,11 +247,11 @@ class PipelineExecution:
             loss = self.loss
             loss.backward()
         else:
-            output_tensors: Tuple[torch.Tensor] = self.pipeline.pipe_buffers["outputs"][
+            output_tensors: tuple[torch.Tensor] = self.pipeline.pipe_buffers["outputs"][
                 buffer_id
             ]
             output_tensors = tuple([t for t in output_tensors if t.requires_grad])
-            grad_tensors: Tuple[
+            grad_tensors: tuple[
                 torch.Tensor
             ] = self.pipeline.communication.grad_recv_buf
 
@@ -289,9 +288,9 @@ class PipelineCommunication:
 
         self.sent_activation_meta: bool = False
         # initialized in :func:`oobleck.execution.PipelineCommunication.recv_activations`.
-        self.activation_recv_buf: Optional[Tuple[torch.Tensor]] = None
+        self.activation_recv_buf: tuple[torch.Tensor] | None = None
         # initialized in :func:`oobleck.execution.PipelineCommunication.recv_gradients`.
-        self.grad_recv_buf: Optional[Tuple[torch.Tensor]] = None
+        self.grad_recv_buf: tuple[torch.Tensor] | None = None
 
     def _send(
         self, tensor: torch.Tensor, dest_rank: int, async_op: bool = False
@@ -313,7 +312,7 @@ class PipelineCommunication:
 
     @measure_time("comm/send_activations")
     def send_activations(self, buffer_id: int):
-        def _send_activation_meta(buffer: Tuple[torch.Tensor], receiver_rank: int):
+        def _send_activation_meta(buffer: tuple[torch.Tensor], receiver_rank: int):
             """Send activation dimension first to the next stage
             so that it can initialize buffers.
 
@@ -345,7 +344,7 @@ class PipelineCommunication:
                 self._send(send_shape, receiver_rank)
                 self._send(send_req_grad, receiver_rank)
 
-        outputs: Tuple[torch.Tensor] = self.pipeline.pipe_buffers["outputs"][buffer_id]
+        outputs: tuple[torch.Tensor] = self.pipeline.pipe_buffers["outputs"][buffer_id]
         if not self.sent_activation_meta:
             _send_activation_meta(outputs, self.pipeline.next_rank)
             self.sent_activation_meta = True
@@ -357,7 +356,7 @@ class PipelineCommunication:
 
     @measure_time("comm/recv_activations")
     def recv_activations(self, buffer_id: int):
-        def create_receive_buffer(sender_rank: int) -> Tuple[torch.Tensor]:
+        def create_receive_buffer(sender_rank: int) -> tuple[torch.Tensor]:
             """Receive metadata about upcoming p2p transfers and return allocated buffer.
 
             Metadata is communicated in this order:
@@ -371,7 +370,7 @@ class PipelineCommunication:
             count_tensor = torch.LongTensor(data=[0]).to(self.device)
             self._recv(count_tensor, sender_rank)
             num_tensors = count_tensor.item()
-            buffers: List[torch.Tensor] = []
+            buffers: list[torch.Tensor] = []
             for _ in range(num_tensors):
                 recv_ndims = torch.LongTensor(data=[0]).to(self.device)
                 self._recv(recv_ndims, sender_rank)
@@ -403,7 +402,7 @@ class PipelineCommunication:
             self.activation_recv_buf = create_receive_buffer(self.pipeline.prev_rank)
 
         assert isinstance(self.activation_recv_buf, tuple)
-        recvd: List[Optional[torch.Tensor]] = [None] * len(self.activation_recv_buf)
+        recvd: list[torch.Tensor | None] = [None] * len(self.activation_recv_buf)
         for idx, buffer in enumerate(self.activation_recv_buf):
             assert torch.is_tensor(buffer)
             self._recv(buffer, self.pipeline.prev_rank)
@@ -431,10 +430,10 @@ class PipelineCommunication:
     @measure_time("comm/recv_gradients")
     def recv_gradients(self, buffer_id: int):
         def create_gradients_buffer(
-            tensors: Tuple[torch.Tensor],
-        ) -> Tuple[torch.Tensor]:
+            tensors: tuple[torch.Tensor],
+        ) -> tuple[torch.Tensor]:
             assert isinstance(tensors, tuple)
-            buffers: List[torch.Tensor] = []
+            buffers: list[torch.Tensor] = []
             for tensor in tensors:
                 assert isinstance(tensor, torch.Tensor)
                 if tensor.requires_grad:
@@ -478,7 +477,7 @@ class OobleckPipeline:
         dataloader: OobleckDataLoader,
         pipeline_id: int,
         step: int,
-        ranks: List[int],
+        ranks: list[int],
         process_group: ProcessGroup,
         training_args: TrainingArguments,
     ):
@@ -495,12 +494,12 @@ class OobleckPipeline:
         assert self.my_rank in self.ranks, "My rank is not in the ranks list."
 
         rank_index = ranks.index(self.my_rank)
-        self.prev_rank: Optional[int] = (
+        self.prev_rank: int | None = (
             ranks[rank_index - num_gpus_per_node]
             if rank_index >= num_gpus_per_node
             else None
         )
-        self.next_rank: Optional[int] = (
+        self.next_rank: int | None = (
             ranks[rank_index + num_gpus_per_node]
             if rank_index < len(ranks) - num_gpus_per_node
             else None
@@ -531,7 +530,7 @@ class OobleckPipeline:
         )
 
         num_pipe_buffers = self.train_schedule.num_pipe_buffers()
-        self.pipe_buffers: Dict[str, Tuple[torch.Tensor]] = {
+        self.pipe_buffers: dict[str, tuple[torch.Tensor]] = {
             # batch input and received activations
             "inputs": [None for _ in range(num_pipe_buffers)],
             # labels from batch input
