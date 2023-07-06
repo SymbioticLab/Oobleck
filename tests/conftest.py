@@ -129,7 +129,12 @@ class OobleckStaticClassFactory:
 
         return self._profile
 
-    def get_dummy_pipeline_template(self, num_gpus: int) -> PipelineTemplate:
+    def get_dummy_pipeline_template(
+        self,
+        num_stages: int,
+        num_nodes: int,
+        num_gpus_per_node: int = 1,
+    ) -> PipelineTemplate:
         self.get_dummy_profile()
 
         def slice_layers(lst: List[Any], num_chunks: int) -> List[Tuple[int, int]]:
@@ -145,22 +150,29 @@ class OobleckStaticClassFactory:
                 slicing_points.append((i, end))
             return slicing_points
 
-        if num_gpus not in self._pipeline_templates:
-            # TODO: take user argument for it
-            num_gpus_per_stage = 1
+        assert (
+            num_nodes * num_gpus_per_node
+        ) % num_stages == 0, "Stages in dummy pipeline template must have equal size."
 
-            layer_indices = slice_layers(self._profile.get(), num_gpus)
+        key = (num_stages, num_nodes, num_gpus_per_node)
+        if key not in self._pipeline_templates:
+            layer_indices = slice_layers(self._profile.get(), num_stages)
 
+            num_gpus_per_stage = (num_nodes * num_gpus_per_node) // num_stages
             stages = [
                 StageExecutionResult(self._profile, indices, num_gpus_per_stage)
                 for indices in layer_indices
             ]
 
-            self._pipeline_templates[num_gpus] = PipelineTemplate(
-                stages, 0.1, self._profile.size, num_gpus, num_gpus_per_stage
+            self._pipeline_templates[key] = PipelineTemplate(
+                stages,
+                0.1,
+                self._profile.size,
+                num_nodes,
+                num_gpus_per_node,
             )
 
-        return self._pipeline_templates[num_gpus]
+        return self._pipeline_templates[key]
 
 
 class OobleckDynamicClassFactory:
@@ -202,7 +214,10 @@ class OobleckDynamicClassFactory:
 
     def get_dummy_pipeline(self, num_gpus: int) -> OobleckPipeline:
         model = self._static_factory.get_model()
-        template = self._static_factory.get_dummy_pipeline_template(num_gpus)
+        # TODO: make this more flexible
+        template = self._static_factory.get_dummy_pipeline_template(
+            num_stages=num_gpus, num_nodes=num_gpus, num_gpus_per_node=1
+        )
         training_args = self._static_factory._training_args
         dataloader = self.get_dataloader(0, [training_args.gradient_accumulation_steps])
 
