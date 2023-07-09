@@ -544,11 +544,11 @@ class OobleckPipeline:
         step: int,
         training_args: TrainingArguments,
     ):
-        self._pipelind_id = pipeline_id
+        self._pipeline_id = pipeline_id
         self._template = pipeline_template
         self._ranks = ranks
         self._dataloader = dataloader
-        self._step = step
+        self._global_step = step
         self._training_args = training_args
 
         assert dist.is_initialized(), "torch.distributed is not intialized."
@@ -578,8 +578,62 @@ class OobleckPipeline:
 
         assert len(ranks) == 0, "Not all ranks were assigned to a stage."
 
+    def train(self):
+        for step_cmds in self.train_schedule:
+            # For each instruction in the step
+            for cmd in step_cmds:
+                if type(cmd) not in INSTRUCTION_MAP:
+                    raise RuntimeError(
+                        f"{self.__class__.__name__} does not understand instruction {repr(cmd)}"
+                    )
+
+                # Equivalent to: self._exec_forward_pass(buffer_id=0)
+                _exec_instr = MethodType(INSTRUCTION_MAP[type(cmd)], self)
+                _exec_instr(**cmd.kwargs)
+
+        self._global_step += 1
+
     def get_rank_for_id(self, layer_id: int, shard_id: int) -> int:
         return self._rank_grid[layer_id][shard_id]
+
+    def initialize_execution(
+        self,
+        layers: list[FullyShardedDataParallel],
+        shard_id: int,
+    ):
+        self._execution = PipelineExecution(
+            pipeline=self,
+            layers=layers,
+            shard_id=shard_id,
+            dataloader=self._dataloader,
+        )
+
+        # initialize_execution assumes to be called only if this rank is involved in
+        # the pipeline. Failure of getting my_layer_index cannot happen.
+        my_rank = dist.get_rank()
+        my_layer_index = next(my_rank in ranks for ranks in self._rank_grid.values())
+        my_stage_index = next(
+            stage_index
+            for stage_index, stage in enumerate(self._template.get_stages())
+            if my_layer_index in stage._layer_indices
+        )
+
+        sampler: OobleckSampler = self._dataloader.batch_sampler
+        self.train_schedule = OobleckPipelineSchedule(
+            micro_batches=sampler.num_microbatches[self._pipeline_id],
+            num_stages=len(self._template.get_stages()),
+            stage_id=my_stage_index,
+        )
+
+        num_pipe_buffers = self.train_schedule.num_pipe_buffers()
+        self.pipe_buffers: dict[str, tuple[torch.Tensor]] = {
+            # batch input and received activations
+            "inputs": [None for _ in range(num_pipe_buffers)],
+            # labels from batch input
+            "labels": [None for _ in range(num_pipe_buffers)],
+            # activations to be sent
+            "outputs": [None for _ in range(num_pipe_buffers)],
+        }
 
     def initialize_distributed_fsdp(self, model: OobleckModel):
         """Initialize torch.distributed.process_groups per layer.
@@ -608,12 +662,7 @@ class OobleckPipeline:
 
         if fsdp_layers:
             assert shard_id >= 0, "shard id is not set while fsdp_layers have layers."
-            self._execution = PipelineExecution(
-                pipeline=self,
-                layers=fsdp_layers,
-                shard_id=shard_id,
-                dataloader=self._dataloader,
-            )
+            self.initialize_execution(fsdp_layers, shard_id)
 
         assert len(self._per_layer_pgs) == len(
             model.model
@@ -660,90 +709,3 @@ class OobleckPipeline:
         ), "Number of per-shard process groups and model layers must match."
 
         # self._communication may not be initialized at this moment. Don't add assertion here.
-
-
-# NOTE: it is going to be completely recreated during reconfiguration after failure.
-# NOTE: Must instantiate all pipelines as it includes ProcessGroup creation.
-class OobleckPipeline:
-    def __init__(
-        self,
-        pipeline_id: int,
-        stages: list[PipelineStage],
-        dataloader: OobleckDataLoader,
-        step: int,
-        training_args: TrainingArguments,
-    ):
-        logger.info(f"Creating pipeline ({len(stages)} stages)")
-        self._pipeline_id = pipeline_id
-        self._stages = stages
-        self._step = step
-        self._training_args = training_args
-
-        assert dist.is_initialized(), "torch.distributed is not intialized."
-        self.my_rank = dist.get_rank()
-        self.my_stage = next(
-            (stage for stage in stages if self.my_rank in stage.ranks), None
-        )
-        if self.my_stage is None:
-            raise RuntimeError(f"Rank {self.my_rank} is not in any stage.")
-
-        stage_index = stages.index(self.my_stage)
-        rank_index = self.my_stage.ranks.index(self.my_rank)
-        self.prev_rank: int | None = (
-            (stages[stage_index - 1].ranks[rank_index]) if stage_index > 0 else None
-        )
-        self.next_rank: int | None = (
-            (stages[stage_index + 1].ranks[rank_index])
-            if stage_index < len(stages) - 1
-            else None
-        )
-
-        sampler: OobleckSampler = dataloader.batch_sampler
-        self.train_schedule = OobleckPipelineSchedule(
-            sampler.num_microbatches[self._pipeline_id],
-            len(stages),
-            stage_index,
-        )
-
-        num_pipe_buffers = self.train_schedule.num_pipe_buffers()
-        self.pipe_buffers: dict[str, tuple[torch.Tensor]] = {
-            # batch input and received activations
-            "inputs": [None for _ in range(num_pipe_buffers)],
-            # labels from batch input
-            "labels": [None for _ in range(num_pipe_buffers)],
-            # activations to be sent
-            "outputs": [None for _ in range(num_pipe_buffers)],
-        }
-
-        # Create process groups for this pipeline
-        process_groups = [
-            dist.new_group([stage.ranks[i] for stage in stages])
-            for i in range(len(self.my_stage.ranks))
-        ]
-
-        self.communication = PipelineCommunication(self, process_groups[rank_index])
-        self.execution = PipelineExecution(self, training_args, dataloader)
-
-        self.timer = OobleckTimer()
-        self.global_steps = step
-
-    def train(self):
-        for step_cmds in self.train_schedule:
-            # For each instruction in the step
-            for cmd in step_cmds:
-                if type(cmd) not in INSTRUCTION_MAP:
-                    raise RuntimeError(
-                        f"{self.__class__.__name__} does not understand instruction {repr(cmd)}"
-                    )
-
-                # Equivalent to: self._exec_forward_pass(buffer_id=0)
-                _exec_instr = MethodType(INSTRUCTION_MAP[type(cmd)], self)
-                _exec_instr(**cmd.kwargs)
-
-        self.global_steps += 1
-
-    def is_first_stage(self):
-        return self.prev_rank is None
-
-    def is_last_stage(self):
-        return self.next_rank is None
