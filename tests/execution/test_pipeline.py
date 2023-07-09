@@ -23,7 +23,7 @@ class TestOobleckSingleStagePipeline(OobleckMultiProcessTestCase):
     ):
         model = factory.get_model()
         pipeline = dfactory.get_dummy_pipeline(
-            num_stages=1, num_nodes=1, num_gpus_per_node=num_gpus_per_node
+            num_stages=1, num_gpus_per_node=num_gpus_per_node
         )
         assert pipeline.prev_rank is None
         assert pipeline.next_rank is None
@@ -55,7 +55,7 @@ class TestOobleckSingleStagePipeline(OobleckMultiProcessTestCase):
         num_gpus_per_node: int,
     ):
         pipeline = dfactory.get_dummy_pipeline(
-            num_stages=1, num_nodes=1, num_gpus_per_node=num_gpus_per_node
+            num_stages=1, num_gpus_per_node=num_gpus_per_node
         )
 
         assert pipeline.pipe_buffers["inputs"][0] is None
@@ -78,7 +78,7 @@ class TestOobleckSingleStagePipeline(OobleckMultiProcessTestCase):
         num_gpus_per_node: int,
     ):
         pipeline = dfactory.get_dummy_pipeline(
-            num_stages=1, num_nodes=1, num_gpus_per_node=num_gpus_per_node
+            num_stages=1, num_gpus_per_node=num_gpus_per_node
         )
         pipeline.execution.load_microbatch(buffer_id=0)
 
@@ -99,7 +99,7 @@ class TestOobleckSingleStagePipeline(OobleckMultiProcessTestCase):
         num_gpus_per_node: int,
     ):
         pipeline = dfactory.get_dummy_pipeline(
-            num_stages=1, num_nodes=1, num_gpus_per_node=num_gpus_per_node
+            num_stages=1, num_gpus_per_node=num_gpus_per_node
         )
         pipeline.execution.load_microbatch(buffer_id=0)
         pipeline.execution.forward_pass(buffer_id=0)
@@ -135,7 +135,7 @@ class TestOobleckSingleStagePipeline(OobleckMultiProcessTestCase):
         num_gpus_per_node: int,
     ):
         pipeline = dfactory.get_dummy_pipeline(
-            num_stages=1, num_nodes=1, num_gpus_per_node=num_gpus_per_node
+            num_stages=1, num_gpus_per_node=num_gpus_per_node
         )
         pipeline.execution.load_microbatch(buffer_id=0)
         pipeline.execution.forward_pass(buffer_id=0)

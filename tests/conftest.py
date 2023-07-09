@@ -216,9 +216,9 @@ class OobleckDynamicClassFactory:
     def get_dummy_pipeline(
         self,
         num_stages: int,
-        num_nodes: int,
         num_gpus_per_node: int = 1,
     ) -> OobleckPipeline:
+        num_nodes = 1
         model = self._static_factory.get_model()
         # TODO: make this more flexible
         template = self._static_factory.get_dummy_pipeline_template(
@@ -230,14 +230,17 @@ class OobleckDynamicClassFactory:
         dataloader = self.get_dataloader(0, [training_args.gradient_accumulation_steps])
 
         pg = torch.distributed.new_group(self._ranks)
+        stage = PipelineStage(
+            model,
+            template._stages[0],
+            self._ranks,
+            pg,
+        )
         return OobleckPipeline(
-            pipeline_template=template,
-            model=model,
-            dataloader=dataloader,
             pipeline_id=0,
+            stages=[stage],
+            dataloader=dataloader,
             step=0,
-            ranks=self._ranks,
-            process_group=pg,
             training_args=training_args,
         )
 

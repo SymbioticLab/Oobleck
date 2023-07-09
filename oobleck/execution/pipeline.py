@@ -7,18 +7,20 @@ from typing import Any
 
 import torch
 import torch.distributed
+import torch.fx
 from deepspeed import comm as dist
 from deepspeed.runtime.lr_schedules import WarmupLR
 from deepspeed.runtime.pipe import schedule
 from deepspeed.utils import instrument_w_nvtx, logger
 from torch.distributed import ProcessGroup, Work
+from torch.distributed.fsdp import FullyShardedDataParallel
 from torch.optim import AdamW
 from transformers.training_args import TrainingArguments
 
 from oobleck.csrc.planning.pipeline_template import PipelineTemplate
 from oobleck.execution.dataloader import OobleckDataLoader, OobleckSampler
 from oobleck.execution.utils import DTYPE_TO_ID, ID_TO_DTYPE, zero_grads
-from oobleck.module.layer import is_checkpointable
+from oobleck.module.layer import Layer, is_checkpointable
 from oobleck.module.model import OobleckModel
 from oobleck.utils.timer import OobleckTimer, measure_time
 
@@ -268,12 +270,7 @@ class PipelineExecution:
     def optimizer_step(self, lr_kwargs=None):
         # amp enable check: gradient clipping
         self.optimizer.step()
-
-        overflow = (
-            self.optimizer.overflow if hasattr(self.optimizer, "overflow") else False
-        )
-        if not overflow:
-            self.lr_scheduler.step(**(lr_kwargs or {}))
+        self.lr_scheduler.step(**(lr_kwargs or {}))
 
 
 class PipelineCommunication:
@@ -466,66 +463,245 @@ INSTRUCTION_MAP = {
 }
 
 
-# FIXME: all ranks now should be changed to the global rank.
-# TODO: Integrate FSDP.
-# NOTE: it is going to be completely recreated during reconfiguration after failure.
+class PipelineExecution:
+    """
+    Pipeline execution module that this rank will use for training.
+    For a single stage where this rank is in, there might be several ranks in FSDP group.
+
+    TODO: explain shard_id. Heterogeneous pipeline could have different number of GPUs for the same layer.
+    """
+
+    def __init__(
+        self,
+        pipeline: OobleckPipeline,
+        layers: list[FullyShardedDataParallel],
+        shard_id: int,
+        dataloader: OobleckDataLoader,
+    ):
+        self._pipeline = pipeline
+        self._layers = layers
+        self._shard_id = shard_id
+        self._dataloader = dataloader
+
+    def next_batch(self):
+        pass
+
+    def forward(self):
+        pass
+
+    def backward(self):
+        pass
+
+    def step(self):
+        pass
+
+
+class PipelineCommunication:
+    def __init__(
+        self,
+        pipeline: OobleckPipeline,
+        process_group: ProcessGroup,
+        prev_rank: int | None,
+        next_rank: int | None,
+    ):
+        self._pipeline = pipeline
+        self._process_group = process_group
+        self._prev_rank = prev_rank
+        self._next_rank = next_rank
+
+    def _send(self):
+        pass
+
+    def _recv(self):
+        pass
+
+    def send_activations(self):
+        pass
+
+    def recv_activations(self):
+        pass
+
+    def send_gradients(self):
+        pass
+
+    def recv_gradients(self):
+        pass
+
+    def is_first_stage(self) -> bool:
+        return self._prev_rank is None
+
+    def is_last_stage(self) -> bool:
+        return self._next_rank is None
+
+
 class OobleckPipeline:
     def __init__(
         self,
-        pipeline_template: PipelineTemplate,
-        model: OobleckModel,
-        dataloader: OobleckDataLoader,
         pipeline_id: int,
-        step: int,
+        pipeline_template: PipelineTemplate,
         ranks: list[int],
-        process_group: ProcessGroup,
+        dataloader: OobleckDataLoader,
+        step: int,
         training_args: TrainingArguments,
     ):
-        logger.info(f"Creating pipeline ({len(pipeline_template._stages)} stages)")
+        self._pipelind_id = pipeline_id
+        self._template = pipeline_template
+        self._ranks = ranks
+        self._dataloader = dataloader
+        self._step = step
+        self._training_args = training_args
 
         assert dist.is_initialized(), "torch.distributed is not intialized."
-        num_gpus_per_node = pipeline_template._num_gpus_per_node
-        assert (
-            len(ranks) == len(pipeline_template._stages) * num_gpus_per_node
-        ), "Number of ranks must be equal to number of stages * num_gpus_per_node."
-        self.ranks = ranks
-        self.my_rank = dist.get_rank()
-        self.pipeline_id = pipeline_id
-        assert self.my_rank in self.ranks, "My rank is not in the ranks list."
 
-        rank_index = ranks.index(self.my_rank)
+        # This is used to indicate if we use this `OobleckPipeline` for training.
+        self._my_pipeline = bool(dist.get_rank() in ranks)
+
+        # Construct a 2D rank grid for this pipeline.
+        # First dimension is for layer index, second dimension is for rank.
+        self._rank_grid: dict[int, list[int]] = {}
+        for stage in pipeline_template.get_stages():
+            stage_ranks = ranks[: stage._num_gpus]
+            ranks = ranks[stage._num_gpus :]
+
+            # If length of `stage_ranks` is less than num_gpus_per_node, adjust it
+            # so that it conforms a full 2D grid
+            if stage_ranks < pipeline_template._num_gpus_per_node:
+                stage_ranks = list(
+                    itertools.repeat(
+                        rank, pipeline_template._num_gpus_per_node // stage_ranks
+                    )
+                    for rank in stage_ranks
+                )
+
+            for layer_index in stage._layer_indices:
+                self._rank_grid[layer_index] = stage_ranks
+
+        assert len(ranks) == 0, "Not all ranks were assigned to a stage."
+
+    def get_rank_for_id(self, layer_id: int, shard_id: int) -> int:
+        return self._rank_grid[layer_id][shard_id]
+
+    def initialize_distributed_fsdp(self, model: OobleckModel):
+        """Initialize torch.distributed.process_groups per layer.
+        Even I am not involved in a group, torch.distributed requires all ranks to call
+        `new_group()`. Thus this method should be called by everyone.
+
+        Plus, if this rank is involved in a group, initialize execution.
+        """
+        self._per_layer_pgs: dict[int, ProcessGroup] = {}
+        self._execution: PipelineExecution | None = None
+
+        fsdp_layers: list[FullyShardedDataParallel] = []
+        shard_id: int = -1
+        my_rank = dist.get_rank()
+        for layer_id, ranks in self._rank_grid.items():
+            # Remove potential duplicates
+            pg = dist.new_group(list(set(ranks)))
+            self._per_layer_pgs[layer_id] = pg
+
+            # Get FSDP module if this rank is involved in this layer
+            if my_rank in ranks:
+                fsdp_layers.append(
+                    FullyShardedDataParallel(model.model[layer_id], process_group=pg)
+                )
+                shard_id = ranks.index(my_rank)
+
+        if fsdp_layers:
+            assert shard_id >= 0, "shard id is not set while fsdp_layers have layers."
+            self._execution = PipelineExecution(
+                pipeline=self,
+                layers=fsdp_layers,
+                shard_id=shard_id,
+                dataloader=self._dataloader,
+            )
+
+        assert len(self._per_layer_pgs) == len(
+            model.model
+        ), "Number of per-layer process groups and model layers must match."
+        assert all(
+            layer_index in self._per_layer_pgs
+            for layer_index in range(len(model.model))
+        ), "Process groups for some layers are not initialized."
+
+        # self._execution may not be initialized at this moment. Don't add assertion here.
+
+    def initialize_distributed_pipeline(self):
+        """Initialize torch.distributed.process_groups for a FSDP sharded pipeline.
+        Even I am not involved in a group, torch.distributed requires all ranks to call
+        `new_group()`. Thus this method should be called by everyone.
+
+        Plus, if this rank is involved in a group, initialize communication.
+        """
+        self._per_sharded_pp_pgs: dict[int, ProcessGroup] = {}
+        self._communication: PipelineCommunication | None = None
+
+        my_rank = dist.get_rank()
+        for shard_id in range(len(self._rank_grid[0])):
+            ranks: list[int] = [
+                ranks_per_layer[shard_id] for ranks_per_layer in self._rank_grid
+            ]
+            # Remove potential duplicates
+            pg = dist.new_group(list(set(ranks)))
+            self._per_sharded_pp_pgs[shard_id] = pg
+
+            if my_rank in ranks:
+                rank_index = ranks.index(my_rank)
+                self._communication = PipelineCommunication(
+                    pipeline=self,
+                    process_group=pg,
+                    prev_rank=ranks[rank_index - 1] if rank_index > 0 else None,
+                    next_rank=ranks[rank_index + 1]
+                    if rank_index < len(ranks) - 1
+                    else None,
+                )
+
+        assert len(self._per_sharded_pp_pgs) == len(
+            self._rank_grid[0]
+        ), "Number of per-shard process groups and model layers must match."
+
+        # self._communication may not be initialized at this moment. Don't add assertion here.
+
+
+# NOTE: it is going to be completely recreated during reconfiguration after failure.
+# NOTE: Must instantiate all pipelines as it includes ProcessGroup creation.
+class OobleckPipeline:
+    def __init__(
+        self,
+        pipeline_id: int,
+        stages: list[PipelineStage],
+        dataloader: OobleckDataLoader,
+        step: int,
+        training_args: TrainingArguments,
+    ):
+        logger.info(f"Creating pipeline ({len(stages)} stages)")
+        self._pipeline_id = pipeline_id
+        self._stages = stages
+        self._step = step
+        self._training_args = training_args
+
+        assert dist.is_initialized(), "torch.distributed is not intialized."
+        self.my_rank = dist.get_rank()
+        self.my_stage = next(
+            (stage for stage in stages if self.my_rank in stage.ranks), None
+        )
+        if self.my_stage is None:
+            raise RuntimeError(f"Rank {self.my_rank} is not in any stage.")
+
+        stage_index = stages.index(self.my_stage)
+        rank_index = self.my_stage.ranks.index(self.my_rank)
         self.prev_rank: int | None = (
-            ranks[rank_index - num_gpus_per_node]
-            if rank_index >= num_gpus_per_node
-            else None
+            (stages[stage_index - 1].ranks[rank_index]) if stage_index > 0 else None
         )
         self.next_rank: int | None = (
-            ranks[rank_index + num_gpus_per_node]
-            if rank_index < len(ranks) - num_gpus_per_node
+            (stages[stage_index + 1].ranks[rank_index])
+            if stage_index < len(stages) - 1
             else None
         )
-
-        self.total_num_layers = len(model.model)
-        # Find the stage I am responsible to execute
-        num_gpus_used = 0
-        for stage_index, stage in enumerate(pipeline_template._stages):
-            if rank_index in range(num_gpus_used, num_gpus_used + stage._num_gpus):
-                self.model_layers = [
-                    model.model[index].to("cuda") for index in stage._layer_indices
-                ]
-                self.my_stage_index = stage_index
-                break
-
-            num_gpus_used += stage._num_gpus
-
-        assert hasattr(
-            self, "model_layers"
-        ), f"[rank {self.my_rank}] Could not find a stage to execute."
 
         sampler: OobleckSampler = dataloader.batch_sampler
         self.train_schedule = OobleckPipelineSchedule(
-            sampler.num_microbatches[self.pipeline_id],
-            len(pipeline_template._stages),
+            sampler.num_microbatches[self._pipeline_id],
+            len(stages),
             stage_index,
         )
 
@@ -539,28 +715,17 @@ class OobleckPipeline:
             "outputs": [None for _ in range(num_pipe_buffers)],
         }
 
-        self.communication = PipelineCommunication(self, process_group)
+        # Create process groups for this pipeline
+        process_groups = [
+            dist.new_group([stage.ranks[i] for stage in stages])
+            for i in range(len(self.my_stage.ranks))
+        ]
+
+        self.communication = PipelineCommunication(self, process_groups[rank_index])
         self.execution = PipelineExecution(self, training_args, dataloader)
 
         self.timer = OobleckTimer()
         self.global_steps = step
-
-    def write_samples_logs(self):
-        lr = next(
-            iter(
-                [
-                    param_group["lr"]
-                    for param_group in self.execution.optimizer.param_groups
-                    if "lr" in param_group
-                ]
-            ),
-            0.0,
-        )
-        loss = self.execution.total_loss.mean().item() if self.is_last_stage() else -1
-        self.execution.total_loss = None
-
-        self.timer.write_events([(f"samples/lr", lr, self.global_steps)])
-        self.timer.write_events([(f"samples/train_loss", loss, self.global_steps)])
 
     def train(self):
         for step_cmds in self.train_schedule:
@@ -576,10 +741,9 @@ class OobleckPipeline:
                 _exec_instr(**cmd.kwargs)
 
         self.global_steps += 1
-        self.write_samples_logs()
 
     def is_first_stage(self):
-        return self.model_layers[0].index == 0
+        return self.prev_rank is None
 
     def is_last_stage(self):
-        return self.model_layers[-1].index == self.total_num_layers - 1
+        return self.next_rank is None
