@@ -4,6 +4,7 @@ import logging
 import math
 import multiprocessing as mp
 import random
+import time
 import traceback
 from collections import defaultdict
 from collections.abc import Callable
@@ -34,6 +35,8 @@ from oobleck.module.model import OobleckModel
 TRAIN_BATCH_SIZE = 1
 EVAL_BATCH_SIZE = 2
 GRADIENT_ACCUMULATION_STEP = 4
+
+logging.basicConfig(level=logging.INFO)
 
 
 @dataclass
@@ -338,7 +341,7 @@ class OobleckTestProcess:
                 torch.cuda.set_device(0)
 
                 store = torch.distributed.FileStore(
-                    str(self._directory / f"{world_size}_store"),
+                    str(self._directory / f"{world_size}_{test.__name__}_store"),
                     world_size,
                 )
 
@@ -371,7 +374,11 @@ class OobleckTestProcess:
                 torch.distributed.barrier()
                 torch.distributed.destroy_process_group()
                 dist.cdb = None
-                (self._directory / f"{world_size}_store").unlink(missing_ok=True)
+                store = self._directory / f"{world_size}_{test.__name__}_store"
+                store.unlink(missing_ok=True)
+                while store.exists():
+                    logging.info("Waiting for store to be deleted...")
+                    time.sleep(1)
                 monkeypatch.undo()
 
         logging.info(f"Rank {self._rank} in world size {world_size} finished.")
@@ -442,7 +449,7 @@ class OobleckMultiProcessTestCase:
         results: list[Any] = [None] * len(procs)
         try:
             for index, (_, pipe) in enumerate(procs):
-                if not pipe.poll(timeout=30):
+                if not pipe.poll(timeout=60):
                     raise TimeoutError()
 
                 result = pipe.recv()
