@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import itertools
 from collections.abc import Iterable, Mapping
 from types import MethodType
@@ -151,7 +152,7 @@ class PipelineExecution:
                 [
                     output
                     if torch.is_tensor(output)
-                    else torch.LongTensor(data=output).to(self._device)
+                    else torch.LongTensor(data=output).to(self._pipeline.device)
                     for output in outputs
                 ]
             )
@@ -178,6 +179,7 @@ class PipelineExecution:
         # Free up memory from the output of forward()
         self._pipeline.pipe_buffers["outputs"][buffer_id] = None
         grad_tensors = None
+        self._loss = None
 
     def optimizer_step(self, lr_kwargs=None):
         # amp enable check: gradient clipping
@@ -507,7 +509,7 @@ class OobleckPipeline:
             if my_rank in ranks:
                 fsdp_layers.append(
                     FullyShardedDataParallel(
-                        model.model[layer_id].to("cuda"),
+                        copy.deepcopy(model.model[layer_id]).to("cuda"),
                         process_group=pg,
                         device_id=self.device,
                     )

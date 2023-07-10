@@ -27,10 +27,12 @@ class Layer(torch.nn.Module):
     def __init__(
         self, index: int, layer: torch.fx.GraphModule, training_args: TrainingArguments
     ):
+        self.layer: torch.fx.GraphModule
+
         super().__init__()
         self.index = index
         self.add_module("layer", layer)
-        self.checkpointable = False
+        self.checkpointable = is_checkpointable(layer)
 
         # TODO: will be used for fp16/bf16
         self.training_args = training_args
@@ -38,9 +40,6 @@ class Layer(torch.nn.Module):
         # Load pre-installed or JIT compile (un)flatten ops
         self.flatten = _flatten_dense_tensors
         self.unflatten = _unflatten_dense_tensors
-
-    def set_checkpointable(self, checkpointable: bool):
-        self.checkpointable = checkpointable
 
     def forward(self, *args):
         if self.checkpointable:
