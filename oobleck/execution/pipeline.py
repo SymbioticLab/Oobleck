@@ -511,7 +511,7 @@ class OobleckPipeline:
                     FullyShardedDataParallel(
                         copy.deepcopy(model.model[layer_id]).to("cuda"),
                         process_group=pg,
-                        device_id=self.device,
+                        use_orig_params=True,
                     )
                 )
                 shard_id = ranks.index(my_rank)
