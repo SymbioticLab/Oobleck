@@ -273,182 +273,6 @@ class PipelineExecution:
         self.lr_scheduler.step(**(lr_kwargs or {}))
 
 
-class PipelineCommunication:
-    def __init__(
-        self,
-        pipeline: OobleckPipeline,
-        process_group: ProcessGroup,
-    ):
-        self.pipeline = pipeline
-        self.device = torch.device("cuda")
-        self.process_group = process_group
-
-        self.sent_activation_meta: bool = False
-        # initialized in :func:`oobleck.execution.PipelineCommunication.recv_activations`.
-        self.activation_recv_buf: tuple[torch.Tensor] | None = None
-        # initialized in :func:`oobleck.execution.PipelineCommunication.recv_gradients`.
-        self.grad_recv_buf: tuple[torch.Tensor] | None = None
-
-    def _send(
-        self, tensor: torch.Tensor, dest_rank: int, async_op: bool = False
-    ) -> Work:
-        return (
-            dist.isend(tensor, dest_rank, self.process_group)
-            if async_op
-            else dist.send(tensor, dest_rank, self.process_group)
-        )
-
-    def _recv(
-        self, tensor: torch.Tensor, src_rank: int, async_op: bool = False
-    ) -> Work:
-        return (
-            dist.irecv(tensor, src_rank, self.process_group)
-            if async_op
-            else dist.recv(tensor, src_rank, self.process_group)
-        )
-
-    @measure_time("comm/send_activations")
-    def send_activations(self, buffer_id: int):
-        def _send_activation_meta(buffer: tuple[torch.Tensor], receiver_rank: int):
-            """Send activation dimension first to the next stage
-            so that it can initialize buffers.
-
-            Metadata is communicated in this order:
-                * num_tensors in tensor tuple
-                foreeach tensor in buffer:
-                    * ndims
-                    * dtype
-                    * shape
-                    * requires_grad
-            """
-            assert isinstance(
-                buffer, tuple
-            ), f"Could not send meta type {type(buffer)}."
-            count_tensor = torch.LongTensor(data=[len(buffer)]).to(self.device)
-            self._send(count_tensor, receiver_rank)
-            for tensor in buffer:
-                assert isinstance(tensor, torch.Tensor)
-                send_ndims = torch.LongTensor(data=[len(tensor.size())]).to(self.device)
-                send_dtype = torch.LongTensor(data=[DTYPE_TO_ID[tensor.dtype]]).to(
-                    self.device
-                )
-                send_shape = torch.LongTensor(data=tensor.size()).to(self.device)
-                send_req_grad = torch.LongTensor(
-                    data=[1 if tensor.requires_grad else 0]
-                ).to(self.device)
-                self._send(send_ndims, receiver_rank)
-                self._send(send_dtype, receiver_rank)
-                self._send(send_shape, receiver_rank)
-                self._send(send_req_grad, receiver_rank)
-
-        outputs: tuple[torch.Tensor] = self.pipeline.pipe_buffers["outputs"][buffer_id]
-        if not self.sent_activation_meta:
-            _send_activation_meta(outputs, self.pipeline.next_rank)
-            self.sent_activation_meta = True
-
-        assert isinstance(outputs, tuple)
-        for buffer in outputs:
-            assert isinstance(buffer, torch.Tensor)
-            self._send(buffer, self.pipeline.next_rank)
-
-    @measure_time("comm/recv_activations")
-    def recv_activations(self, buffer_id: int):
-        def create_receive_buffer(sender_rank: int) -> tuple[torch.Tensor]:
-            """Receive metadata about upcoming p2p transfers and return allocated buffer.
-
-            Metadata is communicated in this order:
-                * num_tensors in tensor tuple
-                foreeach tensor in buffer:
-                    * ndims
-                    * dtype
-                    * shape
-                    * requires_grad
-            """
-            count_tensor = torch.LongTensor(data=[0]).to(self.device)
-            self._recv(count_tensor, sender_rank)
-            num_tensors = count_tensor.item()
-            buffers: list[torch.Tensor] = []
-            for _ in range(num_tensors):
-                recv_ndims = torch.LongTensor(data=[0]).to(self.device)
-                self._recv(recv_ndims, sender_rank)
-                recv_ndims = recv_ndims.item()
-
-                recv_dtype = torch.LongTensor(data=[0]).to(self.device)
-                self._recv(recv_dtype, sender_rank)
-                recv_dtype = ID_TO_DTYPE[recv_dtype.item()]
-
-                recv_shape = torch.LongTensor([1] * recv_ndims).to(self.device)
-                self._recv(recv_shape, sender_rank)
-                recv_shape = recv_shape.tolist()
-
-                recv_req_grad = torch.LongTensor(data=[0]).to(self.device)
-                self._recv(recv_req_grad, sender_rank)
-                recv_req_grad = True if recv_req_grad.item() == 1 else False
-
-                buffers.append(
-                    torch.zeros(
-                        recv_shape,
-                        device=self.device,
-                        dtype=recv_dtype,
-                        requires_grad=recv_req_grad,
-                    )
-                )
-            return tuple(buffers)
-
-        if self.activation_recv_buf is None:
-            self.activation_recv_buf = create_receive_buffer(self.pipeline.prev_rank)
-
-        assert isinstance(self.activation_recv_buf, tuple)
-        recvd: list[torch.Tensor | None] = [None] * len(self.activation_recv_buf)
-        for idx, buffer in enumerate(self.activation_recv_buf):
-            assert torch.is_tensor(buffer)
-            self._recv(buffer, self.pipeline.prev_rank)
-            recvd[idx] = buffer.clone().detach()
-            recvd[idx].requires_grad = buffer.requires_grad
-
-        self.pipeline.pipe_buffers["inputs"][buffer_id] = tuple(recvd)
-
-    @measure_time("comm/send_gradients")
-    def send_gradients(self, buffer_id: int):
-        inputs = self.pipeline.pipe_buffers["inputs"][buffer_id]
-        assert isinstance(inputs, tuple)
-
-        for buffer in inputs:
-            # Skip tensors that will not produce a gradient
-            if not buffer.requires_grad:
-                assert buffer.grad is None
-                continue
-            assert buffer.grad is not None
-            self._send(buffer.grad, self.pipeline.prev_rank)
-
-        # We can free up the input buffer now
-        self.pipeline.pipe_buffers["inputs"][buffer_id] = None
-
-    @measure_time("comm/recv_gradients")
-    def recv_gradients(self, buffer_id: int):
-        def create_gradients_buffer(
-            tensors: tuple[torch.Tensor],
-        ) -> tuple[torch.Tensor]:
-            assert isinstance(tensors, tuple)
-            buffers: list[torch.Tensor] = []
-            for tensor in tensors:
-                assert isinstance(tensor, torch.Tensor)
-                if tensor.requires_grad:
-                    buffers.append(torch.zeros_like(tensor))
-
-            return tuple(buffers)
-
-        outputs = self.pipeline.pipe_buffers["outputs"][buffer_id]
-        assert isinstance(outputs, tuple)
-
-        # Allocate gradients if necessary
-        if self.grad_recv_buf is None:
-            self.grad_recv_buf = create_gradients_buffer(outputs)
-
-        for buffer in self.grad_recv_buf:
-            self._recv(buffer, self.pipeline.next_rank)
-
-
 # A map of PipeInstruction types to methods. Each method will be executed with the
 # kwargs provided to the PipeInstruction from the scheduler.
 INSTRUCTION_MAP = {
@@ -504,28 +328,172 @@ class PipelineCommunication:
         prev_rank: int | None,
         next_rank: int | None,
     ):
+        self.device = torch.device("cuda")
         self._pipeline = pipeline
         self._process_group = process_group
         self._prev_rank = prev_rank
         self._next_rank = next_rank
 
-    def _send(self):
-        pass
+        self.sent_activation_meta: bool = False
+        # initialized in :func:`oobleck.execution.PipelineCommunication.recv_activations`.
+        self.activation_recv_buf: tuple[torch.Tensor] | None = None
+        # initialized in :func:`oobleck.execution.PipelineCommunication.recv_gradients`.
+        self.grad_recv_buf: tuple[torch.Tensor] | None = None
 
-    def _recv(self):
-        pass
+    def _send(
+        self, tensor: torch.Tensor, dest_rank: int, async_op: bool = False
+    ) -> Work:
+        return (
+            dist.isend(tensor, dest_rank, self._process_group)
+            if async_op
+            else dist.send(tensor, dest_rank, self._process_group)
+        )
 
-    def send_activations(self):
-        pass
+    def _recv(
+        self, tensor: torch.Tensor, src_rank: int, async_op: bool = False
+    ) -> Work:
+        return (
+            dist.irecv(tensor, src_rank, self._process_group)
+            if async_op
+            else dist.recv(tensor, src_rank, self._process_group)
+        )
 
-    def recv_activations(self):
-        pass
+    def send_activations(self, buffer_id: int):
+        def _send_activation_meta(buffer: tuple[torch.Tensor], receiver_rank: int):
+            """Send activation dimension first to the next stage
+            so that it can initialize buffers.
 
-    def send_gradients(self):
-        pass
+            Metadata is communicated in this order:
+                * num_tensors in tensor tuple
+                foreeach tensor in buffer:
+                    * ndims
+                    * dtype
+                    * shape
+                    * requires_grad
+            """
+            assert isinstance(
+                buffer, tuple
+            ), f"Could not send meta type {type(buffer)}."
+            count_tensor = torch.LongTensor(data=[len(buffer)]).to(self.device)
+            self._send(count_tensor, receiver_rank)
+            for tensor in buffer:
+                assert isinstance(tensor, torch.Tensor)
+                send_ndims = torch.LongTensor(data=[len(tensor.size())]).to(self.device)
+                send_dtype = torch.LongTensor(data=[DTYPE_TO_ID[tensor.dtype]]).to(
+                    self.device
+                )
+                send_shape = torch.LongTensor(data=tensor.size()).to(self.device)
+                send_req_grad = torch.LongTensor(
+                    data=[1 if tensor.requires_grad else 0]
+                ).to(self.device)
+                self._send(send_ndims, receiver_rank)
+                self._send(send_dtype, receiver_rank)
+                self._send(send_shape, receiver_rank)
+                self._send(send_req_grad, receiver_rank)
 
-    def recv_gradients(self):
-        pass
+        outputs: tuple[torch.Tensor] = self._pipeline.pipe_buffers["outputs"][buffer_id]
+        if not self.sent_activation_meta:
+            _send_activation_meta(outputs, self._next_rank)
+            self.sent_activation_meta = True
+
+        assert isinstance(outputs, tuple)
+        for buffer in outputs:
+            assert isinstance(buffer, torch.Tensor)
+            self._send(buffer, self._next_rank)
+
+    def recv_activations(self, buffer_id: int):
+        def create_receive_buffer(sender_rank: int) -> tuple[torch.Tensor]:
+            """Receive metadata about upcoming p2p transfers and return allocated buffer.
+
+            Metadata is communicated in this order:
+                * num_tensors in tensor tuple
+                foreeach tensor in buffer:
+                    * ndims
+                    * dtype
+                    * shape
+                    * requires_grad
+            """
+            count_tensor = torch.LongTensor(data=[0]).to(self.device)
+            self._recv(count_tensor, sender_rank)
+            num_tensors = count_tensor.item()
+            buffers: list[torch.Tensor] = []
+            for _ in range(num_tensors):
+                recv_ndims = torch.LongTensor(data=[0]).to(self.device)
+                self._recv(recv_ndims, sender_rank)
+                recv_ndims = recv_ndims.item()
+
+                recv_dtype = torch.LongTensor(data=[0]).to(self.device)
+                self._recv(recv_dtype, sender_rank)
+                recv_dtype = ID_TO_DTYPE[recv_dtype.item()]
+
+                recv_shape = torch.LongTensor([1] * recv_ndims).to(self.device)
+                self._recv(recv_shape, sender_rank)
+                recv_shape = recv_shape.tolist()
+
+                recv_req_grad = torch.LongTensor(data=[0]).to(self.device)
+                self._recv(recv_req_grad, sender_rank)
+                recv_req_grad = True if recv_req_grad.item() == 1 else False
+
+                buffers.append(
+                    torch.zeros(
+                        recv_shape,
+                        device=self.device,
+                        dtype=recv_dtype,
+                        requires_grad=recv_req_grad,
+                    )
+                )
+            return tuple(buffers)
+
+        if self.activation_recv_buf is None:
+            self.activation_recv_buf = create_receive_buffer(self._prev_rank)
+
+        assert isinstance(self.activation_recv_buf, tuple)
+        recvd: list[torch.Tensor | None] = [None] * len(self.activation_recv_buf)
+        for idx, buffer in enumerate(self.activation_recv_buf):
+            assert torch.is_tensor(buffer)
+            self._recv(buffer, self._prev_rank)
+            recvd[idx] = buffer.clone().detach()
+            recvd[idx].requires_grad = buffer.requires_grad
+
+        self._pipeline.pipe_buffers["inputs"][buffer_id] = tuple(recvd)
+
+    def send_gradients(self, buffer_id: int):
+        inputs = self._pipeline.pipe_buffers["inputs"][buffer_id]
+        assert isinstance(inputs, tuple)
+
+        for buffer in inputs:
+            # Skip tensors that will not produce a gradient
+            if not buffer.requires_grad:
+                assert buffer.grad is None
+                continue
+            assert buffer.grad is not None
+            self._send(buffer.grad, self._prev_rank)
+
+        # We can free up the input buffer now
+        self._pipeline.pipe_buffers["inputs"][buffer_id] = None
+
+    def recv_gradients(self, buffer_id: int):
+        def create_gradients_buffer(
+            tensors: tuple[torch.Tensor],
+        ) -> tuple[torch.Tensor]:
+            assert isinstance(tensors, tuple)
+            buffers: list[torch.Tensor] = []
+            for tensor in tensors:
+                assert isinstance(tensor, torch.Tensor)
+                if tensor.requires_grad:
+                    buffers.append(torch.zeros_like(tensor))
+
+            return tuple(buffers)
+
+        outputs = self._pipeline.pipe_buffers["outputs"][buffer_id]
+        assert isinstance(outputs, tuple)
+
+        # Allocate gradients if necessary
+        if self.grad_recv_buf is None:
+            self.grad_recv_buf = create_gradients_buffer(outputs)
+
+        for buffer in self.grad_recv_buf:
+            self._recv(buffer, self._next_rank)
 
     def is_first_stage(self) -> bool:
         return self._prev_rank is None
