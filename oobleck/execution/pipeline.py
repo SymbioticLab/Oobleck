@@ -44,7 +44,6 @@ class PipelineExecution:
         self._dataloader = dataloader
         self._data_iterator = iter(self._dataloader)
         self._training_args = training_args
-        self._device = torch.cuda("device")
 
         # stores the loss for the current microbatch being processed
         self._loss: torch.Tensor | Iterable[torch.Tensor] | None = None
@@ -78,7 +77,7 @@ class PipelineExecution:
         elif isinstance(data, (tuple, list)):
             return type(data)(self._prepare_input(v) for v in data)
         elif isinstance(data, torch.Tensor):
-            data = data.clone().detach().to(self.device)
+            data = data.clone().detach().to(self._pipeline.device)
             data.requires_grad = data.is_floating_point()
             return data
         return data
@@ -194,7 +193,6 @@ class PipelineCommunication:
         prev_rank: int | None,
         next_rank: int | None,
     ):
-        self.device = torch.device("cuda")
         self._pipeline = pipeline
         self._process_group = process_group
         self.prev_rank = prev_rank
@@ -240,18 +238,24 @@ class PipelineCommunication:
             assert isinstance(
                 buffer, tuple
             ), f"Could not send meta type {type(buffer)}."
-            count_tensor = torch.LongTensor(data=[len(buffer)]).to(self.device)
+            count_tensor = torch.LongTensor(data=[len(buffer)]).to(
+                self._pipeline.device
+            )
             self._send(count_tensor, receiver_rank)
             for tensor in buffer:
                 assert isinstance(tensor, torch.Tensor)
-                send_ndims = torch.LongTensor(data=[len(tensor.size())]).to(self.device)
-                send_dtype = torch.LongTensor(data=[DTYPE_TO_ID[tensor.dtype]]).to(
-                    self.device
+                send_ndims = torch.LongTensor(data=[len(tensor.size())]).to(
+                    self._pipeline.device
                 )
-                send_shape = torch.LongTensor(data=tensor.size()).to(self.device)
+                send_dtype = torch.LongTensor(data=[DTYPE_TO_ID[tensor.dtype]]).to(
+                    self._pipeline.device
+                )
+                send_shape = torch.LongTensor(data=tensor.size()).to(
+                    self._pipeline.device
+                )
                 send_req_grad = torch.LongTensor(
                     data=[1 if tensor.requires_grad else 0]
-                ).to(self.device)
+                ).to(self._pipeline.device)
                 self._send(send_ndims, receiver_rank)
                 self._send(send_dtype, receiver_rank)
                 self._send(send_shape, receiver_rank)
@@ -279,31 +283,33 @@ class PipelineCommunication:
                     * shape
                     * requires_grad
             """
-            count_tensor = torch.LongTensor(data=[0]).to(self.device)
+            count_tensor = torch.LongTensor(data=[0]).to(self._pipeline.device)
             self._recv(count_tensor, sender_rank)
             num_tensors = count_tensor.item()
             buffers: list[torch.Tensor] = []
             for _ in range(num_tensors):
-                recv_ndims = torch.LongTensor(data=[0]).to(self.device)
+                recv_ndims = torch.LongTensor(data=[0]).to(self._pipeline.device)
                 self._recv(recv_ndims, sender_rank)
                 recv_ndims = recv_ndims.item()
 
-                recv_dtype = torch.LongTensor(data=[0]).to(self.device)
+                recv_dtype = torch.LongTensor(data=[0]).to(self._pipeline.device)
                 self._recv(recv_dtype, sender_rank)
                 recv_dtype = ID_TO_DTYPE[recv_dtype.item()]
 
-                recv_shape = torch.LongTensor([1] * recv_ndims).to(self.device)
+                recv_shape = torch.LongTensor([1] * recv_ndims).to(
+                    self._pipeline.device
+                )
                 self._recv(recv_shape, sender_rank)
                 recv_shape = recv_shape.tolist()
 
-                recv_req_grad = torch.LongTensor(data=[0]).to(self.device)
+                recv_req_grad = torch.LongTensor(data=[0]).to(self._pipeline.device)
                 self._recv(recv_req_grad, sender_rank)
                 recv_req_grad = True if recv_req_grad.item() == 1 else False
 
                 buffers.append(
                     torch.zeros(
                         recv_shape,
-                        device=self.device,
+                        device=self._pipeline.device,
                         dtype=recv_dtype,
                         requires_grad=recv_req_grad,
                     )
@@ -392,6 +398,7 @@ class OobleckPipeline:
         self._dataloader = dataloader
         self._global_step = step
         self._training_args = training_args
+        self.device = torch.cuda("device")
 
         assert dist.is_initialized(), "torch.distributed is not intialized."
 
@@ -498,7 +505,9 @@ class OobleckPipeline:
             # Get FSDP module if this rank is involved in this layer
             if my_rank in ranks:
                 fsdp_layers.append(
-                    FullyShardedDataParallel(model.model[layer_id], process_group=pg)
+                    FullyShardedDataParallel(
+                        model.model[layer_id], process_group=pg, device_id=self.device
+                    )
                 )
                 shard_id = ranks.index(my_rank)
 
