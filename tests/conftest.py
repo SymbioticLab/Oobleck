@@ -24,7 +24,7 @@ from oobleck.csrc.planning.pipeline_template import (
 )
 from oobleck.execution.dataloader import LoaderType, OobleckDataLoader
 from oobleck.execution.dataset import OobleckDataset
-from oobleck.execution.pipeline import OobleckPipeline, PipelineStage
+from oobleck.execution.pipeline import OobleckPipeline
 from oobleck.module.model import OobleckModel
 
 TRAIN_BATCH_SIZE = 1
@@ -229,20 +229,19 @@ class OobleckDynamicClassFactory:
         training_args = self._static_factory._training_args
         dataloader = self.get_dataloader(0, [training_args.gradient_accumulation_steps])
 
-        pg = torch.distributed.new_group(self._ranks)
-        stage = PipelineStage(
-            model,
-            template._stages[0],
-            self._ranks,
-            pg,
-        )
-        return OobleckPipeline(
+        pipeline = OobleckPipeline(
             pipeline_id=0,
-            stages=[stage],
+            pipeline_template=template,
+            ranks=self._ranks,
             dataloader=dataloader,
             step=0,
             training_args=training_args,
         )
+
+        pipeline.initialize_distributed_fsdp(model)
+        pipeline.initialize_distributed_pipeline()
+
+        return pipeline
 
 
 class OobleckSingleProcessTestCase:

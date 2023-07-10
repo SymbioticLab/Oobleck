@@ -64,7 +64,7 @@ class PipelineExecution:
         )
         num_training_steps = len(self._dataloader)
         self._lr_scheduler = WarmupLR(
-            self.optimizer, self._training_args.get_warmup_steps(num_training_steps)
+            self._optimizer, self._training_args.get_warmup_steps(num_training_steps)
         )
 
     # https://github.com/huggingface/transformers/blob/v4.26.1/src/transformers/trainer.py#L2454
@@ -414,7 +414,7 @@ class OobleckPipeline:
 
             # If length of `stage_ranks` is less than num_gpus_per_node, adjust it
             # so that it conforms a full 2D grid
-            if stage_ranks < pipeline_template._num_gpus_per_node:
+            if stage._num_gpus < pipeline_template._num_gpus_per_node:
                 stage_ranks = list(
                     itertools.repeat(
                         rank, pipeline_template._num_gpus_per_node // stage_ranks
@@ -445,7 +445,7 @@ class OobleckPipeline:
     def get_rank_for_id(self, layer_id: int, shard_id: int) -> int:
         return self._rank_grid[layer_id][shard_id]
 
-    def initialize_execution(
+    def _initialize_execution(
         self,
         layers: list[FullyShardedDataParallel],
         shard_id: int,
@@ -455,6 +455,7 @@ class OobleckPipeline:
             layers=layers,
             shard_id=shard_id,
             dataloader=self._dataloader,
+            training_args=self._training_args,
         )
 
         # initialize_execution assumes to be called only if this rank is involved in
@@ -470,7 +471,7 @@ class OobleckPipeline:
         sampler: OobleckSampler = self._dataloader.batch_sampler
         self.train_schedule = schedule.TrainSchedule(
             micro_batches=sampler.num_microbatches[self._pipeline_id],
-            num_stages=len(self._template.get_stages()),
+            stages=len(self._template.get_stages()),
             stage_id=my_stage_index,
         )
 
@@ -506,14 +507,16 @@ class OobleckPipeline:
             if my_rank in ranks:
                 fsdp_layers.append(
                     FullyShardedDataParallel(
-                        model.model[layer_id], process_group=pg, device_id=self.device
+                        model.model[layer_id].to("cuda"),
+                        process_group=pg,
+                        device_id=self.device,
                     )
                 )
                 shard_id = ranks.index(my_rank)
 
         if fsdp_layers:
             assert shard_id >= 0, "shard id is not set while fsdp_layers have layers."
-            self.initialize_execution(fsdp_layers, shard_id)
+            self._initialize_execution(fsdp_layers, shard_id)
 
         assert len(self._per_layer_pgs) == len(
             model.model
@@ -538,20 +541,22 @@ class OobleckPipeline:
         my_rank = dist.get_rank()
         for shard_id in range(len(self._rank_grid[0])):
             ranks: list[int] = [
-                ranks_per_layer[shard_id] for ranks_per_layer in self._rank_grid
+                ranks_per_layer[shard_id]
+                for ranks_per_layer in self._rank_grid.values()
             ]
             # Remove potential duplicates
             pg = dist.new_group(list(set(ranks)))
             self._per_sharded_pp_pgs[shard_id] = pg
 
             if my_rank in ranks:
-                rank_index = ranks.index(my_rank)
+                unique_ranks = list(set(ranks))
+                rank_index = unique_ranks.index(my_rank)
                 self.communication = PipelineCommunication(
                     pipeline=self,
                     process_group=pg,
-                    prev_rank=ranks[rank_index - 1] if rank_index > 0 else None,
-                    next_rank=ranks[rank_index + 1]
-                    if rank_index < len(ranks) - 1
+                    prev_rank=unique_ranks[rank_index - 1] if rank_index > 0 else None,
+                    next_rank=unique_ranks[rank_index + 1]
+                    if rank_index < len(unique_ranks) - 1
                     else None,
                 )
 

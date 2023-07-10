@@ -25,17 +25,17 @@ class TestOobleckSingleStagePipeline(OobleckMultiProcessTestCase):
         pipeline = dfactory.get_dummy_pipeline(
             num_stages=1, num_gpus_per_node=num_gpus_per_node
         )
-        assert pipeline.prev_rank is None
-        assert pipeline.next_rank is None
+        assert pipeline.communication.prev_rank is None
+        assert pipeline.communication.next_rank is None
 
         # Because we only have one rank, it should execute all layers in the model
-        assert len(pipeline.model_layers) == len(model.model)
+        assert len(pipeline.execution._layers) == len(model.model)
 
-        assert isinstance(pipeline.execution.optimizer, AdamW)
-        assert isinstance(pipeline.execution.lr_scheduler, WarmupLR)
-        assert pipeline.global_steps == 0
+        assert isinstance(pipeline.execution._optimizer, AdamW)
+        assert isinstance(pipeline.execution._lr_scheduler, WarmupLR)
+        assert pipeline._global_step == 0
 
-        for layer in pipeline.model_layers:
+        for layer in pipeline.execution._layers:
             assert all(p.is_cuda for p in layer.parameters())
 
     @pytest.mark.parametrize(
@@ -111,7 +111,7 @@ class TestOobleckSingleStagePipeline(OobleckMultiProcessTestCase):
         # before backward pass, check grad are none
         assert all(
             all(p.grad is None for p in layer.parameters())
-            for layer in pipeline.model_layers
+            for layer in pipeline.execution._layers
         )
 
         pipeline.execution.backward_pass(buffer_id=0)
@@ -125,7 +125,7 @@ class TestOobleckSingleStagePipeline(OobleckMultiProcessTestCase):
                 p._grad is not None if p.requires_grad else None
                 for p in layer.parameters()
             )
-            for layer in pipeline.model_layers
+            for layer in pipeline.execution._layers
         )
 
     @staticmethod
@@ -142,14 +142,14 @@ class TestOobleckSingleStagePipeline(OobleckMultiProcessTestCase):
         pipeline.execution.backward_pass(buffer_id=0)
 
         # optimizer must not have internal data for now
-        for p in pipeline.execution.optimizer.param_groups[0]["params"]:
-            assert len(pipeline.execution.optimizer.state[p]) == 0
+        for p in pipeline.execution._optimizer.param_groups[0]["params"]:
+            assert len(pipeline.execution._optimizer.state[p]) == 0
 
         pipeline.execution.optimizer_step()
 
         # optimizer must have internal data for now
-        for p in pipeline.execution.optimizer.param_groups[0]["params"]:
-            assert len(pipeline.execution.optimizer.state[p]) > 0
+        for p in pipeline.execution._optimizer.param_groups[0]["params"]:
+            assert len(pipeline.execution._optimizer.state[p]) > 0
 
     @pytest.mark.parametrize(
         "func_name",
@@ -183,12 +183,12 @@ class TestMultiStagePipeline(OobleckMultiProcessTestCase):
             None if dfactory._my_rank == 3 else dfactory._my_rank + 1
         )
 
-        assert len(pipeline.model_layers) < len(model.model)
+        assert len(pipeline.execution._layers) < len(model.model)
 
-        for layer in pipeline.model_layers:
+        for layer in pipeline.execution._layers:
             assert all(p.is_cuda for p in layer.parameters())
 
-        return (len(pipeline.model_layers), len(model.model))
+        return (len(pipeline.execution._layers), len(model.model))
 
     def test_attributes_type(self):
         results = self.run_in_parallel(
@@ -263,7 +263,7 @@ class TestMultiStagePipeline(OobleckMultiProcessTestCase):
         assert pipeline.communication.grad_recv_buf is None
         assert all(
             all(p.grad is None for p in layer.parameters())
-            for layer in pipeline.model_layers
+            for layer in pipeline.execution._layers
         )
 
         # start backward
@@ -284,7 +284,7 @@ class TestMultiStagePipeline(OobleckMultiProcessTestCase):
 
         assert all(
             all(p.grad is not None for p in layer.parameters() if p.requires_grad)
-            for layer in pipeline.model_layers
+            for layer in pipeline.execution._layers
         )
 
     @pytest.mark.parametrize(
