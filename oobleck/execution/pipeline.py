@@ -398,7 +398,7 @@ class OobleckPipeline:
         self._dataloader = dataloader
         self._global_step = step
         self._training_args = training_args
-        self.device = torch.cuda("device")
+        self.device = torch.device("cuda")
 
         assert dist.is_initialized(), "torch.distributed is not intialized."
 
@@ -475,7 +475,7 @@ class OobleckPipeline:
         )
 
         num_pipe_buffers = self.train_schedule.num_pipe_buffers()
-        self.pipe_buffers: dict[str, tuple[torch.Tensor]] = {
+        self.pipe_buffers: dict[str, list[tuple[torch.Tensor] | None]] = {
             # batch input and received activations
             "inputs": [None for _ in range(num_pipe_buffers)],
             # labels from batch input
