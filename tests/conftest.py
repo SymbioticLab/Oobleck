@@ -1,19 +1,23 @@
 from __future__ import annotations
 
+import logging
 import math
 import multiprocessing as mp
-import os
 import random
 import traceback
+from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
+from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import deepspeed.comm as dist
 import pytest
 import torch
 import torch.distributed
+from pytest_mock import MockerFixture
 from transformers.training_args import TrainingArguments
 
 from oobleck.csrc.planning.pipeline_template import (
@@ -55,7 +59,7 @@ model_args: dict[str, dict[str, int] | None] = {
 }
 
 
-@pytest.fixture(scope="class", params=list(models_to_test.keys()))
+@pytest.fixture(scope="session", params=list(models_to_test.keys()))
 def model_name_fixture(request: pytest.FixtureRequest) -> str:
     return request.param
 
@@ -67,7 +71,7 @@ class OobleckStaticClassFactory:
     and fixed once a class object is created.
     """
 
-    def __init__(self, model_name: str, test_directory: str):
+    def __init__(self, model_name: str, test_directory: Path):
         self._model_data: Model = models_to_test[model_name]
         self._training_args = TrainingArguments(
             output_dir=test_directory,
@@ -244,21 +248,31 @@ class OobleckDynamicClassFactory:
         return pipeline
 
 
+@pytest.fixture(scope="session", autouse=True)
+def factory(
+    model_name_fixture: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> OobleckStaticClassFactory:
+    directory = tmp_path_factory.mktemp(
+        f"single_process_{model_name_fixture.replace('/', '-')}"
+    )
+    return OobleckStaticClassFactory(model_name_fixture, directory)
+
+
 class OobleckSingleProcessTestCase:
     """
     A base class for Oobleck test cases that run in a single process.
     Test cases for functionalities of static classes will inherit this class.
     """
 
-    factory: OobleckStaticClassFactory
-
     @pytest.fixture(scope="function", autouse=False)
-    def distributed(self, model: OobleckModel, request: pytest.FixtureRequest):
+    def distributed(self, mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
         assert not dist.is_initialized() and not torch.distributed.is_initialized()
 
         # envs required by deepspeed.comm
-        os.environ["RANK"] = "0"
-        os.environ["WORLD_SIZE"] = "1"
+        monkeypatch.setenv("RANK", "0")
+        monkeypatch.setenv("WORLD_SIZE", "1")
+
         # Initialize a single process torch.distributed group.
         store = torch.distributed.HashStore()
         torch.distributed.init_process_group(
@@ -274,27 +288,87 @@ class OobleckSingleProcessTestCase:
         dist.cdb = None
         assert not torch.distributed.is_initialized()
         assert not dist.is_initialized()
-        os.environ.pop("RANK")
-        os.environ.pop("WORLD_SIZE")
 
-    @classmethod
-    @pytest.fixture(scope="class", autouse=True)
-    def setup_class(
-        cls,
-        model_name_fixture: str,
-        tmp_path_factory: pytest.TempPathFactory,
-        request: pytest.FixtureRequest,
+
+class OobleckTestProcess:
+    def __init__(
+        self,
+        pipe: Connection,
+        rank: int,
+        world_size: int,
+        model_name: str,
+        directory: Path,
     ):
-        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-        device_count_backup = torch.cuda.device_count
-        torch.cuda.device_count = lambda: 1
-        directory = tmp_path_factory.getbasetemp()
-        request.cls.factory = OobleckStaticClassFactory(model_name_fixture, directory)
+        logging.info(f"Launching rank{rank} in world size {world_size}")
+        self._pipe = pipe
+        self._rank = rank
+        self._world_size = world_size
 
-        yield
+        # Very careful initialization dependency due to too many third-party libraries.
+        # As we use torch.distributed.FileStore for distributed initialization, it doesn't require
+        # os envs (MASTER_ADDR, MASTER_PORT), while deepspeed and HuggingFace by default use them.
+        # Thus, initialize StaticClassFactory (which relies on HF) first without the envs.
+        # Then, initialize distributed and deepspeed.
+        # After that, create dynamic class factory since it requires distributed configuration.
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", str(rank))
+        monkeypatch.delenv("RANK", raising=False)
+        monkeypatch.delenv("WORLD_SIZE", raising=False)
 
-        os.environ.pop("CUDA_VISIBLE_DEVICES")
-        torch.cuda.device_count = device_count_backup
+        patcher = patch("torch.cuda.device_count", return_value=1)
+        patcher.start()
+
+        self.factory = OobleckStaticClassFactory(model_name, directory)
+
+        monkeypatch.setenv("RANK", str(rank))
+        monkeypatch.setenv("WORLD_SIZE", str(world_size))
+
+        store = torch.distributed.FileStore(
+            str(directory / f"{world_size}_store"),
+            world_size,
+        )
+
+        torch.distributed.init_process_group(
+            backend="nccl", store=store, rank=rank, world_size=world_size
+        )
+        dist.init_distributed(dist_backend="nccl", dist_init_required=False)
+
+        self.run()
+
+    def run(self):
+        test: Callable
+        args: tuple
+
+        while True:
+            try:
+                test, args = self._pipe.recv()
+                if test is None:
+                    break
+
+                dfactory = OobleckDynamicClassFactory(
+                    self.factory, self._rank, list(range(self._world_size))
+                )
+                logging.info(
+                    f"Running test in rank{self._rank} / {self._world_size}: {test.__name__}"
+                )
+                result = test(self.factory, dfactory, *args)
+                logging.info("Test done.")
+
+                self._pipe.send(
+                    {
+                        "success": (result if result is not None else ""),
+                    }
+                )
+            except Exception as e:
+                logging.error(f"Rank {self._rank} failed with exception: {e}")
+                self._pipe.send({"error": str(e) + "\n" + traceback.format_exc()})
+
+        logging.info(f"Rank {self._rank} in world size {self._world_size} finished.")
+
+
+processes: dict[tuple[int, str], list[tuple[mp.Process, Connection]]] = defaultdict(
+    list
+)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="requires 4 GPUs")
@@ -304,118 +378,76 @@ class OobleckMultiProcessTestCase:
     Test cases for functionalities of dynamic classes will inherit this class.
     """
 
-    @staticmethod
-    def _worker_init(
-        queue: mp.Queue,
-        rank: int,
-        world_size: int,
-        model_name: str,
-        directory: Path,
-        test: Callable,
-        *args,
+    def get_processes(
+        self, num_processes: int, model_name: str, directory: Path
+    ) -> list[tuple[mp.Process, Connection]]:
+        global processes
+        if (num_processes, model_name) in processes:
+            return processes[(num_processes, model_name)]
+
+        ranks = list(range(num_processes))
+        world_size = num_processes
+
+        ctx = mp.get_context("spawn")
+        for rank in ranks:
+            pipe = ctx.Pipe()
+            p = ctx.Process(
+                target=OobleckTestProcess,
+                args=(
+                    pipe[1],
+                    rank,
+                    world_size,
+                    model_name,
+                    directory,
+                ),
+                daemon=True,
+            )
+            p.start()
+            processes[(num_processes, model_name)].append((p, pipe[0]))
+
+        return processes[(num_processes, model_name)]
+
+    model_name: str
+    tmp_directory: Path
+
+    @pytest.fixture(scope="session", autouse=True)
+    def directory(
+        self, tmp_path_factory: pytest.TempPathFactory, model_name_fixture: str
     ):
-        # Very careful initialization dependency due to too many third-party libraries.
-        # As we use torch.distributed.FileStore for distributed initialization, it doesn't require
-        # os envs (MASTER_ADDR, MASTER_PORT), while deepspeed and HuggingFace by default use them.
-        # Thus, initialize StaticClassFactory (which relies on HF) first without the envs.
-        # Then, initialize distributed and deepspeed.
-        # After that, create dynamic class factory since it requires distributed configuration.
-        try:
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
-            torch.cuda.device_count = lambda: 1
+        return tmp_path_factory.mktemp(
+            f"multi_process_{model_name_fixture.replace('/', '-')}"
+        )
 
-            factory = OobleckStaticClassFactory(model_name, directory)
-
-            os.environ["RANK"] = str(rank)
-            os.environ["WORLD_SIZE"] = str(world_size)
-            store = torch.distributed.FileStore(
-                str(directory.joinpath("store")), world_size
-            )
-            torch.distributed.init_process_group(
-                backend="nccl", store=store, rank=rank, world_size=world_size
-            )
-            dist.init_distributed(dist_backend="nccl", dist_init_required=False)
-
-            dynamic_factory = OobleckDynamicClassFactory(
-                factory, rank, list(range(world_size))
-            )
-
-            result = test(factory, dynamic_factory, *args)
-
-            queue.put(
-                {
-                    "success": (result if result is not None else ""),
-                    "rank": rank,
-                }
-            )
-        except Exception as e:
-            queue.put({"error": str(e) + "\n" + traceback.format_exc()})
-        finally:
-            if torch.distributed.is_initialized():
-                torch.distributed.barrier()
-                torch.distributed.destroy_process_group()
-            # Make sure to remove FileStore after each test.
-            directory.joinpath("store").unlink(missing_ok=True)
-
-        return result
+    @classmethod
+    @pytest.fixture(scope="class", autouse=True)
+    def setup_class(
+        cls, model_name_fixture: str, directory: Path, request: pytest.FixtureRequest
+    ):
+        request.cls.model_name = model_name_fixture
+        request.cls.tmp_directory = directory
 
     def run_in_parallel(
         self, num_processes: int, func: Callable, *args
     ) -> list[str | None]:
-        ctx = mp.get_context("spawn")
-        queue = ctx.Queue()
+        procs = self.get_processes(num_processes, self.model_name, self.tmp_directory)
+        for _, pipe in procs:
+            pipe.send((func, args))
 
-        self.directory.joinpath("store").unlink(missing_ok=True)
-
-        processes: list[mp.Process] = []
-        for rank in range(num_processes):
-            p = ctx.Process(
-                target=OobleckMultiProcessTestCase._worker_init,
-                args=(
-                    queue,
-                    rank,
-                    num_processes,
-                    self.model_name,
-                    self.directory,
-                    func,
-                    *args,
-                ),
-            )
-            p.start()
-            processes.append(p)
-
-        results: list[Any] = [None] * len(processes)
-
+        results: list[Any] = [None] * len(procs)
         try:
-            for _ in range(len(processes)):
-                result = queue.get(timeout=60)
+            for index, (_, pipe) in enumerate(procs):
+                if not pipe.poll(timeout=60):
+                    raise TimeoutError()
 
+                result = pipe.recv()
                 if "error" in result:
                     # If any process get an error,
                     # immediately abort the test.
                     raise RuntimeError(result["error"])
                 else:
-                    results[result["rank"]] = result["success"]
-
-            # Here, all processes are successfully finished.
-            for process in processes:
-                process.join()
+                    results[index] = result["success"]
         except Exception as e:
-            for process in processes:
-                process.kill()
-                process.join()
-            pytest.fail(e)
+            logging.error(f"Failed with exception: {e}")
+            raise e
 
         return results
-
-    @classmethod
-    @pytest.fixture(scope="class", autouse=True)
-    def setup_class(
-        cls,
-        model_name_fixture: str,
-        tmp_path_factory: pytest.TempPathFactory,
-        request: pytest.FixtureRequest,
-    ):
-        request.cls.model_name = model_name_fixture
-        directory = tmp_path_factory.getbasetemp()
-        request.cls.directory = directory
