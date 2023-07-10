@@ -295,14 +295,13 @@ class OobleckTestProcess:
         self,
         pipe: Connection,
         rank: int,
-        world_size: int,
         model_name: str,
         directory: Path,
     ):
-        logging.info(f"Launching rank{rank} in world size {world_size}")
+        logging.info(f"Launching rank{rank} with model {model_name}")
         self._pipe = pipe
         self._rank = rank
-        self._world_size = world_size
+        self._directory = directory
 
         # Very careful initialization dependency due to too many third-party libraries.
         # As we use torch.distributed.FileStore for distributed initialization, it doesn't require
@@ -320,36 +319,42 @@ class OobleckTestProcess:
 
         self.factory = OobleckStaticClassFactory(model_name, directory)
 
-        monkeypatch.setenv("RANK", str(rank))
-        monkeypatch.setenv("WORLD_SIZE", str(world_size))
-
-        store = torch.distributed.FileStore(
-            str(directory / f"{world_size}_store"),
-            world_size,
-        )
-
-        torch.distributed.init_process_group(
-            backend="nccl", store=store, rank=rank, world_size=world_size
-        )
-        dist.init_distributed(dist_backend="nccl", dist_init_required=False)
-
         self.run()
 
     def run(self):
         test: Callable
         args: tuple
 
+        monkeypatch = pytest.MonkeyPatch()
+
         while True:
             try:
-                test, args = self._pipe.recv()
+                test, world_size, args = self._pipe.recv()
                 if test is None:
                     break
 
+                monkeypatch.setenv("RANK", str(self._rank))
+                monkeypatch.setenv("WORLD_SIZE", str(world_size))
+                torch.cuda.set_device(0)
+
+                store = torch.distributed.FileStore(
+                    str(self._directory / f"{world_size}_store"),
+                    world_size,
+                )
+
+                torch.distributed.init_process_group(
+                    backend="nccl",
+                    store=store,
+                    rank=self._rank,
+                    world_size=world_size,
+                )
+                dist.init_distributed(dist_backend="nccl", dist_init_required=False)
+
                 dfactory = OobleckDynamicClassFactory(
-                    self.factory, self._rank, list(range(self._world_size))
+                    self.factory, self._rank, list(range(world_size))
                 )
                 logging.info(
-                    f"Running test in rank{self._rank} / {self._world_size}: {test.__name__}"
+                    f"Running test in rank{self._rank} / {world_size}: {test.__name__}"
                 )
                 result = test(self.factory, dfactory, *args)
                 logging.info("Test done.")
@@ -362,13 +367,17 @@ class OobleckTestProcess:
             except Exception as e:
                 logging.error(f"Rank {self._rank} failed with exception: {e}")
                 self._pipe.send({"error": str(e) + "\n" + traceback.format_exc()})
+            finally:
+                torch.distributed.barrier()
+                torch.distributed.destroy_process_group()
+                dist.cdb = None
+                (self._directory / f"{world_size}_store").unlink(missing_ok=True)
+                monkeypatch.undo()
 
-        logging.info(f"Rank {self._rank} in world size {self._world_size} finished.")
+        logging.info(f"Rank {self._rank} in world size {world_size} finished.")
 
 
-processes: dict[tuple[int, str], list[tuple[mp.Process, Connection]]] = defaultdict(
-    list
-)
+processes: dict[str, list[tuple[mp.Process, Connection]]] = defaultdict(list)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="requires 4 GPUs")
@@ -382,30 +391,27 @@ class OobleckMultiProcessTestCase:
         self, num_processes: int, model_name: str, directory: Path
     ) -> list[tuple[mp.Process, Connection]]:
         global processes
-        if (num_processes, model_name) in processes:
-            return processes[(num_processes, model_name)]
+        if model_name in processes:
+            return processes[model_name][:num_processes]
 
-        ranks = list(range(num_processes))
-        world_size = num_processes
-
+        # always initialize 4 processes
         ctx = mp.get_context("spawn")
-        for rank in ranks:
+        for rank in range(4):
             pipe = ctx.Pipe()
             p = ctx.Process(
                 target=OobleckTestProcess,
                 args=(
                     pipe[1],
                     rank,
-                    world_size,
                     model_name,
                     directory,
                 ),
                 daemon=True,
             )
             p.start()
-            processes[(num_processes, model_name)].append((p, pipe[0]))
+            processes[model_name].append((p, pipe[0]))
 
-        return processes[(num_processes, model_name)]
+        return processes[model_name][:num_processes]
 
     model_name: str
     tmp_directory: Path
@@ -431,12 +437,12 @@ class OobleckMultiProcessTestCase:
     ) -> list[str | None]:
         procs = self.get_processes(num_processes, self.model_name, self.tmp_directory)
         for _, pipe in procs:
-            pipe.send((func, args))
+            pipe.send((func, num_processes, args))
 
         results: list[Any] = [None] * len(procs)
         try:
             for index, (_, pipe) in enumerate(procs):
-                if not pipe.poll(timeout=60):
+                if not pipe.poll(timeout=30):
                     raise TimeoutError()
 
                 result = pipe.recv()
