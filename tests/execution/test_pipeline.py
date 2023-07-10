@@ -83,13 +83,13 @@ class TestOobleckSingleStagePipeline(OobleckMultiProcessTestCase):
         pipeline.execution.load_microbatch(buffer_id=0)
 
         assert pipeline.pipe_buffers["outputs"][0] is None
-        assert pipeline.execution.loss is None
+        assert pipeline.execution._loss is None
         assert pipeline.execution.total_loss is None
         pipeline.execution.forward_pass(buffer_id=0)
         # because it is the last stage, output should still be None
         # Instead, it should write loss and total_loss
         assert pipeline.pipe_buffers["outputs"][0] is None
-        assert pipeline.execution.loss is not None
+        assert pipeline.execution._loss is not None
         assert pipeline.execution.total_loss is not None
 
     @staticmethod
