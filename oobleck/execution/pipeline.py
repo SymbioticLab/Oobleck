@@ -180,7 +180,15 @@ class PipelineExecution:
 
             # Oobleck sharded model always returns tuple with tensors and torch.Size.
             assert len(output_tensors) == len(grad_tensors)
-            torch.autograd.backward(tensors=output_tensors, grad_tensors=grad_tensors)
+            if self.pipeline.is_first_stage():
+                torch.autograd.backward(
+                    tensors=output_tensors, grad_tensors=grad_tensors
+                )
+            else:
+                with [l.no_sync() for l in self._layers]:
+                    torch.autograd.backward(
+                        tensors=output_tensors, grad_tensors=grad_tensors
+                    )
 
         # Free up memory from the output of forward()
         self.pipeline.pipe_buffers["outputs"][buffer_id] = None
@@ -531,7 +539,7 @@ class OobleckPipeline:
 
             # Get FSDP module if this rank is involved in this layer
             if my_rank in ranks:
-                # NOTE: BackwardPrefetch.BACKWARD_PRE doesn't work in pipeline parallelism.
+                # FIXME: Seems backward_prefetch doesn't work with pipeline parallelism.
                 fsdp_layers.append(
                     FullyShardedDataParallel(
                         copy.deepcopy(model.model[layer_id]).to("cuda"),
@@ -539,7 +547,7 @@ class OobleckPipeline:
                         sharding_strategy=ShardingStrategy.FULL_SHARD,
                         backward_prefetch=BackwardPrefetch.BACKWARD_POST,
                         mixed_precision=None,
-                        use_orig_params=True,
+                        use_orig_params=False,
                     )
                 )
                 shard_id = ranks.index(my_rank)
