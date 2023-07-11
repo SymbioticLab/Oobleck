@@ -180,15 +180,8 @@ class PipelineExecution:
 
             # Oobleck sharded model always returns tuple with tensors and torch.Size.
             assert len(output_tensors) == len(grad_tensors)
-            if self.pipeline.is_first_stage():
-                torch.autograd.backward(
-                    tensors=output_tensors, grad_tensors=grad_tensors
-                )
-            else:
-                with [l.no_sync() for l in self._layers]:
-                    torch.autograd.backward(
-                        tensors=output_tensors, grad_tensors=grad_tensors
-                    )
+
+            torch.autograd.backward(tensors=output_tensors, grad_tensors=grad_tensors)
 
         # Free up memory from the output of forward()
         self.pipeline.pipe_buffers["outputs"][buffer_id] = None
