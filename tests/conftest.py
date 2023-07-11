@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import logging
 import math
 import multiprocessing as mp
@@ -381,6 +382,20 @@ class OobleckTestProcess:
                     time.sleep(1)
                 monkeypatch.undo()
 
+                # Release the GPU memory and check
+                obj: torch.Tensor
+                for obj in gc.get_objects():
+                    if torch.is_tensor(obj) and obj.is_cuda:
+                        if obj.grad is not None:
+                            obj.grad.data = torch.empty(0)
+                        obj.data = torch.empty(0)
+                gc.collect()
+                torch.cuda.empty_cache()
+                if torch.cuda.memory_allocated() > (1000 * 2**20):
+                    logging.fatal("Failed to reclaim GPU memory. Abort testing.")
+                    self._pipe.close()
+                    return
+
         logging.info(f"Rank {self._rank} in world size {world_size} finished.")
 
 
@@ -449,10 +464,16 @@ class OobleckMultiProcessTestCase:
         results: list[Any] = [None] * len(procs)
         try:
             for index, (_, pipe) in enumerate(procs):
-                if not pipe.poll(timeout=60):
-                    raise TimeoutError()
+                # if not pipe.poll(timeout=60):
+                #     raise TimeoutError()
 
-                result = pipe.recv()
+                try:
+                    result = pipe.recv()
+                except Exception:
+                    for proc, _ in procs:
+                        proc.kill()
+                    pytest.exit("Aborted due to GPU reclaim failure.", returncode=1)
+
                 if "error" in result:
                     # If any process get an error,
                     # immediately abort the test.

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import itertools
+import weakref
 from collections.abc import Iterable, Mapping
 from types import MethodType
 from typing import Any
@@ -14,6 +15,7 @@ from deepspeed.runtime.lr_schedules import WarmupLR
 from deepspeed.runtime.pipe import schedule
 from torch.distributed import ProcessGroup, Work
 from torch.distributed.fsdp import FullyShardedDataParallel
+from torch.distributed.fsdp.api import ShardingStrategy
 from torch.optim import AdamW
 from transformers.training_args import TrainingArguments
 
@@ -39,7 +41,7 @@ class PipelineExecution:
         dataloader: OobleckDataLoader,
         training_args: TrainingArguments,
     ):
-        self._pipeline = pipeline
+        self._pipeline = weakref.ref(pipeline)
         self._layers = layers
         self._shard_id = shard_id
         self._dataloader = dataloader
@@ -68,6 +70,10 @@ class PipelineExecution:
             self._optimizer, self._training_args.get_warmup_steps(num_training_steps)
         )
 
+    @property
+    def pipeline(self) -> OobleckPipeline:
+        return self._pipeline()
+
     # https://github.com/huggingface/transformers/blob/v4.26.1/src/transformers/trainer.py#L2454
     def _prepare_input(self, data: torch.Tensor | Any) -> torch.Tensor | Any:
         """
@@ -78,7 +84,7 @@ class PipelineExecution:
         elif isinstance(data, (tuple, list)):
             return type(data)(self._prepare_input(v) for v in data)
         elif isinstance(data, torch.Tensor):
-            data = data.clone().detach().to(self._pipeline.device)
+            data = data.clone().detach().to(self.pipeline.device)
             data.requires_grad = data.is_floating_point()
             return data
         return data
@@ -95,17 +101,17 @@ class PipelineExecution:
 
     def load_microbatch(self, buffer_id: int):
         assert (
-            self._pipeline.is_first_stage() or self._pipeline.is_last_stage()
+            self.pipeline.is_first_stage() or self.pipeline.is_last_stage()
         ), "load_microatch can only be called at either the first stage or the last stage."
 
-        if self._pipeline.is_first_stage():
+        if self.pipeline.is_first_stage():
             batch = next(self._data_iterator)
-            self._pipeline.pipe_buffers["inputs"][buffer_id] = self._prepare_inputs(
+            self.pipeline.pipe_buffers["inputs"][buffer_id] = self._prepare_inputs(
                 batch
             )
 
     def forward_pass(self, buffer_id: int):
-        inputs: tuple[torch.Tensor, ...] = self._pipeline.pipe_buffers["inputs"][
+        inputs: tuple[torch.Tensor, ...] = self.pipeline.pipe_buffers["inputs"][
             buffer_id
         ]
         zero_grads(inputs)
@@ -130,7 +136,7 @@ class PipelineExecution:
         outputs = inputs
 
         # Optionally compute loss on the last stage
-        if self._pipeline.is_last_stage():
+        if self.pipeline.is_last_stage():
             self._loss = outputs["loss"]
             del outputs["logits"]
 
@@ -152,32 +158,32 @@ class PipelineExecution:
                 [
                     output
                     if torch.is_tensor(output)
-                    else torch.LongTensor(data=output).to(self._pipeline.device)
+                    else torch.LongTensor(data=output).to(self.pipeline.device)
                     for output in outputs
                 ]
             )
 
-            self._pipeline.pipe_buffers["outputs"][buffer_id] = outputs
+            self.pipeline.pipe_buffers["outputs"][buffer_id] = outputs
 
     def backward_pass(self, buffer_id: int):
-        if self._pipeline.is_last_stage():
+        if self.pipeline.is_last_stage():
             loss = self._loss
             loss.backward()
         else:
-            output_tensors: tuple[torch.Tensor] = self._pipeline.pipe_buffers[
-                "outputs"
-            ][buffer_id]
+            output_tensors: tuple[torch.Tensor] = self.pipeline.pipe_buffers["outputs"][
+                buffer_id
+            ]
             output_tensors = tuple([t for t in output_tensors if t.requires_grad])
             grad_tensors: tuple[
                 torch.Tensor
-            ] = self._pipeline.communication.grad_recv_buf
+            ] = self.pipeline.communication.grad_recv_buf
 
             # Oobleck sharded model always returns tuple with tensors and torch.Size.
             assert len(output_tensors) == len(grad_tensors)
             torch.autograd.backward(tensors=output_tensors, grad_tensors=grad_tensors)
 
         # Free up memory from the output of forward()
-        self._pipeline.pipe_buffers["outputs"][buffer_id] = None
+        self.pipeline.pipe_buffers["outputs"][buffer_id] = None
         grad_tensors = None
         self._loss = None
 
@@ -195,7 +201,7 @@ class PipelineCommunication:
         prev_rank: int | None,
         next_rank: int | None,
     ):
-        self._pipeline = pipeline
+        self._pipeline = weakref.ref(pipeline)
         self._process_group = process_group
         self.prev_rank = prev_rank
         self.next_rank = next_rank
@@ -205,6 +211,10 @@ class PipelineCommunication:
         self.activation_recv_buf: tuple[torch.Tensor] | None = None
         # initialized in :func:`oobleck.execution.PipelineCommunication.recv_gradients`.
         self.grad_recv_buf: tuple[torch.Tensor] | None = None
+
+    @property
+    def pipeline(self) -> OobleckPipeline:
+        return self._pipeline()
 
     def _send(
         self, tensor: torch.Tensor, dest_rank: int, async_op: bool = False
@@ -240,30 +250,28 @@ class PipelineCommunication:
             assert isinstance(
                 buffer, tuple
             ), f"Could not send meta type {type(buffer)}."
-            count_tensor = torch.LongTensor(data=[len(buffer)]).to(
-                self._pipeline.device
-            )
+            count_tensor = torch.LongTensor(data=[len(buffer)]).to(self.pipeline.device)
             self._send(count_tensor, receiver_rank)
             for tensor in buffer:
                 assert isinstance(tensor, torch.Tensor)
                 send_ndims = torch.LongTensor(data=[len(tensor.size())]).to(
-                    self._pipeline.device
+                    self.pipeline.device
                 )
                 send_dtype = torch.LongTensor(data=[DTYPE_TO_ID[tensor.dtype]]).to(
-                    self._pipeline.device
+                    self.pipeline.device
                 )
                 send_shape = torch.LongTensor(data=tensor.size()).to(
-                    self._pipeline.device
+                    self.pipeline.device
                 )
                 send_req_grad = torch.LongTensor(
                     data=[1 if tensor.requires_grad else 0]
-                ).to(self._pipeline.device)
+                ).to(self.pipeline.device)
                 self._send(send_ndims, receiver_rank)
                 self._send(send_dtype, receiver_rank)
                 self._send(send_shape, receiver_rank)
                 self._send(send_req_grad, receiver_rank)
 
-        outputs: tuple[torch.Tensor] = self._pipeline.pipe_buffers["outputs"][buffer_id]
+        outputs: tuple[torch.Tensor] = self.pipeline.pipe_buffers["outputs"][buffer_id]
         if not self.sent_activation_meta:
             _send_activation_meta(outputs, self.next_rank)
             self.sent_activation_meta = True
@@ -285,33 +293,31 @@ class PipelineCommunication:
                     * shape
                     * requires_grad
             """
-            count_tensor = torch.LongTensor(data=[0]).to(self._pipeline.device)
+            count_tensor = torch.LongTensor(data=[0]).to(self.pipeline.device)
             self._recv(count_tensor, sender_rank)
             num_tensors = count_tensor.item()
             buffers: list[torch.Tensor] = []
             for _ in range(num_tensors):
-                recv_ndims = torch.LongTensor(data=[0]).to(self._pipeline.device)
+                recv_ndims = torch.LongTensor(data=[0]).to(self.pipeline.device)
                 self._recv(recv_ndims, sender_rank)
                 recv_ndims = recv_ndims.item()
 
-                recv_dtype = torch.LongTensor(data=[0]).to(self._pipeline.device)
+                recv_dtype = torch.LongTensor(data=[0]).to(self.pipeline.device)
                 self._recv(recv_dtype, sender_rank)
                 recv_dtype = ID_TO_DTYPE[recv_dtype.item()]
 
-                recv_shape = torch.LongTensor([1] * recv_ndims).to(
-                    self._pipeline.device
-                )
+                recv_shape = torch.LongTensor([1] * recv_ndims).to(self.pipeline.device)
                 self._recv(recv_shape, sender_rank)
                 recv_shape = recv_shape.tolist()
 
-                recv_req_grad = torch.LongTensor(data=[0]).to(self._pipeline.device)
+                recv_req_grad = torch.LongTensor(data=[0]).to(self.pipeline.device)
                 self._recv(recv_req_grad, sender_rank)
                 recv_req_grad = True if recv_req_grad.item() == 1 else False
 
                 buffers.append(
                     torch.zeros(
                         recv_shape,
-                        device=self._pipeline.device,
+                        device=self.pipeline.device,
                         dtype=recv_dtype,
                         requires_grad=recv_req_grad,
                     )
@@ -329,10 +335,10 @@ class PipelineCommunication:
             recvd[idx] = buffer.clone().detach()
             recvd[idx].requires_grad = buffer.requires_grad
 
-        self._pipeline.pipe_buffers["inputs"][buffer_id] = tuple(recvd)
+        self.pipeline.pipe_buffers["inputs"][buffer_id] = tuple(recvd)
 
     def send_gradients(self, buffer_id: int):
-        inputs = self._pipeline.pipe_buffers["inputs"][buffer_id]
+        inputs = self.pipeline.pipe_buffers["inputs"][buffer_id]
         assert isinstance(inputs, tuple)
 
         for buffer in inputs:
@@ -344,7 +350,7 @@ class PipelineCommunication:
             self._send(buffer.grad, self.prev_rank)
 
         # We can free up the input buffer now
-        self._pipeline.pipe_buffers["inputs"][buffer_id] = None
+        self.pipeline.pipe_buffers["inputs"][buffer_id] = None
 
     def recv_gradients(self, buffer_id: int):
         def create_gradients_buffer(
@@ -359,7 +365,7 @@ class PipelineCommunication:
 
             return tuple(buffers)
 
-        outputs = self._pipeline.pipe_buffers["outputs"][buffer_id]
+        outputs = self.pipeline.pipe_buffers["outputs"][buffer_id]
         assert isinstance(outputs, tuple)
 
         # Allocate gradients if necessary
@@ -511,6 +517,8 @@ class OobleckPipeline:
                     FullyShardedDataParallel(
                         copy.deepcopy(model.model[layer_id]).to("cuda"),
                         process_group=pg,
+                        sharding_strategy=ShardingStrategy.FULL_SHARD,
+                        mixed_precision=None,
                         use_orig_params=True,
                     )
                 )
