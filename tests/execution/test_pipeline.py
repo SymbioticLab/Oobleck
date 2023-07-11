@@ -186,11 +186,13 @@ class TestMultiStagePipeline(OobleckMultiProcessTestCase):
         dfactory: OobleckDynamicClassFactory,
     ):
         model = factory.get_model()
-        pipeline = dfactory.get_dummy_pipeline(4)
-        assert pipeline.prev_rank == (
+        pipeline = dfactory.get_dummy_pipeline(
+            num_stages=4, num_gpus_per_node=4, num_nodes=1
+        )
+        assert pipeline.communication.prev_rank == (
             None if dfactory._my_rank == 0 else dfactory._my_rank - 1
         )
-        assert pipeline.next_rank == (
+        assert pipeline.communication.next_rank == (
             None if dfactory._my_rank == 3 else dfactory._my_rank + 1
         )
 
@@ -214,7 +216,9 @@ class TestMultiStagePipeline(OobleckMultiProcessTestCase):
         factory: OobleckStaticClassFactory,
         dfactory: OobleckDynamicClassFactory,
     ):
-        pipeline = dfactory.get_dummy_pipeline(4)
+        pipeline = dfactory.get_dummy_pipeline(
+            num_stages=4, num_gpus_per_node=4, num_nodes=1
+        )
         rank = dfactory._my_rank
 
         assert pipeline.pipe_buffers["inputs"][0] is None
@@ -247,9 +251,9 @@ class TestMultiStagePipeline(OobleckMultiProcessTestCase):
             raise RuntimeError("Invalid rank")
 
         if rank == 3:
-            assert pipeline.execution.loss is not None
+            assert pipeline.execution._loss is not None
         else:
-            assert pipeline.execution.loss is None
+            assert pipeline.execution._loss is None
             assert pipeline.communication.sent_activation_meta is True
 
         if rank != 0:
@@ -260,7 +264,9 @@ class TestMultiStagePipeline(OobleckMultiProcessTestCase):
         factory: OobleckStaticClassFactory,
         dfactory: OobleckDynamicClassFactory,
     ):
-        pipeline = dfactory.get_dummy_pipeline(4)
+        pipeline = dfactory.get_dummy_pipeline(
+            num_stages=4, num_gpus_per_node=4, num_nodes=1
+        )
         rank = dfactory._my_rank
 
         if rank == 0:
@@ -298,18 +304,70 @@ class TestMultiStagePipeline(OobleckMultiProcessTestCase):
             for layer in pipeline.execution._layers
         )
 
+    @staticmethod
+    def reduce_gradient(
+        factory: OobleckStaticClassFactory,
+        dfactory: OobleckDynamicClassFactory,
+    ):
+        pytest.mark.skip("Not implemented yet")
+
     @pytest.mark.parametrize(
         "func_name",
         [
             "send_recv_in_forward",
             "send_recv_in_backward",
+            "reduce_gradient",
         ],
     )
     def test_distributed_execution(self, func_name):
         func = getattr(TestMultiStagePipeline, func_name)
         self.run_in_parallel(num_processes=4, func=func)
 
-    @pytest.mark.skip(reason="TODO")
-    def test_pipeline_train(self):
-        # TODO: test train() method with mock spy
-        pass
+    @staticmethod
+    def pipeline_train(
+        factory: OobleckStaticClassFactory,
+        dfactory: OobleckDynamicClassFactory,
+        num_stages: int,
+        num_gpus_per_node: int,
+    ):
+        pipeline = dfactory.get_dummy_pipeline(
+            num_stages=num_stages,
+            num_gpus_per_node=num_gpus_per_node,
+            num_nodes=1,
+        )
+        assert pipeline._global_step == 0
+        assert pipeline.execution._loss is None
+        assert pipeline.execution.total_loss is None
+        pipeline.train()
+        assert pipeline._global_step == 1
+        assert pipeline.execution._loss is None
+        if pipeline.is_last_stage():
+            assert pipeline.execution.total_loss is not None
+        # Check all pipe buffers are clean
+        for pipe_buffers in pipeline.pipe_buffers.values():
+            assert all(x is None for x in pipe_buffers)
+
+    @pytest.mark.parametrize(
+        "num_stages, num_gpus_per_node",
+        [
+            (1, 2),
+            (2, 2),
+            (1, 4),
+            (2, 4),
+            (4, 4),
+        ],
+        ids=[
+            "1 stage 2 GPUs",
+            "2 stages 2 GPUs",
+            "1 stage 4 GPUs",
+            "2 stages 4 GPUs",
+            "4 stages 4 GPUs",
+        ],
+    )
+    def test_pipeline_train(self, num_stages: int, num_gpus_per_node: int):
+        self.run_in_parallel(
+            num_gpus_per_node,
+            TestMultiStagePipeline.pipeline_train,
+            num_stages,
+            num_gpus_per_node,
+        )

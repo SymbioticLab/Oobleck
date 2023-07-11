@@ -15,7 +15,7 @@ from deepspeed.runtime.lr_schedules import WarmupLR
 from deepspeed.runtime.pipe import schedule
 from torch.distributed import ProcessGroup, Work
 from torch.distributed.fsdp import FullyShardedDataParallel
-from torch.distributed.fsdp.api import ShardingStrategy
+from torch.distributed.fsdp.api import BackwardPrefetch, ShardingStrategy
 from torch.optim import AdamW
 from transformers.training_args import TrainingArguments
 
@@ -375,19 +375,11 @@ class PipelineCommunication:
         for buffer in self.grad_recv_buf:
             self._recv(buffer, self.next_rank)
 
+    def reduce_gradients(self):
+        pass
 
-# A map of PipeInstruction types to methods. Each method will be executed with the
-# kwargs provided to the PipeInstruction from the scheduler.
-INSTRUCTION_MAP = {
-    schedule.OptimizerStep: PipelineExecution.optimizer_step,
-    schedule.LoadMicroBatch: PipelineExecution.load_microbatch,
-    schedule.ForwardPass: PipelineExecution.forward_pass,
-    schedule.BackwardPass: PipelineExecution.backward_pass,
-    schedule.SendActivation: PipelineCommunication.send_activations,
-    schedule.RecvActivation: PipelineCommunication.recv_activations,
-    schedule.SendGrad: PipelineCommunication.send_gradients,
-    schedule.RecvGrad: PipelineCommunication.recv_gradients,
-}
+    def reduce_tied_gradients(self):
+        pass
 
 
 class OobleckPipeline:
@@ -423,12 +415,16 @@ class OobleckPipeline:
             # If length of `stage_ranks` is less than num_gpus_per_node, adjust it
             # so that it conforms a full 2D grid
             if stage._num_gpus < pipeline_template._num_gpus_per_node:
-                stage_ranks = list(
-                    itertools.repeat(
-                        rank, pipeline_template._num_gpus_per_node // stage_ranks
+                stage_ranks = [
+                    list(
+                        itertools.repeat(
+                            rank,
+                            pipeline_template._num_gpus_per_node // len(stage_ranks),
+                        )
                     )
                     for rank in stage_ranks
-                )
+                ]
+                stage_ranks = list(itertools.chain.from_iterable(stage_ranks))
 
             for layer_index in stage._layer_indices:
                 self._rank_grid[layer_index] = stage_ranks
@@ -436,17 +432,35 @@ class OobleckPipeline:
         assert len(ranks) == 0, "Not all ranks were assigned to a stage."
 
     def train(self):
+        # A map of PipeInstruction types to methods. Each method will be executed with the
+        # kwargs provided to the PipeInstruction from the scheduler.
+        instruction_map = {
+            schedule.OptimizerStep: self.execution.optimizer_step,
+            schedule.LoadMicroBatch: self.execution.load_microbatch,
+            schedule.ForwardPass: self.execution.forward_pass,
+            schedule.BackwardPass: self.execution.backward_pass,
+            schedule.SendActivation: self.communication.send_activations,
+            schedule.RecvActivation: self.communication.recv_activations,
+            schedule.SendGrad: self.communication.send_gradients,
+            schedule.RecvGrad: self.communication.recv_gradients,
+            schedule.ReduceGrads: self.communication.reduce_gradients,
+            schedule.ReduceTiedGrads: self.communication.reduce_tied_gradients,
+        }
+
         for step_cmds in self.train_schedule:
             # For each instruction in the step
             for cmd in step_cmds:
-                if type(cmd) not in INSTRUCTION_MAP:
+                if type(cmd) not in instruction_map:
                     raise RuntimeError(
                         f"{self.__class__.__name__} does not understand instruction {repr(cmd)}"
                     )
 
-                # Equivalent to: self._exec_forward_pass(buffer_id=0)
-                _exec_instr = MethodType(INSTRUCTION_MAP[type(cmd)], self)
-                _exec_instr(**cmd.kwargs)
+                # Equivalent to: self.[execution|communication].func(buffer_id)
+                instruction_map[type(cmd)](**cmd.kwargs)
+
+        # Cleanup buffers
+        for name, pipe_buffers in self.pipe_buffers.items():
+            self.pipe_buffers[name] = [None] * len(pipe_buffers)
 
         self._global_step += 1
 
@@ -469,7 +483,11 @@ class OobleckPipeline:
         # initialize_execution assumes to be called only if this rank is involved in
         # the pipeline. Failure of getting my_layer_index cannot happen.
         my_rank = dist.get_rank()
-        my_layer_index = next(my_rank in ranks for ranks in self._rank_grid.values())
+        my_layer_index = next(
+            layer_index
+            for layer_index, ranks in self._rank_grid.items()
+            if my_rank in ranks
+        )
         my_stage_index = next(
             stage_index
             for stage_index, stage in enumerate(self._template.get_stages())
@@ -513,11 +531,13 @@ class OobleckPipeline:
 
             # Get FSDP module if this rank is involved in this layer
             if my_rank in ranks:
+                # NOTE: BackwardPrefetch.BACKWARD_PRE doesn't work in pipeline parallelism.
                 fsdp_layers.append(
                     FullyShardedDataParallel(
                         copy.deepcopy(model.model[layer_id]).to("cuda"),
                         process_group=pg,
                         sharding_strategy=ShardingStrategy.FULL_SHARD,
+                        backward_prefetch=BackwardPrefetch.BACKWARD_POST,
                         mixed_precision=None,
                         use_orig_params=True,
                     )

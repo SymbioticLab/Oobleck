@@ -224,9 +224,9 @@ class OobleckDynamicClassFactory:
     def get_dummy_pipeline(
         self,
         num_stages: int,
+        num_nodes: int = 1,
         num_gpus_per_node: int = 1,
     ) -> OobleckPipeline:
-        num_nodes = 1
         model = self._static_factory.get_model()
         # TODO: make this more flexible
         template = self._static_factory.get_dummy_pipeline_template(
