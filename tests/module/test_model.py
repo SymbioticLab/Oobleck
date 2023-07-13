@@ -36,12 +36,14 @@ class TestOobleckModel(OobleckSingleProcessTestCase):
     def test_run_model(self, model: OobleckModel):
         device = torch.device("cuda:0")
 
-        input = tuple([i.to(device) for i in model.sample_inputs.values()])
-        for layer in model.model:
+        input: tuple[torch.Tensor, ...] = tuple(
+            [i.to(device) for i in model.sample_inputs.values()]
+        )
+        for layer in model.layers:
             layer.to(device)
             assert all(p.device == device for p in layer.parameters())
 
-        for layer in model.model:
+        for layer in model.layers:
             input = layer(*input)
 
         assert "loss" in input

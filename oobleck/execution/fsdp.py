@@ -19,7 +19,7 @@ class ShardStatus(Enum):
     Unsharded = 2
 
 
-class FullyShardedDataParallelLayer(FlatParamHandle):
+class FullyShardedDataParallelLayer(torch.nn.Module):
     """
     Copy parameters in `layer` to CUDA device, then flatten and shard it.
     In GPU memory, there is only a `FlatParameter` object.
@@ -36,10 +36,10 @@ class FullyShardedDataParallelLayer(FlatParamHandle):
         process_group: ProcessGroup,
         streams: dict[str, torch.cuda.Stream],
     ):
+        super().__init__()
         device = torch.device("cuda", torch.cuda.current_device())
-        self._layer = layer
         layer.to(device)
-        super().__init__(
+        self._param_handle = FlatParamHandle(
             params=layer.parameters(),
             fully_sharded_module=layer,
             device=device,
@@ -52,8 +52,8 @@ class FullyShardedDataParallelLayer(FlatParamHandle):
             use_orig_params=True,
         )
 
-        self.shard()
-        self.init_flat_param_attributes()
+        # self.shard()
+        self._param_handle.init_flat_param_attributes()
 
         self._process_group = process_group
         self._streams = streams
@@ -63,33 +63,8 @@ class FullyShardedDataParallelLayer(FlatParamHandle):
         self._parameter_shard: ShardStatus = ShardStatus.Unsharded
         self._gradients_shard: ShardStatus = ShardStatus.NotExist
 
-    def unshard_parameters(self):
-        if self._parameter_shard == ShardStatus.Unsharded:
-            return
-        with torch.cuda.stream(self._streams["forward"]):
-            for param in self._layer.parameters():
-                if isinstance(param, FlatParameter):
-                    param.unflatten()
-        self._parameter_sharded = False
-
-    def shard_parameters(self):
-        if self._parameter_shard == ShardStatus.Sharded:
-            return
-
-        # use reduce-scatter to shard it
-
-        self._parameter_sharded = True
-
-    def unshard_gradients(self):
-        if self._gradients_shard in [ShardStatus.Unsharded, ShardStatus.NotExist]:
-            return
-
-    def shard_gradients(self):
-        if self._gradients_shard in [ShardStatus.Sharded, ShardStatus.NotExist]:
-            return
-
-    def forward(self, *args):
-        pass
+    def forward(self, *args) -> tuple[torch.Tensor]:
+        return self._param_handle._fully_sharded_module(*args)
 
     def backward(self, output: tuple[torch.Tensor], gradients: tuple[torch.Tensor]):
         pass
