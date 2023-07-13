@@ -10,7 +10,6 @@ from transformers import (
     TrainingArguments,
 )
 
-from oobleck.module.layer import Layer
 from oobleck.module.sharding import get_split_points, shard_model
 
 # Oobleck has been tested only with the following models.
@@ -69,15 +68,12 @@ class OobleckModel:
         self.trace_input_names = list(sample_inputs.keys())
 
         split_points = get_split_points(model_config)
-        sharded_model = shard_model(model, self.trace_input_names, split_points)
+        self.layers = shard_model(model, self.trace_input_names, split_points)
         self.model_name = model_name
         self.model_tag = model_tag
-        self.model = [
-            Layer(index, layer, training_args)
-            for index, layer in enumerate(sharded_model)
-        ]
+
         self.total_num_params = sum(
-            sum(p.numel() for p in layer.parameters()) for layer in self.model
+            sum(p.numel() for p in layer.parameters()) for layer in self.layers
         )
         self.training_args = training_args
         self.model_args = model_config
