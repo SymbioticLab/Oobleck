@@ -4,19 +4,14 @@ import torch
 import torch.distributed
 import torch.fx
 from torch.distributed import ProcessGroup
-from torch.distributed.fsdp.flat_param import (
-    FlatParameter,
-    FlatParamHandle,
-    HandleShardingStrategy,
-)
-
-from oobleck.module.layer import Layer
+from torch.distributed.fsdp._common_utils import HandleTrainingState
+from torch.distributed.fsdp.flat_param import FlatParamHandle, HandleShardingStrategy
 
 
-class ShardStatus(Enum):
-    NotExist = 0
-    Sharded = 1
-    Unsharded = 2
+class StreamType(Enum):
+    UNSHARD = "unshard"
+    UNSHARD_GRAD = "unshard_grad"
+    EXECUTION = "execution"
 
 
 class FullyShardedDataParallelLayer(torch.nn.Module):
@@ -34,7 +29,7 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
         self,
         layer: torch.fx.GraphModule,
         process_group: ProcessGroup,
-        streams: dict[str, torch.cuda.Stream],
+        streams: dict[StreamType, torch.cuda.Stream],
     ):
         super().__init__()
         device = torch.device("cuda", torch.cuda.current_device())
@@ -52,16 +47,39 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
             use_orig_params=True,
         )
 
-        # self.shard()
         self._param_handle.init_flat_param_attributes()
+        self._param_handle._check_on_compute_device(self._param_handle.flat_param)
 
         self._process_group = process_group
         self._streams = streams
+        self._unshard_param_event: torch.cuda.Event | None = None
         self._rank_index = torch.distributed.get_rank(group=process_group)
         self._group_size = torch.distributed.get_world_size(group=process_group)
 
-        self._parameter_shard: ShardStatus = ShardStatus.Unsharded
-        self._gradients_shard: ShardStatus = ShardStatus.NotExist
+        # TODO: register pre-backward hooks and post-backward hooks
+
+    def unshard(self, wait: bool = False):
+        """
+        Initiate unsharding of parameters (if not in progress).
+        Wait for unsharding to complete if `wait` is True.
+        """
+        if not self._param_handle.is_sharded(self._param_handle.flat_param):
+            # Return immediately if the parameter is not sharded
+            return
+
+        if self._unshard_param_event is None:
+            # If we don't have an event, it means there is no unsharding
+            # in process. Iniiate unsharing
+            with self._streams[StreamType.UNSHARD]:
+                self._param_handle.pre_unshard()
+                self._param_handle.unshard()
+                self._param_handle.post_unshard()
+                self._unshard_param_event = torch.cuda.Event()
+                self._unshard_param_event.record()
+
+        if wait:
+            self._unshard_param_event.synchronize()
+            self._unshard_param_event = None
 
     def forward(self, *args) -> tuple[torch.Tensor]:
         return self._param_handle._fully_sharded_module(*args)

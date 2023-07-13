@@ -1,10 +1,8 @@
 import deepspeed.comm as dist
 import pytest
 import torch
-from torch.distributed.fsdp.api import BackwardPrefetch
-from torch.distributed.fsdp.flat_param import FlatParamHandle, HandleTrainingState
 
-from oobleck.execution.fsdp import FullyShardedDataParallelLayer
+from oobleck.execution.fsdp import FullyShardedDataParallelLayer, StreamType
 from tests.conftest import (
     GRADIENT_ACCUMULATION_STEP,
     OobleckDynamicClassFactory,
@@ -21,18 +19,18 @@ def fsdplayer(
     model = factory.get_model()
 
     layers: list[FullyShardedDataParallelLayer] = []
+    unshard_stream = torch.cuda.Stream()
     for layer in model.layers:
-        layers.append(FullyShardedDataParallelLayer(layer, pg, {}))
-
-    print("Before unsharding memory: ", torch.cuda.memory_allocated())
+        layers.append(
+            FullyShardedDataParallelLayer(
+                layer, pg, {StreamType.UNSHARD: unshard_stream}
+            )
+        )
 
     for layer in layers:
-        layer._param_handle.pre_unshard()
-        layer._param_handle.unshard()
-        layer._param_handle.post_unshard()
+        layer.unshard(False)
 
-    torch.cuda.synchronize()
-    print("After unsharding memory: ", torch.cuda.memory_allocated())
+    unshard_stream.synchronize()
 
     device = torch.device("cuda", torch.cuda.current_device())
     input: tuple[torch.Tensor, ...] = tuple(
