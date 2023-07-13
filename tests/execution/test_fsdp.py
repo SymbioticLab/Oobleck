@@ -1,6 +1,9 @@
+import time
+
 import deepspeed.comm as dist
 import pytest
 import torch
+from torch.distributed.fsdp._common_utils import HandleTrainingState
 
 from oobleck.execution.fsdp import FullyShardedDataParallelLayer, StreamType
 from tests.conftest import (
@@ -27,8 +30,12 @@ def fsdplayer(
             )
         )
 
+    start = time.time_ns()
     for layer in layers:
-        layer.unshard(False)
+        layer._param_handle.init_flat_param_attributes()
+        layer.unshard()
+    end = time.time_ns()
+    print(f"Unsharding took {(end - start) / 1_000} microseconds")
 
     unshard_stream.synchronize()
 
@@ -37,10 +44,30 @@ def fsdplayer(
         [i.to(device) for i in model.sample_inputs.values()]
     )
     for layer in layers:
-        input = layer(*input)
+        with layer._param_handle.unflatten_as_params():
+            input = layer(*input)
 
     assert "loss" in input
     assert isinstance(input["loss"], torch.Tensor)
+
+    start = time.time_ns()
+    for layer in layers:
+        layer.reshard()
+    end = time.time_ns()
+    print(f"Resharding took {(end - start) / 1_000} microseconds")
+
+    unshard_stream.synchronize()
+
+    # # ========================
+    # for i in range(3):
+    #     print("range: ", i)
+
+    #     layers[0].unshard()
+    #     torch.cuda.synchronize()
+
+    #     layers[0].reshard()
+    #     torch.cuda.synchronize()
+    # # ========================
 
 
 class TestFullyShardedDataParallelClass(OobleckMultiProcessTestCase):
