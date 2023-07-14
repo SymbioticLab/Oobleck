@@ -19,7 +19,7 @@ from tests.conftest import (
 
 def get_fsdp_layers(
     model: OobleckModel, pgs: list[ProcessGroup]
-) -> tuple[list[FullyShardedDataParallelLayer], torch.cuda.Stream]:
+) -> list[FullyShardedDataParallelLayer]:
     assert len(model.layers) == len(pgs)
 
     unshard_stream = torch.cuda.Stream()
@@ -37,7 +37,7 @@ def get_fsdp_layers(
         fsdp_layer._param_handle.init_flat_param_attributes()
         layers.append(fsdp_layer)
 
-    return layers, unshard_stream
+    return layers
 
 
 def check_unsharded_equal_to_original(
@@ -55,7 +55,7 @@ def check_unsharded_equal_to_original(
         layer.to(device)
         _sync_module_params_and_buffers(layer, list(layer.parameters()), pg)
 
-    fsdp_layers, unshard_stream = get_fsdp_layers(fsdp_model, pgs)
+    fsdp_layers = get_fsdp_layers(fsdp_model, pgs)
     assert len(fsdp_layers) == len(original_model.layers)
 
     for original_layer, fsdp_layer in zip(original_model.layers, fsdp_layers):
@@ -71,26 +71,6 @@ def check_unsharded_equal_to_original(
                 torch.allclose(o, f) for o, f in zip(original_params, fsdp_params)
             )
 
-    # output1 = tuple(tensor.detach().clone() for tensor in input)
-    # for layer in layers:
-    #     layer.unshard()
-    #     torch.cuda.synchronize()
-    #     with layer._param_handle.unflatten_as_params():
-    #         output1 = layer(*output1)
-    #         torch.cuda.synchronize()
-    #     layer.reshard()
-    #     torch.cuda.synchronize()
-
-    # # Compare with existing model execution
-    # output2 = tuple([tensor for tensor in input])
-    # for layer in gpu_model.layers:
-    #     output2 = layer(*output2)
-
-    # assert all(
-    #     torch.allclose(o1, o2, atol=1e-5)
-    #     for o1, o2 in zip(output1.values(), output2.values())
-    # )
-
 
 def check_forward(
     factory: OobleckStaticClassFactory,
@@ -100,7 +80,7 @@ def check_forward(
     pg = dist.new_group(ranks=dfactory._ranks)
     pgs = [pg] * len(model.layers)
 
-    fsdp_layers, unshard_stream = get_fsdp_layers(model, pgs)
+    fsdp_layers = get_fsdp_layers(model, pgs)
 
     device = torch.device("cuda", torch.cuda.current_device())
     input: tuple[torch.Tensor, ...] = tuple(
@@ -108,9 +88,7 @@ def check_forward(
     )
 
     for layer in fsdp_layers:
-        layer.unshard(HandleTrainingState.FORWARD)
         input = layer(*input)
-        layer.reshard()
 
     assert "loss" in input
     assert isinstance(input["loss"], torch.Tensor)

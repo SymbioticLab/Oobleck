@@ -106,10 +106,13 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
 
         self._param_handle.reshard(True)
         self._param_handle.post_reshard()
+        self._param_handle._training_state = HandleTrainingState.IDLE
 
     def forward(self, *args) -> tuple[torch.Tensor]:
-        self._param_handle._training_state = HandleTrainingState.FORWARD
-        return self._param_handle._fully_sharded_module(*args)
+        self.unshard(HandleTrainingState.FORWARD)
+        result = self._param_handle._fully_sharded_module(*args)
+        self.reshard()
+        return result
 
     def backward(self, output: tuple[torch.Tensor], gradients: tuple[torch.Tensor]):
         pass
