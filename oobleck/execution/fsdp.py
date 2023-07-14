@@ -6,7 +6,6 @@ import torch.distributed
 import torch.fx
 from torch.distributed import ProcessGroup
 from torch.distributed.fsdp._common_utils import HandleTrainingState
-from torch.distributed.fsdp._init_utils import _sync_module_params_and_buffers
 from torch.distributed.fsdp.flat_param import FlatParamHandle, HandleShardingStrategy
 
 
@@ -36,8 +35,6 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
         super().__init__()
         device = torch.device("cuda", torch.cuda.current_device())
         layer.to(device)
-
-        _sync_module_params_and_buffers(layer, list(layer.parameters()), process_group)
 
         self._param_handle = FlatParamHandle(
             params=layer.parameters(),

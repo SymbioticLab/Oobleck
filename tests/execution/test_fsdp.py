@@ -44,22 +44,22 @@ def check_unsharded_equal_to_original(
     factory: OobleckStaticClassFactory,
     dfactory: OobleckDynamicClassFactory,
 ):
-    model = factory.get_model()
-    fsdp_model: OobleckModel = copy.deepcopy(model)
-    original_model: OobleckModel = copy.deepcopy(model)
+    fsdp_model: OobleckModel = copy.deepcopy(factory.get_model())
+    original_model: OobleckModel = copy.deepcopy(factory.get_model())
     device = torch.device("cuda", torch.cuda.current_device())
     pg = dist.new_group(ranks=dfactory._ranks)
-    pgs = [pg] * len(model.layers)
+    pgs = [pg] * len(fsdp_model.layers)
 
     for pg, layer in zip(pgs, original_model.layers):
         layer.to(device)
-        _sync_module_params_and_buffers(layer, list(layer.parameters()), pg)
+        # _sync_module_params_and_buffers(layer, list(layer.parameters()), pg)
 
     fsdp_layers = get_fsdp_layers(fsdp_model, pgs)
     assert len(fsdp_layers) == len(original_model.layers)
 
     for original_layer, fsdp_layer in zip(original_model.layers, fsdp_layers):
-        fsdp_layer.unshard(HandleTrainingState.FORWARD)
+        fsdp_layer._param_handle._training_state = HandleTrainingState.FORWARD
+        fsdp_layer.unshard()
 
         with fsdp_layer._param_handle.unflatten_as_params():
             original_params = list(original_layer.parameters())
@@ -76,7 +76,7 @@ def check_forward(
     factory: OobleckStaticClassFactory,
     dfactory: OobleckDynamicClassFactory,
 ):
-    model = factory.get_model()
+    model = copy.deepcopy(factory.get_model())
     pg = dist.new_group(ranks=dfactory._ranks)
     pgs = [pg] * len(model.layers)
 
@@ -98,7 +98,7 @@ def check_backward(
     factory: OobleckStaticClassFactory,
     dfactory: OobleckDynamicClassFactory,
 ):
-    model = factory.get_model()
+    model = copy.deepcopy(factory.get_model())
     pg = dist.new_group(ranks=dfactory._ranks)
     pgs = [pg] * len(model.layers)
 

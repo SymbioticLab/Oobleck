@@ -1,5 +1,7 @@
+import random
 from typing import Any, Dict, List, Optional, Type
 
+import torch
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -11,6 +13,8 @@ from transformers import (
 )
 
 from oobleck.module.sharding import get_split_points, shard_model
+
+RANDOM_SEED = 42
 
 # Oobleck has been tested only with the following models.
 lang_models = ["gpt2", "t5", "bert", "bloom"]
@@ -47,6 +51,10 @@ class OobleckModel:
         model_tag: Optional[str] = None,
         config_args: Optional[Dict[str, Any]] = None,
     ):
+        # Initialize CPU seed
+        random.seed(RANDOM_SEED)
+        torch.default_generator.manual_seed(RANDOM_SEED)
+
         if config_args is None:
             config_args = {}
         config_args["use_cache"] = False
