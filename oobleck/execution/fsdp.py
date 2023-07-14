@@ -101,12 +101,11 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
         unshard_stream = self._streams[StreamType.UNSHARD]
         execution_stream = self._streams[StreamType.EXECUTION]
 
+        # resharding must be done after execution
         unshard_stream.wait_stream(execution_stream)
 
         self._param_handle.reshard(True)
         self._param_handle.post_reshard()
-
-        execution_stream.wait_stream(unshard_stream)
 
     def forward(self, *args) -> tuple[torch.Tensor]:
         self._param_handle._training_state = HandleTrainingState.FORWARD
