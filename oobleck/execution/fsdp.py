@@ -87,7 +87,6 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
 
             with torch.cuda.stream(unshard_stream):
                 self._param_handle.pre_unshard()
-                torch.cuda.current_stream().synchronize()
                 self._param_handle.unshard()
                 self._param_handle.post_unshard()
                 self.unshard_param_event.record(unshard_stream)
