@@ -94,9 +94,67 @@ def check_forward(
     assert isinstance(input["loss"], torch.Tensor)
 
 
+def check_backward(
+    factory: OobleckStaticClassFactory,
+    dfactory: OobleckDynamicClassFactory,
+):
+    model = factory.get_model()
+    pg = dist.new_group(ranks=dfactory._ranks)
+    pgs = [pg] * len(model.layers)
+
+    fsdp_layers = get_fsdp_layers(model, pgs)
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    input: tuple[torch.Tensor, ...] = tuple(
+        [tensor.to(device) for tensor in model.sample_inputs.values()]
+    )
+
+    inputs: list[tuple[torch.Tensor | torch.Size]] = []
+    outputs: list[tuple[torch.Tensor | torch.Size]] = []
+
+    for layer in fsdp_layers:
+        new_input = tuple(
+            tensor.detach().clone() if isinstance(tensor, torch.Tensor) else tensor
+            for tensor in input
+        )
+        for ni, i in zip(new_input, input):
+            if isinstance(ni, torch.Tensor):
+                ni.requires_grad = i.requires_grad
+
+        output = layer(*new_input)
+        inputs.append(new_input)
+        outputs.append(output)
+        input = output
+
+    torch.cuda.synchronize()
+
+    # Begin test
+    assert "loss" in input
+    fsdp_layers[-1].backward(input["loss"])
+
+    for index in reversed(range(len(fsdp_layers) - 1)):
+        output = [
+            t for t in outputs[index] if isinstance(t, torch.Tensor) and t.requires_grad
+        ]
+        layer = fsdp_layers[index]
+        next_input = [
+            t.grad
+            for t in inputs[index + 1]
+            if isinstance(t, torch.Tensor) and t.requires_grad
+        ]
+
+        print(f"Backward for {index}th layer")
+        layer.backward((tuple(output), tuple(next_input)))
+
+    # TODO: what to assert here?
+
+
 class TestFullyShardedDataParallelClass(OobleckMultiProcessTestCase):
     def test_fsdp_unshard(self):
         self.run_in_parallel(2, check_unsharded_equal_to_original)
 
     def test_fsdp_forward(self):
         self.run_in_parallel(2, check_forward)
+
+    def test_fsdp_backward(self):
+        self.run_in_parallel(2, check_backward)

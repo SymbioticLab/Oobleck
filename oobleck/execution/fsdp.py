@@ -61,7 +61,7 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
         self.unshard_param_event = torch.cuda.Event()
         # TODO: register pre-backward hooks and post-backward hooks
 
-    def unshard(self, state: HandleTrainingState):
+    def unshard(self):
         """
         Initiate unsharding of parameters (if not in progress).
         Mark all future execution to execute after unsharding to complete if `wait` is True.
@@ -76,11 +76,10 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
             # If we don't have an event, it means there is no unsharding
             # in process. Iniiate unsharing
 
-            assert state in [
+            assert self._param_handle._training_state in [
                 HandleTrainingState.FORWARD,
                 HandleTrainingState.BACKWARD_PRE,
             ]
-            self._param_handle._training_state = state
 
             unshard_stream = self._streams[StreamType.UNSHARD]
             execution_stream = self._streams[StreamType.EXECUTION]
@@ -106,16 +105,46 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
 
         self._param_handle.reshard(True)
         self._param_handle.post_reshard()
-        self._param_handle._training_state = HandleTrainingState.IDLE
+
+    def unshard_grad(self):
+        unshard_stream = self._streams[StreamType.UNSHARD]
+        execution_stream = self._streams[StreamType.EXECUTION]
+
+        with torch.cuda.stream(unshard_stream):
+            self._param_handle.unshard_grad()
+
+        # further execution should wait for unsharding to be done
+        execution_stream.wait_stream(unshard_stream)
+
+    def reshard_grad(self):
+        # resharding must be done after execution
+        unshard_stream = self._streams[StreamType.UNSHARD]
+        execution_stream = self._streams[StreamType.EXECUTION]
+        unshard_stream.wait_stream(execution_stream)
+
+        self._param_handle.reshard_grad()
 
     def forward(self, *args) -> tuple[torch.Tensor]:
-        self.unshard(HandleTrainingState.FORWARD)
+        self._param_handle._training_state = HandleTrainingState.FORWARD
+        self.unshard()
         result = self._param_handle._fully_sharded_module(*args)
         self.reshard()
+        self._param_handle._training_state = HandleTrainingState.IDLE
         return result
 
-    def backward(self, output: tuple[torch.Tensor], gradients: tuple[torch.Tensor]):
-        pass
+    def backward(self, tensor: torch.Tensor | tuple[tuple[torch.Tensor], torch.Tensor]):
+        self._param_handle._training_state = HandleTrainingState.BACKWARD_PRE
+        self.unshard()
+        self.unshard_param_event.synchronize()
+        self._param_handle.prepare_gradient_for_backward()
+        if isinstance(tensor, torch.Tensor):
+            tensor.backward()
+        else:
+            output, gradients = tensor
+            torch.autograd.backward(output, gradients)
+        self.reshard()
+        torch.cuda.synchronize()
+        # TODO: what to do after backward?
 
 
 class OobleckFullyShardedDataParallel:
