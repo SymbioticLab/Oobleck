@@ -71,10 +71,6 @@ def check_unsharded_equal_to_original(
                 torch.allclose(o, f) for o, f in zip(original_params, fsdp_params)
             )
 
-    # input: tuple[torch.Tensor, ...] = tuple(
-    #     [tensor.to(device) for tensor in model.sample_inputs.values()]
-    # )
-
     # output1 = tuple(tensor.detach().clone() for tensor in input)
     # for layer in layers:
     #     layer.unshard()
@@ -96,6 +92,33 @@ def check_unsharded_equal_to_original(
     # )
 
 
+def check_forward(
+    factory: OobleckStaticClassFactory,
+    dfactory: OobleckDynamicClassFactory,
+):
+    model = factory.get_model()
+    pg = dist.new_group(ranks=dfactory._ranks)
+    pgs = [pg] * len(model.layers)
+
+    fsdp_layers, unshard_stream = get_fsdp_layers(model, pgs)
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    input: tuple[torch.Tensor, ...] = tuple(
+        [tensor.to(device) for tensor in model.sample_inputs.values()]
+    )
+
+    for layer in fsdp_layers:
+        layer.unshard(HandleTrainingState.FORWARD)
+        input = layer(*input)
+        layer.reshard()
+
+    assert "loss" in input
+    assert isinstance(input["loss"], torch.Tensor)
+
+
 class TestFullyShardedDataParallelClass(OobleckMultiProcessTestCase):
     def test_fsdp_unshard(self):
         self.run_in_parallel(2, check_unsharded_equal_to_original)
+
+    def test_fsdp_forward(self):
+        self.run_in_parallel(2, check_forward)
