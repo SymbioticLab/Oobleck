@@ -1,3 +1,4 @@
+import logging
 from enum import Enum
 
 import torch
@@ -5,6 +6,7 @@ import torch.distributed
 import torch.fx
 from torch.distributed import ProcessGroup
 from torch.distributed.fsdp._common_utils import HandleTrainingState
+from torch.distributed.fsdp._init_utils import _sync_module_params_and_buffers
 from torch.distributed.fsdp.flat_param import FlatParamHandle, HandleShardingStrategy
 
 
@@ -34,6 +36,9 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
         super().__init__()
         device = torch.device("cuda", torch.cuda.current_device())
         layer.to(device)
+
+        _sync_module_params_and_buffers(layer, list(layer.parameters()), process_group)
+
         self._param_handle = FlatParamHandle(
             params=layer.parameters(),
             fully_sharded_module=layer,
@@ -47,8 +52,6 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
             use_orig_params=False,
         )
         self._param_handle.shard()
-        # self._param_handle.shard()
-        # torch.cuda.current_stream().synchronize()
 
         self._process_group = process_group
         self._streams = streams
@@ -58,7 +61,7 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
         self.unshard_param_event = torch.cuda.Event()
         # TODO: register pre-backward hooks and post-backward hooks
 
-    def unshard(self):
+    def unshard(self, state: HandleTrainingState):
         """
         Initiate unsharding of parameters (if not in progress).
         Mark all future execution to execute after unsharding to complete if `wait` is True.
@@ -72,20 +75,39 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
 
             # If we don't have an event, it means there is no unsharding
             # in process. Iniiate unsharing
-            with torch.cuda.stream(self._streams[StreamType.UNSHARD]):
+
+            assert state in [
+                HandleTrainingState.FORWARD,
+                HandleTrainingState.BACKWARD_PRE,
+            ]
+            self._param_handle._training_state = state
+
+            unshard_stream = self._streams[StreamType.UNSHARD]
+            execution_stream = self._streams[StreamType.EXECUTION]
+
+            with torch.cuda.stream(unshard_stream):
                 self._param_handle.pre_unshard()
                 torch.cuda.current_stream().synchronize()
                 self._param_handle.unshard()
                 self._param_handle.post_unshard()
-                self.unshard_param_event.record()
+                self.unshard_param_event.record(unshard_stream)
+
+            # further execution should wait for unsharding to be done
+            execution_stream.wait_stream(unshard_stream)
 
     def reshard(self):
         if self._param_handle.is_sharded(self._param_handle.flat_param):
             return
 
+        unshard_stream = self._streams[StreamType.UNSHARD]
+        execution_stream = self._streams[StreamType.EXECUTION]
+
+        unshard_stream.wait_stream(execution_stream)
+
         self._param_handle.reshard(True)
         self._param_handle.post_reshard()
-        torch.cuda.current_stream().synchronize()
+
+        execution_stream.wait_stream(unshard_stream)
 
     def forward(self, *args) -> tuple[torch.Tensor]:
         self._param_handle._training_state = HandleTrainingState.FORWARD
