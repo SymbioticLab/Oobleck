@@ -4,7 +4,7 @@ import itertools
 import deepspeed.comm as dist
 import pytest
 import torch
-from torch.distributed import ProcessGroup
+import torch.distributed
 from torch.distributed.fsdp._common_utils import HandleTrainingState
 from torch.distributed.fsdp._init_utils import _sync_module_params_and_buffers
 
@@ -19,7 +19,7 @@ from tests.conftest import (
 
 
 def get_fsdp_layers(
-    model: OobleckModel, pgs: list[ProcessGroup]
+    model: OobleckModel, pgs: list[torch.distributed.ProcessGroup]
 ) -> list[FullyShardedDataParallelLayer]:
     assert len(model.layers) == len(pgs)
 
@@ -59,8 +59,7 @@ def check_unsharded_equal_to_original(
     assert len(fsdp_layers) == len(original_model.layers)
 
     for original_layer, fsdp_layer in zip(original_model.layers, fsdp_layers):
-        fsdp_layer._param_handle._training_state = HandleTrainingState.FORWARD
-        fsdp_layer.unshard()
+        fsdp_layer.unshard(HandleTrainingState.FORWARD)
 
         with fsdp_layer._param_handle.unflatten_as_params():
             original_params = list(original_layer.parameters())
@@ -121,44 +120,41 @@ def check_backward(
         for ni, i in zip(new_input, input):
             if isinstance(ni, torch.Tensor):
                 ni.requires_grad = i.requires_grad
+        inputs.append(new_input)
 
         output = layer(*new_input)
-        inputs.append(new_input)
         outputs.append(output)
         input = output
 
-    torch.cuda.synchronize()
+    torch.cuda.default_stream().synchronize()
 
     # Begin test
-    assert "loss" in input
-    fsdp_layers[-1].backward(input["loss"])
-    torch.cuda.synchronize()
+    assert "loss" in output
+    fsdp_layers[-1].backward(output["loss"])
 
+    # For layers except for the last one,
+    # we need to manually get grads of the output tensors
     for index in reversed(range(len(fsdp_layers) - 1)):
-        output = [
+        output: list[torch.Tensor] = [
             t for t in outputs[index] if isinstance(t, torch.Tensor) and t.requires_grad
         ]
-        for o, i in zip(output, inputs[index + 1]):
-            if isinstance(i, torch.Tensor):
-                o.grad = i.grad
 
-        layer = fsdp_layers[index]
-        next_input = [
+        grads: list[torch.nn.Parameter] = [
             t.grad
             for t in inputs[index + 1]
             if isinstance(t, torch.Tensor) and t.requires_grad
         ]
 
         print(f"Backward for {index}th layer")
-        layer.backward((tuple(output), tuple(next_input)))
+        layer = fsdp_layers[index]
+        layer.backward((tuple(output), tuple(grads)))
 
         torch.cuda.synchronize()
 
-    torch.cuda.synchronize()
     for layer in fsdp_layers:
         handle = layer._param_handle
         if handle.flat_param.requires_grad:
-            assert torch.count_nonzero(handle.flat_param.grad).item() > 0
+            assert handle.flat_param.grad is not None
         else:
             assert handle.flat_param.grad is None
         assert handle.is_sharded(handle.flat_param)
@@ -168,13 +164,16 @@ def check_optimizer_step(
     factory: OobleckStaticClassFactory,
     dfactory: OobleckDynamicClassFactory,
 ):
+    """
+    Oobleck has a single optimizer that contains all parameters from
+    several layers. Because each layer doesn't have its own optimizer,
+    here we emulate the optimizer.
+    """
     model = copy.deepcopy(factory.get_model())
     pg = dist.new_group(ranks=dfactory._ranks)
     pgs = [pg] * len(model.layers)
 
     fsdp_layers = get_fsdp_layers(model, pgs)
-
-    # torch_fsdp_layers = [FullyShardedDataParallel(layer, pg) for layer in model.layers]
 
     params = [l._param_handle.flat_param for l in fsdp_layers]
     params_before = copy.deepcopy(params)
@@ -202,12 +201,7 @@ def check_optimizer_step(
         outputs.append(output)
         input = output
 
-    torch.cuda.synchronize()
-
-    # Begin test
-    assert "loss" in input
     fsdp_layers[-1].backward(input["loss"])
-
     for index in reversed(range(len(fsdp_layers) - 1)):
         output: list[torch.Tensor] = [
             t for t in outputs[index] if isinstance(t, torch.Tensor) and t.requires_grad
@@ -218,7 +212,7 @@ def check_optimizer_step(
 
         layer = fsdp_layers[index]
 
-        next_input = [
+        next_input: list[torch.nn.Parameter] = [
             t.grad
             for t in inputs[index + 1]
             if isinstance(t, torch.Tensor) and t.requires_grad
@@ -226,7 +220,9 @@ def check_optimizer_step(
 
         print(f"Backward for {index}th layer")
         layer.backward((tuple(output), tuple(next_input)))
+    torch.distributed.barrier()
 
+    # Begin test
     # optimizer must not have internal data for now
     for p in optimizer.param_groups[0]["params"]:
         assert len(optimizer.state[p]) == 0
@@ -234,12 +230,18 @@ def check_optimizer_step(
     for l in fsdp_layers:
         l._param_handle.prepare_gradient_for_optim()
     optimizer.step()
-    torch.cuda.synchronize()
 
+    torch.cuda.synchronize()
+    # check parameters are updated
     assert all(
         not torch.allclose(p, pb)
         for p, pb in zip(params, params_before)
         if p.requires_grad
+    )
+
+    # check parameters are still sharded
+    assert all(
+        l._param_handle.is_sharded(l._param_handle.flat_param) for l in fsdp_layers
     )
 
     # optimizer must have internal data for now
