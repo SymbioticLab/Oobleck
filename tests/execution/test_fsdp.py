@@ -146,7 +146,14 @@ def check_backward(
         print(f"Backward for {index}th layer")
         layer.backward((tuple(output), tuple(next_input)))
 
-    # TODO: what to assert here?
+    torch.cuda.synchronize()
+    for layer in fsdp_layers:
+        handle = layer._param_handle
+        if handle.flat_param.requires_grad:
+            assert handle.flat_param.grad is not None
+        else:
+            assert handle.flat_param.grad is None
+        assert handle.is_sharded(handle.flat_param)
 
 
 class TestFullyShardedDataParallelClass(OobleckMultiProcessTestCase):
