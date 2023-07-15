@@ -104,15 +104,6 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
             self._param_handle.reshard(True)
             self._param_handle.post_reshard()
 
-    def unshard_grad(self):
-        unshard_stream = self._streams[StreamType.UNSHARD]
-        execution_stream = self._streams[StreamType.EXECUTION]
-
-        self._param_handle.prepare_gradient_for_backward()
-
-        # further execution should wait for unsharding to be done
-        execution_stream.wait_stream(unshard_stream)
-
     def reshard_grad(self):
         # resharding must be done after execution
         unshard_stream = self._streams[StreamType.UNSHARD]
@@ -133,13 +124,24 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
     def backward(self, tensor: torch.Tensor | tuple[tuple[torch.Tensor], torch.Tensor]):
         self._param_handle._training_state = HandleTrainingState.BACKWARD_PRE
         self.unshard()
-        self.unshard_grad()
+        self._param_handle.prepare_gradient_for_backward()
 
         if isinstance(tensor, torch.Tensor):
             tensor.backward()
         else:
             output, gradients = tensor
             torch.autograd.backward(output, gradients)
+
+        self._param_handle._training_state = HandleTrainingState.BACKWARD_POST
+
+        # emulate fsdp._runtime_utils._post_backward_pass()
+        # to store _param_handle.flat_param._saved_grad_shard
+        self._param_handle.flat_param._post_backward_called = True
+        unsharded_grad = self._param_handle.flat_param.grad.data
+        world_size = torch.distributed.get_world_size(self._process_group)
+        chunks = list(unsharded_grad.chunk(world_size))
+        new_sharded_grad = torch.empty_like(chunks[0])  # padded
+        self._param_handle.flat_param._saved_grad_shard = new_sharded_grad
 
         self.reshard()
         torch.cuda.synchronize()
