@@ -7,6 +7,7 @@ import torch.fx
 from torch.distributed import ProcessGroup
 from torch.distributed.fsdp._common_utils import HandleTrainingState
 from torch.distributed.fsdp.flat_param import FlatParamHandle, HandleShardingStrategy
+from torch.utils.checkpoint import checkpoint as checkpoint_fn
 
 
 class StreamType(Enum):
@@ -35,6 +36,7 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
         super().__init__()
         device = torch.device("cuda", torch.cuda.current_device())
         layer.to(device)
+        self._checkpointable = FullyShardedDataParallelLayer.is_checkpointable(layer)
 
         self._param_handle = FlatParamHandle(
             params=layer.parameters(),
@@ -57,6 +59,18 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
 
         self.unshard_param_event = torch.cuda.Event()
         # TODO: register pre-backward hooks and post-backward hooks
+
+    @staticmethod
+    def is_checkpointable(layer: torch.fx.GraphModule) -> bool:
+        if any(isinstance(m, torch.nn.Embedding) for _, m in layer.named_modules()):
+            return False
+        if any(
+            isinstance(m, torch.nn.CrossEntropyLoss) for _, m in layer.named_modules()
+        ):
+            return False
+        if next(layer.parameters(), None) is None:
+            return False
+        return True
 
     def unshard(self):
         """
@@ -104,6 +118,9 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
             self._param_handle.reshard(True)
             self._param_handle.post_reshard()
 
+        # further execution should wait for unsharding to be done
+        execution_stream.wait_stream(unshard_stream)
+
     def reshard_grad(self):
         # resharding must be done after execution
         unshard_stream = self._streams[StreamType.UNSHARD]
@@ -116,7 +133,10 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
     def forward(self, *args) -> tuple[torch.Tensor]:
         self._param_handle._training_state = HandleTrainingState.FORWARD
         self.unshard()
-        result = self._param_handle._fully_sharded_module(*args)
+        if self._checkpointable:
+            result = checkpoint_fn(self._param_handle._fully_sharded_module, *args)
+        else:
+            result = self._param_handle._fully_sharded_module(*args)
         self.reshard()
         self._param_handle._training_state = HandleTrainingState.IDLE
         return result
