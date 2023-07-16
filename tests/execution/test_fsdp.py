@@ -137,8 +137,6 @@ def check_backward(
         outputs.append(output)
         input = output
 
-    torch.cuda.synchronize()
-
     # Begin test
     assert isinstance(output, tuple)
     fsdp_layers[-1]._param_handle._training_state = HandleTrainingState.BACKWARD_PRE
@@ -161,7 +159,7 @@ def check_backward(
         layer._param_handle._training_state = HandleTrainingState.BACKWARD_PRE
         layer.backward((tuple(output), tuple(grads)))
 
-    torch.cuda.synchronize()
+    torch.cuda.current_stream().synchronize()
 
     for layer in fsdp_layers:
         handle = layer._param_handle
@@ -244,7 +242,7 @@ def check_optimizer_step(
         l._param_handle.prepare_gradient_for_optim()
     optimizer.step()
 
-    torch.cuda.synchronize()
+    torch.cuda.current_stream().synchronize()
 
     # check parameters are still sharded
     assert all(
