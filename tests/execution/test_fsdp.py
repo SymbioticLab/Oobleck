@@ -37,6 +37,11 @@ def get_fsdp_layers(
         fsdp_layer._param_handle.init_flat_param_attributes()
         layers.append(fsdp_layer)
 
+    for prev_layer, layer, next_layer in zip(
+        [None] + layers[:-1], layers, layers[1:] + [None]
+    ):
+        layer.set_prev_and_next_layer(prev_layer, next_layer)
+
     return layers
 
 
@@ -59,7 +64,7 @@ def check_unsharded_equal_to_original(
 
     for original_layer, fsdp_layer in zip(original_model.layers, fsdp_layers):
         fsdp_layer._param_handle._training_state = HandleTrainingState.FORWARD
-        fsdp_layer.unshard()
+        fsdp_layer.unshard(HandleTrainingState.FORWARD)
 
         with fsdp_layer._param_handle.unflatten_as_params():
             original_params = list(original_layer.parameters())

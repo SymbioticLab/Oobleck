@@ -37,6 +37,10 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
         process_group: ProcessGroup,
         streams: dict[StreamType, torch.cuda.Stream],
     ):
+        # Used for prefetching. Lazily initialited by calling set_prev_and_next_layer().
+        self._prev_layer: FullyShardedDataParallelLayer | None
+        self._next_layer: FullyShardedDataParallelLayer | None
+
         super().__init__()
         device = torch.device("cuda", torch.cuda.current_device())
         layer.to(device)
@@ -72,6 +76,14 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
         self.unshard_param_event = torch.cuda.Event()
         # TODO: register pre-backward hooks and post-backward hooks
 
+    def set_prev_and_next_layer(
+        self,
+        prev_layer: FullyShardedDataParallelLayer | None,
+        next_layer: FullyShardedDataParallelLayer | None,
+    ):
+        self._prev_layer = prev_layer
+        self._next_layer = next_layer
+
     @staticmethod
     def is_checkpointable(layer: torch.fx.GraphModule) -> bool:
         if any(isinstance(m, torch.nn.Embedding) for _, m in layer.named_modules()):
@@ -84,7 +96,7 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
             return False
         return True
 
-    def unshard(self):
+    def unshard(self, state: HandleTrainingState):
         """
         Initiate unsharding of parameters (if not in progress).
         Mark all future execution to execute after unsharding to complete if `wait` is True.
@@ -99,10 +111,11 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
             # If we don't have an event, it means there is no unsharding
             # in process. Iniiate unsharing
 
-            assert self._param_handle._training_state in [
+            assert state in [
                 HandleTrainingState.FORWARD,
                 HandleTrainingState.BACKWARD_PRE,
             ], f"Invalid training state {self._param_handle._training_state}"
+            self._param_handle._training_state = state
 
             unshard_stream = self._streams[StreamType.UNSHARD]
             execution_stream = torch.cuda.current_stream()
@@ -119,6 +132,10 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
             # further execution should wait for unsharding to be done
             execution_stream.wait_stream(unshard_stream)
 
+        # if there is a next layer, prefetch unshard it.
+        if self._next_layer is not None:
+            self._next_layer.unshard(state)
+
     def reshard(self):
         if self._param_handle.is_sharded(self._param_handle.flat_param):
             return
@@ -134,7 +151,7 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
 
     def forward(self, *args) -> tuple[torch.Tensor]:
         assert self._param_handle._training_state == HandleTrainingState.FORWARD
-        self.unshard()
+        self.unshard(HandleTrainingState.FORWARD)
 
         # further execution should wait for unsharding to be done
         torch.cuda.default_stream().wait_stream(self._streams[StreamType.UNSHARD])
@@ -150,7 +167,7 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
     ):
         assert self._param_handle._training_state == HandleTrainingState.BACKWARD_PRE
 
-        self.unshard()
+        self.unshard(HandleTrainingState.BACKWARD_PRE)
         with torch.cuda.stream(self._streams[StreamType.UNSHARD]):
             self._param_handle.prepare_gradient_for_backward()
 
