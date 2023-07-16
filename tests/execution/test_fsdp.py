@@ -45,6 +45,28 @@ def get_fsdp_layers(
     return layers
 
 
+def get_layers_and_inputs(
+    factory: OobleckStaticClassFactory, dfactory: OobleckDynamicClassFactory
+) -> tuple[list[FullyShardedDataParallelLayer], tuple[torch.Tensor]]:
+    model = copy.deepcopy(factory.get_model())
+    pg = dist.new_group(ranks=dfactory._ranks)
+    pgs = [pg] * len(model.layers)
+
+    fsdp_layers = get_fsdp_layers(model, pgs)
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    inputs: tuple[torch.Tensor, ...] = tuple(
+        [tensor.to(device) for tensor in model.sample_inputs.values()]
+    )
+
+    # reentrant based activation checkpointing requires
+    # input to require grad
+    for i in inputs:
+        i.requires_grad = i.is_floating_point()
+
+    return fsdp_layers, inputs
+
+
 def check_unsharded_equal_to_original(
     factory: OobleckStaticClassFactory,
     dfactory: OobleckDynamicClassFactory,
@@ -81,16 +103,7 @@ def check_forward(
     factory: OobleckStaticClassFactory,
     dfactory: OobleckDynamicClassFactory,
 ):
-    model = copy.deepcopy(factory.get_model())
-    pg = dist.new_group(ranks=dfactory._ranks)
-    pgs = [pg] * len(model.layers)
-
-    fsdp_layers = get_fsdp_layers(model, pgs)
-
-    device = torch.device("cuda", torch.cuda.current_device())
-    input: tuple[torch.Tensor, ...] = tuple(
-        [tensor.to(device) for tensor in model.sample_inputs.values()]
-    )
+    fsdp_layers, input = get_layers_and_inputs(factory, dfactory)
 
     for layer in fsdp_layers:
         layer._param_handle._training_state = HandleTrainingState.FORWARD
@@ -104,20 +117,7 @@ def check_backward(
     factory: OobleckStaticClassFactory,
     dfactory: OobleckDynamicClassFactory,
 ):
-    model = copy.deepcopy(factory.get_model())
-    pg = dist.new_group(ranks=dfactory._ranks)
-    pgs = [pg] * len(model.layers)
-
-    fsdp_layers = get_fsdp_layers(model, pgs)
-
-    device = torch.device("cuda", torch.cuda.current_device())
-    input: tuple[torch.Tensor, ...] = tuple(
-        [tensor.to(device) for tensor in model.sample_inputs.values()]
-    )
-    # reentrant based activation checkpointing requires
-    # input to require grad
-    for i in input:
-        i.requires_grad = i.is_floating_point()
+    fsdp_layers, input = get_layers_and_inputs(factory, dfactory)
 
     inputs: list[tuple[torch.Tensor | torch.Size]] = []
     outputs: list[tuple[torch.Tensor | torch.Size]] = []
@@ -170,6 +170,90 @@ def check_backward(
         assert handle.is_sharded(handle.flat_param)
 
 
+def check_backward_autograd_execution(
+    factory: OobleckStaticClassFactory,
+    dfactory: OobleckDynamicClassFactory,
+):
+    fsdp_layers, input = get_layers_and_inputs(factory, dfactory)
+
+    for layer in fsdp_layers:
+        # Don't create a new input, just use the previous output
+        layer._param_handle._training_state = HandleTrainingState.FORWARD
+        input = layer(*input)
+
+    output = input
+    # Begin test
+    assert isinstance(output, tuple)
+
+    # This will automatically calculate the gradients in all layers
+    fsdp_layers[-1]._param_handle._training_state = HandleTrainingState.BACKWARD_PRE
+    fsdp_layers[-1].backward(output[0])
+
+    torch.cuda.current_stream().synchronize()
+
+    for layer in fsdp_layers:
+        handle = layer._param_handle
+        if handle.flat_param.requires_grad:
+            assert handle.flat_param.grad is not None
+        else:
+            assert handle.flat_param.grad is None
+        assert handle.is_sharded(handle.flat_param)
+
+
+def check_backward_autograd_from_middle(
+    factory: OobleckStaticClassFactory,
+    dfactory: OobleckDynamicClassFactory,
+):
+    fsdp_layers, input = get_layers_and_inputs(factory, dfactory)
+
+    for layer in fsdp_layers[:-1]:
+        layer._param_handle._training_state = HandleTrainingState.FORWARD
+        input = layer(*input)
+
+    previous_output = tuple(
+        [t for t in input if isinstance(t, torch.Tensor) and t.requires_grad]
+    )
+
+    # Cut torch autograd graph here
+    new_input = tuple(
+        tensor.detach().clone() if isinstance(tensor, torch.Tensor) else tensor
+        for tensor in input
+    )
+    for ni, i in zip(new_input, input):
+        if isinstance(ni, torch.Tensor):
+            ni.requires_grad = i.requires_grad
+
+    # Finish execution
+    fsdp_layers[-1]._param_handle._training_state = HandleTrainingState.FORWARD
+    final_output = fsdp_layers[-1](*new_input)
+
+    # Begin test
+    assert isinstance(final_output, tuple)
+    fsdp_layers[-1]._param_handle._training_state = HandleTrainingState.BACKWARD_PRE
+    fsdp_layers[-1].backward(final_output[0])
+
+    # Use backward with last layer's gradient
+    for layer in fsdp_layers[:-1]:
+        layer._param_handle._training_state = HandleTrainingState.BACKWARD_PRE
+
+    grad_tensors: tuple[torch.Tensor] = tuple(
+        [t.grad for t in new_input if isinstance(t, torch.Tensor) and t.requires_grad]
+    )
+
+    assert len(previous_output) == len(grad_tensors)
+    fsdp_layers[-2].backward((previous_output, grad_tensors))
+
+    torch.cuda.current_stream().synchronize()
+
+    for layer in fsdp_layers:
+        handle = layer._param_handle
+        if handle.flat_param.requires_grad:
+            assert handle.flat_param.grad is not None
+        else:
+            assert handle.flat_param.grad is None
+        assert handle.is_sharded(handle.flat_param)
+
+
 def check_optimizer_step(
     factory: OobleckStaticClassFactory,
     dfactory: OobleckDynamicClassFactory,
@@ -179,24 +263,9 @@ def check_optimizer_step(
     several layers. Because each layer doesn't have its own optimizer,
     here we emulate the optimizer.
     """
-    model = copy.deepcopy(factory.get_model())
-    pg = dist.new_group(ranks=dfactory._ranks)
-    pgs = [pg] * len(model.layers)
-
-    fsdp_layers = get_fsdp_layers(model, pgs)
-
+    fsdp_layers, input = get_layers_and_inputs(factory, dfactory)
     params = [l._param_handle.flat_param for l in fsdp_layers]
     optimizer = torch.optim.AdamW(params, lr=1e-3)
-
-    device = torch.device("cuda", torch.cuda.current_device())
-    input: tuple[torch.Tensor, ...] = tuple(
-        [tensor.to(device) for tensor in model.sample_inputs.values()]
-    )
-    # reentrant based activation checkpointing requires
-    # input to require grad
-    for i in input:
-        if isinstance(i, torch.Tensor):
-            i.requires_grad = i.is_floating_point()
 
     inputs: list[tuple[torch.Tensor | torch.Size]] = []
     outputs: list[tuple[torch.Tensor | torch.Size]] = []
@@ -273,6 +342,12 @@ class TestFullyShardedDataParallelClass(OobleckMultiProcessTestCase):
 
     def test_fsdp_backward(self):
         self.run_in_parallel(2, check_backward)
+
+    def test_fsdp_backward_autograd(self):
+        self.run_in_parallel(2, check_backward_autograd_execution)
+
+    def test_fsp_backward_in_middle(self):
+        self.run_in_parallel(2, check_backward_autograd_from_middle)
 
     def test_fsdp_step(self):
         self.run_in_parallel(2, check_optimizer_step)
