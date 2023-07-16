@@ -383,24 +383,33 @@ def check_optimizer_step(
         assert p.shape == optimizer.state[p]["exp_avg_sq"].shape
 
 
+@pytest.mark.parametrize(
+    "num_gpus",
+    [1, 2, 4],
+    ids=[
+        "1 GPU",
+        "2 GPUs",
+        "4 GPUs",
+    ],
+)
 class TestFullyShardedDataParallelClass(OobleckMultiProcessTestCase):
-    def test_fsdp_unshard(self):
-        self.run_in_parallel(2, check_unsharded_equal_to_original)
+    def test_fsdp_unshard(self, num_gpus: int):
+        self.run_in_parallel(num_gpus, check_unsharded_equal_to_original)
 
-    def test_fsdp_forward(self):
-        self.run_in_parallel(2, check_forward)
+    def test_fsdp_forward(self, num_gpus: int):
+        self.run_in_parallel(num_gpus, check_forward)
 
-    def test_fsdp_mutiple_forwards_backwards(self):
-        self.run_in_parallel(2, check_multiple_forwards_backwards)
+    def test_fsdp_mutiple_forwards_backwards(self, num_gpus: int):
+        self.run_in_parallel(num_gpus, check_multiple_forwards_backwards)
 
-    def test_fsdp_backward(self):
-        self.run_in_parallel(2, check_backward)
+    def test_fsdp_backward(self, num_gpus: int):
+        self.run_in_parallel(num_gpus, check_backward)
 
-    def test_fsdp_backward_autograd(self):
-        self.run_in_parallel(2, check_backward_autograd_execution)
+    def test_fsdp_backward_autograd(self, num_gpus: int):
+        self.run_in_parallel(num_gpus, check_backward_autograd_execution)
 
-    def test_fsp_backward_in_middle(self):
-        self.run_in_parallel(2, check_backward_autograd_from_middle)
+    def test_fsp_backward_in_middle(self, num_gpus: int):
+        self.run_in_parallel(num_gpus, check_backward_autograd_from_middle)
 
-    def test_fsdp_step(self):
-        self.run_in_parallel(2, check_optimizer_step)
+    def test_fsdp_step(self, num_gpus: int):
+        self.run_in_parallel(num_gpus, check_optimizer_step)
