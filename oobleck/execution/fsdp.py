@@ -107,20 +107,17 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
         unshard_stream = self._streams[StreamType.UNSHARD]
         execution_stream = torch.cuda.current_stream()
 
+        assert state in [
+            HandleTrainingState.FORWARD,
+            HandleTrainingState.BACKWARD_PRE,
+        ], f"Invalid training state {self._param_handle._training_state}"
+        self._param_handle._training_state = state
+
         if self.unshard_param_event.query():
             # Unsharding either not started or already finished.
             if not self._param_handle.needs_unshard():
                 # If already finished, return immediately
                 return
-
-            # If we don't have an event, it means there is no unsharding
-            # in process. Iniiate unsharing
-
-            assert state in [
-                HandleTrainingState.FORWARD,
-                HandleTrainingState.BACKWARD_PRE,
-            ], f"Invalid training state {self._param_handle._training_state}"
-            self._param_handle._training_state = state
 
             # unsharding must be done after execution
             unshard_stream.wait_stream(execution_stream)
@@ -131,21 +128,17 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
                 self._param_handle.post_unshard()
                 self.unshard_param_event.record(unshard_stream)
 
-            # further execution should wait for unsharding to be done
-            execution_stream.wait_stream(unshard_stream)
+        # further execution should wait for unsharding to be done
+        execution_stream.wait_stream(unshard_stream)
 
-            if state == HandleTrainingState.FORWARD:
-                # if there is a next layer, prefetch unshard it.
-                if self._next_layer is not None:
-                    self._next_layer.unshard(state)
-            else:
-                # if there is a previous layer, prefetch unshard it.
-                if self._prev_layer is not None:
-                    self._prev_layer.unshard(state)
-
+        if state == HandleTrainingState.FORWARD:
+            # if there is a next layer, prefetch unshard it.
+            if self._next_layer is not None:
+                self._next_layer.unshard(state)
         else:
-            # if prefetched and in progress, mark execution to wait for unsharding
-            execution_stream.wait_stream(unshard_stream)
+            # if there is a previous layer, prefetch unshard it.
+            if self._prev_layer is not None:
+                self._prev_layer.unshard(state)
 
     def reshard(self):
         if self._param_handle.is_sharded(self._param_handle.flat_param):

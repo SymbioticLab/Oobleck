@@ -106,16 +106,13 @@ class TestOobleckSingleStagePipeline(OobleckMultiProcessTestCase):
         pipeline.execution.load_microbatch(buffer_id=0)
         pipeline.execution.forward_pass(buffer_id=0)
 
-        # TODO: try to remove it
-        torch.cuda.synchronize()
-
         # backward_pass must clear outputs.
         # Inject a dummy value and check if it is cleared
         pipeline.pipe_buffers["outputs"][0] = torch.zeros(1)
 
         # before backward pass, check grad are none
         assert all(
-            all(p.grad is None for p in layer.parameters())
+            layer._param_handle.flat_param.grad is None
             for layer in pipeline.execution._layers
         )
 
@@ -128,11 +125,7 @@ class TestOobleckSingleStagePipeline(OobleckMultiProcessTestCase):
         # If FSDP is used, some too small tensors might be only on rank 0,
         # thus pass if size is 0.
         assert all(
-            all(
-                p._grad is not None
-                for p in layer.parameters()
-                if p.requires_grad and p.numel() > 0
-            )
+            layer._param_handle.flat_param.grad is not None
             for layer in pipeline.execution._layers
         )
 
@@ -147,14 +140,7 @@ class TestOobleckSingleStagePipeline(OobleckMultiProcessTestCase):
         )
         pipeline.execution.load_microbatch(buffer_id=0)
         pipeline.execution.forward_pass(buffer_id=0)
-
-        # TODO: try to remove it
-        torch.cuda.synchronize()
-
         pipeline.execution.backward_pass(buffer_id=0)
-
-        # TODO: think how to remove it
-        torch.cuda.synchronize()
 
         # optimizer must not have internal data for now
         for p in pipeline.execution._optimizer.param_groups[0]["params"]:
