@@ -12,7 +12,6 @@ from deepspeed import comm as dist
 from deepspeed.runtime.lr_schedules import WarmupLR
 from deepspeed.runtime.pipe import schedule
 from torch.distributed import ProcessGroup, Work
-from torch.distributed.fsdp._common_utils import HandleTrainingState
 from torch.optim import AdamW
 from transformers.training_args import TrainingArguments
 
@@ -127,9 +126,7 @@ class PipelineExecution:
 
         # Execute forward
         for layer in self._layers:
-            layer._param_handle._training_state = HandleTrainingState.FORWARD
             inputs = layer(*inputs)
-            layer._param_handle._training_state = HandleTrainingState.IDLE
 
         outputs = inputs
 
@@ -158,11 +155,6 @@ class PipelineExecution:
             self.pipeline.pipe_buffers["outputs"][buffer_id] = outputs
 
     def backward_pass(self, buffer_id: int):
-        for layer in self._layers:
-            layer._param_handle._training_state = HandleTrainingState.BACKWARD_PRE
-
-        # FIXME: currently layers are individually handled.
-        # Find out how to make it more elegant.
         if self.pipeline.is_last_stage():
             loss = self._loss
             self._layers[-1].backward(loss)
@@ -188,7 +180,6 @@ class PipelineExecution:
     def optimizer_step(self, lr_kwargs=None):
         # amp enable check: gradient clipping
         for layer in self._layers:
-            layer._param_handle._training_state = HandleTrainingState.BACKWARD_POST
             layer._param_handle.prepare_gradient_for_optim()
         self._optimizer.step()
         self._lr_scheduler.step(**(lr_kwargs or {}))
@@ -531,6 +522,7 @@ class OobleckPipeline:
             self._per_layer_pgs[layer_id] = pg
 
             unshard_stream = torch.cuda.Stream()
+            postbackward_stream = torch.cuda.Stream()
             # Get FSDP module if this rank is involved in this layer
             if my_rank in ranks:
                 fsdp_layer = FullyShardedDataParallelLayer(
@@ -538,6 +530,7 @@ class OobleckPipeline:
                     process_group=pg,
                     streams={
                         StreamType.UNSHARD: unshard_stream,
+                        StreamType.POST_BACKWARD: postbackward_stream,
                     },
                 )
                 fsdp_layer._param_handle.init_flat_param_attributes()
@@ -546,6 +539,11 @@ class OobleckPipeline:
 
         if fsdp_layers:
             assert shard_id >= 0, "shard id is not set while fsdp_layers have layers."
+
+            for prev_layer, layer, next_layer in zip(
+                [None] + fsdp_layers[:-1], fsdp_layers, fsdp_layers[1:] + [None]
+            ):
+                layer.set_prev_and_next_layer(prev_layer, next_layer)
             self._initialize_execution(fsdp_layers, shard_id)
 
         assert len(self._per_layer_pgs) == len(
