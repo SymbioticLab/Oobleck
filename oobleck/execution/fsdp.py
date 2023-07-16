@@ -159,7 +159,6 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
             self._param_handle.post_reshard()
 
     def forward(self, *args) -> tuple[torch.Tensor]:
-        assert self._param_handle._training_state == HandleTrainingState.FORWARD
         self.unshard(HandleTrainingState.FORWARD)
 
         # further execution should wait for unsharding to be done
@@ -174,8 +173,6 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
         module: torch.nn.Module,
         grad_output: torch.nn.modules.module._grad_t,
     ):
-        assert self._param_handle._training_state == HandleTrainingState.BACKWARD_PRE
-
         self.unshard(HandleTrainingState.BACKWARD_PRE)
         with torch.cuda.stream(self._streams[StreamType.UNSHARD]):
             self._param_handle.prepare_gradient_for_backward()
@@ -190,7 +187,9 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
     ):
         unshard_stream = self._streams[StreamType.UNSHARD]
         post_backward_stream = self._streams[StreamType.POST_BACKWARD]
+
         post_backward_stream.wait_stream(torch.cuda.current_stream())
+        self._param_handle._training_state = HandleTrainingState.BACKWARD_POST
 
         # follow fsdp._runtime_utils._post_backward_pass()
         # that stores _param_handle.flat_param._saved_grad_shard

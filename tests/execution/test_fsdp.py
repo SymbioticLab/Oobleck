@@ -85,7 +85,6 @@ def check_unsharded_equal_to_original(
     assert len(fsdp_layers) == len(original_model.layers)
 
     for original_layer, fsdp_layer in zip(original_model.layers, fsdp_layers):
-        fsdp_layer._param_handle._training_state = HandleTrainingState.FORWARD
         fsdp_layer.unshard(HandleTrainingState.FORWARD)
 
         with fsdp_layer._param_handle.unflatten_as_params():
@@ -106,7 +105,6 @@ def check_forward(
     fsdp_layers, input = get_layers_and_inputs(factory, dfactory)
 
     for layer in fsdp_layers:
-        layer._param_handle._training_state = HandleTrainingState.FORWARD
         input = layer(*input)
 
     # input[0]: loss, input[1]: logits
@@ -132,14 +130,12 @@ def check_backward(
                 ni.requires_grad = i.requires_grad
         inputs.append(new_input)
 
-        layer._param_handle._training_state = HandleTrainingState.FORWARD
         output = layer(*new_input)
         outputs.append(output)
         input = output
 
     # Begin test
     assert isinstance(output, tuple)
-    fsdp_layers[-1]._param_handle._training_state = HandleTrainingState.BACKWARD_PRE
     fsdp_layers[-1].backward(output[0])
 
     # For layers except for the last one,
@@ -156,7 +152,6 @@ def check_backward(
         ]
 
         layer = fsdp_layers[index]
-        layer._param_handle._training_state = HandleTrainingState.BACKWARD_PRE
         layer.backward((tuple(output), tuple(grads)))
 
     torch.cuda.current_stream().synchronize()
@@ -178,7 +173,6 @@ def check_backward_autograd_execution(
 
     for layer in fsdp_layers:
         # Don't create a new input, just use the previous output
-        layer._param_handle._training_state = HandleTrainingState.FORWARD
         input = layer(*input)
 
     output = input
@@ -186,7 +180,6 @@ def check_backward_autograd_execution(
     assert isinstance(output, tuple)
 
     # This will automatically calculate the gradients in all layers
-    fsdp_layers[-1]._param_handle._training_state = HandleTrainingState.BACKWARD_PRE
     fsdp_layers[-1].backward(output[0])
 
     torch.cuda.current_stream().synchronize()
@@ -207,7 +200,6 @@ def check_backward_autograd_from_middle(
     fsdp_layers, input = get_layers_and_inputs(factory, dfactory)
 
     for layer in fsdp_layers[:-1]:
-        layer._param_handle._training_state = HandleTrainingState.FORWARD
         input = layer(*input)
 
     previous_output = tuple(
@@ -224,18 +216,13 @@ def check_backward_autograd_from_middle(
             ni.requires_grad = i.requires_grad
 
     # Finish execution
-    fsdp_layers[-1]._param_handle._training_state = HandleTrainingState.FORWARD
     final_output = fsdp_layers[-1](*new_input)
 
     # Begin test
     assert isinstance(final_output, tuple)
-    fsdp_layers[-1]._param_handle._training_state = HandleTrainingState.BACKWARD_PRE
     fsdp_layers[-1].backward(final_output[0])
 
     # Use backward with last layer's gradient
-    for layer in fsdp_layers[:-1]:
-        layer._param_handle._training_state = HandleTrainingState.BACKWARD_PRE
-
     grad_tensors: tuple[torch.Tensor] = tuple(
         [t.grad for t in new_input if isinstance(t, torch.Tensor) and t.requires_grad]
     )
@@ -279,13 +266,11 @@ def check_optimizer_step(
             if isinstance(ni, torch.Tensor):
                 ni.requires_grad = i.requires_grad
 
-        layer._param_handle._training_state = HandleTrainingState.FORWARD
         output = layer(*new_input)
         inputs.append(new_input)
         outputs.append(output)
         input = output
 
-    fsdp_layers[-1]._param_handle._training_state = HandleTrainingState.BACKWARD_PRE
     fsdp_layers[-1].backward(input[0])
     for index in reversed(range(len(fsdp_layers) - 1)):
         output: list[torch.Tensor] = [
@@ -299,7 +284,6 @@ def check_optimizer_step(
         ]
 
         layer = fsdp_layers[index]
-        layer._param_handle._training_state = HandleTrainingState.BACKWARD_PRE
         layer.backward((tuple(output), tuple(grads)))
 
     # Begin test
