@@ -12,6 +12,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
 from torch.distributed.fsdp._common_utils import HandleTrainingState
+from torch.distributed.fsdp._runtime_utils import _check_grad_to_accumulate
 from torch.distributed.fsdp.flat_param import FlatParamHandle, HandleShardingStrategy
 
 
@@ -67,6 +68,7 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
         self._param_handle.flat_param.register_hook(
             functools.partial(self._post_backward_hook, self)
         )
+        self._param_handle.flat_param._saved_grad_shard: tuple[torch.Tensor] = None
 
         self._process_group = process_group
         self._streams = streams
@@ -150,6 +152,7 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
             return
 
         unshard_stream = self._streams[StreamType.UNSHARD]
+        execution_stream = torch.cuda.current_stream()
 
         # resharding must be done after execution
         unshard_stream.wait_stream(torch.cuda.current_stream())
@@ -157,6 +160,8 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
         with torch.cuda.stream(unshard_stream):
             self._param_handle.reshard(True)
             self._param_handle.post_reshard()
+
+        execution_stream.wait_stream(unshard_stream)
 
     def forward(self, *args) -> tuple[torch.Tensor]:
         self.unshard(HandleTrainingState.FORWARD)
@@ -186,25 +191,41 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
         grad_output: torch.Tensor,
     ):
         unshard_stream = self._streams[StreamType.UNSHARD]
-        post_backward_stream = self._streams[StreamType.POST_BACKWARD]
+        post_backward_stream = torch.cuda.default_stream()
+        handle = self._param_handle
 
         post_backward_stream.wait_stream(torch.cuda.current_stream())
-        self._param_handle._training_state = HandleTrainingState.BACKWARD_POST
+        handle._training_state = HandleTrainingState.BACKWARD_POST
 
         # follow fsdp._runtime_utils._post_backward_pass()
         # that stores _param_handle.flat_param._saved_grad_shard
-        with torch.cuda.stream(post_backward_stream):
-            self._param_handle.flat_param._post_backward_called = True
-            # unsharded_grad = self._param_handle.flat_param.grad.data
-            unsharded_grad = grad_output.data
-            world_size = torch.distributed.get_world_size(self._process_group)
-            chunks = list(unsharded_grad.chunk(world_size))
-            new_sharded_grad = torch.empty_like(chunks[0])  # padded
-            self._param_handle.flat_param._saved_grad_shard = new_sharded_grad
+        if self._param_handle.uses_sharded_strategy:
+            with torch.cuda.stream(post_backward_stream):
+                handle.flat_param._post_backward_called = True
+                unsharded_grad = grad_output.data
+                world_size = torch.distributed.get_world_size(self._process_group)
+                chunks = list(unsharded_grad.chunk(world_size))
+                new_sharded_grad = torch.empty_like(chunks[0])  # padded
 
-        # resharding must wait for post backward
-        unshard_stream.wait_stream(post_backward_stream)
-        self.reshard()
+                # cast grad dtype to param dtype
+                if new_sharded_grad.dtype != handle.flat_param.dtype:
+                    new_sharded_grad = new_sharded_grad.to(handle.flat_param.dtype)
+
+                # accumulated gradient if needed
+                if handle.flat_param._saved_grad_shard is not None:
+                    _check_grad_to_accumulate(
+                        new_sharded_grad, handle.flat_param._saved_grad_shard
+                    )
+                    handle.flat_param._saved_grad_shard += new_sharded_grad
+                else:
+                    handle.flat_param._saved_grad_shard = new_sharded_grad
+
+                # Remove temporary grad.
+                handle.flat_param.grad = None
+
+                # resharding must wait for post backward
+                unshard_stream.wait_stream(post_backward_stream)
+                self.reshard()
 
     def backward(self, tensor: torch.Tensor | tuple[tuple[torch.Tensor], torch.Tensor]):
         """

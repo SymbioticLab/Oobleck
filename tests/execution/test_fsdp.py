@@ -165,6 +165,86 @@ def check_backward(
         assert handle.is_sharded(handle.flat_param)
 
 
+def check_multiple_forwards_backwards(
+    factory: OobleckStaticClassFactory,
+    dfactory: OobleckDynamicClassFactory,
+):
+    """Test fwd-fwd-bwd-bwd execution order."""
+    fsdp_layers, input = get_layers_and_inputs(factory, dfactory)
+
+    first_input = input
+    second_input = tuple(
+        [
+            torch.rand_like(
+                tensor,
+                requires_grad=tensor.requires_grad,
+            )
+            if tensor.dtype.is_floating_point
+            else tensor
+            for tensor in input
+        ]
+    )
+
+    for ni, i in zip(first_input, input):
+        if isinstance(ni, torch.Tensor):
+            ni.requires_grad = i.requires_grad
+
+    # first fwd
+    for layer in fsdp_layers:
+        first_input = layer(*first_input)
+
+    # second bwd
+    for layer in fsdp_layers:
+        second_input = layer(*second_input)
+
+    first_loss = first_input[0]
+    second_loss = second_input[0]
+
+    # Before backward, grad should not be set
+    for layer in fsdp_layers:
+        assert layer._param_handle.flat_param.grad is None
+        assert layer._param_handle.flat_param._saved_grad_shard is None
+
+    # First backward
+    fsdp_layers[-1].backward(first_loss)
+    torch.cuda.synchronize()
+
+    grad_tensors: list[list[torch.nn.Parameter]] = []
+    # After first backwad, grad should be set
+    for layer in fsdp_layers:
+        if layer._param_handle.flat_param.requires_grad:
+            assert layer._param_handle.flat_param.grad is not None
+            assert layer._param_handle.flat_param._saved_grad_shard is not None
+        else:
+            assert layer._param_handle.flat_param.grad is None
+            assert layer._param_handle.flat_param._saved_grad_shard is None
+
+        grad_tensors.append(
+            layer._param_handle.flat_param._saved_grad_shard.detach().clone()
+            if layer._param_handle.flat_param._saved_grad_shard is not None
+            else None
+        )
+
+        # Remove grad to check if it is set in second backward
+        layer._param_handle.flat_param.grad = None
+
+    # Second backward
+    fsdp_layers[-1].backward(second_loss)
+    torch.cuda.synchronize()
+
+    for grad_tensor, layer in zip(grad_tensors, fsdp_layers):
+        assert layer._param_handle.is_sharded(layer._param_handle.flat_param)
+
+        if layer._param_handle.flat_param.requires_grad:
+            assert layer._param_handle.flat_param.grad is not None
+        else:
+            assert layer._param_handle.flat_param.grad is None
+
+        # _saved_grad_shard is an accumulated gradient tensor that must be different.
+        second_grad_tensor = layer._param_handle.flat_param._saved_grad_shard
+        assert not torch.allclose(second_grad_tensor, grad_tensor)
+
+
 def check_backward_autograd_execution(
     factory: OobleckStaticClassFactory,
     dfactory: OobleckDynamicClassFactory,
@@ -323,6 +403,9 @@ class TestFullyShardedDataParallelClass(OobleckMultiProcessTestCase):
 
     def test_fsdp_forward(self):
         self.run_in_parallel(2, check_forward)
+
+    def test_fsdp_mutiple_forward(self):
+        self.run_in_parallel(2, check_multiple_forwards_backwards)
 
     def test_fsdp_backward(self):
         self.run_in_parallel(2, check_backward)
