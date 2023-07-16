@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import functools
 import logging
 from enum import Enum
 
@@ -51,6 +54,12 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
             use_orig_params=False,
         )
         self._param_handle.shard()
+        self._param_handle._fully_sharded_module.register_full_backward_pre_hook(
+            functools.partial(self._pre_backward_hook, self)
+        )
+        self._param_handle.flat_param.register_hook(
+            functools.partial(self._post_backward_hook, self)
+        )
 
         self._process_group = process_group
         self._streams = streams
@@ -137,36 +146,50 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
 
     def forward(self, *args) -> tuple[torch.Tensor]:
         self.unshard(HandleTrainingState.FORWARD)
-        if self._checkpointable:
-            result = checkpoint_fn(self._param_handle._fully_sharded_module, *args)
-        else:
-            result = self._param_handle._fully_sharded_module(*args)
+        # TODO: uncomment it with fix in backward recomputation.
+        # Currently recomputing in backward doesn't have unsharded params.
+        # if self._checkpointable:
+        #     result = checkpoint_fn(self._param_handle._fully_sharded_module, *args)
+        # else:
+        #     result = self._param_handle._fully_sharded_module(*args)
+        result = self._param_handle._fully_sharded_module(*args)
         self.reshard()
 
         return result
 
-    def backward(self, tensor: torch.Tensor | tuple[tuple[torch.Tensor], torch.Tensor]):
+    @staticmethod
+    def _pre_backward_hook(
+        self: FullyShardedDataParallelLayer,
+        module: torch.nn.Module,
+        grad_output: torch.nn.modules.module._grad_t,
+    ):
         self.unshard(HandleTrainingState.BACKWARD_PRE)
         self._param_handle.prepare_gradient_for_backward()
 
-        if isinstance(tensor, torch.Tensor):
-            tensor.backward()
-        else:
-            output, gradients = tensor
-            torch.autograd.backward(output, gradients)
-
-        # emulate fsdp._runtime_utils._post_backward_pass()
-        # to store _param_handle.flat_param._saved_grad_shard
+    @staticmethod
+    def _post_backward_hook(
+        self: FullyShardedDataParallelLayer,
+        grad_output: torch.Tensor,
+    ):
+        # follow fsdp._runtime_utils._post_backward_pass()
+        # that stores _param_handle.flat_param._saved_grad_shard
         self._param_handle._training_state = HandleTrainingState.BACKWARD_POST
         self._param_handle.flat_param._post_backward_called = True
-        unsharded_grad = self._param_handle.flat_param.grad.data
+        # unsharded_grad = self._param_handle.flat_param.grad.data
+        unsharded_grad = grad_output.data
         world_size = torch.distributed.get_world_size(self._process_group)
         chunks = list(unsharded_grad.chunk(world_size))
         new_sharded_grad = torch.empty_like(chunks[0])  # padded
         self._param_handle.flat_param._saved_grad_shard = new_sharded_grad
 
         self.reshard()
-        # TODO: what to do after backward?
+
+    def backward(self, tensor: torch.Tensor | tuple[tuple[torch.Tensor], torch.Tensor]):
+        if isinstance(tensor, torch.Tensor):
+            tensor.backward()
+        else:
+            output, gradients = tensor
+            torch.autograd.backward(output, gradients)
 
 
 class OobleckFullyShardedDataParallel:

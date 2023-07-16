@@ -1,12 +1,10 @@
 import copy
-import itertools
 
 import deepspeed.comm as dist
 import pytest
 import torch
 import torch.distributed
 from torch.distributed.fsdp._common_utils import HandleTrainingState
-from torch.distributed.fsdp._init_utils import _sync_module_params_and_buffers
 
 from oobleck.execution.fsdp import FullyShardedDataParallelLayer, StreamType
 from oobleck.module.model import OobleckModel
@@ -90,8 +88,8 @@ def check_forward(
     for layer in fsdp_layers:
         input = layer(*input)
 
-    assert "loss" in input
-    assert isinstance(input["loss"], torch.Tensor)
+    # input[0]: loss, input[1]: logits
+    assert isinstance(input[0], torch.Tensor)
 
 
 def check_backward(
@@ -126,11 +124,12 @@ def check_backward(
         outputs.append(output)
         input = output
 
+    # TODO: think how we can remove this.
     torch.cuda.default_stream().synchronize()
 
     # Begin test
-    assert "loss" in output
-    fsdp_layers[-1].backward(output["loss"])
+    assert isinstance(output, tuple)
+    fsdp_layers[-1].backward(output[0])
 
     # For layers except for the last one,
     # we need to manually get grads of the output tensors
@@ -145,11 +144,10 @@ def check_backward(
             if isinstance(t, torch.Tensor) and t.requires_grad
         ]
 
-        print(f"Backward for {index}th layer")
         layer = fsdp_layers[index]
         layer.backward((tuple(output), tuple(grads)))
 
-        torch.cuda.synchronize()
+    torch.cuda.synchronize()
 
     for layer in fsdp_layers:
         handle = layer._param_handle
@@ -201,7 +199,7 @@ def check_optimizer_step(
         outputs.append(output)
         input = output
 
-    fsdp_layers[-1].backward(input["loss"])
+    fsdp_layers[-1].backward(input[0])
     for index in reversed(range(len(fsdp_layers) - 1)):
         output: list[torch.Tensor] = [
             t for t in outputs[index] if isinstance(t, torch.Tensor) and t.requires_grad

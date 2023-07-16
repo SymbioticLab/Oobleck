@@ -59,6 +59,8 @@ class OobleckModel:
             config_args = {}
         config_args["use_cache"] = False
         config_args["remove_unused_columns"] = False
+        # necessary to register backward hooks
+        config_args["return_dict"] = False
 
         # Use training_args for fp16/bf16
         model_config: PretrainedConfig = AutoConfig.from_pretrained(
