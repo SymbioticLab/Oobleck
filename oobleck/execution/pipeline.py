@@ -13,13 +13,12 @@ from deepspeed import comm as dist
 from deepspeed.runtime.lr_schedules import WarmupLR
 from deepspeed.runtime.pipe import schedule
 from torch.distributed import ProcessGroup, Work
-from torch.distributed.fsdp import FullyShardedDataParallel
-from torch.distributed.fsdp.api import BackwardPrefetch, ShardingStrategy
 from torch.optim import AdamW
 from transformers.training_args import TrainingArguments
 
 from oobleck.csrc.planning.pipeline_template import PipelineTemplate
 from oobleck.execution.dataloader import OobleckDataLoader, OobleckSampler
+from oobleck.execution.fsdp import FullyShardedDataParallelLayer, StreamType
 from oobleck.execution.utils import DTYPE_TO_ID, ID_TO_DTYPE, zero_grads
 from oobleck.module.model import OobleckModel
 
@@ -35,7 +34,7 @@ class PipelineExecution:
     def __init__(
         self,
         pipeline: OobleckPipeline,
-        layers: list[FullyShardedDataParallel],
+        layers: list[FullyShardedDataParallelLayer],
         shard_id: int,
         dataloader: OobleckDataLoader,
         training_args: TrainingArguments,
@@ -48,15 +47,13 @@ class PipelineExecution:
         self._training_args = training_args
 
         # stores the loss for the current microbatch being processed
-        self._loss: torch.Tensor | Iterable[torch.Tensor] | None = None
+        self._loss: torch.Tensor | None = None
 
         # stores the loss for the entire batch
-        self.total_loss: torch.Tensor | Iterable[torch.Tensor] | None = None
+        self.total_loss: torch.Tensor | None = None
 
         # TODO: use HF arguments to initialize optimizer and LR properly
-        parameters = list(
-            itertools.chain(*[list(layer.parameters()) for layer in self._layers])
-        )
+        parameters = list(l._param_handle.flat_param for l in layers)
         self._optimizer = AdamW(
             parameters,
             lr=self._training_args.learning_rate,
@@ -136,19 +133,13 @@ class PipelineExecution:
 
         # Optionally compute loss on the last stage
         if self.pipeline.is_last_stage():
-            self._loss = outputs["loss"]
-            del outputs["logits"]
+            self._loss = outputs[0]
 
-            if isinstance(self._loss, torch.Tensor):
-                if self.total_loss is None:
-                    self.total_loss = torch.zeros_like(self._loss)
-                self.total_loss += self._loss.detach()
-            else:
-                if self.total_loss is None:
-                    self.total_loss = [torch.zeros_like(l) for l in self._loss]
-                for idx, l in enumerate(self._loss):
-                    assert torch.is_tensor(l)
-                    self.total_loss[idx] += l.detach()
+            assert isinstance(self._loss, torch.Tensor)
+            if self.total_loss is None:
+                self.total_loss = torch.zeros_like(self._loss)
+            self.total_loss += self._loss.detach()
+
         else:
             # XXX Hack
             # It might includes torch.Size() in outputs.
@@ -189,6 +180,8 @@ class PipelineExecution:
 
     def optimizer_step(self, lr_kwargs=None):
         # amp enable check: gradient clipping
+        for l in self._layers:
+            l._param_handle.prepare_gradient_for_optim()
         self._optimizer.step()
         self._lr_scheduler.step(**(lr_kwargs or {}))
 
@@ -469,7 +462,7 @@ class OobleckPipeline:
 
     def _initialize_execution(
         self,
-        layers: list[FullyShardedDataParallel],
+        layers: list[FullyShardedDataParallelLayer],
         shard_id: int,
     ):
         self.execution = PipelineExecution(
@@ -521,7 +514,7 @@ class OobleckPipeline:
         self._per_layer_pgs: dict[int, ProcessGroup] = {}
         self.execution: PipelineExecution | None = None
 
-        fsdp_layers: list[FullyShardedDataParallel] = []
+        fsdp_layers: list[FullyShardedDataParallelLayer] = []
         shard_id: int = -1
         my_rank = dist.get_rank()
         for layer_id, ranks in self._rank_grid.items():
@@ -529,17 +522,17 @@ class OobleckPipeline:
             pg = dist.new_group(list(set(ranks)))
             self._per_layer_pgs[layer_id] = pg
 
+            unshard_stream = torch.cuda.Stream()
             # Get FSDP module if this rank is involved in this layer
             if my_rank in ranks:
                 # FIXME: Seems backward_prefetch doesn't work with pipeline parallelism.
                 fsdp_layers.append(
-                    FullyShardedDataParallel(
-                        copy.deepcopy(model.model[layer_id]).to("cuda"),
+                    FullyShardedDataParallelLayer(
+                        copy.deepcopy(model.layers[layer_id]).to("cuda"),
                         process_group=pg,
-                        sharding_strategy=ShardingStrategy.FULL_SHARD,
-                        backward_prefetch=BackwardPrefetch.BACKWARD_POST,
-                        mixed_precision=None,
-                        use_orig_params=False,
+                        streams={
+                            StreamType.UNSHARD: unshard_stream,
+                        },
                     )
                 )
                 shard_id = ranks.index(my_rank)
@@ -549,11 +542,11 @@ class OobleckPipeline:
             self._initialize_execution(fsdp_layers, shard_id)
 
         assert len(self._per_layer_pgs) == len(
-            model.model
+            model.layers
         ), "Number of per-layer process groups and model layers must match."
         assert all(
             layer_index in self._per_layer_pgs
-            for layer_index in range(len(model.model))
+            for layer_index in range(len(model.layers))
         ), "Process groups for some layers are not initialized."
 
         # self.execution may not be initialized at this moment. Don't add assertion here.

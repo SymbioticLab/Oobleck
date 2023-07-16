@@ -117,7 +117,7 @@ class OobleckStaticClassFactory:
         self.get_model()
 
         if not self._profile:
-            num_layers = len(self._model.model)
+            num_layers = len(self._model.layers)
 
             results: list[LayerExecutionResult] = []
             for index in range(num_layers):

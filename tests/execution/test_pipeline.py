@@ -29,7 +29,7 @@ class TestOobleckSingleStagePipeline(OobleckMultiProcessTestCase):
         assert pipeline.communication.next_rank is None
 
         # Because we only have one rank, it should execute all layers in the model
-        assert len(pipeline.execution._layers) == len(model.model)
+        assert len(pipeline.execution._layers) == len(model.layers)
 
         assert isinstance(pipeline.execution._optimizer, AdamW)
         assert isinstance(pipeline.execution._lr_scheduler, WarmupLR)
@@ -196,12 +196,12 @@ class TestMultiStagePipeline(OobleckMultiProcessTestCase):
             None if dfactory._my_rank == 3 else dfactory._my_rank + 1
         )
 
-        assert len(pipeline.execution._layers) < len(model.model)
+        assert len(pipeline.execution._layers) < len(model.layers)
 
         for layer in pipeline.execution._layers:
             assert all(p.is_cuda for p in layer.parameters())
 
-        return (len(pipeline.execution._layers), len(model.model))
+        return (len(pipeline.execution._layers), len(model.layers))
 
     def test_attributes_type(self):
         results = self.run_in_parallel(
