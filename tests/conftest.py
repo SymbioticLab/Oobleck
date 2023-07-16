@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import gc
 import logging
 import math
@@ -227,7 +228,7 @@ class OobleckDynamicClassFactory:
         num_nodes: int = 1,
         num_gpus_per_node: int = 1,
     ) -> OobleckPipeline:
-        model = self._static_factory.get_model()
+        model = copy.deepcopy(self._static_factory.get_model())
         # TODO: make this more flexible
         template = self._static_factory.get_dummy_pipeline_template(
             num_stages=num_stages,

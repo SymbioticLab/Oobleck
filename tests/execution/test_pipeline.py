@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 import pytest
 import torch
 import torch.distributed
@@ -21,7 +23,7 @@ class TestOobleckSingleStagePipeline(OobleckMultiProcessTestCase):
         dfactory: OobleckDynamicClassFactory,
         num_gpus_per_node: int,
     ):
-        model = factory.get_model()
+        model = copy.deepcopy(factory.get_model())
         pipeline = dfactory.get_dummy_pipeline(
             num_stages=1, num_gpus_per_node=num_gpus_per_node
         )

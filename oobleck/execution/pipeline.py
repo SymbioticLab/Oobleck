@@ -525,16 +525,15 @@ class OobleckPipeline:
             unshard_stream = torch.cuda.Stream()
             # Get FSDP module if this rank is involved in this layer
             if my_rank in ranks:
-                # FIXME: Seems backward_prefetch doesn't work with pipeline parallelism.
-                fsdp_layers.append(
-                    FullyShardedDataParallelLayer(
-                        copy.deepcopy(model.layers[layer_id]).to("cuda"),
-                        process_group=pg,
-                        streams={
-                            StreamType.UNSHARD: unshard_stream,
-                        },
-                    )
+                fsdp_layer = FullyShardedDataParallelLayer(
+                    model.layers[layer_id].to("cuda"),
+                    process_group=pg,
+                    streams={
+                        StreamType.UNSHARD: unshard_stream,
+                    },
                 )
+                fsdp_layer._param_handle.init_flat_param_attributes()
+                fsdp_layers.append(fsdp_layer)
                 shard_id = ranks.index(my_rank)
 
         if fsdp_layers:
