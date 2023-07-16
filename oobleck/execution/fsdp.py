@@ -207,6 +207,12 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
                 chunks = list(unsharded_grad.chunk(world_size))
                 new_sharded_grad = torch.empty_like(chunks[0])  # padded
 
+                torch.distributed.reduce_scatter_tensor(
+                    output=new_sharded_grad,
+                    input=unsharded_grad,
+                    group=self._process_group,
+                )
+
                 # cast grad dtype to param dtype
                 if new_sharded_grad.dtype != handle.flat_param.dtype:
                     new_sharded_grad = new_sharded_grad.to(handle.flat_param.dtype)
@@ -220,12 +226,12 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
                 else:
                     handle.flat_param._saved_grad_shard = new_sharded_grad
 
-                # Remove temporary grad.
-                handle.flat_param.grad = None
-
                 # resharding must wait for post backward
                 unshard_stream.wait_stream(post_backward_stream)
                 self.reshard()
+
+        # all further execution must be done after sharding
+        torch.cuda.current_stream().wait_stream(unshard_stream)
 
     def backward(self, tensor: torch.Tensor | tuple[tuple[torch.Tensor], torch.Tensor]):
         """

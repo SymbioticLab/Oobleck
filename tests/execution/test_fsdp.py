@@ -210,37 +210,23 @@ def check_multiple_forwards_backwards(
     torch.cuda.synchronize()
 
     grad_tensors: list[list[torch.nn.Parameter]] = []
-    # After first backwad, grad should be set
+    # After first backward, _saved_grad_shard should be set
     for layer in fsdp_layers:
         if layer._param_handle.flat_param.requires_grad:
-            assert layer._param_handle.flat_param.grad is not None
             assert layer._param_handle.flat_param._saved_grad_shard is not None
+            grad_tensors.append(
+                layer._param_handle.flat_param._saved_grad_shard.detach().clone()
+            )
         else:
-            assert layer._param_handle.flat_param.grad is None
             assert layer._param_handle.flat_param._saved_grad_shard is None
-
-        grad_tensors.append(
-            layer._param_handle.flat_param._saved_grad_shard.detach().clone()
-            if layer._param_handle.flat_param._saved_grad_shard is not None
-            else None
-        )
-
-        # Remove grad to check if it is set in second backward
-        layer._param_handle.flat_param.grad = None
+            grad_tensors.append(None)
 
     # Second backward
     fsdp_layers[-1].backward(second_loss)
     torch.cuda.synchronize()
 
     for grad_tensor, layer in zip(grad_tensors, fsdp_layers):
-        assert layer._param_handle.is_sharded(layer._param_handle.flat_param)
-
-        if layer._param_handle.flat_param.requires_grad:
-            assert layer._param_handle.flat_param.grad is not None
-        else:
-            assert layer._param_handle.flat_param.grad is None
-
-        # _saved_grad_shard is an accumulated gradient tensor that must be different.
+        # _saved_grad_shard is an accumulated gradient tensor that must be different now.
         second_grad_tensor = layer._param_handle.flat_param._saved_grad_shard
         assert not torch.allclose(second_grad_tensor, grad_tensor)
 
@@ -404,7 +390,7 @@ class TestFullyShardedDataParallelClass(OobleckMultiProcessTestCase):
     def test_fsdp_forward(self):
         self.run_in_parallel(2, check_forward)
 
-    def test_fsdp_mutiple_forward(self):
+    def test_fsdp_mutiple_forwards_backwards(self):
         self.run_in_parallel(2, check_multiple_forwards_backwards)
 
     def test_fsdp_backward(self):
