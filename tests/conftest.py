@@ -343,6 +343,7 @@ class OobleckTestProcess:
                     f"Running test in rank{self._rank} / {world_size}: {test.__name__}"
                 )
                 result = test(self.factory, dfactory, *args)
+                dist.barrier()
                 logging.info(
                     f"Test {test.__name__} at rank {self._rank} done. Trying to cleanup..."
                 )
@@ -385,7 +386,7 @@ class OobleckTestProcess:
         return dfactory
 
     def cleanup(self, monkeypatch: pytest.MonkeyPatch, world_size: int, test_name: str):
-        torch.distributed.barrier()
+        torch.cuda.synchronize()
         torch.distributed.destroy_process_group()
         dist.cdb = None
         store = self._directory / f"{world_size}_{test_name}_store"
@@ -427,6 +428,31 @@ class OobleckTestProcess:
 processes: dict[str, list[tuple[mp.Process, Connection]]] = defaultdict(list)
 
 
+def recreate_processes(model_name: str, directory: Path):
+    global processes
+    if model_name in processes:
+        for p, _ in processes[model_name]:
+            p.terminate()
+        del processes[model_name]
+
+    ctx = mp.get_context("spawn")
+    # always initialize 4 processes
+    for rank in range(4):
+        pipe = ctx.Pipe(duplex=True)
+        p = ctx.Process(
+            target=OobleckTestProcess,
+            args=(
+                pipe[1],
+                rank,
+                model_name,
+                directory,
+            ),
+            daemon=True,
+        )
+        processes[model_name].append((p, pipe[0]))
+        p.start()
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="requires 4 GPUs")
 class OobleckMultiProcessTestCase:
     """
@@ -438,31 +464,13 @@ class OobleckMultiProcessTestCase:
         self, num_processes: int, model_name: str, directory: Path
     ) -> list[tuple[mp.Process, Connection]]:
         global processes
-        if model_name in processes:
-            return processes[model_name][:num_processes]
-
-        # always initialize 4 processes
-        ctx = mp.get_context("spawn")
-        for rank in range(4):
-            pipe = ctx.Pipe()
-            p = ctx.Process(
-                target=OobleckTestProcess,
-                args=(
-                    pipe[1],
-                    rank,
-                    model_name,
-                    directory,
-                ),
-                daemon=True,
-            )
-            p.start()
-            processes[model_name].append((p, pipe[0]))
+        if model_name not in processes:
+            recreate_processes(model_name, directory)
 
         return processes[model_name][:num_processes]
 
     model_name: str
     tmp_directory: Path
-    execution_in_progress: bool
 
     @pytest.fixture(scope="session", autouse=True)
     def directory(
@@ -479,42 +487,31 @@ class OobleckMultiProcessTestCase:
     ):
         request.cls.model_name = model_name_fixture
         request.cls.tmp_directory = directory
-        request.cls.execution_in_progress = False
 
     def run_in_parallel(
         self, num_processes: int, func: Callable, *args
     ) -> list[str | None]:
-        assert self.execution_in_progress is False, "Execution already in progress."
-
         procs = self.get_processes(num_processes, self.model_name, self.tmp_directory)
         for _, pipe in procs:
             pipe.send((func, num_processes, args))
-        self.execution_in_progress = True
 
         results: list[Any] = [None] * len(procs)
-        try:
-            for index, (_, pipe) in enumerate(procs):
-                # if not pipe.poll(timeout=60):
-                #     raise TimeoutError()
+        for index, (_, pipe) in enumerate(procs):
+            if not pipe.poll(timeout=60):
+                recreate_processes(self.model_name, self.tmp_directory)
+                raise TimeoutError()
 
-                try:
-                    result = pipe.recv()
-                except Exception as e:
-                    for proc, _ in procs:
-                        proc.kill()
-                    pytest.exit(
-                        f"Aborted due to GPU reclaim failure: ({str(e)})", returncode=1
-                    )
+            try:
+                result = pipe.recv()
+            except Exception:
+                recreate_processes(self.model_name, self.tmp_directory)
+                raise RuntimeError("Aborted due to GPU reclaim failure.")
 
-                if "error" in result:
-                    # If any process get an error,
-                    # immediately abort the test.
-                    raise RuntimeError(result["error"])
-                else:
-                    results[index] = result["success"]
-            self.execution_in_progress = False
-        except Exception as e:
-            logging.error(f"Failed with exception: {e}")
-            raise e
+            if "error" in result:
+                # If any process get an error,
+                # immediately abort the test.
+                raise RuntimeError(result["error"])
+
+            results[index] = result["success"]
 
         return results
