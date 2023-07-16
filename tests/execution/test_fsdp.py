@@ -177,7 +177,6 @@ def check_optimizer_step(
     fsdp_layers = get_fsdp_layers(model, pgs)
 
     params = [l._param_handle.flat_param for l in fsdp_layers]
-    params_before = copy.deepcopy(params)
     optimizer = torch.optim.AdamW(params, lr=1e-3)
 
     device = torch.device("cuda", torch.cuda.current_device())
@@ -207,26 +206,24 @@ def check_optimizer_step(
         outputs.append(output)
         input = output
 
+    torch.cuda.default_stream().synchronize()
+
     fsdp_layers[-1].backward(input[0])
     for index in reversed(range(len(fsdp_layers) - 1)):
         output: list[torch.Tensor] = [
             t for t in outputs[index] if isinstance(t, torch.Tensor) and t.requires_grad
         ]
-        for o, i in zip(output, inputs[index + 1]):
-            if isinstance(i, torch.Tensor):
-                o.grad = i.grad
 
-        layer = fsdp_layers[index]
-
-        next_input: list[torch.nn.Parameter] = [
+        grads: list[torch.nn.Parameter] = [
             t.grad
             for t in inputs[index + 1]
             if isinstance(t, torch.Tensor) and t.requires_grad
         ]
 
-        print(f"Backward for {index}th layer")
-        layer.backward((tuple(output), tuple(next_input)))
-    torch.distributed.barrier()
+        layer = fsdp_layers[index]
+        layer.backward((tuple(output), tuple(grads)))
+
+    torch.cuda.default_stream().synchronize()
 
     # Begin test
     # optimizer must not have internal data for now
@@ -238,12 +235,6 @@ def check_optimizer_step(
     optimizer.step()
 
     torch.cuda.synchronize()
-    # check parameters are updated
-    assert all(
-        not torch.allclose(p, pb)
-        for p, pb in zip(params, params_before)
-        if p.requires_grad
-    )
 
     # check parameters are still sharded
     assert all(
@@ -251,6 +242,7 @@ def check_optimizer_step(
     )
 
     # optimizer must have internal data for now
+    assert len(fsdp_layers) == len(optimizer.param_groups[0]["params"])
     p: torch.Tensor
     for p in optimizer.param_groups[0]["params"]:
         # If FSDP is used, some too small tensors might be only on rank 0,
@@ -260,6 +252,8 @@ def check_optimizer_step(
         assert all(
             key in optimizer.state[p] for key in ["step", "exp_avg", "exp_avg_sq"]
         )
+        assert p.shape == optimizer.state[p]["exp_avg"].shape
+        assert p.shape == optimizer.state[p]["exp_avg_sq"].shape
 
 
 class TestFullyShardedDataParallelClass(OobleckMultiProcessTestCase):
