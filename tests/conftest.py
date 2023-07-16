@@ -338,66 +338,90 @@ class OobleckTestProcess:
                 if test is None:
                     break
 
-                monkeypatch.setenv("RANK", str(self._rank))
-                monkeypatch.setenv("WORLD_SIZE", str(world_size))
-                torch.cuda.set_device(0)
-
-                store = torch.distributed.FileStore(
-                    str(self._directory / f"{world_size}_{test.__name__}_store"),
-                    world_size,
-                )
-
-                torch.distributed.init_process_group(
-                    backend="nccl",
-                    store=store,
-                    rank=self._rank,
-                    world_size=world_size,
-                )
-                dist.init_distributed(dist_backend="nccl", dist_init_required=False)
-
-                dfactory = OobleckDynamicClassFactory(
-                    self.factory, self._rank, list(range(world_size))
-                )
+                dfactory = self.init(monkeypatch, world_size, test.__name__)
                 logging.info(
                     f"Running test in rank{self._rank} / {world_size}: {test.__name__}"
                 )
                 result = test(self.factory, dfactory, *args)
-                logging.info("Test done.")
-
-                self._pipe.send(
-                    {
-                        "success": (result if result is not None else ""),
-                    }
+                logging.info(
+                    f"Test {test.__name__} at rank {self._rank} done. Trying to cleanup..."
                 )
             except Exception as e:
                 logging.error(f"Rank {self._rank} failed with exception: {e}")
                 self._pipe.send({"error": str(e) + "\n" + traceback.format_exc()})
-            finally:
-                torch.distributed.barrier()
-                torch.distributed.destroy_process_group()
-                dist.cdb = None
-                store = self._directory / f"{world_size}_{test.__name__}_store"
-                store.unlink(missing_ok=True)
-                while store.exists():
-                    logging.info("Waiting for store to be deleted...")
-                    time.sleep(1)
-                monkeypatch.undo()
+                self.cleanup(monkeypatch, world_size, test.__name__)
+                continue
 
-                # Release the GPU memory and check
-                obj: torch.Tensor
-                for obj in gc.get_objects():
-                    if torch.is_tensor(obj) and obj.is_cuda:
-                        if obj.grad is not None:
-                            obj.grad.data = torch.empty(0)
-                        obj.data = torch.empty(0)
-                gc.collect()
-                torch.cuda.empty_cache()
-                if torch.cuda.memory_allocated() > (1000 * 2**20):
-                    logging.fatal("Failed to reclaim GPU memory. Abort testing.")
-                    self._pipe.close()
-                    return
+            self.cleanup(monkeypatch, world_size, test.__name__)
+            self._pipe.send(
+                {
+                    "success": (result if result is not None else ""),
+                }
+            )
 
-        logging.info(f"Rank {self._rank} in world size {world_size} finished.")
+    def init(
+        self, monkeypatch: pytest.MonkeyPatch, world_size: int, test_name: str
+    ) -> OobleckDynamicClassFactory:
+        monkeypatch.setenv("RANK", str(self._rank))
+        monkeypatch.setenv("WORLD_SIZE", str(world_size))
+        torch.cuda.set_device(0)
+
+        store = torch.distributed.FileStore(
+            str(self._directory / f"{world_size}_{test_name}_store"),
+            world_size,
+        )
+
+        torch.distributed.init_process_group(
+            backend="nccl",
+            store=store,
+            rank=self._rank,
+            world_size=world_size,
+        )
+        dist.init_distributed(dist_backend="nccl", dist_init_required=False)
+
+        dfactory = OobleckDynamicClassFactory(
+            self.factory, self._rank, list(range(world_size))
+        )
+        return dfactory
+
+    def cleanup(self, monkeypatch: pytest.MonkeyPatch, world_size: int, test_name: str):
+        torch.distributed.barrier()
+        torch.distributed.destroy_process_group()
+        dist.cdb = None
+        store = self._directory / f"{world_size}_{test_name}_store"
+        store.unlink(missing_ok=True)
+        while store.exists():
+            logging.info("Waiting for store to be deleted...")
+            time.sleep(1)
+        monkeypatch.undo()
+
+        # Release the GPU memory and check except for model parameters.
+        model = self.factory.get_model()
+        for layer in model.layers:
+            layer.to("cpu")
+        for name in model.sample_inputs.keys():
+            model.sample_inputs[name] = model.sample_inputs[name].to("cpu")
+
+        torch.cuda.synchronize()
+        for layer in model.layers:
+            for p in layer.parameters():
+                assert not p.is_cuda, "Model parameter still in CPU"
+
+        input: torch.Tensor
+        for input in model.sample_inputs.values():
+            assert not input.is_cuda, "Model input still in CPU"
+
+        obj: torch.Tensor
+        for obj in gc.get_objects():
+            if torch.is_tensor(obj) and obj.is_cuda:
+                if obj.grad is not None:
+                    obj.grad.data = torch.empty(0)
+                obj.data = torch.empty(0)
+        gc.collect()
+        torch.cuda.empty_cache()
+        assert torch.cuda.memory_allocated() < (
+            1000 * 2**20
+        ), "Failed to reclaim GPU memory. Abort testing."
 
 
 processes: dict[str, list[tuple[mp.Process, Connection]]] = defaultdict(list)
@@ -438,6 +462,7 @@ class OobleckMultiProcessTestCase:
 
     model_name: str
     tmp_directory: Path
+    execution_in_progress: bool
 
     @pytest.fixture(scope="session", autouse=True)
     def directory(
@@ -454,13 +479,17 @@ class OobleckMultiProcessTestCase:
     ):
         request.cls.model_name = model_name_fixture
         request.cls.tmp_directory = directory
+        request.cls.execution_in_progress = False
 
     def run_in_parallel(
         self, num_processes: int, func: Callable, *args
     ) -> list[str | None]:
+        assert self.execution_in_progress is False, "Execution already in progress."
+
         procs = self.get_processes(num_processes, self.model_name, self.tmp_directory)
         for _, pipe in procs:
             pipe.send((func, num_processes, args))
+        self.execution_in_progress = True
 
         results: list[Any] = [None] * len(procs)
         try:
@@ -470,10 +499,12 @@ class OobleckMultiProcessTestCase:
 
                 try:
                     result = pipe.recv()
-                except Exception:
+                except Exception as e:
                     for proc, _ in procs:
                         proc.kill()
-                    pytest.exit("Aborted due to GPU reclaim failure.", returncode=1)
+                    pytest.exit(
+                        f"Aborted due to GPU reclaim failure: ({str(e)})", returncode=1
+                    )
 
                 if "error" in result:
                     # If any process get an error,
@@ -481,6 +512,7 @@ class OobleckMultiProcessTestCase:
                     raise RuntimeError(result["error"])
                 else:
                     results[index] = result["success"]
+            self.execution_in_progress = False
         except Exception as e:
             logging.error(f"Failed with exception: {e}")
             raise e
