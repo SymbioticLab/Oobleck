@@ -22,6 +22,7 @@ def get_fsdp_layers(
     assert len(model.layers) == len(pgs)
 
     unshard_stream = torch.cuda.Stream()
+    post_backward_stream = torch.cuda.Stream()
     layers: list[FullyShardedDataParallelLayer] = []
 
     for pg, layer in zip(pgs, model.layers):
@@ -30,6 +31,7 @@ def get_fsdp_layers(
             pg,
             {
                 StreamType.UNSHARD: unshard_stream,
+                StreamType.POST_BACKWARD: post_backward_stream,
             },
         )
         fsdp_layer._param_handle.init_flat_param_attributes()
@@ -56,7 +58,8 @@ def check_unsharded_equal_to_original(
     assert len(fsdp_layers) == len(original_model.layers)
 
     for original_layer, fsdp_layer in zip(original_model.layers, fsdp_layers):
-        fsdp_layer.unshard(HandleTrainingState.FORWARD)
+        fsdp_layer._param_handle._training_state = HandleTrainingState.FORWARD
+        fsdp_layer.unshard()
 
         with fsdp_layer._param_handle.unflatten_as_params():
             original_params = list(original_layer.parameters())
@@ -85,6 +88,7 @@ def check_forward(
     )
 
     for layer in fsdp_layers:
+        layer._param_handle._training_state = HandleTrainingState.FORWARD
         input = layer(*input)
 
     # input[0]: loss, input[1]: logits
@@ -123,15 +127,16 @@ def check_backward(
                 ni.requires_grad = i.requires_grad
         inputs.append(new_input)
 
+        layer._param_handle._training_state = HandleTrainingState.FORWARD
         output = layer(*new_input)
         outputs.append(output)
         input = output
 
-    # TODO: think how we can remove this.
-    torch.cuda.default_stream().synchronize()
+    torch.cuda.synchronize()
 
     # Begin test
     assert isinstance(output, tuple)
+    fsdp_layers[-1]._param_handle._training_state = HandleTrainingState.BACKWARD_PRE
     fsdp_layers[-1].backward(output[0])
 
     # For layers except for the last one,
@@ -148,6 +153,7 @@ def check_backward(
         ]
 
         layer = fsdp_layers[index]
+        layer._param_handle._training_state = HandleTrainingState.BACKWARD_PRE
         layer.backward((tuple(output), tuple(grads)))
 
     torch.cuda.synchronize()
@@ -201,13 +207,13 @@ def check_optimizer_step(
             if isinstance(ni, torch.Tensor):
                 ni.requires_grad = i.requires_grad
 
+        layer._param_handle._training_state = HandleTrainingState.FORWARD
         output = layer(*new_input)
         inputs.append(new_input)
         outputs.append(output)
         input = output
 
-    torch.cuda.default_stream().synchronize()
-
+    fsdp_layers[-1]._param_handle._training_state = HandleTrainingState.BACKWARD_PRE
     fsdp_layers[-1].backward(input[0])
     for index in reversed(range(len(fsdp_layers) - 1)):
         output: list[torch.Tensor] = [
@@ -221,9 +227,8 @@ def check_optimizer_step(
         ]
 
         layer = fsdp_layers[index]
+        layer._param_handle._training_state = HandleTrainingState.BACKWARD_PRE
         layer.backward((tuple(output), tuple(grads)))
-
-    torch.cuda.default_stream().synchronize()
 
     # Begin test
     # optimizer must not have internal data for now
