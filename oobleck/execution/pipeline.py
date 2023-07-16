@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import copy
 import itertools
 import weakref
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -13,6 +12,7 @@ from deepspeed import comm as dist
 from deepspeed.runtime.lr_schedules import WarmupLR
 from deepspeed.runtime.pipe import schedule
 from torch.distributed import ProcessGroup, Work
+from torch.distributed.fsdp._common_utils import HandleTrainingState
 from torch.optim import AdamW
 from transformers.training_args import TrainingArguments
 
@@ -127,7 +127,9 @@ class PipelineExecution:
 
         # Execute forward
         for layer in self._layers:
+            layer._param_handle._training_state = HandleTrainingState.FORWARD
             inputs = layer(*inputs)
+            layer._param_handle._training_state = HandleTrainingState.IDLE
 
         outputs = inputs
 
@@ -156,9 +158,14 @@ class PipelineExecution:
             self.pipeline.pipe_buffers["outputs"][buffer_id] = outputs
 
     def backward_pass(self, buffer_id: int):
+        for layer in self._layers:
+            layer._param_handle._training_state = HandleTrainingState.BACKWARD_PRE
+
+        # FIXME: currently layers are individually handled.
+        # Find out how to make it more elegant.
         if self.pipeline.is_last_stage():
             loss = self._loss
-            loss.backward()
+            self._layers[-1].backward(loss)
         else:
             output_tensors: tuple[torch.Tensor] = self.pipeline.pipe_buffers["outputs"][
                 buffer_id
@@ -171,7 +178,7 @@ class PipelineExecution:
             # Oobleck sharded model always returns tuple with tensors and torch.Size.
             assert len(output_tensors) == len(grad_tensors)
 
-            torch.autograd.backward(tensors=output_tensors, grad_tensors=grad_tensors)
+            self._layers[-1].backward((output_tensors, grad_tensors))
 
         # Free up memory from the output of forward()
         self.pipeline.pipe_buffers["outputs"][buffer_id] = None
@@ -180,8 +187,9 @@ class PipelineExecution:
 
     def optimizer_step(self, lr_kwargs=None):
         # amp enable check: gradient clipping
-        for l in self._layers:
-            l._param_handle.prepare_gradient_for_optim()
+        for layer in self._layers:
+            layer._param_handle._training_state = HandleTrainingState.BACKWARD_POST
+            layer._param_handle.prepare_gradient_for_optim()
         self._optimizer.step()
         self._lr_scheduler.step(**(lr_kwargs or {}))
 
