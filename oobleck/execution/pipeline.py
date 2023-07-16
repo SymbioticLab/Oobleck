@@ -4,7 +4,6 @@ import copy
 import itertools
 import weakref
 from collections.abc import Iterable, Mapping
-from types import MethodType
 from typing import Any
 
 import torch

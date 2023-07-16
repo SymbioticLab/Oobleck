@@ -30,7 +30,6 @@ def get_fsdp_layers(
             pg,
             {
                 StreamType.UNSHARD: unshard_stream,
-                StreamType.EXECUTION: torch.cuda.default_stream(),
             },
         )
         fsdp_layer._param_handle.init_flat_param_attributes()
@@ -106,6 +105,10 @@ def check_backward(
     input: tuple[torch.Tensor, ...] = tuple(
         [tensor.to(device) for tensor in model.sample_inputs.values()]
     )
+    # reentrant based activation checkpointing requires
+    # input to require grad
+    for i in input:
+        i.requires_grad = i.is_floating_point()
 
     inputs: list[tuple[torch.Tensor | torch.Size]] = []
     outputs: list[tuple[torch.Tensor | torch.Size]] = []
@@ -181,6 +184,11 @@ def check_optimizer_step(
     input: tuple[torch.Tensor, ...] = tuple(
         [tensor.to(device) for tensor in model.sample_inputs.values()]
     )
+    # reentrant based activation checkpointing requires
+    # input to require grad
+    for i in input:
+        if isinstance(i, torch.Tensor):
+            i.requires_grad = i.is_floating_point()
 
     inputs: list[tuple[torch.Tensor | torch.Size]] = []
     outputs: list[tuple[torch.Tensor | torch.Size]] = []

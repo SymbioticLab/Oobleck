@@ -8,9 +8,11 @@ import torch
 import torch.distributed
 import torch.fx
 from torch.distributed import ProcessGroup
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    checkpoint_wrapper,
+)
 from torch.distributed.fsdp._common_utils import HandleTrainingState
 from torch.distributed.fsdp.flat_param import FlatParamHandle, HandleShardingStrategy
-from torch.utils.checkpoint import checkpoint as checkpoint_fn
 
 
 class StreamType(Enum):
@@ -40,6 +42,8 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
         device = torch.device("cuda", torch.cuda.current_device())
         layer.to(device)
         self._checkpointable = FullyShardedDataParallelLayer.is_checkpointable(layer)
+        if self._checkpointable:
+            layer = checkpoint_wrapper(layer)
 
         self._param_handle = FlatParamHandle(
             params=layer.parameters(),
@@ -103,7 +107,7 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
             self._param_handle._training_state = state
 
             unshard_stream = self._streams[StreamType.UNSHARD]
-            execution_stream = self._streams[StreamType.EXECUTION]
+            execution_stream = torch.cuda.current_stream()
 
             # unsharding must be done after execution
             unshard_stream.wait_stream(execution_stream)
@@ -122,7 +126,7 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
             return
 
         unshard_stream = self._streams[StreamType.UNSHARD]
-        execution_stream = self._streams[StreamType.EXECUTION]
+        execution_stream = torch.cuda.current_stream()
 
         # resharding must be done after execution
         unshard_stream.wait_stream(execution_stream)
@@ -146,15 +150,8 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
 
     def forward(self, *args) -> tuple[torch.Tensor]:
         self.unshard(HandleTrainingState.FORWARD)
-        # TODO: uncomment it with fix in backward recomputation.
-        # Currently recomputing in backward doesn't have unsharded params.
-        # if self._checkpointable:
-        #     result = checkpoint_fn(self._param_handle._fully_sharded_module, *args)
-        # else:
-        #     result = self._param_handle._fully_sharded_module(*args)
         result = self._param_handle._fully_sharded_module(*args)
         self.reshard()
-
         return result
 
     @staticmethod
