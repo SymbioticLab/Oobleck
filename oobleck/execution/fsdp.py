@@ -42,11 +42,18 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
         if self._checkpointable:
             layer = checkpoint_wrapper(layer)
 
+        self._process_group = process_group
+        self._shard_stream = shard_stream
+        self._rank_index = torch.distributed.get_rank(group=process_group)
+        self._group_size = torch.distributed.get_world_size(group=process_group)
+
         self._param_handle = FlatParamHandle(
             params=layer.parameters(),
             fully_sharded_module=layer,
             device=device,
-            sharding_strategy=HandleShardingStrategy.FULL_SHARD,
+            sharding_strategy=HandleShardingStrategy.FULL_SHARD
+            if self._group_size > 1
+            else HandleShardingStrategy.NO_SHARD,
             offload_params=False,
             mp_param_dtype=torch.float32,  # TODO: change to bf16
             mp_reduce_dtype=torch.float32,
@@ -59,11 +66,6 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
         self._param_handle.flat_param.register_hook(
             functools.partial(self._post_backward_hook, self)
         )
-
-        self._process_group = process_group
-        self._shard_stream = shard_stream
-        self._rank_index = torch.distributed.get_rank(group=process_group)
-        self._group_size = torch.distributed.get_world_size(group=process_group)
 
         self._unshard_param_event = torch.cuda.Event()
         self._reshard_param_event = torch.cuda.Event()
@@ -96,6 +98,8 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
         Mark all future execution to execute after unsharding to complete if `wait` is True.
         NOTE: it does not synchronize by blocking the current thread.
         """
+        if self._param_handle._sharding_strategy == HandleShardingStrategy.NO_SHARD:
+            return
 
         assert state in [
             HandleTrainingState.FORWARD,
@@ -119,6 +123,8 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
                 self._unshard_param_event.record(self._shard_stream)
 
     def reshard(self):
+        if self._param_handle._sharding_strategy == HandleShardingStrategy.NO_SHARD:
+            return
         if self._param_handle.is_sharded(self._param_handle.flat_param):
             return
 

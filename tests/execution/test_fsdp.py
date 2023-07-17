@@ -5,6 +5,7 @@ import pytest
 import torch
 import torch.distributed
 from torch.distributed.fsdp._common_utils import HandleTrainingState
+from torch.distributed.fsdp.flat_param import HandleShardingStrategy
 
 from oobleck.execution.fsdp import FullyShardedDataParallelLayer
 from oobleck.module.model import OobleckModel
@@ -260,7 +261,10 @@ def check_backward_autograd_execution(
             assert handle.flat_param.grad is not None
         else:
             assert handle.flat_param.grad is None
-        assert handle.is_sharded(handle.flat_param)
+        assert (
+            handle._sharding_strategy == HandleShardingStrategy.NO_SHARD
+            or handle.is_sharded(handle.flat_param)
+        )
 
 
 def check_backward_autograd_from_middle(
