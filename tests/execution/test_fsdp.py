@@ -31,7 +31,6 @@ def get_fsdp_layers(
             pg,
             {
                 StreamType.UNSHARD: unshard_stream,
-                StreamType.POST_BACKWARD: post_backward_stream,
             },
         )
         fsdp_layer._param_handle.init_flat_param_attributes()
@@ -120,41 +119,50 @@ def check_backward(
     inputs: list[tuple[torch.Tensor | torch.Size]] = []
     outputs: list[tuple[torch.Tensor | torch.Size]] = []
 
-    for layer in fsdp_layers:
-        new_input = tuple(
-            tensor.detach().clone() if isinstance(tensor, torch.Tensor) else tensor
-            for tensor in input
-        )
-        for ni, i in zip(new_input, input):
-            if isinstance(ni, torch.Tensor):
-                ni.requires_grad = i.requires_grad
-        inputs.append(new_input)
+    torch.cuda.profiler.start()
+    with torch.autograd.profiler.emit_nvtx():
+        for layer in fsdp_layers:
+            new_input = tuple(
+                tensor.detach().clone() if isinstance(tensor, torch.Tensor) else tensor
+                for tensor in input
+            )
+            for ni, i in zip(new_input, input):
+                if isinstance(ni, torch.Tensor):
+                    ni.requires_grad = i.requires_grad
+            inputs.append(new_input)
 
-        output = layer(*new_input)
-        outputs.append(output)
-        input = output
+            output = layer(*new_input)
+            outputs.append(output)
+            input = output
 
-    # Begin test
-    assert isinstance(output, tuple)
-    fsdp_layers[-1].backward(output[0])
+        torch.cuda.synchronize()
 
-    # For layers except for the last one,
-    # we need to manually get grads of the output tensors
-    for index in reversed(range(len(fsdp_layers) - 1)):
-        output: list[torch.Tensor] = [
-            t for t in outputs[index] if isinstance(t, torch.Tensor) and t.requires_grad
-        ]
+        # Begin test
+        assert isinstance(output, tuple)
+        with torch.cuda.nvtx.range(f"{len(fsdp_layers) - 1} bwd"):
+            fsdp_layers[-1].backward(output[0])
 
-        grads: list[torch.nn.Parameter] = [
-            t.grad
-            for t in inputs[index + 1]
-            if isinstance(t, torch.Tensor) and t.requires_grad
-        ]
+        # For layers except for the last one,
+        # we need to manually get grads of the output tensors
+        for index in reversed(range(len(fsdp_layers) - 1)):
+            output: list[torch.Tensor] = [
+                t
+                for t in outputs[index]
+                if isinstance(t, torch.Tensor) and t.requires_grad
+            ]
 
-        layer = fsdp_layers[index]
-        layer.backward((tuple(output), tuple(grads)))
+            grads: list[torch.nn.Parameter] = [
+                t.grad
+                for t in inputs[index + 1]
+                if isinstance(t, torch.Tensor) and t.requires_grad
+            ]
 
-    torch.cuda.current_stream().synchronize()
+            with torch.cuda.nvtx.range(f"{index} bwd"):
+                layer = fsdp_layers[index]
+                layer.backward((tuple(output), tuple(grads)))
+
+        torch.cuda.current_stream().synchronize()
+    torch.cuda.profiler.stop()
 
     for layer in fsdp_layers:
         handle = layer._param_handle
@@ -387,9 +395,9 @@ def check_optimizer_step(
     "num_gpus",
     [1, 2, 4],
     ids=[
-        "1 GPU",
-        "2 GPUs",
-        "4 GPUs",
+        "1GPU",
+        "2GPUs",
+        "4GPUs",
     ],
 )
 class TestFullyShardedDataParallelClass(OobleckMultiProcessTestCase):
