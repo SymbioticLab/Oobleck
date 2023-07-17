@@ -102,7 +102,7 @@ def check_forward(
     fsdp_layers, input = get_layers_and_inputs(factory, dfactory)
 
     for layer in fsdp_layers:
-        input = layer(*input)
+        input = layer(input)
 
     # input[0]: loss, input[1]: logits
     assert isinstance(input[0], torch.Tensor)
@@ -129,15 +129,13 @@ def check_backward(
                     ni.requires_grad = i.requires_grad
             inputs.append(new_input)
 
-            reshard_after = bool(layer != fsdp_layers[-1])
-            output = layer(reshard_after, *new_input)
+            output = layer(new_input)
             outputs.append(output)
             input = output
 
         # Begin test
         assert isinstance(output, tuple)
-        with torch.cuda.nvtx.range(f"{len(fsdp_layers) - 1} bwd"):
-            fsdp_layers[-1].backward(output[0])
+        fsdp_layers[-1].backward(output[0])
 
         # For layers except for the last one,
         # we need to manually get grads of the output tensors
@@ -154,20 +152,20 @@ def check_backward(
                 if isinstance(t, torch.Tensor) and t.requires_grad
             ]
 
-            with torch.cuda.nvtx.range(f"{index} bwd"):
-                layer = fsdp_layers[index]
-                layer.backward((tuple(output), tuple(grads)))
+            layer = fsdp_layers[index]
+            layer.backward((tuple(output), tuple(grads)))
 
-        torch.cuda.current_stream().synchronize()
+        torch.cuda.synchronize()
+
+        for layer in fsdp_layers:
+            handle = layer._param_handle
+            if handle.flat_param.requires_grad:
+                assert handle.flat_param.grad is not None
+                assert handle.flat_param._saved_grad_shard is not None
+            else:
+                assert handle.flat_param.grad is None
+            assert handle.is_sharded(handle.flat_param)
     torch.cuda.profiler.stop()
-
-    for layer in fsdp_layers:
-        handle = layer._param_handle
-        if handle.flat_param.requires_grad:
-            assert handle.flat_param.grad is not None
-        else:
-            assert handle.flat_param.grad is None
-        assert handle.is_sharded(handle.flat_param)
 
 
 def check_multiple_forwards_backwards(
@@ -196,11 +194,11 @@ def check_multiple_forwards_backwards(
 
     # first fwd
     for layer in fsdp_layers:
-        first_input = layer(*first_input)
+        first_input = layer(first_input)
 
     # second bwd
     for layer in fsdp_layers:
-        second_input = layer(*second_input)
+        second_input = layer(second_input)
 
     first_loss = first_input[0]
     second_loss = second_input[0]
@@ -209,6 +207,8 @@ def check_multiple_forwards_backwards(
     for layer in fsdp_layers:
         assert layer._param_handle.flat_param.grad is None
         assert layer._param_handle.flat_param._saved_grad_shard is None
+
+    torch.cuda.synchronize()
 
     # First backward
     fsdp_layers[-1].backward(first_loss)
@@ -243,8 +243,7 @@ def check_backward_autograd_execution(
     fsdp_layers, input = get_layers_and_inputs(factory, dfactory)
 
     for layer in fsdp_layers:
-        # Don't create a new input, just use the previous output
-        input = layer(*input)
+        input = layer(input)
 
     output = input
     # Begin test
@@ -271,7 +270,7 @@ def check_backward_autograd_from_middle(
     fsdp_layers, input = get_layers_and_inputs(factory, dfactory)
 
     for layer in fsdp_layers[:-1]:
-        input = layer(*input)
+        input = layer(input)
 
     previous_output = tuple(
         [t for t in input if isinstance(t, torch.Tensor) and t.requires_grad]
@@ -287,7 +286,7 @@ def check_backward_autograd_from_middle(
             ni.requires_grad = i.requires_grad
 
     # Finish execution
-    final_output = fsdp_layers[-1](*new_input)
+    final_output = fsdp_layers[-1](new_input, False)
 
     # Begin test
     assert isinstance(final_output, tuple)
@@ -404,7 +403,7 @@ class TestFullyShardedDataParallelClass(OobleckMultiProcessTestCase):
     def test_fsdp_forward(self, num_gpus: int):
         self.run_in_parallel(num_gpus, check_forward)
 
-    def test_fsdp_mutiple_forwards_backwards(self, num_gpus: int):
+    def test_fsdp_fwd_fwd_bwd_bwd(self, num_gpus: int):
         self.run_in_parallel(num_gpus, check_multiple_forwards_backwards)
 
     def test_fsdp_backward(self, num_gpus: int):
