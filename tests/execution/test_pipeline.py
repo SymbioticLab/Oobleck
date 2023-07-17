@@ -16,7 +16,7 @@ from tests.conftest import (
 )
 
 
-class TestOobleckSingleStagePipeline(OobleckMultiProcessTestCase):
+class TestSingleStagePipeline(OobleckMultiProcessTestCase):
     @staticmethod
     def _test_attributes_type(
         factory: OobleckStaticClassFactory,
@@ -46,7 +46,7 @@ class TestOobleckSingleStagePipeline(OobleckMultiProcessTestCase):
     def test_attributes_type(self, num_gpus_per_node: int):
         self.run_in_parallel(
             num_gpus_per_node,
-            TestOobleckSingleStagePipeline._test_attributes_type,
+            TestSingleStagePipeline._test_attributes_type,
             num_gpus_per_node,
         )
 
@@ -173,7 +173,7 @@ class TestOobleckSingleStagePipeline(OobleckMultiProcessTestCase):
         "num_gpus_per_node", [1, 2, 4], ids=["1gpu/node", "2gpus/node", "4gpus/node"]
     )
     def test_execution(self, func_name: str, num_gpus_per_node: int):
-        func = getattr(TestOobleckSingleStagePipeline, func_name)
+        func = getattr(TestSingleStagePipeline, func_name)
         self.run_in_parallel(num_gpus_per_node, func, num_gpus_per_node)
 
 
@@ -337,6 +337,7 @@ class TestMultiStagePipeline(OobleckMultiProcessTestCase):
         assert pipeline.execution._loss is None
         assert pipeline.execution.total_loss is None
         pipeline.train()
+
         assert pipeline._global_step == 1
         assert pipeline.execution._loss is None
         if pipeline.is_last_stage():
@@ -355,11 +356,11 @@ class TestMultiStagePipeline(OobleckMultiProcessTestCase):
             (4, 4),
         ],
         ids=[
-            "1 stage 2 GPUs",
-            "2 stages 2 GPUs",
-            "1 stage 4 GPUs",
-            "2 stages 4 GPUs",
-            "4 stages 4 GPUs",
+            "1stage2GPUs",
+            "2stages2GPUs",
+            "1stage4GPUs",
+            "2stages4GPUs",
+            "4stages4GPUs",
         ],
     )
     def test_pipeline_train(self, num_stages: int, num_gpus_per_node: int):
