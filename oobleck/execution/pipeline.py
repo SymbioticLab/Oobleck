@@ -17,7 +17,7 @@ from transformers.training_args import TrainingArguments
 
 from oobleck.csrc.planning.pipeline_template import PipelineTemplate
 from oobleck.execution.dataloader import OobleckDataLoader, OobleckSampler
-from oobleck.execution.fsdp import FullyShardedDataParallelLayer, StreamType
+from oobleck.execution.fsdp import FullyShardedDataParallelLayer
 from oobleck.execution.utils import DTYPE_TO_ID, ID_TO_DTYPE, zero_grads
 from oobleck.module.model import OobleckModel
 

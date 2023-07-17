@@ -6,7 +6,7 @@ import torch
 import torch.distributed
 from torch.distributed.fsdp._common_utils import HandleTrainingState
 
-from oobleck.execution.fsdp import FullyShardedDataParallelLayer, StreamType
+from oobleck.execution.fsdp import FullyShardedDataParallelLayer
 from oobleck.module.model import OobleckModel
 from tests.conftest import (
     GRADIENT_ACCUMULATION_STEP,
@@ -21,17 +21,14 @@ def get_fsdp_layers(
 ) -> list[FullyShardedDataParallelLayer]:
     assert len(model.layers) == len(pgs)
 
-    unshard_stream = torch.cuda.Stream()
-    post_backward_stream = torch.cuda.Stream()
+    shard_stream = torch.cuda.Stream()
     layers: list[FullyShardedDataParallelLayer] = []
 
     for pg, layer in zip(pgs, model.layers):
         fsdp_layer = FullyShardedDataParallelLayer(
             layer,
             pg,
-            {
-                StreamType.UNSHARD: unshard_stream,
-            },
+            shard_stream,
         )
         fsdp_layer._param_handle.init_flat_param_attributes()
         layers.append(fsdp_layer)
@@ -78,7 +75,6 @@ def check_unsharded_equal_to_original(
 
     for pg, layer in zip(pgs, original_model.layers):
         layer.to(device)
-        # _sync_module_params_and_buffers(layer, list(layer.parameters()), pg)
 
     fsdp_layers = get_fsdp_layers(fsdp_model, pgs)
     assert len(fsdp_layers) == len(original_model.layers)
@@ -86,7 +82,9 @@ def check_unsharded_equal_to_original(
     for original_layer, fsdp_layer in zip(original_model.layers, fsdp_layers):
         fsdp_layer.unshard(HandleTrainingState.FORWARD)
 
-        with fsdp_layer._param_handle.unflatten_as_params():
+        with torch.cuda.stream(
+            fsdp_layer._shard_stream
+        ), fsdp_layer._param_handle.unflatten_as_params():
             original_params = list(original_layer.parameters())
             fsdp_params = list(
                 fsdp_layer._param_handle._fully_sharded_module.parameters()
@@ -131,11 +129,10 @@ def check_backward(
                     ni.requires_grad = i.requires_grad
             inputs.append(new_input)
 
-            output = layer(*new_input)
+            reshard_after = bool(layer != fsdp_layers[-1])
+            output = layer(reshard_after, *new_input)
             outputs.append(output)
             input = output
-
-        torch.cuda.synchronize()
 
         # Begin test
         assert isinstance(output, tuple)
