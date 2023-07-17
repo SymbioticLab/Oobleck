@@ -165,7 +165,10 @@ def check_backward(
                 assert handle.flat_param._saved_grad_shard is not None
             else:
                 assert handle.flat_param.grad is None
-            assert handle.is_sharded(handle.flat_param)
+            assert (
+                handle._sharding_strategy == HandleShardingStrategy.NO_SHARD
+                or handle.is_sharded(handle.flat_param)
+            )
     torch.cuda.profiler.stop()
 
 

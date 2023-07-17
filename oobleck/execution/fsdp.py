@@ -159,11 +159,12 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
         # All post backward work must be done after backward pass
         handle._training_state = HandleTrainingState.BACKWARD_POST
 
+        unsharded_grad = grad_output.data
         # follow fsdp._runtime_utils._post_backward_pass()
         # that stores _param_handle.flat_param._saved_grad_shard
         if self._param_handle.uses_sharded_strategy:
+            self._shard_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self._shard_stream):
-                unsharded_grad = grad_output.data
                 world_size = torch.distributed.get_world_size(self._process_group)
                 chunks = list(unsharded_grad.chunk(world_size))
                 new_sharded_grad = torch.empty_like(chunks[0])  # padded
@@ -173,21 +174,24 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
                     input=unsharded_grad,
                     group=self._process_group,
                 )
+        else:
+            new_sharded_grad = unsharded_grad
+        torch.cuda.current_stream().wait_stream(self._shard_stream)
 
-                # cast grad dtype to param dtype
-                if new_sharded_grad.dtype != handle.flat_param.dtype:
-                    new_sharded_grad = new_sharded_grad.to(
-                        handle.flat_param.dtype, non_blocking=True
-                    )
+        # cast grad dtype to param dtype
+        if new_sharded_grad.dtype != handle.flat_param.dtype:
+            new_sharded_grad = new_sharded_grad.to(
+                handle.flat_param.dtype, non_blocking=True
+            )
 
-                # accumulated gradient if needed
-                if handle.flat_param._saved_grad_shard is not None:
-                    _check_grad_to_accumulate(
-                        new_sharded_grad, handle.flat_param._saved_grad_shard
-                    )
-                    handle.flat_param._saved_grad_shard += new_sharded_grad
-                else:
-                    handle.flat_param._saved_grad_shard = new_sharded_grad
+        # accumulated gradient if needed
+        if handle.flat_param._saved_grad_shard is not None:
+            _check_grad_to_accumulate(
+                new_sharded_grad, handle.flat_param._saved_grad_shard
+            )
+            handle.flat_param._saved_grad_shard += new_sharded_grad
+        else:
+            handle.flat_param._saved_grad_shard = new_sharded_grad
 
     def backward(self, tensor: torch.Tensor | tuple[tuple[torch.Tensor], torch.Tensor]):
         """
