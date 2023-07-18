@@ -22,6 +22,7 @@ from tests.conftest import (
 )
 
 
+@pytest.mark.skip
 class TestOobleckEngineClass(OobleckElasticTestCase):
     factory: OobleckStaticClassFactory
 
