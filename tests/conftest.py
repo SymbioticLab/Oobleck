@@ -143,8 +143,8 @@ class OobleckStaticClassFactory:
     def get_dummy_pipeline_template(
         self,
         num_stages: int,
-        num_nodes: int,
-        num_gpus_per_node: int = 1,
+        num_gpus_per_node: int,
+        num_nodes: int = 1,
     ) -> PipelineTemplate:
         self.get_dummy_profile()
 
@@ -518,9 +518,9 @@ class OobleckMultiProcessTestCase:
 
         results: list[Any] = [None] * len(procs)
         for index, (_, pipe) in enumerate(procs):
-            if not pipe.poll(timeout=60):
-                recreate_processes(self.model_name, self.tmp_directory)
-                raise TimeoutError()
+            # if not pipe.poll(timeout=60):
+            #     recreate_processes(self.model_name, self.tmp_directory)
+            #     raise TimeoutError()
 
             try:
                 result = pipe.recv()

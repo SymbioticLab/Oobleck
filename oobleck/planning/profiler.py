@@ -8,9 +8,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+import torch.fx
 from deepspeed.utils.logging import logger
 
-from oobleck.module.layer import Layer
 from oobleck.module.model import OobleckModel
 
 PROFILE_CACHE = "/tmp/oobleck/profiles"
@@ -117,7 +117,7 @@ class Profiler:
 
     @staticmethod
     def profile_allreduce_layer(
-        layer: Layer, process_group: dist.ProcessGroup
+        layer: torch.fx.GraphModule, process_group: dist.ProcessGroup
     ) -> float:
         numel = sum([p.numel() for p in layer.parameters()])
         tensor = torch.zeros(numel, dtype=torch.float32, device="cuda")

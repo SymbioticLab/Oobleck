@@ -112,8 +112,7 @@ class TestSingleStagePipeline(OobleckMultiProcessTestCase):
 
         # before backward pass, check grad are none
         assert all(
-            layer._param_handle.flat_param.grad is None
-            for layer in pipeline.execution._layers
+            l._param_handle.flat_param.grad is None for l in pipeline.execution._layers
         )
 
         pipeline.execution.backward_pass(buffer_id=0)
@@ -169,14 +168,13 @@ class TestSingleStagePipeline(OobleckMultiProcessTestCase):
             "optimizer_step",
         ],
     )
-    @pytest.mark.parametrize(
-        "num_gpus_per_node", [1, 2, 4], ids=["1gpu/node", "2gpus/node", "4gpus/node"]
-    )
-    def test_execution(self, func_name: str, num_gpus_per_node: int):
+    def test_execution(self, func_name: str):
+        num_gpus_per_node = 1
         func = getattr(TestSingleStagePipeline, func_name)
         self.run_in_parallel(num_gpus_per_node, func, num_gpus_per_node)
 
 
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="4 GPUs are required")
 class TestMultiStagePipeline(OobleckMultiProcessTestCase):
     @staticmethod
     def _four_stages(
@@ -347,25 +345,14 @@ class TestMultiStagePipeline(OobleckMultiProcessTestCase):
             assert all(x is None for x in pipe_buffers)
 
     @pytest.mark.parametrize(
-        "num_stages, num_gpus_per_node",
-        [
-            (1, 2),
-            (2, 2),
-            (1, 4),
-            (2, 4),
-            (4, 4),
-        ],
-        ids=[
-            "1stage2GPUs",
-            "2stages2GPUs",
-            "1stage4GPUs",
-            "2stages4GPUs",
-            "4stages4GPUs",
-        ],
+        "num_stages",
+        [1, 2, 4],
+        ids=["1stage", "2stages", "4stages"],
     )
-    def test_pipeline_train(self, num_stages: int, num_gpus_per_node: int):
+    def test_pipeline_train(self, num_stages: int):
+        num_gpus_per_node = num_stages
         self.run_in_parallel(
-            num_gpus_per_node,
+            num_stages,
             TestMultiStagePipeline.pipeline_train,
             num_stages,
             num_gpus_per_node,

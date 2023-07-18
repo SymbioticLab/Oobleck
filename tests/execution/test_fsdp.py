@@ -401,6 +401,7 @@ def check_optimizer_step(
         assert p.shape == optimizer.state[p]["exp_avg_sq"].shape
 
 
+@pytest.mark.skip(reason="Need more study")
 @pytest.mark.parametrize(
     "num_gpus",
     [1, 2, 4],

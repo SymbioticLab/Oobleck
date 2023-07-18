@@ -17,6 +17,7 @@ from transformers.training_args import TrainingArguments
 
 from oobleck.csrc.planning.pipeline_template import PipelineTemplate
 from oobleck.execution.dataloader import OobleckDataLoader, OobleckSampler
+from oobleck.execution.layer import Layer
 from oobleck.execution.utils import DTYPE_TO_ID, ID_TO_DTYPE, zero_grads
 from oobleck.module.model import OobleckModel
 
@@ -32,7 +33,7 @@ class PipelineExecution:
     def __init__(
         self,
         pipeline: OobleckPipeline,
-        layers: list[torch.fx.GraphModule],
+        layers: list[Layer],
         shard_id: int,
         dataloader: OobleckDataLoader,
         training_args: TrainingArguments,
@@ -51,9 +52,8 @@ class PipelineExecution:
         self.total_loss: torch.Tensor | None = None
 
         # TODO: use HF arguments to initialize optimizer and LR properly
-        parameters = list(itertools.chain([l.parameters() for l in layers]))
         self._optimizer = AdamW(
-            parameters,
+            [l._param_handle.flat_param for l in layers],
             lr=self._training_args.learning_rate,
             betas=(self._training_args.adam_beta1, self._training_args.adam_beta2),
             eps=self._training_args.adam_epsilon,
@@ -125,7 +125,7 @@ class PipelineExecution:
 
         # Execute forward
         for layer in self._layers:
-            inputs = layer(*inputs)
+            inputs = layer(inputs)
 
         outputs = inputs
 
@@ -178,8 +178,6 @@ class PipelineExecution:
 
     def optimizer_step(self, lr_kwargs=None):
         # amp enable check: gradient clipping
-        for layer in self._layers:
-            layer._param_handle.prepare_gradient_for_optim()
         self._optimizer.step()
         self._lr_scheduler.step(**(lr_kwargs or {}))
 
@@ -512,8 +510,7 @@ class OobleckPipeline:
         self._per_layer_pgs: dict[int, ProcessGroup] = {}
         self.execution: PipelineExecution | None = None
 
-        layers: list[torch.fx.GraphModule] = []
-        device = torch.device("cuda", torch.cuda.current_device())
+        layers: list[Layer] = []
         shard_id: int = -1
         my_rank = dist.get_rank()
         for layer_id, ranks in self._rank_grid.items():
@@ -523,7 +520,7 @@ class OobleckPipeline:
 
             # Get layer if this rank is involved in this layer
             if my_rank in ranks:
-                layer = model.layers[layer_id].to(device)
+                layer = Layer(model.layers[layer_id], pg)
                 layers.append(layer)
                 shard_id = torch.distributed.get_rank(group=pg)
 
