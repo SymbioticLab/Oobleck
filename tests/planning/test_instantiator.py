@@ -50,7 +50,7 @@ class TestPipelineInstantiator(OobleckSingleProcessTestCase):
         assert isinstance(execution_plan, HeterogeneousPipelinesExecutionPlan)
         assert len(execution_plan.pipeline_templates) == 1
         assert execution_plan.pipeline_templates[0] == template
-        assert execution_plan.num_instances_set[template] == 4 // num_gpus
+        assert execution_plan.num_instances_set[template] == 4
         assert (
             execution_plan.num_instances_set[template]
             * execution_plan.num_microbatches_set[template]
