@@ -130,7 +130,8 @@ def check_backward(
                     ni.requires_grad = i.requires_grad
             inputs.append(new_input)
 
-            output = layer(new_input)
+            need_reshard = bool(layer != fsdp_layers[-1])
+            output = layer(new_input, need_reshard)
             outputs.append(output)
             input = output
 

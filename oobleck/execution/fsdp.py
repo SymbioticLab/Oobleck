@@ -134,7 +134,9 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
             self._param_handle.post_reshard()
             self._reshard_param_event.record(self._shard_stream)
 
-    def forward(self, inputs: tuple[torch.Tensor]) -> tuple[torch.Tensor]:
+    def forward(
+        self, inputs: tuple[torch.Tensor], reshard_after: bool = True
+    ) -> tuple[torch.Tensor]:
         self.unshard(HandleTrainingState.FORWARD)
         # wait for unshard event to complete
         torch.cuda.current_stream().wait_event(self._unshard_param_event)
@@ -146,7 +148,9 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
         result = self._param_handle._fully_sharded_module(*inputs)
         self._forward_event.record(torch.cuda.current_stream())
 
-        self.reshard()
+        if reshard_after:
+            self.reshard()
+
         return result
 
     @staticmethod
@@ -162,9 +166,9 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
         unsharded_grad = grad_output.data
         # follow fsdp._runtime_utils._post_backward_pass()
         # that stores _param_handle.flat_param._saved_grad_shard
-        if self._param_handle.uses_sharded_strategy:
-            self._shard_stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(self._shard_stream):
+        self._shard_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self._shard_stream):
+            if self._param_handle.uses_sharded_strategy:
                 world_size = torch.distributed.get_world_size(self._process_group)
                 chunks = list(unsharded_grad.chunk(world_size))
                 new_sharded_grad = torch.empty_like(chunks[0])  # padded
@@ -174,8 +178,8 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
                     input=unsharded_grad,
                     group=self._process_group,
                 )
-        else:
-            new_sharded_grad = unsharded_grad
+            else:
+                new_sharded_grad = unsharded_grad
         torch.cuda.current_stream().wait_stream(self._shard_stream)
 
         # cast grad dtype to param dtype
