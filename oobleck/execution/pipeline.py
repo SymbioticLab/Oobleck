@@ -17,7 +17,6 @@ from transformers.training_args import TrainingArguments
 
 from oobleck.csrc.planning.pipeline_template import PipelineTemplate
 from oobleck.execution.dataloader import OobleckDataLoader, OobleckSampler
-from oobleck.execution.fsdp import FullyShardedDataParallelLayer
 from oobleck.execution.utils import DTYPE_TO_ID, ID_TO_DTYPE, zero_grads
 from oobleck.module.model import OobleckModel
 
@@ -33,7 +32,7 @@ class PipelineExecution:
     def __init__(
         self,
         pipeline: OobleckPipeline,
-        layers: list[FullyShardedDataParallelLayer],
+        layers: list[torch.fx.GraphModule],
         shard_id: int,
         dataloader: OobleckDataLoader,
         training_args: TrainingArguments,
@@ -52,7 +51,7 @@ class PipelineExecution:
         self.total_loss: torch.Tensor | None = None
 
         # TODO: use HF arguments to initialize optimizer and LR properly
-        parameters = list(l._param_handle.flat_param for l in layers)
+        parameters = list(itertools.chain([l.parameters() for l in layers]))
         self._optimizer = AdamW(
             parameters,
             lr=self._training_args.learning_rate,
@@ -461,7 +460,7 @@ class OobleckPipeline:
 
     def _initialize_execution(
         self,
-        layers: list[FullyShardedDataParallelLayer],
+        layers: list[torch.fx.GraphModule],
         shard_id: int,
     ):
         self.execution = PipelineExecution(
@@ -513,7 +512,8 @@ class OobleckPipeline:
         self._per_layer_pgs: dict[int, ProcessGroup] = {}
         self.execution: PipelineExecution | None = None
 
-        fsdp_layers: list[FullyShardedDataParallelLayer] = []
+        layers: list[torch.fx.GraphModule] = []
+        device = torch.device("cuda", torch.cuda.current_device())
         shard_id: int = -1
         my_rank = dist.get_rank()
         for layer_id, ranks in self._rank_grid.items():
@@ -521,30 +521,15 @@ class OobleckPipeline:
             pg = dist.new_group(list(set(ranks)))
             self._per_layer_pgs[layer_id] = pg
 
-            unshard_stream = torch.cuda.Stream()
-            postbackward_stream = torch.cuda.Stream()
-            # Get FSDP module if this rank is involved in this layer
+            # Get layer if this rank is involved in this layer
             if my_rank in ranks:
-                fsdp_layer = FullyShardedDataParallelLayer(
-                    model.layers[layer_id].to("cuda"),
-                    process_group=pg,
-                    streams={
-                        StreamType.UNSHARD: unshard_stream,
-                        StreamType.POST_BACKWARD: postbackward_stream,
-                    },
-                )
-                fsdp_layer._param_handle.init_flat_param_attributes()
-                fsdp_layers.append(fsdp_layer)
-                shard_id = ranks.index(my_rank)
+                layer = model.layers[layer_id].to(device)
+                layers.append(layer)
+                shard_id = torch.distributed.get_rank(group=pg)
 
-        if fsdp_layers:
+        if layers:
             assert shard_id >= 0, "shard id is not set while fsdp_layers have layers."
-
-            for prev_layer, layer, next_layer in zip(
-                [None] + fsdp_layers[:-1], fsdp_layers, fsdp_layers[1:] + [None]
-            ):
-                layer.set_prev_and_next_layer(prev_layer, next_layer)
-            self._initialize_execution(fsdp_layers, shard_id)
+            self._initialize_execution(layers, shard_id)
 
         assert len(self._per_layer_pgs) == len(
             model.layers
