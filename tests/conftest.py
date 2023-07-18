@@ -5,6 +5,7 @@ import gc
 import logging
 import math
 import multiprocessing as mp
+import os
 import random
 import time
 import traceback
@@ -270,6 +271,8 @@ class OobleckSingleProcessTestCase:
     Test cases for functionalities of static classes will inherit this class.
     """
 
+    factory: OobleckStaticClassFactory
+
     @pytest.fixture(scope="function", autouse=False)
     def distributed(self, mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
         assert not dist.is_initialized() and not torch.distributed.is_initialized()
@@ -293,6 +296,24 @@ class OobleckSingleProcessTestCase:
         dist.cdb = None
         assert not torch.distributed.is_initialized()
         assert not dist.is_initialized()
+
+    @classmethod
+    @pytest.fixture(scope="class", autouse=True)
+    def setup_class(
+        cls,
+        model_name_fixture: str,
+        tmp_path_factory: pytest.TempPathFactory,
+        class_mocker: MockerFixture,
+        request: pytest.FixtureRequest,
+    ):
+        with pytest.MonkeyPatch().context() as monkeypatch:
+            monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+            class_mocker.patch("torch.cuda.device_count", return_value=1)
+            directory = tmp_path_factory.getbasetemp()
+            request.cls.factory = OobleckStaticClassFactory(
+                model_name_fixture, directory
+            )
+            yield
 
 
 class OobleckTestProcess:

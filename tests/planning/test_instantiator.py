@@ -115,14 +115,14 @@ class TestPipelineInstantiator(OobleckSingleProcessTestCase):
         assert (
             sum(
                 stage._num_gpus
-                for stage in execution_plan.pipeline_templates[0]._stages
+                for stage in execution_plan.pipeline_templates[0].get_stages()
             )
             == num_nodes * num_gpus_per_node
         )
         assert (
             sum(
                 len(stage._layer_indices)
-                for stage in execution_plan.pipeline_templates[0]._stages
+                for stage in execution_plan.pipeline_templates[0].get_stages()
             )
             == profile.size
         )

@@ -4,7 +4,7 @@ from oobleck.csrc.planning.pipeline_template import (
     LayerExecutionResults,
     PipelineTemplateGenerator,
 )
-from tests.conftest import OobleckMultiProcessTestCase, OobleckSingleProcessTestCase
+from tests.conftest import OobleckSingleProcessTestCase
 
 
 class TestOobleckPipelineTemplate(OobleckSingleProcessTestCase):
@@ -22,7 +22,7 @@ class TestOobleckPipelineTemplate(OobleckSingleProcessTestCase):
         assert len(pipeline_templates) == 1
         assert pipeline_templates[0]._num_nodes == 1
         assert pipeline_templates[0]._num_gpus_per_node == 1
-        assert len(pipeline_templates[0]._stages) == 1
+        assert len(pipeline_templates[0].get_stages()) == 1
         assert pipeline_templates[0]._iteration_time > 0
 
     def test_create_pipeline_templates_maxnode(self, profile: LayerExecutionResults):
@@ -36,7 +36,7 @@ class TestOobleckPipelineTemplate(OobleckSingleProcessTestCase):
         assert len(pipeline_templates) == 1
         assert pipeline_templates[0]._num_nodes == num_nodes
         assert pipeline_templates[0]._num_gpus_per_node == 1
-        assert len(pipeline_templates[0]._stages) == num_nodes
+        assert len(pipeline_templates[0].get_stages()) == num_nodes
         assert pipeline_templates[0]._iteration_time > 0
 
     def test_create_pipeline_templates_too_many_nodes(
@@ -63,7 +63,7 @@ class TestOobleckPipelineTemplate(OobleckSingleProcessTestCase):
         assert 0 < pipeline_templates[0]._num_nodes <= max_num_nodes
         for pipeline_template in pipeline_templates:
             assert pipeline_templates[0]._num_gpus_per_node == 1
-            assert 2 <= len(pipeline_template._stages) <= 8
+            assert 2 <= len(pipeline_template.get_stages()) <= 8
             assert pipeline_template._iteration_time > 0
 
     def test_create_pipeline_templates_multiple_gpus_in_node(

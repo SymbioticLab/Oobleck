@@ -1,36 +1,33 @@
-import os
-import pyomo.environ as pyomo
-import torch.distributed
 import gc
+import math
+import os
 import sys
 import time
-import multiprocess as mp
-import math
-
 from ast import literal_eval
-from typing import Optional, Dict, Tuple, List, Any, TypeVar
-from torch.distributed import ProcessGroup
+from typing import Any, Dict, List, Optional, Tuple, TypeVar
 
+import multiprocess as mp
+import pyomo.environ as pyomo
+import torch.distributed
 from deepspeed import comm as dist
 from deepspeed.utils import logger
+from torch.distributed import ProcessGroup
+from transformers import TrainingArguments
 
-from pipeline_template import PipelineTemplate, PipelineTemplateGenerator
 from oobleck.elastic.client import RedisClient
+from oobleck.execution.dataloader import OobleckTrainDataLoader
 from oobleck.execution.dataset import OobleckDataset
+from oobleck.execution.pipeline import OobleckPipeline
 from oobleck.execution.utils import run_once
 from oobleck.module.layer import Layer
 from oobleck.module.model import OobleckModel
-from oobleck.planning.profiler import profile, get_profile_results, LayerExecutionResult
 from oobleck.planning.instantiator import (
     HeterogeneousPipelineExecutionPlan,
     PipelineInstantiator,
 )
-
-from oobleck.execution.dataloader import OobleckTrainDataLoader
-from oobleck.execution.pipeline import OobleckPipeline
+from oobleck.planning.profiler import LayerExecutionResult, get_profile_results, profile
 from oobleck.utils.timer import OobleckTimer, measure_time
-
-from transformers import TrainingArguments
+from pipeline_template import PipelineTemplate, PipelineTemplateGenerator
 
 T = TypeVar("T", bound="OobleckEngine")
 
@@ -69,7 +66,7 @@ class DynamicReconfigurationMixin(object):
         having_layers = self.redis.get_all_having_layers()
         logger.info("having_layers: %s", having_layers)
         # check whether there is a layer owned by nobody
-        assert len(having_layers) == len(self.model.model) and all(
+        assert len(having_layers) == len(self.model.layers) and all(
             l for l in having_layers.values()
         ), "Some layers are not owned by any node."
 
@@ -97,12 +94,12 @@ class DynamicReconfigurationMixin(object):
         # Missing layers mean layers that I didn't own but assigned to me in a new spec.
         # If any, report it to Redis.
         assert (
-            len(self.model.model) == len(new_pipeline_spec.layer_spec) == len(old_spec)
+            len(self.model.layers) == len(new_pipeline_spec.layer_spec) == len(old_spec)
         ), "Number of layers in the model is inconsistent with the number of layers in the pipeline spec."
         missing_layers: List[Layer] = [
             layer
             for layer, old_layer_rank, new_layer_rank in zip(
-                self.model.model, old_spec, new_pipeline_spec.layer_spec
+                self.model.layers, old_spec, new_pipeline_spec.layer_spec
             )
             if new_layer_rank == new_local_rank and old_layer_rank != old_local_rank
         ]
@@ -137,7 +134,7 @@ class DynamicReconfigurationMixin(object):
                 # if I (self.rank) am the source rank, then I will send the layer.
                 if self.rank == source_rank:
                     logger.info(f"Sending layer {layer_index} to ranks {ranks}...")
-            target_layer = self.model.model[layer_index]
+            target_layer = self.model.layers[layer_index]
 
             # TODO: send optimizer state, too.
             # TODO: update opptimizer state dict. Modify class structure if needed.
@@ -455,7 +452,7 @@ class OobleckEngine(
 
         # Reconstruct per-layer rank group for data parallelism from execution plan
         layer_dp_groups: List[ProcessGroup] = []
-        for layer_index in range(len(pipeline.model.model)):
+        for layer_index in range(len(pipeline.model.layers)):
             ranks = [ranks[layer_index] for ranks in pipeline_ranks_list]
             dp_pg = dist.new_group(ranks)
             if self.rank in ranks:

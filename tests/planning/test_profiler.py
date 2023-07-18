@@ -37,12 +37,12 @@ class TestProfiler(OobleckSingleProcessTestCase):
         profiler = Profiler(model)
 
         assert all(
-            all(not p.is_cuda for p in layer.parameters()) for layer in model.model
+            all(not p.is_cuda for p in layer.parameters()) for layer in model.layers
         )
 
         results = profiler.profile_execution_layers(1)
         assert isinstance(results, list)
-        assert len(results) == len(model.model)
+        assert len(results) == len(model.layers)
         for layer_result in results:
             assert isinstance(layer_result, dict)
             assert "forward" in layer_result and isinstance(
@@ -62,7 +62,7 @@ class TestProfiler(OobleckSingleProcessTestCase):
 
         # make sure model parameters are still on CPU side
         assert all(
-            all(not p.is_cuda for p in layer.parameters()) for layer in model.model
+            all(not p.is_cuda for p in layer.parameters()) for layer in model.layers
         )
 
     @pytest.mark.skip(
@@ -72,14 +72,14 @@ class TestProfiler(OobleckSingleProcessTestCase):
         profiler = Profiler(model)
 
         assert all(
-            all(not p.is_cuda for p in layer.parameters()) for layer in model.model
+            all(not p.is_cuda for p in layer.parameters()) for layer in model.layers
         )
 
         # test allreduce between GPUs in node
         # unittest only uses 1 GPU
         results_in_node = profiler.profile_allreduce_in_node()
         assert isinstance(results_in_node, list)
-        assert len(results_in_node) == len(model.model)
+        assert len(results_in_node) == len(model.layers)
         for layer_result in results_in_node:
             assert isinstance(layer_result, dict)
             assert len(list(layer_result.keys())) == 1
@@ -87,7 +87,7 @@ class TestProfiler(OobleckSingleProcessTestCase):
 
         # make sure model parameters are still on CPU side
         assert all(
-            all(not p.is_cuda for p in layer.parameters()) for layer in model.model
+            all(not p.is_cuda for p in layer.parameters()) for layer in model.layers
         )
 
     @pytest.mark.skip(
@@ -99,14 +99,14 @@ class TestProfiler(OobleckSingleProcessTestCase):
         profiler = Profiler(model)
 
         assert all(
-            all(not p.is_cuda for p in layer.parameters()) for layer in model.model
+            all(not p.is_cuda for p in layer.parameters()) for layer in model.layers
         )
 
         # test allreduce across nodes
         # unittest only uses 1 node
         results_across_nodes = profiler.profile_allreduce_across_nodes()
         assert isinstance(results_across_nodes, list)
-        assert len(results_across_nodes) == len(model.model)
+        assert len(results_across_nodes) == len(model.layers)
         for layer_result in results_across_nodes:
             assert isinstance(layer_result, dict)
             assert len(list(layer_result.keys())) == 1
@@ -114,7 +114,7 @@ class TestProfiler(OobleckSingleProcessTestCase):
 
         # make sure model parameters are still on CPU side
         assert all(
-            all(not p.is_cuda for p in layer.parameters()) for layer in model.model
+            all(not p.is_cuda for p in layer.parameters()) for layer in model.layers
         )
 
     @pytest.fixture
@@ -167,7 +167,7 @@ class TestProfiler(OobleckSingleProcessTestCase):
                     # check the file is json format, otherwise json.load will raise an error
                     data = json.load(f)
                     assert isinstance(data, list)
-                    assert len(data) == len(model.model)
+                    assert len(data) == len(model.layers)
 
         assert not torch.distributed.is_initialized()
 
@@ -209,7 +209,7 @@ class TestProfiler(OobleckSingleProcessTestCase):
                     # check the file is json format, otherwise json.load will raise an error
                     data = json.load(f)
                     assert isinstance(data, list)
-                    assert len(data) == len(model.model)
+                    assert len(data) == len(model.layers)
 
         assert not torch.distributed.is_initialized()
 

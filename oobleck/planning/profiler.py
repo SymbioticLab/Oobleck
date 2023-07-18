@@ -36,7 +36,7 @@ class Profiler:
         import copy
 
         results: List[List[int]] = [
-            [0.0, 0.0, 0.0, 0.0] for _ in range(len(self.model.model))
+            [0.0, 0.0, 0.0, 0.0] for _ in range(len(self.model.layers))
         ]
         if dist.get_rank() == 0:
             for i in range(num_warmup + 1):
@@ -56,7 +56,7 @@ class Profiler:
                         new_input.append(input[i].repeat(repeat))
                     input = tuple(new_input)
 
-                for idx, layer in enumerate(self.model.model):
+                for idx, layer in enumerate(self.model.layers):
                     start_mem = torch.cuda.memory_allocated()
 
                     gpu_layer = copy.deepcopy(layer).to("cuda")
@@ -158,9 +158,9 @@ class Profiler:
             )
 
         results: List[List[int]] = [
-            [0] * len(process_groups) for _ in range(len(self.model.model))
+            [0] * len(process_groups) for _ in range(len(self.model.layers))
         ]
-        for layer_index, layer in enumerate(self.model.model):
+        for layer_index, layer in enumerate(self.model.layers):
             for pg_index, (should_run, pg) in enumerate(process_groups):
                 if should_run:
                     results[layer_index][pg_index] = Profiler.profile_allreduce_layer(
@@ -207,9 +207,9 @@ class Profiler:
             )
 
         results: List[List[int]] = [
-            [0] * len(process_groups) for _ in range(len(self.model.model))
+            [0] * len(process_groups) for _ in range(len(self.model.layers))
         ]
-        for layer_index, layer in enumerate(self.model.model):
+        for layer_index, layer in enumerate(self.model.layers):
             for pg_index, (should_run, pg) in enumerate(process_groups):
                 if should_run:
                     results[layer_index][pg_index] = Profiler.profile_allreduce_layer(

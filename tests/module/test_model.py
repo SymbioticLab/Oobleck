@@ -15,9 +15,9 @@ class TestOobleckModel(OobleckSingleProcessTestCase):
 
     def test_attributes_type(self, model: OobleckModel):
         assert isinstance(model, OobleckModel)
-        assert isinstance(model.model, list)
+        assert isinstance(model.layers, list)
         # All split points must be consumed, thus have creating points + 1 sharded layers.
-        assert len(model.model) == len(get_split_points(model.model_args)) + 1
+        assert len(model.layers) == len(get_split_points(model.model_args)) + 1
         assert model.training_args == self.factory._training_args
         assert isinstance(model.model_args, PretrainedConfig)
         assert model.sample_inputs == self.factory.get_dataset().sample
@@ -27,7 +27,7 @@ class TestOobleckModel(OobleckSingleProcessTestCase):
         pass
 
     def test_model_layers_type(self, model: OobleckModel):
-        for index, layer in enumerate(model.model):
+        for index, layer in enumerate(model.layers):
             assert isinstance(layer, Layer)
             assert isinstance(layer.layer, torch.fx.GraphModule)
             assert layer.index == index

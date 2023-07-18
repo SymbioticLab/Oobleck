@@ -101,7 +101,7 @@ class HeterogeneousPipelinesExecutionPlan:
             for _ in range(num_instances):
                 logger.info(
                     f"Instantiating a pipeline "
-                    f"({len(pipeline_template._stages)} stages with {pipeline_template._num_nodes}) nodes)"
+                    f"({len(pipeline_template.get_stages())} stages with {pipeline_template._num_nodes}) nodes)"
                 )
 
                 ranks = list(
@@ -233,7 +233,7 @@ class PipelineInstantiator:
             i: instance_num for i, instance_num in enumerate(num_instances_set.values())
         }
         s = {
-            i: len(pipeline_template._stages)
+            i: len(pipeline_template.get_stages())
             for i, pipeline_template in enumerate(num_instances_set.keys())
         }
 
