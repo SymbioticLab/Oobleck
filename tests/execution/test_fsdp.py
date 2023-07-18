@@ -254,10 +254,10 @@ def check_backward_autograd_execution(
     # Begin test
     assert isinstance(output, tuple)
 
+    torch.cuda.synchronize()
+
     # This will automatically calculate the gradients in all layers
     fsdp_layers[-1].backward(output[0])
-
-    torch.cuda.current_stream().synchronize()
 
     for layer in fsdp_layers:
         handle = layer._param_handle
@@ -284,6 +284,8 @@ def check_backward_autograd_from_middle(
         [t for t in input if isinstance(t, torch.Tensor) and t.requires_grad]
     )
 
+    torch.cuda.synchronize()
+
     # Cut torch autograd graph here
     new_input = tuple(
         tensor.detach().clone() if isinstance(tensor, torch.Tensor) else tensor
@@ -294,7 +296,7 @@ def check_backward_autograd_from_middle(
             ni.requires_grad = i.requires_grad
 
     # Finish execution
-    final_output = fsdp_layers[-1](new_input, False)
+    final_output = fsdp_layers[-1](new_input)
 
     torch.cuda.synchronize()
 
