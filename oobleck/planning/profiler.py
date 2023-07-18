@@ -8,9 +8,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+import torch.fx
 from deepspeed.utils.logging import logger
 
-from oobleck.module.layer import Layer
 from oobleck.module.model import OobleckModel
 
 PROFILE_CACHE = "/tmp/oobleck/profiles"
@@ -36,7 +36,7 @@ class Profiler:
         import copy
 
         results: List[List[int]] = [
-            [0.0, 0.0, 0.0, 0.0] for _ in range(len(self.model.model))
+            [0.0, 0.0, 0.0, 0.0] for _ in range(len(self.model.layers))
         ]
         if dist.get_rank() == 0:
             for i in range(num_warmup + 1):
@@ -56,7 +56,7 @@ class Profiler:
                         new_input.append(input[i].repeat(repeat))
                     input = tuple(new_input)
 
-                for idx, layer in enumerate(self.model.model):
+                for idx, layer in enumerate(self.model.layers):
                     start_mem = torch.cuda.memory_allocated()
 
                     gpu_layer = copy.deepcopy(layer).to("cuda")
@@ -117,7 +117,7 @@ class Profiler:
 
     @staticmethod
     def profile_allreduce_layer(
-        layer: Layer, process_group: dist.ProcessGroup
+        layer: torch.fx.GraphModule, process_group: dist.ProcessGroup
     ) -> float:
         numel = sum([p.numel() for p in layer.parameters()])
         tensor = torch.zeros(numel, dtype=torch.float32, device="cuda")
@@ -158,9 +158,9 @@ class Profiler:
             )
 
         results: List[List[int]] = [
-            [0] * len(process_groups) for _ in range(len(self.model.model))
+            [0] * len(process_groups) for _ in range(len(self.model.layers))
         ]
-        for layer_index, layer in enumerate(self.model.model):
+        for layer_index, layer in enumerate(self.model.layers):
             for pg_index, (should_run, pg) in enumerate(process_groups):
                 if should_run:
                     results[layer_index][pg_index] = Profiler.profile_allreduce_layer(
@@ -207,9 +207,9 @@ class Profiler:
             )
 
         results: List[List[int]] = [
-            [0] * len(process_groups) for _ in range(len(self.model.model))
+            [0] * len(process_groups) for _ in range(len(self.model.layers))
         ]
-        for layer_index, layer in enumerate(self.model.model):
+        for layer_index, layer in enumerate(self.model.layers):
             for pg_index, (should_run, pg) in enumerate(process_groups):
                 if should_run:
                     results[layer_index][pg_index] = Profiler.profile_allreduce_layer(

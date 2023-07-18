@@ -55,6 +55,7 @@ class LayerExecutionResults
  * Execution result of a stage.
  * Stage consists of multiple layers;
  * StageExecutionResult is the aggregation of LayerExecutionResults.
+ * A stage can only be executed in one node.
  */
 class StageExecutionResult {
  public:
@@ -69,8 +70,8 @@ class StageExecutionResult {
 
     for (int i = layer_start_index; i < layer_end_index; ++i) {
       layer_indices_.push_back(layer_results->at(i).layer_index_);
-      forward_ += layer_results->at(i).forward_;
-      backward_ += layer_results->at(i).backward_;
+      forward_ += layer_results->at(i).forward_ / num_gpus_;
+      backward_ += layer_results->at(i).backward_ / num_gpus_;
 
       if (num_gpus_ > 1) {
         forward_ += layer_results->at(i).allreduce_in_node_.at(num_gpus_ - 1);

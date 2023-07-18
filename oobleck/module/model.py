@@ -1,5 +1,7 @@
+import random
 from typing import Any, Dict, List, Optional, Type
 
+import torch
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -10,8 +12,9 @@ from transformers import (
     TrainingArguments,
 )
 
-from oobleck.module.layer import Layer
 from oobleck.module.sharding import get_split_points, shard_model
+
+RANDOM_SEED = 42
 
 # Oobleck has been tested only with the following models.
 lang_models = ["gpt2", "t5", "bert", "bloom"]
@@ -48,10 +51,16 @@ class OobleckModel:
         model_tag: Optional[str] = None,
         config_args: Optional[Dict[str, Any]] = None,
     ):
+        # Initialize CPU seed
+        random.seed(RANDOM_SEED)
+        torch.default_generator.manual_seed(RANDOM_SEED)
+
         if config_args is None:
             config_args = {}
         config_args["use_cache"] = False
         config_args["remove_unused_columns"] = False
+        # necessary to register backward hooks
+        config_args["return_dict"] = False
 
         # Use training_args for fp16/bf16
         model_config: PretrainedConfig = AutoConfig.from_pretrained(
@@ -69,15 +78,12 @@ class OobleckModel:
         self.trace_input_names = list(sample_inputs.keys())
 
         split_points = get_split_points(model_config)
-        sharded_model = shard_model(model, self.trace_input_names, split_points)
+        self.layers = shard_model(model, self.trace_input_names, split_points)
         self.model_name = model_name
         self.model_tag = model_tag
-        self.model = [
-            Layer(index, layer, training_args)
-            for index, layer in enumerate(sharded_model)
-        ]
+
         self.total_num_params = sum(
-            sum(p.numel() for p in layer.parameters()) for layer in self.model
+            sum(p.numel() for p in layer.parameters()) for layer in self.layers
         )
         self.training_args = training_args
         self.model_args = model_config
