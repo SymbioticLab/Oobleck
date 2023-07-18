@@ -1,5 +1,4 @@
 import os
-from typing import List, Tuple
 
 import pytest
 import torch
@@ -19,7 +18,7 @@ class TestOobleckDataloader(OobleckMultiProcessTestCase):
     def _attributes(
         factory: OobleckStaticClassFactory,
         dfactory: OobleckDynamicClassFactory,
-        num_microbatches: List[int],
+        num_microbatches: list[int],
         num_iterations: int,
     ):
         rank = int(os.environ["RANK"])
@@ -47,7 +46,7 @@ class TestOobleckDataloader(OobleckMultiProcessTestCase):
     def _batch(
         factory: OobleckStaticClassFactory,
         dfactory: OobleckDynamicClassFactory,
-        num_microbatches: List[int],
+        num_microbatches: list[int],
     ):
         rank = int(os.environ["RANK"])
         dataloader: OobleckDataLoader = dfactory.get_dataloader(rank, num_microbatches)
@@ -71,7 +70,7 @@ class TestOobleckDataloader(OobleckMultiProcessTestCase):
     def _run_iterator_twice(
         factory: OobleckStaticClassFactory,
         dfactory: OobleckDynamicClassFactory,
-        num_microbatches: List[int],
+        num_microbatches: list[int],
     ):
         rank = int(os.environ["RANK"])
         dataloader: OobleckDataLoader = dfactory.get_dataloader(rank, num_microbatches)
@@ -103,7 +102,7 @@ class TestOobleckDataloader(OobleckMultiProcessTestCase):
     def _iteration(
         factory: OobleckStaticClassFactory,
         dfactory: OobleckDynamicClassFactory,
-        num_microbatches: List[int],
+        num_microbatches: list[int],
     ):
         rank = int(os.environ["RANK"])
         dataloader: OobleckDataLoader = dfactory.get_dataloader(rank, num_microbatches)
@@ -130,7 +129,7 @@ class TestOobleckDataloader(OobleckMultiProcessTestCase):
     def _distributed_batch_samples(
         factory: OobleckStaticClassFactory,
         dfactory: OobleckDynamicClassFactory,
-        num_microbatches: List[int],
+        num_microbatches: list[int],
     ):
         rank = int(os.environ["RANK"])
         dataloader: OobleckDataLoader = dfactory.get_dataloader(rank, num_microbatches)
@@ -152,7 +151,7 @@ class TestOobleckDataloader(OobleckMultiProcessTestCase):
         ],
         ids=["equal", "heterogeneous"],
     )
-    def test_unique_batches_per_index(self, num_microbatches: List[int]):
+    def test_unique_batches_per_index(self, num_microbatches: list[int]):
         results = self.run_in_parallel(
             4,
             TestOobleckDataloader._distributed_batch_samples,
@@ -170,9 +169,9 @@ class TestOobleckDataloader(OobleckMultiProcessTestCase):
     def _jump_batch(
         factory: OobleckStaticClassFactory,
         dfactory: OobleckDynamicClassFactory,
-        num_microbatches: List[int],
+        num_microbatches: list[int],
     ):
-        rank = int(os.environ["RANK"])
+        rank = dfactory._my_rank
         dataloader: OobleckDataLoader = dfactory.get_dataloader(rank, num_microbatches)
         sampler: OobleckSampler = dataloader.batch_sampler
         iterator = iter(sampler)
@@ -182,9 +181,9 @@ class TestOobleckDataloader(OobleckMultiProcessTestCase):
         for i in range(num_microbatches[rank]):
             batch = next(iterator)
             if i == 0:
-                results.append(batch)
+                results.extend(batch)
         assert sampler.num_iterations_done == 1
-        results.append(next(iterator))
+        results.extend(next(iterator))
 
         return results
 
@@ -196,8 +195,8 @@ class TestOobleckDataloader(OobleckMultiProcessTestCase):
         ],
         ids=["equal", "heterogeneous"],
     )
-    def test_jump_batch(self, num_microbatches: List[int]):
-        results: Tuple[List, List] = self.run_in_parallel(
+    def test_jump_batch(self, num_microbatches: list[int]):
+        results: tuple[list, list] = self.run_in_parallel(
             4,
             TestOobleckDataloader._jump_batch,
             num_microbatches,
@@ -210,16 +209,13 @@ class TestOobleckDataloader(OobleckMultiProcessTestCase):
             assert len(result) == 2
             # Second iteration batch should jump target size
             # so that within the same iteration batches are unique
-            assert all(
-                result[1][i] == result[0][i] + target_jump_size
-                for i in range(len(results))
-            )
+            assert result[1] == result[0] + target_jump_size
 
     @staticmethod
     def _run_until_stop(
         factory: OobleckStaticClassFactory,
         dfactory: OobleckDynamicClassFactory,
-        num_microbatches: List[int],
+        num_microbatches: list[int],
     ):
         assert len(num_microbatches) == 1
         pipeline_id = 0
