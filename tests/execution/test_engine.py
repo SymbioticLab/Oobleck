@@ -14,7 +14,9 @@ from pytest_mock import MockerFixture
 from oobleck.elastic.message_util import DistributionInfo
 from oobleck.elastic.training_util import TrainingArguments as OobleckArguments
 from oobleck.execution.engine import OobleckEngine
+from oobleck.execution.pipeline import OobleckPipeline
 from tests.conftest import (
+    TRAIN_BATCH_SIZE,
     OobleckElasticTestCase,
     OobleckStaticClassFactory,
     datasets,
@@ -22,7 +24,6 @@ from tests.conftest import (
 )
 
 
-@pytest.mark.skip
 class TestOobleckEngineClass(OobleckElasticTestCase):
     factory: OobleckStaticClassFactory
 
@@ -43,6 +44,10 @@ class TestOobleckEngineClass(OobleckElasticTestCase):
             model_tag="test",
             dataset_path=dataset[0],
             dataset_name=dataset[1],
+            fault_threshold=1,
+            model_args=model_args[model_name_fixture],
+            microbatch_size=TRAIN_BATCH_SIZE,
+            global_microbatch_size=512,
         )
 
     @classmethod
@@ -139,3 +144,42 @@ class TestOobleckEngineClass(OobleckElasticTestCase):
         assert torch_init_spy.call_count == 1
         assert torch.distributed.is_initialized()
         assert dist.is_initialized()
+
+    @pytest.mark.asyncio
+    async def test_init_engine_pipeline(
+        self,
+        pipe: tuple[connection.Connection, connection.Connection],
+        engine: OobleckEngine,
+        event_loop: asyncio.AbstractEventLoop,
+        sample_args: OobleckArguments,
+        mocker: MockerFixture,
+    ):
+        pipe[0].send(DistributionInfo([socket.gethostbyname(socket.gethostname())], 1))
+
+        def rebroadcast() -> int:
+            port = pipe[0].recv()
+            pipe[0].send(port)
+            return port
+
+        future = event_loop.run_in_executor(None, rebroadcast)
+        engine.initialize_distributed()
+        await asyncio.wait_for(future, timeout=5)
+
+        init_pipeline_spy = mocker.spy(
+            OobleckPipeline, "initialize_distributed_pipeline"
+        )
+
+        global_num_microbatch = (
+            sample_args.global_microbatch_size // sample_args.microbatch_size
+        )
+        engine.instantiate_pipelines(global_num_microbatch)
+
+        expected_pipeline_template = self.factory.get_dummy_pipeline_template(
+            num_stages=1,
+            num_gpus_per_node=1,
+            num_nodes=1,
+        )
+        assert engine._num_nodes == 1
+        assert engine._pipeline
+        assert engine._pipeline._template == expected_pipeline_template
+        assert init_pipeline_spy.call_count == 1

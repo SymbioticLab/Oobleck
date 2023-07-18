@@ -113,7 +113,7 @@ class HeterogeneousPipelinesExecutionPlan:
                 )
 
                 max_num_gpus_in_stage = max(
-                    stage._num_gpus for stage in pipeline_template._stages
+                    stage._num_gpus for stage in pipeline_template.get_stages()
                 )
 
                 for fsdp_index in range(max_num_gpus_in_stage):
@@ -124,19 +124,18 @@ class HeterogeneousPipelinesExecutionPlan:
                             )
                         )
                     )
-                    process_group = torch.distributed.new_group(ranks)
-                    if dist.get_rank() in ranks:
-                        assert my_pipeline is None
-                        my_pipeline = OobleckPipeline(
-                            pipeline_template=pipeline_template,
-                            model=model,
-                            dataloader=dataloader,
-                            ranks=ranks,
-                            pipeline_id=pipeline_index,
-                            training_args=training_args,
-                            process_group=process_group,
-                            step=step,
-                        )
+                    pipeline = OobleckPipeline(
+                        pipeline_id=0,
+                        pipeline_template=pipeline_template,
+                        ranks=ranks,
+                        dataloader=dataloader,
+                        step=0,
+                        training_args=training_args,
+                    )
+                    pipeline.initialize_distributed_fsdp(model)
+                    pipeline.initialize_distributed_pipeline()
+                    if pipeline.my_pipeline:
+                        my_pipeline = pipeline
                     pipeline_index += 1
                     num_gpus_used += len(ranks)
 

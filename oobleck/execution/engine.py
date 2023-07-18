@@ -33,13 +33,12 @@ class OobleckEngine:
 
         self._agent_pipe: connection.Connection = pipe
         self._args: OobleckArguments = args
-
-        if args.hf_training_args is None:
-            args.hf_training_args = {}
-        args.hf_training_args["output_dir"] = "/tmp/oobleck_output"
-
+        training_args = {
+            "output_dir": f"/tmp/oobleck/output/{args.model_name}-{args.model_tag}",
+            "per_device_train_batch_size": args.microbatch_size,
+        }
         self._hf_training_args: HFTrainingArguments = HFTrainingArguments(
-            **args.hf_training_args
+            **training_args
         )
 
         self._max_num_gpus: int = pipe.recv()
@@ -150,7 +149,7 @@ class OobleckEngine:
 
         # TODO: create pipeline and continue training
 
-    def instantiate_pipelines(self):
+    def instantiate_pipelines(self, global_num_microbatch: int):
         instantiator = PipelineInstantiator()
         execution_plan: HeterogeneousPipelinesExecutionPlan = (
             instantiator.get_best_execution_plan(
@@ -160,6 +159,7 @@ class OobleckEngine:
                     for layer in self._profile_results.get()
                 ],
                 self._num_nodes,
+                global_num_microbatch,
             )
         )
 

@@ -10,5 +10,6 @@ class TrainingArguments(Serializable):
     dataset_path: str
     dataset_name: str | None = None
     fault_threshold: int = 3
+    microbatch_size: int = 1
+    global_microbatch_size: int = 128
     model_args: dict[str, any] | None = None
-    hf_training_args: dict[str, any] | None = None

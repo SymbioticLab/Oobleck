@@ -392,7 +392,7 @@ class OobleckPipeline:
         assert dist.is_initialized(), "torch.distributed is not intialized."
 
         # This is used to indicate if we use this `OobleckPipeline` for training.
-        self._my_pipeline = bool(dist.get_rank() in ranks)
+        self.my_pipeline = bool(dist.get_rank() in ranks)
 
         # Construct a 2D rank grid for this pipeline.
         # First dimension is for layer index, second dimension is for rank.
