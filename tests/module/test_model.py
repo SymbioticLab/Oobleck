@@ -2,7 +2,6 @@ import pytest
 import torch.fx
 from transformers.configuration_utils import PretrainedConfig
 
-from oobleck.module.layer import Layer
 from oobleck.module.model import OobleckModel
 from oobleck.module.sharding import get_split_points
 from tests.conftest import OobleckSingleProcessTestCase
@@ -27,10 +26,7 @@ class TestOobleckModel(OobleckSingleProcessTestCase):
         pass
 
     def test_model_layers_type(self, model: OobleckModel):
-        for index, layer in enumerate(model.layers):
-            assert isinstance(layer, Layer)
-            assert isinstance(layer.layer, torch.fx.GraphModule)
-            assert layer.index == index
+        assert all(isinstance(layer, torch.fx.GraphModule) for layer in model.layers)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="No GPU available")
     def test_run_model(self, model: OobleckModel):
@@ -46,6 +42,9 @@ class TestOobleckModel(OobleckSingleProcessTestCase):
         for layer in model.layers:
             input = layer(*input)
 
-        assert "loss" in input
-        assert isinstance(input["loss"], torch.Tensor)
-        assert input["loss"].device == device
+        # output[0]: loss, output[1]: logits
+        output = input
+
+        assert isinstance(output, tuple)
+        assert isinstance(output[0], torch.Tensor)
+        assert output[0].device == device
