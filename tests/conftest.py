@@ -50,7 +50,7 @@ class Model:
 
 models_to_test: dict[str, Model] = {
     "gpt2": Model("gpt2", "wikitext", "wikitext-2-raw-v1"),
-    "microsoft/resnet-50": Model("microsoft/resnet-50", "Maysee/tiny-imagenet"),
+    # "microsoft/resnet-50": Model("microsoft/resnet-50", "Maysee/tiny-imagenet"),
 }
 
 # Add model arguments here, if it is needed.

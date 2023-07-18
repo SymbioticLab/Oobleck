@@ -296,6 +296,8 @@ def check_backward_autograd_from_middle(
     # Finish execution
     final_output = fsdp_layers[-1](new_input, False)
 
+    torch.cuda.synchronize()
+
     # Begin test
     assert isinstance(final_output, tuple)
     fsdp_layers[-1].backward(final_output[0])
@@ -348,6 +350,8 @@ def check_optimizer_step(
         inputs.append(new_input)
         outputs.append(output)
         input = output
+
+    torch.cuda.synchronize()
 
     fsdp_layers[-1].backward(input[0])
     for index in reversed(range(len(fsdp_layers) - 1)):

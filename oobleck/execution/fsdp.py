@@ -160,27 +160,25 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
     ):
         handle = self._param_handle
 
-        # All post backward work must be done after backward pass
-        handle._training_state = HandleTrainingState.BACKWARD_POST
-
         unsharded_grad = grad_output.data
         # follow fsdp._runtime_utils._post_backward_pass()
         # that stores _param_handle.flat_param._saved_grad_shard
-        self._shard_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self._shard_stream):
-            if self._param_handle.uses_sharded_strategy:
-                world_size = torch.distributed.get_world_size(self._process_group)
-                chunks = list(unsharded_grad.chunk(world_size))
-                new_sharded_grad = torch.empty_like(chunks[0])  # padded
+        # self._shard_stream.wait_stream(torch.cuda.current_stream())
+        # with torch.cuda.stream(self._shard_stream):
+        #     if self._param_handle.uses_sharded_strategy:
+        #         world_size = torch.distributed.get_world_size(self._process_group)
+        #         chunks = list(unsharded_grad.chunk(world_size))
+        #         new_sharded_grad = torch.empty_like(chunks[0])  # padded
 
-                torch.distributed.reduce_scatter_tensor(
-                    output=new_sharded_grad,
-                    input=unsharded_grad,
-                    group=self._process_group,
-                )
-            else:
-                new_sharded_grad = unsharded_grad
-        torch.cuda.current_stream().wait_stream(self._shard_stream)
+        #         torch.distributed.reduce_scatter_tensor(
+        #             output=new_sharded_grad,
+        #             input=unsharded_grad,
+        #             group=self._process_group,
+        #         )
+        #     else:
+        #         new_sharded_grad = unsharded_grad
+        # torch.cuda.current_stream().wait_stream(self._shard_stream)
+        new_sharded_grad = unsharded_grad
 
         # cast grad dtype to param dtype
         if new_sharded_grad.dtype != handle.flat_param.dtype:
@@ -204,9 +202,9 @@ class FullyShardedDataParallelLayer(torch.nn.Module):
         """
 
         self.unshard(HandleTrainingState.BACKWARD_PRE)
+        self._param_handle.prepare_gradient_for_backward()
         # wait for unshard event to complete
         torch.cuda.current_stream().wait_event(self._unshard_param_event)
-        self._param_handle.prepare_gradient_for_backward()
 
         # if there is a previous layer, prefetch unshard it.
         if self._prev_layer is not None:
