@@ -50,7 +50,7 @@ PYBIND11_MODULE(pipeline_template, m) {
            py::arg("start_rank"), py::arg("fsdp_index"))
       .def("get_layer_ranks", &PipelineTemplate::get_layer_ranks,
            py::arg("start_rank"), py::arg("layer_index"))
-      .def_property_readonly("_stages", &PipelineTemplate::get_stages)
+      .def("get_stages", &PipelineTemplate::get_stages)
       .def_property_readonly("_iteration_time",
                              &PipelineTemplate::get_iteration_time)
       .def_property_readonly("_num_nodes", &PipelineTemplate::get_num_nodes)

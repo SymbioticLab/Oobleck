@@ -114,7 +114,8 @@ class OobleckEngine:
         self._world_size = dist_info.world_size
         self._local_rank = int(os.environ["CUDA_VISIBLE_DEVICES"])
         self._rank = (
-            dist_info.agent_ips.index(my_ip) * torch.cuda.device_count() + local_rank
+            dist_info.agent_ips.index(my_ip) * torch.cuda.device_count()
+            + self._local_rank
         )
 
         if self._rank == 0:

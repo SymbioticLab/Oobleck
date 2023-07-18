@@ -1,5 +1,5 @@
 from collections import defaultdict
-from typing import Dict, List, Optional
+from typing import Optional
 
 import pyomo.environ as pyomo
 import torch.distributed
@@ -16,10 +16,10 @@ from oobleck.module.model import OobleckModel
 class HeterogeneousPipelinesExecutionPlan:
     def __init__(
         self,
-        pipeline_templates: List[PipelineTemplate],
-        num_instances_set: Dict[PipelineTemplate, int],
-        num_microbatches_set: Dict[PipelineTemplate, int],
-        allreduce_across_nodes: List[Dict[int, float]],
+        pipeline_templates: list[PipelineTemplate],
+        num_instances_set: dict[PipelineTemplate, int],
+        num_microbatches_set: dict[PipelineTemplate, int],
+        allreduce_across_nodes: list[dict[int, float]],
     ):
         pipeline_templates = [
             template
@@ -109,7 +109,7 @@ class HeterogeneousPipelinesExecutionPlan:
             for _ in range(num_instances):
                 logger.info(
                     f"Instantiating a pipeline "
-                    f"({len(pipeline_template._stages)} stages with {pipeline_template._num_nodes}) nodes)"
+                    f"({len(pipeline_template.get_stages())} stages with {pipeline_template._num_nodes}) nodes)"
                 )
 
                 max_num_gpus_in_stage = max(
@@ -147,24 +147,24 @@ class HeterogeneousPipelinesExecutionPlan:
 class PipelineInstantiator:
     def get_best_execution_plan(
         self,
-        pipeline_templates: List[PipelineTemplate],
-        allreduce_across_nodes: List[Dict[int, float]],
+        pipeline_templates: list[PipelineTemplate],
+        allreduce_across_nodes: list[dict[int, float]],
         num_nodes: int,
         global_num_microbatch: int,
     ) -> HeterogeneousPipelinesExecutionPlan:
         """
         Section 4.2. Pipeline Instantiation implementation
         """
-        num_instances_set_list: List[
-            Dict[PipelineTemplate, int]
+        num_instances_set_list: list[
+            dict[PipelineTemplate, int]
         ] = self._enumerate_instantiation_options(pipeline_templates, num_nodes)
 
-        num_microbatches_set_list: List[Dict[PipelineTemplate, int]] = [
+        num_microbatches_set_list: list[dict[PipelineTemplate, int]] = [
             self._distribute_batch(global_num_microbatch, num_instances_set)
             for num_instances_set in num_instances_set_list
         ]
 
-        execution_plans: List[HeterogeneousPipelinesExecutionPlan] = [
+        execution_plans: list[HeterogeneousPipelinesExecutionPlan] = [
             HeterogeneousPipelinesExecutionPlan(
                 pipeline_templates,
                 num_instances_set,
@@ -186,14 +186,14 @@ class PipelineInstantiator:
 
     def _enumerate_instantiation_options(
         self,
-        pipeline_templates: List[PipelineTemplate],
+        pipeline_templates: list[PipelineTemplate],
         num_nodes: int,
-    ) -> List[Dict[PipelineTemplate, int]]:
+    ) -> list[dict[PipelineTemplate, int]]:
         """Oobleck paper section 4.2.1. Enumerating instantiation options implementation
         Get all feasible sets of xi's that can use all of the given nodes.
         """
 
-        dp: List[List[List[Dict[PipelineTemplate, int]]]] = [
+        dp: list[list[list[dict[PipelineTemplate, int]]]] = [
             [[] for _ in range(num_nodes + 1)]
             for _ in range(len(pipeline_templates) + 1)
         ]
@@ -217,8 +217,8 @@ class PipelineInstantiator:
     def _distribute_batch(
         self,
         global_num_microbatch: int,
-        num_instances_set: Dict[PipelineTemplate, int],
-    ) -> Optional[Dict[PipelineTemplate, int]]:
+        num_instances_set: dict[PipelineTemplate, int],
+    ) -> Optional[dict[PipelineTemplate, int]]:
         """Oobleck paper section 4.2.2. Batch distribution implementation
         satisfying the following two requirements
         1. std(Bi * Ti) is minimized
@@ -229,11 +229,11 @@ class PipelineInstantiator:
 
         Args:
             global_num_microbatch (int): Global batch // training_args.per_device_train_batch_size.
-            instances_per_pp_template (List[int]): List of number of pipeline instances per template
-            pipeline_iteration_time (List[float]): List of PipelineSpec.e.
+            instances_per_pp_template (list[int]): list of number of pipeline instances per template
+            pipeline_iteration_time (list[float]): list of PipelineSpec.e.
 
         Returns:
-            List[int]: List of number of microbatch per template.
+            list[int]: list of number of microbatch per template.
                 Multiply by training_args.per_device_train_batch_size to calculate minibatch size.
         """
 
@@ -250,7 +250,7 @@ class PipelineInstantiator:
             i: instance_num for i, instance_num in enumerate(num_instances_set.values())
         }
         s = {
-            i: len(pipeline_template._stages)
+            i: len(pipeline_template.get_stages())
             for i, pipeline_template in enumerate(num_instances_set.keys())
         }
 

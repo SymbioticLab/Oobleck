@@ -1,4 +1,3 @@
-import ast
 import os
 
 import torch
@@ -57,7 +56,7 @@ class TestMultiProcess(OobleckMultiProcessTestCase):
         assert all(len(r) == 2 for r in results)
         assert all(r[0] == self.model_name for r in results)
 
-        ranks = sorted([r[1] for r in results])
+        ranks = [r[1] for r in results]
         assert ranks == [0, 1, 2, 3]
 
     @staticmethod

@@ -11,7 +11,6 @@ import torch._C._distributed_c10d as c10d
 import torch.distributed
 from pytest_mock import MockerFixture
 
-from oobleck.elastic.agent import OobleckAgent
 from oobleck.elastic.message_util import DistributionInfo
 from oobleck.elastic.training_util import TrainingArguments as OobleckArguments
 from oobleck.execution.engine import OobleckEngine
@@ -75,7 +74,11 @@ class TestOobleckEngineClass(OobleckElasticTestCase):
         class_mocker.patch(
             "oobleck.execution.engine.PipelineTemplateGenerator.create_pipeline_templates",
             return_value=[
-                cls.factory.get_dummy_pipeline_template(num_gpus + 1)
+                cls.factory.get_dummy_pipeline_template(
+                    num_stages=num_gpus + 1,
+                    num_gpus_per_node=num_gpus + 1,
+                    num_nodes=1,
+                )
                 for num_gpus in range(4)
             ],
         )
