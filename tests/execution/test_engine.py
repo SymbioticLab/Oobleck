@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import multiprocessing
+import os
 import socket
+import threading
+import traceback
 from multiprocessing import connection
+from pathlib import Path
+from unittest.mock import patch
 
 import deepspeed.comm as dist
 import pytest
@@ -18,10 +23,26 @@ from oobleck.execution.pipeline import OobleckPipeline
 from tests.conftest import (
     TRAIN_BATCH_SIZE,
     OobleckElasticTestCase,
+    OobleckMultiProcessTestCase,
     OobleckStaticClassFactory,
     datasets,
     model_args,
 )
+
+
+@pytest.fixture(scope="module")
+def sample_args(model_name_fixture: str) -> OobleckArguments:
+    dataset: tuple[str, (str | None)] = datasets[model_name_fixture]
+    return OobleckArguments(
+        model_name=model_name_fixture,
+        model_tag="test",
+        dataset_path=dataset[0],
+        dataset_name=dataset[1],
+        fault_threshold=1,
+        model_args=model_args[model_name_fixture],
+        microbatch_size=TRAIN_BATCH_SIZE,
+        global_microbatch_size=512,
+    )
 
 
 class TestOobleckEngineClass(OobleckElasticTestCase):
@@ -36,20 +57,6 @@ class TestOobleckEngineClass(OobleckElasticTestCase):
         p1.close()
         p2.close()
 
-    @pytest.fixture(scope="class")
-    def sample_args(self, model_name_fixture: str) -> OobleckArguments:
-        dataset: tuple[str, (str | None)] = datasets[model_name_fixture]
-        return OobleckArguments(
-            model_name=model_name_fixture,
-            model_tag="test",
-            dataset_path=dataset[0],
-            dataset_name=dataset[1],
-            fault_threshold=1,
-            model_args=model_args[model_name_fixture],
-            microbatch_size=TRAIN_BATCH_SIZE,
-            global_microbatch_size=512,
-        )
-
     @classmethod
     @pytest.fixture(scope="class", autouse=True)
     def setup_class(
@@ -60,6 +67,7 @@ class TestOobleckEngineClass(OobleckElasticTestCase):
         tmp_path_factory: pytest.TempPathFactory,
         request: pytest.FixtureRequest,
     ) -> None:
+        # max num GPUs
         pipe[0].send(4)
 
         directory = tmp_path_factory.getbasetemp()
@@ -183,3 +191,128 @@ class TestOobleckEngineClass(OobleckElasticTestCase):
         assert engine._pipeline
         assert engine._pipeline._template == expected_pipeline_template
         assert init_pipeline_spy.call_count == 1
+
+
+class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
+    @staticmethod
+    def _worker_init(
+        queue: multiprocessing.Queue,
+        rank: int,
+        world_size: int,
+        model_name: str,
+        directory: Path,
+        test: callable,
+        *args,
+    ):
+        """
+        OobleckEngine initializes distributed inside it,
+        so we need to avoid automatic distributed env initialization.
+        """
+        try:
+            monkeypatch = pytest.MonkeyPatch()
+            monkeypatch.setenv("CUDA_VISIBLE_DEVICES", str(rank))
+            monkeypatch.delenv("RANK", raising=False)
+            monkeypatch.delenv("WORLD_SIZE", raising=False)
+            monkeypatch.delenv("MASTER_ADDR", raising=False)
+            monkeypatch.delenv("MASTER_PORT", raising=False)
+
+            patcher = patch("torch.cuda.device_count", return_value=1)
+            patcher.start()
+
+            factory = OobleckStaticClassFactory(model_name, directory)
+            torch.cuda.set_device(0)
+
+            with patch(
+                "oobleck.execution.engine.OobleckModel",
+                return_value=factory.get_model(),
+            ), patch(
+                "oobleck.execution.engine.get_profile_results",
+                return_value=factory.get_dummy_profile(),
+            ), patch(
+                "oobleck.execution.engine.PipelineTemplateGenerator.create_pipeline_templates",
+                return_value=[
+                    factory.get_dummy_pipeline_template(
+                        num_stages=1, num_gpus_per_node=1, num_nodes=1
+                    )
+                ],
+            ):
+                result = test(factory, rank, *args)
+
+            queue.put(
+                {
+                    "success": (result if result is not None else ""),
+                    "rank": rank,
+                }
+            )
+        except Exception as e:
+            queue.put({"error": str(e) + "\n" + traceback.format_exc()})
+
+    @staticmethod
+    def _run_distributed_engine(
+        factory: OobleckStaticClassFactory,
+        rank: int,
+        pipe: list[connection.Connection],
+        agent_ips: list[str],
+        arguments: OobleckArguments,
+    ):
+        pipe = pipe[rank]
+
+        my_ip = agent_ips[rank]
+        patcher = patch("socket.gethostbyname", return_value=my_ip)
+        patcher.start()
+
+        engine = OobleckEngine(pipe, arguments)
+        engine.initialize_distributed()
+        assert dist.get_rank() < dist.get_world_size()
+        global_num_microbatch = (
+            arguments.global_microbatch_size // arguments.microbatch_size
+        )
+        engine.instantiate_pipelines(global_num_microbatch)
+
+        # Check it uses expected pipeline template and pipeline
+        expected = factory.get_dummy_pipeline_template(
+            num_stages=1, num_gpus_per_node=1, num_nodes=1
+        )
+        assert engine._pipeline_templates == [expected]
+        assert engine._pipeline
+        assert engine._pipeline._template == expected
+
+        # OobleckSampler has a list of num_microbatches for all pipelines.
+        # Sum of number of microbatches must be equal to global # microbatches
+        world_size = dist.get_world_size()
+        assert len(engine._dataloader.batch_sampler.num_microbatches) == world_size
+        assert (
+            sum(engine._dataloader.batch_sampler.num_microbatches)
+            == global_num_microbatch
+        )
+
+    def test_distributed_engine(self, sample_args: OobleckArguments):
+        ctx = multiprocessing.get_context("spawn")
+        agent_ips: list[str] = ["127.0.0.1", "127.0.0.2", "127.0.0.3", "127.0.0.4"]
+        pipes = [ctx.Pipe(duplex=True) for _ in range(len(agent_ips))]
+        for pipe, _ in pipes:
+            # max num GPUs
+            pipe.send(1)
+            # DistributionInfo
+            pipe.send(DistributionInfo(agent_ips, len(agent_ips)))
+
+        # Agent should re-broadcast the port
+        def broadcast_rank0_port():
+            port: int = pipes[0][0].recv()
+            for pipe, _ in pipes:
+                pipe.send(port)
+
+        thread = threading.Thread(target=broadcast_rank0_port)
+        thread.start()
+
+        self.run_in_parallel(
+            len(agent_ips),
+            self._run_distributed_engine,
+            [p[1] for p in pipes],
+            agent_ips,
+            sample_args,
+        )
+        thread.join()
+
+        [p[0].close() for p in pipes]
+        [p[1].close() for p in pipes]

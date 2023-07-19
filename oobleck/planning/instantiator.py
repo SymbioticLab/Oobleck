@@ -73,13 +73,21 @@ class HeterogeneousPipelinesExecutionPlan:
         my_rank = dist.get_rank()
 
         start_rank = 0
-        for index, pipeline_template in enumerate(self.pipeline_templates):
-            num_gpus_per_template = (
-                pipeline_template._num_nodes * pipeline_template._num_gpus_per_node
-            )
+        pipeline_index = 0
+        for pipeline_template, num_instances in self.num_instances_set.items():
+            for _ in range(num_instances):
+                num_gpus_per_template = (
+                    pipeline_template._num_nodes * pipeline_template._num_gpus_per_node
+                )
 
-            if my_rank >= start_rank and my_rank < start_rank + num_gpus_per_template:
-                return index
+                if (
+                    my_rank >= start_rank
+                    and my_rank < start_rank + num_gpus_per_template
+                ):
+                    return pipeline_index
+
+                start_rank += num_gpus_per_template
+                pipeline_index += 1
 
         raise RuntimeError("This rank is not in any pipeline")
 

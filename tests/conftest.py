@@ -6,7 +6,6 @@ import logging
 import math
 import multiprocessing as mp
 import random
-import shutil
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -349,6 +348,8 @@ class OobleckMultiProcessTestCase:
             monkeypatch.setenv("CUDA_VISIBLE_DEVICES", str(rank))
             monkeypatch.delenv("RANK", raising=False)
             monkeypatch.delenv("WORLD_SIZE", raising=False)
+            monkeypatch.delenv("MASTER_ADDR", raising=False)
+            monkeypatch.delenv("MASTER_PORT", raising=False)
 
             patcher = patch("torch.cuda.device_count", return_value=1)
             patcher.start()
@@ -394,7 +395,7 @@ class OobleckMultiProcessTestCase:
         request.cls.tmp_path_factory = tmp_path_factory
 
     model_name: str
-    tmp_directory: pytest.TempPathFactory
+    tmp_path_directory: pytest.TempPathFactory
 
     def run_in_parallel(
         self, num_processes: int, func: callable, *args
@@ -408,7 +409,7 @@ class OobleckMultiProcessTestCase:
         processes: list[mp.Process] = []
         for rank in range(num_processes):
             p = ctx.Process(
-                target=OobleckMultiProcessTestCase._worker_init,
+                target=self._worker_init,
                 args=(
                     queue,
                     rank,
@@ -428,6 +429,7 @@ class OobleckMultiProcessTestCase:
         try:
             for _ in range(len(processes)):
                 result = queue.get(timeout=60)
+                # result = queue.get()
 
                 if "error" in result:
                     # If any process get an error,

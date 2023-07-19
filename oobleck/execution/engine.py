@@ -36,6 +36,8 @@ class OobleckEngine:
         training_args = {
             "output_dir": f"/tmp/oobleck/output/{args.model_name}-{args.model_tag}",
             "per_device_train_batch_size": args.microbatch_size,
+            "no_cuda": True,  # don't use cuda in HFTrainingArguments
+            "log_level": "error",  # omit warning messages from HFTrainingArguments
         }
         self._hf_training_args: HFTrainingArguments = HFTrainingArguments(
             **training_args
@@ -111,7 +113,7 @@ class OobleckEngine:
 
         self._num_nodes = len(dist_info.agent_ips)
         self._world_size = dist_info.world_size
-        self._local_rank = int(os.environ["CUDA_VISIBLE_DEVICES"])
+        self._local_rank = torch.cuda.current_device()
         self._rank = (
             dist_info.agent_ips.index(my_ip) * torch.cuda.device_count()
             + self._local_rank
@@ -132,7 +134,7 @@ class OobleckEngine:
             # wait for rank 0's port information
             port: int = self._agent_pipe.recv()
             store = torch.distributed.TCPStore(
-                host_name=my_ip,
+                host_name=dist_info.agent_ips[0],
                 port=port,
                 world_size=dist_info.world_size,
                 is_master=False,
