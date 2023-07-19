@@ -29,7 +29,7 @@ class PipelineTemplate {
         iteration_time_(iteration_time),
         num_nodes_(num_nodes),
         num_gpus_per_node_(num_gpus_per_node),
-        ranks_per_layer_(get_ranks_per_layer()) {
+        ranks_per_layer_(get_ranks_per_layer(num_gpus_per_node, num_layers)) {
     // Run divide and conquer to create a vector of StageExecutionResult
     // Perform assertion
     // 1. num_nodes * num_gpus_per_node == all # GPUs used by stage results
@@ -58,7 +58,7 @@ class PipelineTemplate {
   const std::vector<int> get_pipeline_ranks(int start_rank,
                                             const int fsdp_index) const {
     if (fsdp_index < 0) {
-      throw pybind11::value_error("fsdp_index must be >= 0");
+      throw pybind11::index_error("fsdp_index must be >= 0");
     }
     if (fsdp_index >= num_gpus_per_node_) {
       throw pybind11::value_error(
@@ -73,6 +73,9 @@ class PipelineTemplate {
     return ranks;
   }
 
+  // Returns a list of ranks per layer
+  // Becasue a pipeline instantiated from this pipeline template
+  // has ranks that do not start from rank 0, start_rank acts as an offset.
   const std::vector<int> get_layer_ranks(int start_rank,
                                          const int layer_index) const {
     if (layer_index >= ranks_per_layer_.size()) {
@@ -92,31 +95,39 @@ class PipelineTemplate {
   const double iteration_time_;
   const int num_nodes_;
   const int num_gpus_per_node_;
+
+  // ranks_per_layer is a 2D vector of ranks per layer
+  // that is used by get_pipeline_ranks() and get_layer_ranks()
+  // to return horizontal list of ranks or vertical, respectively.
   std::vector<std::vector<int>> ranks_per_layer_;
 
-  const std::vector<std::vector<int>> get_ranks_per_layer() const {
-    int max_num_gpus_in_stage = 0;
-    for (auto& stage : stage_execution_results_) {
-      max_num_gpus_in_stage = std::max(max_num_gpus_in_stage, stage->num_gpus_);
-    }
-
-    // Retuns a list of ranks per layer
+  // Fill the 2D grid of ranks per layer.
+  // e.g. stage 1 uses 4 GPUs and stage 2 uses 2 GPUs:
+  // ranks_per_layer will be [[0, 1, 2, 3], [4, 4, 5, 5]]
+  // number of ranks per layer is always equals to the number of GPUs per node
+  // If a stage uses less GPUs than the number of GPUs per node,
+  // the ranks will be repeated.
+  // Ranks provided by this function starts from 0.
+  const std::vector<std::vector<int>> get_ranks_per_layer(
+      const int num_gpus_per_node,
+      const int num_layers) const {
     std::vector<std::vector<int>> ranks;
+    int rank = 0;
     for (auto& stage : stage_execution_results_) {
-      int rank = 0;
-      const int repeat_count = max_num_gpus_in_stage / stage->num_gpus_;
-      std::vector<int> stage_ranks(max_num_gpus_in_stage);
+      std::vector<int> stage_ranks(num_gpus_per_node);
       auto it = stage_ranks.begin();
 
       // Adjust number of ranks per layer to fix the number of GPUs
       // e.g. stage 1 uses 4 GPUs and stage 2 uses 2 GPUs:
       // ranks will be [[0, 1, 2, 3], [4, 4, 5, 5]]
+      const int repeat_count = num_gpus_per_node / stage->num_gpus_;
       for (int i = 0; i < stage->num_gpus_; i++) {
         std::fill_n(it, repeat_count, rank);
         std::advance(it, repeat_count);
         rank++;
       }
 
+      // push per-layer ranks to the result
       for (auto layer_index : stage->layer_indices_) {
         ranks.push_back(stage_ranks);
       }
