@@ -2,7 +2,6 @@ from collections import defaultdict
 from typing import Optional
 
 import pyomo.environ as pyomo
-import torch.distributed
 from deepspeed import comm as dist
 from deepspeed.utils import logger
 from transformers.training_args import TrainingArguments
@@ -107,10 +106,15 @@ class HeterogeneousPipelinesExecutionPlan:
         dataloader: OobleckDataLoader,
         training_args: TrainingArguments,
         step: int = 0,
-    ) -> OobleckPipeline:
+        # layer_index -> dict of [fsdp_index -> ProcessGroup]
+    ) -> tuple[OobleckPipeline, dict[int, dict[int, dist.ProcessGroup]]]:
         my_pipeline: Optional[OobleckPipeline] = None
         pipeline_index: int = 0
         num_gpus_used = 0
+
+        # 2D grid of ranks involved in each layer, sharded by fsdp
+        # (layer_index, fsdp_index) -> list of ranks
+        ranks_grid: dict[tuple[int, int], list[int]] = defaultdict(list)
 
         for pipeline_template in self.pipeline_templates:
             num_instances = self.num_instances_set[pipeline_template]
@@ -125,6 +129,7 @@ class HeterogeneousPipelinesExecutionPlan:
                 )
 
                 for fsdp_index in range(max_num_gpus_in_stage):
+                    # Ranks involved in this fsdp-sharded pipeline (horizontal)
                     ranks: list[int] = list(
                         set(
                             pipeline_template.get_pipeline_ranks(
@@ -132,6 +137,9 @@ class HeterogeneousPipelinesExecutionPlan:
                             )
                         )
                     )
+                    for layer_index, rank in enumerate(ranks):
+                        ranks_grid[(layer_index, fsdp_index)].append(rank)
+
                     pipeline = OobleckPipeline(
                         pipeline_id=pipeline_index,
                         pipeline_template=pipeline_template,
@@ -147,8 +155,13 @@ class HeterogeneousPipelinesExecutionPlan:
                     pipeline_index += 1
                     num_gpus_used += len(ranks)
 
+        # Create process groups for each layer
+        pg_grid: dict[int, dict[int, dist.ProcessGroup]] = defaultdict(dict)
+        for (layer_index, fsdp_index), ranks in ranks_grid.items():
+            pg_grid[layer_index][fsdp_index] = dist.new_group(ranks)
+
         assert my_pipeline is not None
-        return my_pipeline
+        return my_pipeline, pg_grid
 
 
 class PipelineInstantiator:

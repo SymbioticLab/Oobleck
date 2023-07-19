@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 import logging
-import os
 import socket
+import weakref
 from multiprocessing import connection
 
 import deepspeed.comm as dist
@@ -23,6 +25,27 @@ from oobleck.planning.instantiator import (
     HeterogeneousPipelinesExecutionPlan,
     PipelineInstantiator,
 )
+
+
+class DataParallelEngine:
+    def __init__(
+        self,
+        engine: OobleckEngine,
+        dp_process_groups: dict[int, dict[int, dist.ProcessGroup]],
+    ):
+        self._engine = weakref.ref(engine)
+        self._dp_process_groups = dp_process_groups
+
+    @property
+    def engine(self):
+        return self._engine()
+
+    def do_allreduce(self):
+        for layer, pgs_per_layer in zip(
+            self.engine._pipeline.execution._layers,
+            self._dp_process_groups.values(),
+        ):
+            layer.reduce_gradients(pgs_per_layer.values())
 
 
 class OobleckEngine:
@@ -176,9 +199,14 @@ class OobleckEngine:
             epoch=0,
         )
 
-        self._pipeline: OobleckPipeline = execution_plan.instantiate(
+        self._pipeline: OobleckPipeline
+        # (layer_index, fsdp_index) -> list of ranks
+        process_groups_dp: dict[tuple[int, int], dist.ProcessGroup]
+        self._pipeline, process_groups_dp = execution_plan.instantiate(
             model=self._model,
             dataloader=self._dataloader,
             training_args=self._hf_training_args,
             step=0,
         )
+
+        self._dp_engine = DataParallelEngine(self, process_groups_dp)

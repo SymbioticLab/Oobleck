@@ -58,3 +58,9 @@ class Layer(torch.nn.Module):
         else:
             output, gradients = tensor
             torch.autograd.backward(output, gradients)
+
+    def reduce_gradients(self, process_groups: list[torch.distributed.ProcessGroup]):
+        for process_group in process_groups:
+            if torch.distributed.get_rank(process_group) < 0:
+                continue
+            torch.distributed.all_reduce(self._param_handle.flat_param.grad)
