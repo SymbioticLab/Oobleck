@@ -133,11 +133,11 @@ class HeterogeneousPipelinesExecutionPlan:
                         )
                     )
                     pipeline = OobleckPipeline(
-                        pipeline_id=0,
+                        pipeline_id=pipeline_index,
                         pipeline_template=pipeline_template,
                         ranks=ranks,
                         dataloader=dataloader,
-                        step=0,
+                        step=step,
                         training_args=training_args,
                     )
                     pipeline.initialize_distributed_fsdp(model)
