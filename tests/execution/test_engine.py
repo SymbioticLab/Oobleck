@@ -196,6 +196,7 @@ class TestOobleckEngineClass(OobleckElasticTestCase):
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="This test requires 4 GPUs")
+@pytest.mark.parametrize("num_stages", [1, 2, 4], ids=["1stage", "2stages", "4stages"])
 class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
     @staticmethod
     def _worker_init(
@@ -303,9 +304,6 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
             == global_num_microbatch
         )
 
-    @pytest.mark.parametrize(
-        "num_stages", [1, 2, 4], ids=["1stage", "2stages", "4stages"]
-    )
     def test_distributed_engine(self, num_stages: int, sample_args: OobleckArguments):
         num_gpus_per_node = 1
         ctx = multiprocessing.get_context("spawn")
@@ -344,32 +342,50 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
     def _run_data_parallel_allreduce(
         factory: OobleckStaticClassFactory,
         rank: int,
+        num_stages: int,
+        num_gpus_per_node: int,
         pipe: list[connection.Connection],
         agent_ips: list[str],
         arguments: OobleckArguments,
     ):
+        num_nodes_per_pipeline = num_stages
         pipe = pipe[rank]
         global_num_microbatch = (
             arguments.global_microbatch_size // arguments.microbatch_size
         )
 
         my_ip = agent_ips[rank]
-        patcher = patch("socket.gethostbyname", return_value=my_ip)
-        patcher.start()
+        socket_patcher = patch("socket.gethostbyname", return_value=my_ip)
+        socket_patcher.start()
+        pt_patcher = patch(
+            "oobleck.execution.engine.PipelineTemplateGenerator.create_pipeline_templates",
+            return_value=[
+                factory.get_dummy_pipeline_template(
+                    num_stages=num_stages,
+                    num_gpus_per_node=num_gpus_per_node,
+                    num_nodes=num_nodes_per_pipeline,
+                )
+            ],
+        )
+        pt_patcher.start()
 
         engine = OobleckEngine(pipe, arguments)
         engine.initialize_distributed()
         engine.instantiate_pipelines(global_num_microbatch)
 
+        # TODO: test allreduce
         engine._pipeline.train()
 
-    def test_distributed_engine_train(self, sample_args: OobleckArguments):
+    def test_distributed_engine_train(
+        self, num_stages: int, sample_args: OobleckArguments
+    ):
+        num_gpus_per_node = 1
         ctx = multiprocessing.get_context("spawn")
         agent_ips: list[str] = ["127.0.0.1", "127.0.0.2", "127.0.0.3", "127.0.0.4"]
         pipes = [ctx.Pipe(duplex=True) for _ in range(len(agent_ips))]
         for pipe, _ in pipes:
             # max num GPUs
-            pipe.send(1)
+            pipe.send(num_gpus_per_node)
             # DistributionInfo
             pipe.send(DistributionInfo(agent_ips, len(agent_ips)))
 
@@ -384,6 +400,8 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
         self.run_in_parallel(
             len(agent_ips),
             self._run_data_parallel_allreduce,
+            num_stages,
+            num_gpus_per_node,
             [p[1] for p in pipes],
             agent_ips,
             sample_args,
