@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import multiprocessing
-import os
 import socket
 import threading
 import traceback
@@ -373,8 +372,16 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
         engine.initialize_distributed()
         engine.instantiate_pipelines(global_num_microbatch)
 
-        # TODO: test allreduce
-        engine._pipeline.train()
+        # Monitor layer allreduce is called
+        with patch.object(
+            torch.distributed, "all_reduce", wraps=torch.distributed.all_reduce
+        ) as allreduce_spy:
+            engine._train_step()
+            expected_call_number = len(engine._pipeline.execution._layers)
+            assert allreduce_spy.call_count == expected_call_number, (
+                f"torch.distributed.allreduce expected to be called {expected_call_number} times, "
+                f"but called {allreduce_spy.call_count} times."
+            )
 
     def test_distributed_engine_train(
         self, num_stages: int, sample_args: OobleckArguments

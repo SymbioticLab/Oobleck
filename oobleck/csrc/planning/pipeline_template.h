@@ -55,39 +55,16 @@ class PipelineTemplate {
   int get_num_nodes() const { return num_nodes_; }
   int get_num_gpus_per_node() const { return num_gpus_per_node_; }
 
-  const std::vector<int> get_pipeline_ranks(int start_rank,
-                                            const int fsdp_index) const {
-    if (fsdp_index < 0) {
-      throw pybind11::index_error("fsdp_index must be >= 0");
-    }
-    if (fsdp_index >= num_gpus_per_node_) {
-      throw pybind11::value_error(
-          "fsdp_index must be less than num_gpus_per_node");
-    }
-
-    std::vector<int> ranks;
+  std::vector<std::vector<int>> get_ranks(const int rank_offset) const {
+    std::vector<std::vector<int>> ranks;
     for (auto& ranks_per_layer : ranks_per_layer_) {
-      ranks.push_back(ranks_per_layer[fsdp_index] + start_rank);
+      std::vector<int> ranks_per_layer_offset;
+      for (auto& rank : ranks_per_layer) {
+        ranks_per_layer_offset.push_back(rank + rank_offset);
+      }
+      ranks.push_back(ranks_per_layer_offset);
     }
-
-    return ranks;
-  }
-
-  // Returns a list of ranks per layer
-  // Becasue a pipeline instantiated from this pipeline template
-  // has ranks that do not start from rank 0, start_rank acts as an offset.
-  const std::vector<int> get_layer_ranks(int start_rank,
-                                         const int layer_index) const {
-    if (layer_index >= ranks_per_layer_.size()) {
-      throw pybind11::index_error(
-          "layer_index must be less than the number of layers");
-    }
-
-    std::vector<int> ranks = ranks_per_layer_[layer_index];
-    for (auto& rank : ranks) {
-      rank += start_rank;
-    }
-    return ranks;
+    return std::move(ranks);
   }
 
  private:

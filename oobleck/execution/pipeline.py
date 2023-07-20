@@ -22,6 +22,69 @@ from oobleck.execution.utils import DTYPE_TO_ID, ID_TO_DTYPE, zero_grads
 from oobleck.module.model import OobleckModel
 
 
+class OobleckPipelineSchedule(schedule.TrainSchedule):
+    """A schedule for training a batch using pipeline parallelism.
+
+    Unlike existing :class:`deepspeed.runtime.pipe.schedule.TrainSchedule`,
+    :class:`OobleckPipelineSchedule` decouples allreduce synchronization and optimizer step
+    from pipeline execution and only schedules computation part and intermediate p2p operations.
+
+    reducing (tied) gradients and optimizer step must be done separately.
+    """
+
+    def steps(self):
+        prev_micro_batch_id = -1
+        total_steps = 2 * (self.micro_batches + self.stages - 1)
+        for step_id in range(total_steps):
+            micro_batch_id, is_forward = self._step_to_micro_batch(step_id)
+
+            if self._valid_micro_batch(prev_micro_batch_id):
+                prev_buffer = self._buffer_idx(prev_micro_batch_id)
+            if self._valid_micro_batch(micro_batch_id):
+                curr_buffer = self._buffer_idx(micro_batch_id)
+
+            cmds = []
+
+            # Exchange activations
+            if is_forward:
+                if self._valid_micro_batch(prev_micro_batch_id) and self._valid_stage(
+                    self.prev_stage
+                ):
+                    cmds.append(schedule.SendGrad(prev_buffer))
+                if self._valid_micro_batch(micro_batch_id) and self._valid_stage(
+                    self.prev_stage
+                ):
+                    cmds.append(schedule.RecvActivation(curr_buffer))
+
+            else:
+                if self._valid_micro_batch(micro_batch_id) and self._valid_stage(
+                    self.next_stage
+                ):
+                    cmds.append(schedule.RecvGrad(curr_buffer))
+                if self._valid_micro_batch(prev_micro_batch_id) and self._valid_stage(
+                    self.next_stage
+                ):
+                    cmds.append(schedule.SendActivation(prev_buffer))
+
+            # First/last stage loads
+            if self.stage_id == 0 or self.stage_id == self.stages - 1:
+                if is_forward and self._valid_micro_batch(micro_batch_id):
+                    cmds.append(schedule.LoadMicroBatch(curr_buffer))
+
+            # Computation
+            if self._valid_micro_batch(micro_batch_id):
+                if is_forward:
+                    cmds.append(schedule.ForwardPass(curr_buffer))
+                else:
+                    cmds.append(schedule.BackwardPass(curr_buffer))
+
+            # No reduce and optimizer step here at the end of the batch
+
+            # Prepare state for next time
+            prev_micro_batch_id = micro_batch_id
+            yield cmds
+
+
 class PipelineExecution:
     """
     Pipeline execution module that this rank will use for training.
@@ -364,12 +427,6 @@ class PipelineCommunication:
         for buffer in self.grad_recv_buf:
             self._recv(buffer, self.next_rank)
 
-    def reduce_gradients(self):
-        pass
-
-    def reduce_tied_gradients(self):
-        pass
-
 
 class OobleckPipeline:
     def __init__(
@@ -432,8 +489,6 @@ class OobleckPipeline:
             schedule.RecvActivation: self.communication.recv_activations,
             schedule.SendGrad: self.communication.send_gradients,
             schedule.RecvGrad: self.communication.recv_gradients,
-            schedule.ReduceGrads: self.communication.reduce_gradients,
-            schedule.ReduceTiedGrads: self.communication.reduce_tied_gradients,
         }
 
         for step_cmds in self.train_schedule:
@@ -484,7 +539,7 @@ class OobleckPipeline:
         )
 
         sampler: OobleckSampler = self._dataloader.batch_sampler
-        self.train_schedule = schedule.TrainSchedule(
+        self.train_schedule = OobleckPipelineSchedule(
             micro_batches=sampler.num_microbatches[self._pipeline_id],
             stages=len(self._template.get_stages()),
             stage_id=my_stage_index,
@@ -520,7 +575,7 @@ class OobleckPipeline:
 
             # Get layer if this rank is involved in this layer
             if my_rank in ranks:
-                layer = Layer(model.layers[layer_id], pg)
+                layer = Layer(layer_id, model.layers[layer_id], pg)
                 layers.append(layer)
                 shard_id = torch.distributed.get_rank(group=pg)
 

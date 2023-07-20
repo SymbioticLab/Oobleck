@@ -105,63 +105,65 @@ class HeterogeneousPipelinesExecutionPlan:
         model: OobleckModel,
         dataloader: OobleckDataLoader,
         training_args: TrainingArguments,
+        num_gpus_per_node: int,
         step: int = 0,
         # layer_index -> dict of [fsdp_index -> ProcessGroup]
     ) -> tuple[OobleckPipeline, dict[int, dict[int, dist.ProcessGroup]]]:
         my_pipeline: Optional[OobleckPipeline] = None
         pipeline_index: int = 0
-        num_gpus_used = 0
+        num_ranks_used = 0
 
         # 2D grid of ranks involved in each layer, sharded by fsdp
-        # (layer_index, fsdp_index) -> list of ranks
-        ranks_grid: dict[tuple[int, int], list[int]] = defaultdict(list)
+        # layer_index -> dict of (fsdp_index -> list of ranks)
+        ranks_grid: dict[int, dict[int, list[int]]] = defaultdict(dict)
 
-        for pipeline_template in self.pipeline_templates:
-            num_instances = self.num_instances_set[pipeline_template]
+        for pipeline_template, num_instances in self.num_instances_set.items():
             for _ in range(num_instances):
-                logger.info(
-                    f"Instantiating a pipeline "
-                    f"({len(pipeline_template.get_stages())} stages with {pipeline_template._num_nodes}) nodes)"
+                ranks: list[int] = list(
+                    range(
+                        num_ranks_used,
+                        num_ranks_used
+                        + pipeline_template._num_nodes * num_gpus_per_node,
+                    )
                 )
 
-                max_num_gpus_in_stage = max(
-                    stage._num_gpus for stage in pipeline_template.get_stages()
+                pipeline = OobleckPipeline(
+                    pipeline_id=pipeline_index,
+                    pipeline_template=pipeline_template,
+                    ranks=ranks,
+                    dataloader=dataloader,
+                    step=step,
+                    training_args=training_args,
                 )
+                pipeline.initialize_distributed_fsdp(model)
+                pipeline.initialize_distributed_pipeline()
 
-                for fsdp_index in range(max_num_gpus_in_stage):
-                    # Ranks involved in this fsdp-sharded pipeline (horizontal)
-                    ranks: list[int] = list(
-                        set(
-                            pipeline_template.get_pipeline_ranks(
-                                num_gpus_used, fsdp_index
-                            )
-                        )
-                    )
-                    for layer_index, rank in enumerate(ranks):
-                        ranks_grid[(layer_index, fsdp_index)].append(rank)
+                # per-layer sharded ranks (outer: per layer, inner: ranks in fsdp group)
+                ranks_pipeline: list[list[int]] = pipeline_template.get_ranks(
+                    num_ranks_used
+                )
+                for layer_index, ranks_per_layer in enumerate(ranks_pipeline):
+                    for fsdp_index, rank in enumerate(ranks_per_layer):
+                        if fsdp_index not in ranks_grid[layer_index]:
+                            ranks_grid[layer_index][fsdp_index] = []
+                        ranks_grid[layer_index][fsdp_index].append(rank)
 
-                    pipeline = OobleckPipeline(
-                        pipeline_id=pipeline_index,
-                        pipeline_template=pipeline_template,
-                        ranks=ranks,
-                        dataloader=dataloader,
-                        step=step,
-                        training_args=training_args,
-                    )
-                    pipeline.initialize_distributed_fsdp(model)
-                    pipeline.initialize_distributed_pipeline()
-                    if pipeline.my_pipeline:
-                        my_pipeline = pipeline
-                    pipeline_index += 1
-                    num_gpus_used += len(ranks)
+                if pipeline.my_pipeline:
+                    my_pipeline = pipeline
 
-        # Create process groups for each layer
-        pg_grid: dict[int, dict[int, dist.ProcessGroup]] = defaultdict(dict)
-        for (layer_index, fsdp_index), ranks in ranks_grid.items():
-            pg_grid[layer_index][fsdp_index] = dist.new_group(ranks)
+                pipeline_index += 1
+                num_ranks_used += len(ranks)
 
         assert my_pipeline is not None
-        return my_pipeline, pg_grid
+
+        # Create process groups for data parallelism
+        dp_pg_grid: dict[int, dict[int, dist.ProcessGroup]] = defaultdict(dict)
+        for layer_index, ranks_per_layer in ranks_grid.items():
+            for fsdp_index, ranks in ranks_per_layer.items():
+                dp_pg_grid[layer_index][fsdp_index] = dist.new_group(ranks)
+
+        assert my_pipeline is not None
+        return my_pipeline, dp_pg_grid
 
 
 class PipelineInstantiator:

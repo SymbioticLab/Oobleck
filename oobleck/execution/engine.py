@@ -31,6 +31,7 @@ class DataParallelEngine:
     def __init__(
         self,
         engine: OobleckEngine,
+        # layer_index -> dict of [fsdp_index -> list of ranks]
         dp_process_groups: dict[int, dict[int, dist.ProcessGroup]],
     ):
         self._engine = weakref.ref(engine)
@@ -41,11 +42,9 @@ class DataParallelEngine:
         return self._engine()
 
     def do_allreduce(self):
-        for layer, pgs_per_layer in zip(
-            self.engine._pipeline.execution._layers,
-            self._dp_process_groups.values(),
-        ):
-            layer.reduce_gradients(pgs_per_layer.values())
+        for layer in self.engine._pipeline.execution._layers:
+            process_groups_per_layer = self._dp_process_groups[layer._layer_id]
+            layer.reduce_gradients(list(process_groups_per_layer.values()))
 
 
 class OobleckEngine:
@@ -66,7 +65,7 @@ class OobleckEngine:
             **training_args
         )
 
-        self._max_num_gpus: int = pipe.recv()
+        self._num_gpus_per_node: int = pipe.recv()
 
         # Initialize without distributed
         self._dataset: OobleckDataset
@@ -77,10 +76,10 @@ class OobleckEngine:
             self._model,
             self._profile_results,
             self._pipeline_templates,
-        ) = self.initialize_engine(self._max_num_gpus)
+        ) = self.initialize_engine(self._num_gpus_per_node)
 
     def initialize_engine(
-        self, max_num_gpus: int
+        self, num_gpus_per_node: int
     ) -> tuple[
         OobleckDataset,
         OobleckModel,
@@ -117,7 +116,7 @@ class OobleckEngine:
         pipeline_templates: list[
             PipelineTemplate
         ] = template_generator.create_pipeline_templates(
-            profile_results, (1, max_num_gpus), num_gpus_per_node
+            profile_results, (1, num_gpus_per_node), num_gpus_per_node
         )
 
         return dataset, model, profile_results, pipeline_templates
@@ -189,7 +188,7 @@ class OobleckEngine:
         )
 
         # TODO: get current iteration progress
-        self._dataloader: OobleckDataLoader = OobleckDataLoader(
+        dataloader: OobleckDataLoader = OobleckDataLoader(
             args=self._hf_training_args,
             datasets=self._dataset,
             dataloader_type=LoaderType.Training,
@@ -200,13 +199,25 @@ class OobleckEngine:
         )
 
         self._pipeline: OobleckPipeline
-        # (layer_index, fsdp_index) -> list of ranks
-        process_groups_dp: dict[tuple[int, int], dist.ProcessGroup]
+        # layer_index -> dict of [fsdp_index -> list of ranks]
+        process_groups_dp: dict[int, dict[int, dist.ProcessGroup]]
         self._pipeline, process_groups_dp = execution_plan.instantiate(
             model=self._model,
-            dataloader=self._dataloader,
+            dataloader=dataloader,
             training_args=self._hf_training_args,
+            num_gpus_per_node=self._num_gpus_per_node,
             step=0,
         )
 
         self._dp_engine = DataParallelEngine(self, process_groups_dp)
+
+    def _train_step(self):
+        self._pipeline.train()
+        self._dp_engine.do_allreduce()
+        self._pipeline.execution.optimizer_step()
+
+    def train(self):
+        assert self._hf_training_args.max_steps > 0
+
+        for _ in range(self._hf_training_args.max_steps):
+            self._train_step()
