@@ -41,7 +41,7 @@ def sample_args(model_name_fixture: str) -> OobleckArguments:
         fault_threshold=1,
         model_args=model_args[model_name_fixture],
         microbatch_size=TRAIN_BATCH_SIZE,
-        global_microbatch_size=512,
+        global_microbatch_size=16 * TRAIN_BATCH_SIZE,
     )
 
 
