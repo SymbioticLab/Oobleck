@@ -50,6 +50,8 @@ class PipelineTemplate:
     _num_gpus_per_node: int
     _stages: list[StageExecutionResult]
     _iteration_time: float
+    def get_ranks(rank_offset: int):
+        list[list[int]]: ...
 
 class PipelineTemplateGenerator:
     def __init__(self): ...

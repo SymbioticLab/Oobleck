@@ -2,7 +2,6 @@ from collections import defaultdict
 from typing import Optional
 
 import pyomo.environ as pyomo
-import torch.distributed
 from deepspeed import comm as dist
 from deepspeed.utils import logger
 from transformers.training_args import TrainingArguments
@@ -33,7 +32,7 @@ class HeterogeneousPipelinesExecutionPlan:
         self.num_microbatches_set = num_microbatches_set
         self.allreduce_across_nodes = allreduce_across_nodes
 
-        self.num_pipelines = sum(
+        self.total_num_pipelines = sum(
             num_instances for num_instances in num_instances_set.values()
         )
         self.total_num_microbatches = sum(
@@ -62,69 +61,109 @@ class HeterogeneousPipelinesExecutionPlan:
         # FIXME: currently we only consider communication overhead
         # of the first layer, believing communication of other layers
         # can fully be hidden in backward pass computing.
-        synchronization_overhead = self.allreduce_across_nodes[0][self.num_pipelines]
+        synchronization_overhead = self.allreduce_across_nodes[0][
+            self.total_num_pipelines
+        ]
 
         return max_iteration_time + synchronization_overhead
 
     @property
-    def num_microbatches_of_mine(self) -> int:
-        assert dist.is_initialized()
-        rank = dist.get_rank()
-        assert rank >= 0
+    def my_pipeline_index(self) -> int:
+        my_rank = dist.get_rank()
 
-        num_ranks_used = 0
-        for template, num_instances in self.num_instances_set.items():
-            num_ranks_for_templates = (
-                template._num_nodes * template._num_gpus_per_node * num_instances
+        start_rank = 0
+        pipeline_index = 0
+        for pipeline_template, num_instances in self.num_instances_set.items():
+            for _ in range(num_instances):
+                num_gpus_per_template = (
+                    pipeline_template._num_nodes * pipeline_template._num_gpus_per_node
+                )
+
+                if (
+                    my_rank >= start_rank
+                    and my_rank < start_rank + num_gpus_per_template
+                ):
+                    return pipeline_index
+
+                start_rank += num_gpus_per_template
+                pipeline_index += 1
+
+        raise RuntimeError("This rank is not in any pipeline")
+
+    @property
+    def num_microbatches(self) -> list[int]:
+        results: list[int] = []
+        for pipeline_template in self.pipeline_templates:
+            results.extend(
+                [self.num_microbatches_set[pipeline_template]]
+                * self.num_instances_set[pipeline_template]
             )
-            num_ranks_used += num_ranks_for_templates
-            if rank < num_ranks_used:
-                return self.num_microbatches_set[template]
-
-        raise ValueError("Cannot find a range that the global rank falls.")
+        return results
 
     def instantiate(
         self,
         model: OobleckModel,
         dataloader: OobleckDataLoader,
         training_args: TrainingArguments,
+        num_gpus_per_node: int,
         step: int = 0,
-    ) -> list[OobleckPipeline]:
+        # layer_index -> dict of [fsdp_index -> ProcessGroup]
+    ) -> tuple[OobleckPipeline, dict[int, dict[int, dist.ProcessGroup]]]:
         my_pipeline: Optional[OobleckPipeline] = None
-        total_num_gpus_used = 0
+        pipeline_index: int = 0
+        num_ranks_used = 0
+
+        # 2D grid of ranks involved in each layer, sharded by fsdp
+        # layer_index -> dict of (fsdp_index -> list of ranks)
+        ranks_grid: dict[int, dict[int, list[int]]] = defaultdict(dict)
 
         for pipeline_template, num_instances in self.num_instances_set.items():
-            num_gpus_per_template = (
-                pipeline_template._num_nodes * pipeline_template._num_gpus_per_node
-            )
-
             for _ in range(num_instances):
-                logger.info(
-                    f"Instantiating a pipeline "
-                    f"({len(pipeline_template.get_stages())} stages with {pipeline_template._num_nodes}) nodes)"
-                )
-
-                ranks = list(
+                ranks: list[int] = list(
                     range(
-                        total_num_gpus_used, total_num_gpus_used + num_gpus_per_template
+                        num_ranks_used,
+                        num_ranks_used
+                        + pipeline_template._num_nodes * num_gpus_per_node,
                     )
                 )
-                total_num_gpus_used += num_gpus_per_template
-                process_group = torch.distributed.new_group(ranks)
-                if dist.get_rank(process_group) >= 0:
-                    assert my_pipeline is None
-                    my_pipeline = OobleckPipeline(
-                        pipeline_template,
-                        model,
-                        dataloader,
-                        step,
-                        ranks,
-                        process_group,
-                        training_args,
-                    )
 
-        assert my_pipeline, "No pipeline has been initiated for this rank"
-        return my_pipeline
+                pipeline = OobleckPipeline(
+                    pipeline_id=pipeline_index,
+                    pipeline_template=pipeline_template,
+                    ranks=ranks,
+                    dataloader=dataloader,
+                    step=step,
+                    training_args=training_args,
+                )
+                pipeline.initialize_distributed_fsdp(model)
+                pipeline.initialize_distributed_pipeline()
+
+                # per-layer sharded ranks (outer: per layer, inner: ranks in fsdp group)
+                ranks_pipeline: list[list[int]] = pipeline_template.get_ranks(
+                    num_ranks_used
+                )
+                for layer_index, ranks_per_layer in enumerate(ranks_pipeline):
+                    for fsdp_index, rank in enumerate(ranks_per_layer):
+                        if fsdp_index not in ranks_grid[layer_index]:
+                            ranks_grid[layer_index][fsdp_index] = []
+                        ranks_grid[layer_index][fsdp_index].append(rank)
+
+                if pipeline.my_pipeline:
+                    my_pipeline = pipeline
+
+                pipeline_index += 1
+                num_ranks_used += len(ranks)
+
+        assert my_pipeline is not None
+
+        # Create process groups for data parallelism
+        dp_pg_grid: dict[int, dict[int, dist.ProcessGroup]] = defaultdict(dict)
+        for layer_index, ranks_per_layer in ranks_grid.items():
+            for fsdp_index, ranks in ranks_per_layer.items():
+                dp_pg_grid[layer_index][fsdp_index] = dist.new_group(ranks)
+
+        assert my_pipeline is not None
+        return my_pipeline, dp_pg_grid
 
 
 class PipelineInstantiator:

@@ -25,15 +25,16 @@ dependencies:
   - cxx-compiler
   - tbb-devel
   - pip:
-    - transformers>=4.26.0
+    - transformers>=4.29.0
     - deepspeed>=0.8.1
     - accelerate
     - datasets
-    - rpyc
     - psutil
     - tensorboard
     - evaluate
     - scikit-learn
+    - numpy
     - pytest
     - pytest-asyncio
     - pytest-mock
+    - simple-parsing

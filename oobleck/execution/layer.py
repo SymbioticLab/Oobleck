@@ -20,11 +20,13 @@ def is_checkpointable(layer: torch.fx.GraphModule) -> bool:
 class Layer(torch.nn.Module):
     def __init__(
         self,
+        layer_id: int,
         layer: torch.fx.GraphModule,
         process_group: torch.distributed.ProcessGroup,
     ):
         super().__init__()
         device = torch.device("cuda", torch.cuda.current_device())
+        self._layer_id = layer_id
         layer.to(device)
         if is_checkpointable(layer):
             layer = checkpoint_wrapper(layer)
@@ -58,3 +60,9 @@ class Layer(torch.nn.Module):
         else:
             output, gradients = tensor
             torch.autograd.backward(output, gradients)
+
+    def reduce_gradients(self, process_groups: list[torch.distributed.ProcessGroup]):
+        for process_group in process_groups:
+            if torch.distributed.get_rank(process_group) < 0:
+                continue
+            torch.distributed.all_reduce(self._param_handle.flat_param.grad)

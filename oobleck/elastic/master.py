@@ -1,186 +1,267 @@
-import redis
-import rpyc
+from __future__ import annotations
 
-from enum import Enum
-from rpyc.utils.server import ThreadedServer
-from typing import Any, List, Dict, Tuple, Optional, TypeVar
+import asyncio
+import logging
+from dataclasses import dataclass
 
-from deepspeed.utils import logging
-
-OOBLECK_MASTER_DEFAULT_PORT = 27322
+import oobleck.elastic.message_util as message_util
 
 
-class Reconfiguration(Enum):
-    NEXT_ITERATION = 0
-    IMMEDIATELY = 1
-    NONE = 2
+@dataclass
+class _Job:
+    name: str
+    agent_info: list[_AgentInfo]
 
 
-T = TypeVar("T", bound="OobleckMaster")
+@dataclass
+class _AgentInfo:
+    """
+    OobleckAgent information.
+    A list of agent information is generated when a user requests a job to be launched.
+    First connected is set False, but will be set True when the agent connects to the master.
+    """
+
+    ip: str
+    ranks: list[int]
+    streams: tuple[asyncio.StreamReader, asyncio.StreamWriter] | None = None
 
 
-class MasterServiceMixin(rpyc.Service):
+class OobleckMasterDaemon:
+    """
+    Master daemon process that manages the Oobleck cluster.
+    Currently only supports a single job with a single master node and
+    implemented in Python using asyncio with a single thread for proof of concept.
+
+    A master daemon is responsible for:
+    1. Launching agent processes into agent nodes as requested from user.
+    2. Managing connections between agents and the master.
+    3. Checking liveness of all connected agents.
+    4. Broadcasting a failure message to all live agents if happens.
+    5. Serving request of distributed information from agents.
+    """
+
     def __init__(self):
-        super().__init__()
-        self.connections: List[Tuple(int, Tuple[str, int])] = []
+        self._server: asyncio.Server | None = None
+        self._port: int | None = None
+        self._job: _Job | None = None
 
-    def on_connect(self: T, conn: rpyc.Connection):
-        conn_id = (id(conn), conn._channel.stream.sock.getpeername())
-        logger.info("Adding connection %s", conn_id)
-        self.connections.append(conn_id)
-
-    def on_disconnect(self: T, conn: rpyc.Connection):
-        # Remove the disconnected node from the connection list
-        # Finding a connection is done by id(conn)
-        conn_id = next(filter(lambda c: c[0] == id(conn), self.connections), None)
-        assert conn_id is not None, "Non managed ID is disconnected..."
-        logger.info("A connection %s disconnected", conn_id)
-
-        # Remove connection
-        self.connections.remove(conn_id)
-
-        # If it is an agent, remove it from the agent list too
-        self.delete_agent(conn_id[0])
-
-    def exposed_register_agent(self: T, agent_ip: Tuple[str, int]):
-        # Since it is not possible to get Connection ID in RPC, we extract it from Connection list with its IP address.
-        conn_id = next(filter(lambda c: c[1] == agent_ip, self.connections), None)
-        assert conn_id, "No connection with this client."
-
-        self.add_agent(conn_id[0], agent_ip)
-
-    def exposed_run_model(
-        self: T,
-        fault_tolerance_spec: int,
-        model_name: str,
-        dataset_path: str,
-        dataset_name: Optional[str] = None,
-        model_tag: Optional[str] = None,
-        model_args: Optional[Dict[str, Any]] = None,
-        training_args: Optional[Dict[str, Any]] = None,
-    ):
-        if self.training_in_progress:
-            raise Exception("Training already in progress")
-
-        if len(self.agents) == 0:
-            raise RuntimeError("No agent online.")
-
-        # all five arguments for OobleckEngine
-        execution_info = {
-            "fault_tolerance_spec": fault_tolerance_spec,
-            "model_name": model_name,
-            "model_args": model_args,
-            "model_tag": model_tag,
-            "dataset_path": dataset_path,
-            "dataset_name": dataset_name,
-            "training_args": training_args,
-        }
-
-        # Replcae the above etcd transaction to one redis transaction using pipeline.
-        with self.redis.pipeline() as pipe:
-            pipe.set("oobleck:world_info", str(self.world_info))
-            pipe.set("oobleck:execution_info", str(execution_info))
-            pipe.set("oobleck:reconfiguration", Reconfiguration.NONE.name)
-            pipe.set("oobleck:epoch", 0)
-            pipe.set("oobleck:step", 0)
-            pipe.set("oobleck:consumed_samples", 0)
-            pipe.publish("oobleck:training_start", 0)
-            pipe.execute()
-
-        self.training_in_progress = True
-        logger.info("Training %s started.", model_name)
-
-    def exposed_get_agents(self: T) -> List[Tuple[str, int]]:
-        return list(self.agents.values())
-
-    def exposed_remove_agent(self: T, agent_ip: Tuple[str, int]) -> bool:
-        """
-        Remove an agent from training. This is for emulating failure.
-        Corresponding agent will terminate itself at the end of the current iteration.
-        """
-        agent = next(filter(lambda a: a[1] == agent_ip, self.agents.items()), None)
-        if agent is None:
-            return False
-
-        self.delete_agent(agent[0])
-        return True
-
-
-class OobleckMaster(MasterServiceMixin):
-    def __init__(
-        self,
-        num_gpus_per_node: int,
-        ip: Optional[str] = None,
-        port: int = OOBLECK_MASTER_DEFAULT_PORT,
-    ):
-        super().__init__()
-
-        self.ip = ip
-        self.port = port
-        self.num_gpus_per_node = num_gpus_per_node
-        self.training_in_progress = False
-
-        self.agents: Dict[int, Tuple[str, int]] = {}
-
-        self.server = ThreadedServer(self, ip, port=port)
-        self.redis = redis.Redis(host=ip, port=6379, decode_responses=True)
-        self.redis.delete("oobleck:*")
-        # for key in self.redis.scan_iter("oobleck:*"):
-        #     self.redis.delete(key)
-
-    def start(self):
-        logger.info(f"Serving on {self.server.host}:{self.server.port}")
-        self.server.start()
+        self._nodes_to_rendezvous: set[asyncio.StreamWriter] = set()
 
     @property
-    def world_info(self) -> str:
-        results: Dict[Tuple[str, int], List[int]] = {}
-        num_gpus_used = 0
-        for agent in self.agents.values():
-            results[agent] = list(
-                range(num_gpus_used, num_gpus_used + self.num_gpus_per_node)
-            )
-            num_gpus_used += self.num_gpus_per_node
+    def port(self) -> int:
+        return self._port
 
-        return str(results)
+    @classmethod
+    async def create(cls, master_port: int = 0) -> OobleckMasterDaemon:
+        daemon = OobleckMasterDaemon()
+        server: asyncio.Server = await asyncio.start_server(
+            daemon.on_connected, "127.0.0.1", master_port
+        )
+        daemon._server = server
+        daemon._port = server.sockets[0].getsockname()[1]
 
-    def add_agent(self, conn_id: int, agent_id: Tuple[str, int]):
-        logger.info("Adding agent %s", agent_id)
-        if conn_id in self.agents:
-            return
-        self.agents[conn_id] = agent_id
+        return daemon
 
-        # Change world info
-        # Notify workers that reconfiguration is needed (at the next iteration)
-        self._broadcast_world_info_change(Reconfiguration.NEXT_ITERATION)
+    async def run(self) -> OobleckMasterDaemon:
+        logging.info(f"Master daemon is running on port {self._port}...")
+        async with self._server:
+            await self._server.serve_forever()
 
-    def delete_agent(self, conn_id: int):
+    async def request_job_handler(
+        self, r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ):
+        """
+        Temporary request handler without maintaining the connection.
+        Store job information and launch agents.
+        """
+        result: message_util.Response
         try:
-            agent_id = self.agents[conn_id]
-            logger.info("Removing agent %s", agent_id)
-            del self.agents[conn_id]
+            if self._job:
+                logging.warning("Job already exists.")
+                result = message_util.Response.FAILURE
+            else:
+                self._job = await message_util.recv(r, need_pickle=True)
+                # TODO: Implement job launch.
+                result = message_util.Response.SUCCESS
+        except Exception as e:
+            result = message_util.Response.FAILURE
+        finally:
+            await message_util.send_response(
+                w, message_util.RequestType.LAUNCH_JOB, result
+            )
 
-            # Change world info
-            # Notify workers that reconfiguration is needed immediately
-            self._broadcast_world_info_change(Reconfiguration.IMMEDIATELY)
+    async def get_dist_info_handler(
+        self, r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ):
+        """
+        Temporary request handler without maintaining the connection.
+        Return distributed information stored in job launch.
+        """
+        if not self._job:
+            logging.warning("No job exists.")
+            await message_util.send_response(
+                w,
+                message_util.RequestType.GET_DIST_INFO,
+                message_util.Response.FAILURE,
+            )
+            return
 
-            if self.training_in_progress and len(self.agents) == 0:
-                # No more agents. If training was in progress, cancel it.
-                logger.warning("No agent online. Cancel training.")
-                self.training_in_progress = False
+        # put client into waiting list
+        self._nodes_to_rendezvous.add(w)
 
-        except KeyError:
-            pass
+        logging.debug(
+            f"Putting agent into waiting list "
+            f"({len(self._nodes_to_rendezvous)} / {len(self._job.agent_info)})"
+        )
 
-    def _broadcast_world_info_change(self, reconfiguration: Reconfiguration):
-        with self.redis.pipeline() as pipe:
-            pipe.set("oobleck:world_info", str(self.world_info))
-            pipe.publish("oobleck:reconfiguration", reconfiguration.name)
-            pipe.execute()
+        # if all clients are waiting, send dist info
+        if len(self._nodes_to_rendezvous) == len(self._job.agent_info):
+            logging.debug("Sending distributed information to agents")
+
+            dist_info = message_util.DistributionInfo(
+                agent_ips=[agent.ip for agent in self._job.agent_info],
+                world_size=len(self._job.agent_info)
+                * len(self._job.agent_info[0].ranks),
+            )
+
+            for w in self._nodes_to_rendezvous:
+                await message_util.send_response(
+                    w,
+                    message_util.RequestType.GET_DIST_INFO,
+                    message_util.Response.SUCCESS,
+                    close=False,
+                )
+                await message_util.send(w, dist_info, need_pickle=True, close=False)
+            self._nodes_to_rendezvous.clear()
+
+    async def forward_rank0_port_handler(
+        self, r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ):
+        port: int = await message_util.recv(r, need_pickle=True)
+        logging.debug(f"Received rank0 port: {port}")
+        for agent in self._job.agent_info:
+            await message_util.send(
+                agent.streams[1], port, need_pickle=True, close=False
+            )
+
+    async def register_agent_handler(
+        self, r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ):
+        # TODO: find another unique identifier than IP address.
+        client_ip = w.get_extra_info("peername")[0]
+
+        agent: _AgentInfo = next(
+            (agent for agent in self._job.agent_info if agent.ip == client_ip), None
+        )
+
+        if agent is None:
+            logging.warning(f"Unknown agent: {client_ip}")
+            await message_util.send_response(
+                w,
+                message_util.RequestType.REGISTER_AGENT,
+                message_util.Response.FAILURE,
+                close=True,
+            )
+            return
+
+        # TODO: register callback on agent reader disconnection
+        agent.streams = (r, w)
+        logging.info("Registering agent stream")
+
+        self._server.get_loop().create_task(self.agent_handler(agent))
+
+        # self._server.get_loop().create_task(self.on_agent_callback(agent))
+        await message_util.send_response(
+            w,
+            message_util.RequestType.REGISTER_AGENT,
+            message_util.Response.SUCCESS,
+            close=False,
+        )
+
+    async def close_agent(self, agent: _AgentInfo):
+        _, w = agent.streams
+        w.close()
+        await w.wait_closed()
+        self._job.agent_info.remove(agent)
+
+        # Broadcast reconfiguration event
+        for agent in self._job.agent_info:
+            if agent.streams:
+                await message_util.send_response(
+                    agent.streams[1],
+                    message_util.RequestType.UNDEFINED,
+                    message_util.Response.RECONFIGURATION,
+                    close=False,
+                )
+
+    async def pong(self, w: asyncio.StreamWriter):
+        try:
+            agent: _AgentInfo = next(
+                agent
+                for agent in self._job.agent_info
+                if agent.streams and agent.streams[1] == w
+            )
+            logging.info("Sending pong")
+            await message_util.send_response(
+                agent.streams[1],
+                message_util.RequestType.PING,
+                message_util.Response.PONG,
+                close=False,
+            )
+        except (AttributeError, StopIteration) as e:
+            logging.warning(f"Unknown agent: {w.get_extra_info('peername')[0]}")
+            w.close()
+            await w.wait_closed()
+
+    async def agent_handler(self, agent: _AgentInfo):
+        r, w = agent.streams
+        loop = self._server.get_loop()
+        try:
+            while True:
+                request_type = await message_util.recv_request_type(r)
+
+                if request_type == message_util.RequestType.PING:
+                    await self.pong(w)
+                elif request_type == message_util.RequestType.GET_DIST_INFO:
+                    loop.create_task(self.get_dist_info_handler(r, w))
+                elif request_type == message_util.RequestType.FORWARD_RANK0_PORT:
+                    loop.create_task(self.forward_rank0_port_handler(r, w))
+                else:
+                    logging.warning(f"Unknown request type: {request_type}")
+                    continue
+        except asyncio.IncompleteReadError:
+            logging.warning("Agent disconnected")
+            await self.close_agent(agent)
+
+    async def on_connected(self, r: asyncio.StreamReader, w: asyncio.StreamWriter):
+        """
+        Callback function when any process (either agent or user) connects to the master.
+        """
+        try:
+            request_type = await message_util.recv_request_type(r)
+            loop = self._server.get_loop()
+
+            logging.info(f"Received request: {request_type}")
+
+            if request_type == message_util.RequestType.LAUNCH_JOB:
+                loop.create_task(self.request_job_handler(r, w))
+            elif request_type == message_util.RequestType.REGISTER_AGENT:
+                loop.create_task(self.register_agent_handler(r, w))
+            else:
+                logging.warning(f"Unknown request type: {request_type}")
+                w.close()
+                await w.wait_closed()
+        except asyncio.IncompleteReadError:
+            logging.warning("Connection closed unexpectedly.")
+            w.close()
+            await w.wait_closed()
+
+
+async def main():
+    daemon = await OobleckMasterDaemon.create()
+    await daemon.run()
 
 
 if __name__ == "__main__":
-    logger = logging.LoggerFactory.create_logger("oobleck.master")
-
-    master = OobleckMaster(1, "127.0.0.1")
-    master.start()
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(main())

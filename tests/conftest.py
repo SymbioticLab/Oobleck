@@ -1,24 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import copy
-import gc
 import logging
 import math
 import multiprocessing as mp
-import os
 import random
-import time
 import traceback
-from collections import defaultdict
-from collections.abc import Callable
 from dataclasses import dataclass
-from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 import deepspeed.comm as dist
 import pytest
+import pytest_asyncio
 import torch
 import torch.distributed
 from pytest_mock import MockerFixture
@@ -30,6 +26,8 @@ from oobleck.csrc.planning.pipeline_template import (
     PipelineTemplate,
     StageExecutionResult,
 )
+from oobleck.elastic.agent import OobleckAgent
+from oobleck.elastic.master import OobleckMasterDaemon, _AgentInfo, _Job
 from oobleck.execution.dataloader import LoaderType, OobleckDataLoader
 from oobleck.execution.dataset import OobleckDataset
 from oobleck.execution.pipeline import OobleckPipeline
@@ -49,6 +47,11 @@ class Model:
     dataset_name: str | None = None
 
 
+datasets: dict[str, tuple[str, (str | None)]] = {
+    "gpt2": ("wikitext", "wikitext-2-raw-v1"),
+    "microsoft/resnet-50": ("Maysee/tiny-imagenet", None),
+}
+
 models_to_test: dict[str, Model] = {
     "gpt2": Model("gpt2", "wikitext", "wikitext-2-raw-v1"),
     # "microsoft/resnet-50": Model("microsoft/resnet-50", "Maysee/tiny-imagenet"),
@@ -62,6 +65,7 @@ model_args: dict[str, dict[str, int] | None] = {
         "n_embd": 1024,
         "n_head": 16,
     },
+    "microsoft/resnet-50": None,
 }
 
 
@@ -316,164 +320,6 @@ class OobleckSingleProcessTestCase:
             yield
 
 
-class OobleckTestProcess:
-    def __init__(
-        self,
-        pipe: Connection,
-        rank: int,
-        model_name: str,
-        directory: Path,
-    ):
-        logging.info(f"Launching rank{rank} with model {model_name}")
-        self._pipe = pipe
-        self._rank = rank
-        self._directory = directory
-
-        # Very careful initialization dependency due to too many third-party libraries.
-        # As we use torch.distributed.FileStore for distributed initialization, it doesn't require
-        # os envs (MASTER_ADDR, MASTER_PORT), while deepspeed and HuggingFace by default use them.
-        # Thus, initialize StaticClassFactory (which relies on HF) first without the envs.
-        # Then, initialize distributed and deepspeed.
-        # After that, create dynamic class factory since it requires distributed configuration.
-        monkeypatch = pytest.MonkeyPatch()
-        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", str(rank))
-        monkeypatch.delenv("RANK", raising=False)
-        monkeypatch.delenv("WORLD_SIZE", raising=False)
-
-        patcher = patch("torch.cuda.device_count", return_value=1)
-        patcher.start()
-
-        self.factory = OobleckStaticClassFactory(model_name, directory)
-
-        self.run()
-
-    def run(self):
-        test: Callable
-        args: tuple
-
-        monkeypatch = pytest.MonkeyPatch()
-
-        while True:
-            try:
-                test, world_size, args = self._pipe.recv()
-                if test is None:
-                    break
-
-                dfactory = self.init(monkeypatch, world_size, test.__name__)
-                logging.info(
-                    f"Running test in rank{self._rank} / {world_size}: {test.__name__}"
-                )
-                result = test(self.factory, dfactory, *args)
-                dist.barrier()
-                logging.info(
-                    f"Test {test.__name__} at rank {self._rank} done. Trying to cleanup..."
-                )
-            except Exception as e:
-                logging.error(f"Rank {self._rank} failed with exception: {e}")
-                self._pipe.send({"error": str(e) + "\n" + traceback.format_exc()})
-                self.cleanup(monkeypatch, world_size, test.__name__)
-                continue
-
-            self.cleanup(monkeypatch, world_size, test.__name__)
-            self._pipe.send(
-                {
-                    "success": (result if result is not None else ""),
-                }
-            )
-
-    def init(
-        self, monkeypatch: pytest.MonkeyPatch, world_size: int, test_name: str
-    ) -> OobleckDynamicClassFactory:
-        monkeypatch.setenv("RANK", str(self._rank))
-        monkeypatch.setenv("WORLD_SIZE", str(world_size))
-        torch.cuda.set_device(0)
-
-        store = torch.distributed.FileStore(
-            str(self._directory / f"{world_size}_{test_name}_store"),
-            world_size,
-        )
-
-        torch.distributed.init_process_group(
-            backend="nccl",
-            store=store,
-            rank=self._rank,
-            world_size=world_size,
-        )
-        dist.init_distributed(dist_backend="nccl", dist_init_required=False)
-
-        dfactory = OobleckDynamicClassFactory(
-            self.factory, self._rank, list(range(world_size))
-        )
-        return dfactory
-
-    def cleanup(self, monkeypatch: pytest.MonkeyPatch, world_size: int, test_name: str):
-        torch.cuda.synchronize()
-        torch.distributed.destroy_process_group()
-        dist.cdb = None
-        store = self._directory / f"{world_size}_{test_name}_store"
-        store.unlink(missing_ok=True)
-        while store.exists():
-            logging.info("Waiting for store to be deleted...")
-            time.sleep(1)
-        monkeypatch.undo()
-
-        # Release the GPU memory and check except for model parameters.
-        model = self.factory.get_model()
-        for layer in model.layers:
-            layer.to("cpu")
-        for name in model.sample_inputs.keys():
-            model.sample_inputs[name] = model.sample_inputs[name].to("cpu")
-
-        torch.cuda.synchronize()
-        for layer in model.layers:
-            for p in layer.parameters():
-                assert not p.is_cuda, "Model parameter still in CPU"
-
-        input: torch.Tensor
-        for input in model.sample_inputs.values():
-            assert not input.is_cuda, "Model input still in CPU"
-
-        obj: torch.Tensor
-        for obj in gc.get_objects():
-            if torch.is_tensor(obj) and obj.is_cuda:
-                if obj.grad is not None:
-                    obj.grad.data = torch.empty(0)
-                obj.data = torch.empty(0)
-        gc.collect()
-        torch.cuda.empty_cache()
-        assert torch.cuda.memory_allocated() < (
-            1000 * 2**20
-        ), "Failed to reclaim GPU memory. Abort testing."
-
-
-processes: dict[str, list[tuple[mp.Process, Connection]]] = defaultdict(list)
-
-
-def recreate_processes(model_name: str, directory: Path):
-    global processes
-    if model_name in processes:
-        for p, _ in processes[model_name]:
-            p.terminate()
-        del processes[model_name]
-
-    ctx = mp.get_context("spawn")
-    # always initialize 4 processes
-    for rank in range(4):
-        pipe = ctx.Pipe(duplex=True)
-        p = ctx.Process(
-            target=OobleckTestProcess,
-            args=(
-                pipe[1],
-                rank,
-                model_name,
-                directory,
-            ),
-            daemon=True,
-        )
-        processes[model_name].append((p, pipe[0]))
-        p.start()
-
-
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="requires 4 GPUs")
 class OobleckMultiProcessTestCase:
     """
@@ -481,58 +327,150 @@ class OobleckMultiProcessTestCase:
     Test cases for functionalities of dynamic classes will inherit this class.
     """
 
-    def get_processes(
-        self, num_processes: int, model_name: str, directory: Path
-    ) -> list[tuple[mp.Process, Connection]]:
-        global processes
-        if model_name not in processes:
-            recreate_processes(model_name, directory)
-
-        return processes[model_name][:num_processes]
-
-    model_name: str
-    tmp_directory: Path
-
-    @pytest.fixture(scope="session", autouse=True)
-    def directory(
-        self, tmp_path_factory: pytest.TempPathFactory, model_name_fixture: str
+    @staticmethod
+    def _worker_init(
+        queue: mp.Queue,
+        rank: int,
+        world_size: int,
+        model_name: str,
+        directory: Path,
+        test: callable,
+        *args,
     ):
-        return tmp_path_factory.mktemp(
-            f"multi_process_{model_name_fixture.replace('/', '-')}"
-        )
+        # Very careful initialization dependency due to too many third-party libraries.
+        # As we use torch.distributed.FileStore for distributed initialization, it doesn't require
+        # os envs (MASTER_ADDR, MASTER_PORT), while deepspeed and HuggingFace by default use them.
+        # Thus, initialize StaticClassFactory (which relies on HF) first without the envs.
+        # Then, initialize distributed and deepspeed.
+        # After that, create dynamic class factory since it requires distributed configuration.
+        try:
+            monkeypatch = pytest.MonkeyPatch()
+            monkeypatch.setenv("CUDA_VISIBLE_DEVICES", str(rank))
+            monkeypatch.delenv("RANK", raising=False)
+            monkeypatch.delenv("WORLD_SIZE", raising=False)
+            monkeypatch.delenv("MASTER_ADDR", raising=False)
+            monkeypatch.delenv("MASTER_PORT", raising=False)
+
+            patcher = patch("torch.cuda.device_count", return_value=1)
+            patcher.start()
+
+            factory = OobleckStaticClassFactory(model_name, directory)
+
+            monkeypatch.setenv("RANK", str(rank))
+            monkeypatch.setenv("WORLD_SIZE", str(world_size))
+            torch.cuda.set_device(0)
+
+            store = torch.distributed.FileStore(
+                str(directory.joinpath("store")), world_size
+            )
+            torch.distributed.init_process_group(
+                backend="nccl", store=store, rank=rank, world_size=world_size
+            )
+            dist.init_distributed(dist_backend="nccl", dist_init_required=False)
+
+            dynamic_factory = OobleckDynamicClassFactory(
+                factory, rank, list(range(world_size))
+            )
+
+            result = test(factory, dynamic_factory, *args)
+
+            queue.put(
+                {
+                    "success": (result if result is not None else ""),
+                    "rank": rank,
+                }
+            )
+        except Exception as e:
+            queue.put({"error": str(e) + "\n" + traceback.format_exc()})
 
     @classmethod
     @pytest.fixture(scope="class", autouse=True)
     def setup_class(
-        cls, model_name_fixture: str, directory: Path, request: pytest.FixtureRequest
+        cls,
+        model_name_fixture: str,
+        tmp_path_factory: pytest.TempPathFactory,
+        request: pytest.FixtureRequest,
     ):
         request.cls.model_name = model_name_fixture
-        request.cls.tmp_directory = directory
+        request.cls.tmp_path_factory = tmp_path_factory
+
+    model_name: str
+    tmp_path_directory: pytest.TempPathFactory
 
     def run_in_parallel(
-        self, num_processes: int, func: Callable, *args
+        self, num_processes: int, func: callable, *args
     ) -> list[str | None]:
-        procs = self.get_processes(num_processes, self.model_name, self.tmp_directory)
-        for _, pipe in procs:
-            pipe.send((func, num_processes, args))
+        ctx = mp.get_context("spawn")
+        queue = ctx.Queue()
 
-        results: list[Any] = [None] * len(procs)
-        for index, (_, pipe) in enumerate(procs):
-            # if not pipe.poll(timeout=60):
-            #     recreate_processes(self.model_name, self.tmp_directory)
-            #     raise TimeoutError()
+        tmp_directory = self.tmp_path_factory.mktemp(func.__qualname__, numbered=True)
+        logging.info(f"Using directory {tmp_directory}")
 
-            try:
-                result = pipe.recv()
-            except Exception:
-                recreate_processes(self.model_name, self.tmp_directory)
-                raise RuntimeError("Aborted due to GPU reclaim failure.")
+        processes: list[mp.Process] = []
+        for rank in range(num_processes):
+            p = ctx.Process(
+                target=self._worker_init,
+                args=(
+                    queue,
+                    rank,
+                    num_processes,
+                    self.model_name,
+                    tmp_directory,
+                    func,
+                    *args,
+                ),
+                daemon=True,
+            )
+            p.start()
+            processes.append(p)
 
-            if "error" in result:
-                # If any process get an error,
-                # immediately abort the test.
-                raise RuntimeError(result["error"])
+        results: list[Any] = [None] * len(processes)
 
-            results[index] = result["success"]
+        try:
+            for _ in range(len(processes)):
+                # result = queue.get(timeout=60)
+                result = queue.get()
+
+                if "error" in result:
+                    # If any process get an error,
+                    # immediately abort the test.
+                    raise RuntimeError(result["error"])
+                else:
+                    results[result["rank"]] = result["success"]
+
+            # Here, all processes are successfully finished.
+            for process in processes:
+                process.join()
+        except Exception as e:
+            for process in processes:
+                process.terminate()
+                process.join()
+            raise e
 
         return results
+
+
+class OobleckElasticTestCase:
+    @pytest_asyncio.fixture(autouse=True)
+    async def daemon(
+        self, event_loop: asyncio.AbstractEventLoop
+    ) -> OobleckMasterDaemon:
+        daemon = await OobleckMasterDaemon.create()
+        event_loop.create_task(daemon.run())
+
+        yield daemon
+
+        if not daemon._server.is_serving():
+            return
+        daemon._server.close()
+        await daemon._server.wait_closed()
+
+    @pytest_asyncio.fixture
+    async def agent(self, daemon: OobleckMasterDaemon) -> OobleckAgent:
+        daemon._job = _Job("test", [_AgentInfo("127.0.0.1", [0])])
+
+        agent = OobleckAgent()
+        await agent.connect_to_master("localhost", daemon.port)
+        yield agent
+        agent.conn_[1].close()
+        await agent.conn_[1].wait_closed()

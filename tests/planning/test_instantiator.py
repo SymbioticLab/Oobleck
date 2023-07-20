@@ -1,20 +1,30 @@
 import pytest
+from pytest_mock import MockerFixture
 
 from oobleck.csrc.planning.pipeline_template import (
     LayerExecutionResults,
     PipelineTemplate,
 )
+from oobleck.execution.pipeline import OobleckPipeline
+from oobleck.module.model import OobleckModel
 from oobleck.planning.instantiator import (
     HeterogeneousPipelinesExecutionPlan,
     PipelineInstantiator,
 )
-from tests.conftest import OobleckSingleProcessTestCase
+from tests.conftest import (
+    TRAIN_BATCH_SIZE,
+    OobleckDynamicClassFactory,
+    OobleckSingleProcessTestCase,
+    OobleckStaticClassFactory,
+)
 
 
 @pytest.mark.parametrize(
     "num_gpus_per_node", [1, 2, 4], ids=["1gpu/node", "2gpus/node", "4gpus/node"]
 )
 class TestPipelineInstantiator(OobleckSingleProcessTestCase):
+    factory: OobleckStaticClassFactory
+
     @pytest.fixture(scope="function")
     def profile(self):
         return self.factory.get_dummy_profile()
