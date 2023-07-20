@@ -16,8 +16,8 @@ def get_layers(model: OobleckModel, pgs: list[torch.distributed.ProcessGroup]):
     assert len(model.layers) == len(pgs)
 
     layers: list[Layer] = []
-    for pg, layer in zip(pgs, model.layers):
-        layers.append(Layer(layer, pg))
+    for layer_id, (pg, layer) in enumerate(zip(pgs, model.layers)):
+        layers.append(Layer(layer_id, layer, pg))
 
     return layers
 
