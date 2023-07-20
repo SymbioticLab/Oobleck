@@ -17,6 +17,7 @@ from pytest_mock import MockerFixture
 
 from oobleck.elastic.message_util import DistributionInfo
 from oobleck.elastic.training_util import TrainingArguments as OobleckArguments
+from oobleck.execution.dataloader import OobleckSampler
 from oobleck.execution.engine import OobleckEngine
 from oobleck.execution.pipeline import OobleckPipeline
 from tests.conftest import (
@@ -295,13 +296,11 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
         # OobleckSampler has a list of num_microbatches for all pipelines.
         # Sum of number of microbatches must be equal to global # microbatches
         world_size = dist.get_world_size()
-        assert len(engine._dataloader.batch_sampler.num_microbatches) == world_size // (
+        sampler: OobleckSampler = engine._pipeline._dataloader.batch_sampler
+        assert len(sampler.num_microbatches) == world_size // (
             num_stages * num_gpus_per_node
         )
-        assert (
-            sum(engine._dataloader.batch_sampler.num_microbatches)
-            == global_num_microbatch
-        )
+        assert sum(sampler.num_microbatches) == global_num_microbatch
 
     def test_distributed_engine(self, num_stages: int, sample_args: OobleckArguments):
         num_gpus_per_node = 1
@@ -377,10 +376,22 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
             torch.distributed, "all_reduce", wraps=torch.distributed.all_reduce
         ) as allreduce_spy:
             engine._train_step()
+            torch.cuda.synchronize()
+            print(f"Rank {rank} finished training step")
             expected_call_number = len(engine._pipeline.execution._layers)
             assert allreduce_spy.call_count == expected_call_number, (
                 f"torch.distributed.allreduce expected to be called {expected_call_number} times, "
                 f"but called {allreduce_spy.call_count} times."
+            )
+
+        # Optimizer must have its own state
+        p: torch.nn.Parameter
+        optimizer = engine._pipeline.execution._optimizer
+        for p in optimizer.param_groups[0]["params"]:
+            if p.numel() == 0:
+                continue
+            assert all(
+                key in optimizer.state[p] for key in ["step", "exp_avg", "exp_avg_sq"]
             )
 
     def test_distributed_engine_train(

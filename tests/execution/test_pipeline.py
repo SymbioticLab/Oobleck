@@ -147,7 +147,7 @@ class TestSingleStagePipeline(OobleckMultiProcessTestCase):
 
         pipeline.execution.optimizer_step()
 
-        p: torch.Tensor
+        p: torch.nn.Parameter
         # optimizer must have internal data for now
         for p in pipeline.execution._optimizer.param_groups[0]["params"]:
             # If FSDP is used, some too small tensors might be only on rank 0,
