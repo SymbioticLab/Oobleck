@@ -65,4 +65,6 @@ class Layer(torch.nn.Module):
         for process_group in process_groups:
             if torch.distributed.get_rank(process_group) < 0:
                 continue
-            torch.distributed.all_reduce(self._param_handle.flat_param.grad)
+            torch.distributed.all_reduce(
+                self._param_handle.flat_param.grad, group=process_group
+            )
