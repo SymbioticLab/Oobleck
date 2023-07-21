@@ -258,7 +258,7 @@ class OobleckDynamicClassFactory:
         return pipeline
 
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(scope="session")
 def factory(
     model_name_fixture: str,
     tmp_path_factory: pytest.TempPathFactory,
