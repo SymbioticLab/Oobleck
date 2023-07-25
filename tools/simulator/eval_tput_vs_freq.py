@@ -80,6 +80,9 @@ def merge_results(results: list):
 def run_simulator_on_traces(model, bar_trace_list):
     bar_result_dict = {'bamboo':{}, 'varuna':{}, 'oobleck':{}}
     for trace_path in tqdm(bar_trace_list):
+        print()
+        print(trace_path)
+        print()
         csv_file = open(trace_path, 'r')
         simulator = bamboo_simulator(
             seed=seed,

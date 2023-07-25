@@ -1539,13 +1539,13 @@ class Simulator:
         detailed_result['value'] = [self.value_xs, self.value_ys, result.average_value]
 
         print("bamboo")
-        print(f"Ending delta: {delta}")
+        # print(f"Ending delta: {delta}")
         total = self.effective_time + self.rebalance_time + self.restart_time + \
                 self.sum_gpu_overhead + self.redundant_time + self.fallback_loss_time
         print(
             f"Sum of breakdowns: {total}"
         )
-        print("effective_time:{}, {}".format(self.effective_time, (self.effective_time/total) ))
+        print("Effective Time:{}, {}".format(self.effective_time, (self.effective_time/total) ))
         print("redundant_time:{}, {}".format(self.redundant_time, (self.redundant_time/total) ))
         print("rebalance_time:{}, {}".format(self.rebalance_time, self.rebalance_time/total))
         print("restart_time:{}, {}".format(self.restart_time, self.restart_time/total))
@@ -1554,6 +1554,7 @@ class Simulator:
         print()
 
         if self.generate_graphs:
+            exit()
             from main import graph
             #pdf_suffix = f'-seed-{self.seed}-start-hour-{self.start_hour}-generate-addition-probabilities-{self.generate_addition_probabilities}-removal-probability-{self.removal_probability}.pdf'
             pdf_suffix = f'-{self.model}.pdf'
