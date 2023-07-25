@@ -508,9 +508,6 @@ class OobleckPipeline:
 
         self._global_step += 1
 
-    def get_rank_for_id(self, layer_id: int, shard_id: int) -> int:
-        return self.rank_grid[layer_id][shard_id]
-
     def _initialize_execution(
         self,
         layers: list[torch.fx.GraphModule],

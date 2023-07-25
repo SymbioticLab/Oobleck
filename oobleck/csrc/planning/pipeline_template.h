@@ -55,18 +55,6 @@ class PipelineTemplate {
   int get_num_nodes() const { return num_nodes_; }
   int get_num_gpus_per_node() const { return num_gpus_per_node_; }
 
-  std::vector<std::vector<int>> get_ranks(const int rank_offset) const {
-    std::vector<std::vector<int>> ranks;
-    for (auto& ranks_per_layer : ranks_per_layer_) {
-      std::vector<int> ranks_per_layer_offset;
-      for (auto& rank : ranks_per_layer) {
-        ranks_per_layer_offset.push_back(rank + rank_offset);
-      }
-      ranks.push_back(ranks_per_layer_offset);
-    }
-    return std::move(ranks);
-  }
-
  private:
   std::vector<std::shared_ptr<StageExecutionResult>> stage_execution_results_;
   const double iteration_time_;
