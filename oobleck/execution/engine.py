@@ -45,11 +45,13 @@ class ReconfigurationEngine:
         return self._engine()
 
     def on_reconfigure(self, lost_ranks: list[int]):
-        def get_pipeline_template(ranks: list[int]) -> PipelineTemplate | None:
+        def get_pipeline_template(
+            ranks: list[int], pipeline_templates: list[PipelineTemplate]
+        ) -> PipelineTemplate | None:
             return next(
                 (
                     template
-                    for template in self.engine._pipeline_templates
+                    for template in pipeline_templates
                     if template._num_nodes * template._num_gpus_per_node == len(ranks)
                 ),
                 None,
@@ -65,7 +67,9 @@ class ReconfigurationEngine:
         # Prepare new instances set.
         for pipeline in self._pipelines:
             ranks = [rank for rank in pipeline._ranks if rank not in lost_ranks]
-            target_pipeline_template = get_pipeline_template(ranks)
+            target_pipeline_template = get_pipeline_template(
+                ranks, self.engine._pipeline_templates
+            )
 
             # If there is an available template, use it.
             if target_pipeline_template is not None:
@@ -99,6 +103,9 @@ class ReconfigurationEngine:
 
             self.merge_pipelines()
 
+        # Sort ranks by length so that smaller pipeline ranks always come first.
+        new_ranks_list.sort(key=lambda ranks: len(ranks))
+
         global_num_microbatch = (
             self.engine._args.global_microbatch_size
             // self.engine._args.microbatch_size
@@ -116,16 +123,18 @@ class ReconfigurationEngine:
         )
         (
             self.engine._pipeline,
-            self._pipelines,
+            pipelines,
             process_groups_dp,
         ) = execution_plan.instantiate(
             model=self.engine._model,
             dataloader=self.engine._dataset,
             training_args=self.engine._hf_training_args,
             num_gpus_per_node=self.engine._num_gpus_per_node,
+            ranks=new_ranks_list,
             step=self.engine._pipeline._global_step,
         )
-        self._dp_engine = DataParallelEngine(self, process_groups_dp)
+        self.engine._dp_engine = DataParallelEngine(self.engine, process_groups_dp)
+        self._pipelines = pipelines
 
     def _find_biggest_pipeline(
         self, pipelines: list[OobleckPipeline]

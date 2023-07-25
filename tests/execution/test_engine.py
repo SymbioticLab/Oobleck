@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import multiprocessing
 import socket
 import threading
@@ -445,6 +446,31 @@ class TestOobleckReconfigurationClass(OobleckSingleProcessTestCase):
             self._global_step = 0
             self.my_pipeline = bool(0 in self._ranks)
 
+            # copy from pipeline __init__
+            # layer_index -> ranks
+            self.rank_grid: dict[int, list[int]] = {}
+            for stage in pipeline_template.get_stages():
+                stage_ranks = ranks[: stage._num_gpus]
+                ranks = ranks[stage._num_gpus :]
+
+                if stage._num_gpus < pipeline_template._num_gpus_per_node:
+                    stage_ranks = [
+                        list(
+                            itertools.repeat(
+                                rank,
+                                pipeline_template._num_gpus_per_node
+                                // len(stage_ranks),
+                            )
+                        )
+                        for rank in stage_ranks
+                    ]
+                    stage_ranks = list(itertools.chain.from_iterable(stage_ranks))
+
+                for layer_index in stage._layer_indices:
+                    self.rank_grid[layer_index] = stage_ranks
+
+            assert len(ranks) == 0, "Not all ranks were assigned to a stage."
+
         def initialize_distributed_fsdp(self, *args):
             pass
 
@@ -500,9 +526,10 @@ class TestOobleckReconfigurationClass(OobleckSingleProcessTestCase):
             self._pipeline = pipelines[0]
             return pipelines
 
-    def test_reconfigure_with_all_available_templates(
-        self, sample_args: OobleckArguments, mocker: MockerFixture
-    ):
+    @pytest.fixture
+    def fake_engine(
+        self, mocker: MockerFixture, sample_args: OobleckArguments
+    ) -> TestOobleckReconfigurationClass.FakeEngine:
         mocker.patch(
             "oobleck.planning.instantiator.OobleckPipeline",
             new=TestOobleckReconfigurationClass.FakePipeline,
@@ -511,20 +538,34 @@ class TestOobleckReconfigurationClass(OobleckSingleProcessTestCase):
             "deepspeed.comm.new_group",
             return_value=None,
         )
+        yield self.FakeEngine(self, sample_args)
 
-        engine = self.FakeEngine(self, sample_args)
-        pipelines = engine.init_pipelines()
+    @pytest.mark.parametrize(
+        ["failed_ranks", "expected_ranks"],
+        [
+            ([2], [[0, 1], [3, 4], [5, 6, 7, 8], [9, 10, 11, 12, 13]]),
+            ([6, 8], [[0, 1], [5, 7], [2, 3, 4], [9, 10, 11, 12, 13]]),
+            ([10, 11], [[0, 1], [2, 3, 4], [9, 12, 13], [5, 6, 7, 8]]),
+        ],
+    )
+    def test_reconfigure_with_all_available_templates(
+        self,
+        fake_engine: TestOobleckReconfigurationClass.FakeEngine,
+        failed_ranks: list[int],
+        expected_ranks: list[list[int]],
+    ):
+        pipelines = fake_engine.init_pipelines()
         assert len(pipelines) == 4
         # 2 + 3 + 4 + 5
         assert sum(len(pipeline._ranks) for pipeline in pipelines) == 14
-        reconfigure_engine = ReconfigurationEngine(engine, pipelines)
+        reconfigure_engine = ReconfigurationEngine(fake_engine, pipelines)
 
         # [0,1],[2,3,4],[5,6,7,8],[9,10,11,12,13]
-        reconfigure_engine.on_reconfigure([2])
+        reconfigure_engine.on_reconfigure(failed_ranks)
 
         # New pipelines must have: 2, 2, 4, 5 stages
         assert len(reconfigure_engine._pipelines) == 4
-        assert reconfigure_engine._pipelines[0]._ranks == [0, 1]
-        assert reconfigure_engine._pipelines[1]._ranks == [3, 4]
-        assert reconfigure_engine._pipelines[2]._ranks == [5, 6, 7, 8]
-        assert reconfigure_engine._pipelines[3]._ranks == [9, 10, 11, 12, 13]
+        for pipeline, expected_ranks in zip(
+            reconfigure_engine._pipelines, expected_ranks
+        ):
+            assert pipeline._ranks == expected_ranks

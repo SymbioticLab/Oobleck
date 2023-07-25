@@ -453,7 +453,7 @@ class OobleckPipeline:
 
         # Construct a 2D rank grid for this pipeline.
         # First dimension is for layer index, second dimension is for rank.
-        self._rank_grid: dict[int, list[int]] = {}
+        self.rank_grid: dict[int, list[int]] = {}
         for stage in pipeline_template.get_stages():
             stage_ranks = ranks[: stage._num_gpus]
             ranks = ranks[stage._num_gpus :]
@@ -473,7 +473,7 @@ class OobleckPipeline:
                 stage_ranks = list(itertools.chain.from_iterable(stage_ranks))
 
             for layer_index in stage._layer_indices:
-                self._rank_grid[layer_index] = stage_ranks
+                self.rank_grid[layer_index] = stage_ranks
 
         assert len(ranks) == 0, "Not all ranks were assigned to a stage."
 
@@ -509,7 +509,7 @@ class OobleckPipeline:
         self._global_step += 1
 
     def get_rank_for_id(self, layer_id: int, shard_id: int) -> int:
-        return self._rank_grid[layer_id][shard_id]
+        return self.rank_grid[layer_id][shard_id]
 
     def _initialize_execution(
         self,
@@ -529,7 +529,7 @@ class OobleckPipeline:
         my_rank = dist.get_rank()
         my_layer_index = next(
             layer_index
-            for layer_index, ranks in self._rank_grid.items()
+            for layer_index, ranks in self.rank_grid.items()
             if my_rank in ranks
         )
         my_stage_index = next(
@@ -568,7 +568,7 @@ class OobleckPipeline:
         layers: list[Layer] = []
         shard_id: int = -1
         my_rank = dist.get_rank()
-        for layer_id, ranks in self._rank_grid.items():
+        for layer_id, ranks in self.rank_grid.items():
             # Remove potential duplicates
             pg = dist.new_group(list(set(ranks)))
             self._per_layer_pgs[layer_id] = pg
@@ -604,10 +604,9 @@ class OobleckPipeline:
         self.communication: PipelineCommunication | None = None
 
         my_rank = dist.get_rank()
-        for shard_id in range(len(self._rank_grid[0])):
+        for shard_id in range(len(self.rank_grid[0])):
             ranks: list[int] = [
-                ranks_per_layer[shard_id]
-                for ranks_per_layer in self._rank_grid.values()
+                ranks_per_layer[shard_id] for ranks_per_layer in self.rank_grid.values()
             ]
             # Remove potential duplicates
             pg = dist.new_group(list(set(ranks)))
@@ -626,7 +625,7 @@ class OobleckPipeline:
                 )
 
         assert len(self._per_sharded_pp_pgs) == len(
-            self._rank_grid[0]
+            self.rank_grid[0]
         ), "Number of per-shard process groups and model layers must match."
 
         # self.communication may not be initialized at this moment. Don't add assertion here.

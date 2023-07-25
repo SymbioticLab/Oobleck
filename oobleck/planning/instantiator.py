@@ -106,6 +106,7 @@ class HeterogeneousPipelinesExecutionPlan:
         dataloader: OobleckDataLoader,
         training_args: TrainingArguments,
         num_gpus_per_node: int,
+        ranks: list[list[int]] | None = None,
         step: int = 0,
         # layer_index -> dict of [fsdp_index -> ProcessGroup]
     ) -> tuple[
@@ -122,18 +123,25 @@ class HeterogeneousPipelinesExecutionPlan:
         all_pipelines: list[OobleckPipeline] = []
         for pipeline_template, num_instances in self.num_instances_set.items():
             for _ in range(num_instances):
-                ranks: list[int] = list(
-                    range(
-                        num_ranks_used,
-                        num_ranks_used
-                        + pipeline_template._num_nodes * num_gpus_per_node,
+                pipeline_ranks: list[int] = (
+                    list(
+                        range(
+                            num_ranks_used,
+                            num_ranks_used
+                            + pipeline_template._num_nodes * num_gpus_per_node,
+                        )
                     )
+                    if ranks is None
+                    else ranks[pipeline_index]
+                )
+                assert pipeline_template._num_nodes * num_gpus_per_node == len(
+                    pipeline_ranks
                 )
 
                 pipeline = OobleckPipeline(
                     pipeline_id=pipeline_index,
                     pipeline_template=pipeline_template,
-                    ranks=ranks,
+                    ranks=pipeline_ranks,
                     dataloader=dataloader,
                     step=step,
                     training_args=training_args,
@@ -141,11 +149,7 @@ class HeterogeneousPipelinesExecutionPlan:
                 pipeline.initialize_distributed_fsdp(model)
                 pipeline.initialize_distributed_pipeline()
 
-                # per-layer sharded ranks (outer: per layer, inner: ranks in fsdp group)
-                ranks_pipeline: list[list[int]] = pipeline_template.get_ranks(
-                    num_ranks_used
-                )
-                for layer_index, ranks_per_layer in enumerate(ranks_pipeline):
+                for layer_index, ranks_per_layer in pipeline.rank_grid.items():
                     for fsdp_index, rank in enumerate(ranks_per_layer):
                         if fsdp_index not in ranks_grid[layer_index]:
                             ranks_grid[layer_index][fsdp_index] = []
@@ -156,7 +160,7 @@ class HeterogeneousPipelinesExecutionPlan:
                     my_pipeline = pipeline
 
                 pipeline_index += 1
-                num_ranks_used += len(ranks)
+                num_ranks_used += len(pipeline_ranks)
 
         # Create process groups for data parallelism
         dp_pg_grid: dict[int, dict[int, dist.ProcessGroup]] = defaultdict(dict)
