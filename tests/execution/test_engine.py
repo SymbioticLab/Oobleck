@@ -15,15 +15,17 @@ import torch._C._distributed_c10d as c10d
 import torch.distributed
 from pytest_mock import MockerFixture
 
+from oobleck.csrc.planning.pipeline_template import PipelineTemplate
 from oobleck.elastic.message_util import DistributionInfo
 from oobleck.elastic.training_util import TrainingArguments as OobleckArguments
 from oobleck.execution.dataloader import OobleckSampler
-from oobleck.execution.engine import OobleckEngine
+from oobleck.execution.engine import OobleckEngine, ReconfigurationEngine
 from oobleck.execution.pipeline import OobleckPipeline
 from tests.conftest import (
     TRAIN_BATCH_SIZE,
     OobleckElasticTestCase,
     OobleckMultiProcessTestCase,
+    OobleckSingleProcessTestCase,
     OobleckStaticClassFactory,
     datasets,
     model_args,
@@ -425,3 +427,104 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
             sample_args,
         )
         thread.join()
+
+
+class TestOobleckReconfigurationClass(OobleckSingleProcessTestCase):
+    class FakePipeline:
+        def __init__(
+            self,
+            pipeline_id: int,
+            pipeline_template: PipelineTemplate,
+            ranks: list[int],
+            *args,
+            **kwargs,
+        ):
+            self._pipeline_id = pipeline_id
+            self._template = pipeline_template
+            self._ranks = ranks
+            self._global_step = 0
+            self.my_pipeline = bool(0 in self._ranks)
+
+        def initialize_distributed_fsdp(self, *args):
+            pass
+
+        def initialize_distributed_pipeline(self, *args):
+            pass
+
+    class FakeEngine:
+        def __init__(
+            self,
+            test_class: TestOobleckReconfigurationClass,
+            sample_args: OobleckArguments,
+        ):
+            self.test_class = test_class
+            self._agent_pipe: connection.Connection = None
+            self._args = sample_args
+            self._hf_training_args = test_class.factory._training_args
+            self._num_nodes = sum(range(2, 6))
+            self._num_gpus_per_node = 1
+            self._dataset = test_class.factory.get_dataset()
+            self._model = test_class.factory.get_model()
+            self._profile_results = test_class.factory.get_dummy_profile()
+            self._pipeline_templates = [
+                test_class.factory.get_dummy_pipeline_template(
+                    num_stages=i,
+                    num_gpus_per_node=1,
+                    num_nodes=i,
+                )
+                for i in range(2, 6)
+            ]
+
+        def init_pipelines(self) -> list[OobleckPipeline]:
+            num_gpus_used: int = 0
+            pipeline_id: int = 0
+            pipelines: list[OobleckPipeline] = []
+
+            # Have one pipelines for each pipeline template
+            for template in self._pipeline_templates:
+                pipelines.append(
+                    self.test_class.FakePipeline(
+                        pipeline_id,
+                        template,
+                        list(
+                            range(
+                                num_gpus_used,
+                                num_gpus_used + len(template.get_stages()),
+                            )
+                        ),
+                    )
+                )
+
+                pipeline_id += 1
+                num_gpus_used += len(template.get_stages())
+            self._pipeline = pipelines[0]
+            return pipelines
+
+    def test_reconfigure_with_all_available_templates(
+        self, sample_args: OobleckArguments, mocker: MockerFixture
+    ):
+        mocker.patch(
+            "oobleck.planning.instantiator.OobleckPipeline",
+            new=TestOobleckReconfigurationClass.FakePipeline,
+        )
+        mocker.patch(
+            "deepspeed.comm.new_group",
+            return_value=None,
+        )
+
+        engine = self.FakeEngine(self, sample_args)
+        pipelines = engine.init_pipelines()
+        assert len(pipelines) == 4
+        # 2 + 3 + 4 + 5
+        assert sum(len(pipeline._ranks) for pipeline in pipelines) == 14
+        reconfigure_engine = ReconfigurationEngine(engine, pipelines)
+
+        # [0,1],[2,3,4],[5,6,7,8],[9,10,11,12,13]
+        reconfigure_engine.on_reconfigure([2])
+
+        # New pipelines must have: 2, 2, 4, 5 stages
+        assert len(reconfigure_engine._pipelines) == 4
+        assert reconfigure_engine._pipelines[0]._ranks == [0, 1]
+        assert reconfigure_engine._pipelines[1]._ranks == [3, 4]
+        assert reconfigure_engine._pipelines[2]._ranks == [5, 6, 7, 8]
+        assert reconfigure_engine._pipelines[3]._ranks == [9, 10, 11, 12, 13]

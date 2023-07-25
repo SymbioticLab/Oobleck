@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import socket
 import weakref
+from collections import defaultdict
 from multiprocessing import connection
 
 import deepspeed.comm as dist
@@ -25,6 +26,122 @@ from oobleck.planning.instantiator import (
     HeterogeneousPipelinesExecutionPlan,
     PipelineInstantiator,
 )
+
+
+class ReconfigurationEngine:
+    def __init__(self, engine: OobleckEngine, pipelines: list[OobleckPipeline]):
+        self._engine = weakref.ref(engine)
+        self._pipelines = pipelines
+        self._num_instances_set: dict[PipelineTemplate, int] = defaultdict(int)
+        for pipeline in self._pipelines:
+            self._num_instances_set[pipeline._template] += 1
+        self._min_num_ranks = (
+            engine._pipeline_templates[0]._num_nodes
+            * engine._pipeline_templates[0]._num_gpus_per_node
+        )
+
+    @property
+    def engine(self):
+        return self._engine()
+
+    def on_reconfigure(self, lost_ranks: list[int]):
+        def get_pipeline_template(ranks: list[int]) -> PipelineTemplate | None:
+            return next(
+                (
+                    template
+                    for template in self.engine._pipeline_templates
+                    if template._num_nodes * template._num_gpus_per_node == len(ranks)
+                ),
+                None,
+            )
+
+        # Update number of nodes
+        lost_num_nodes = len(lost_ranks) // self.engine._num_gpus_per_node
+        self.engine._num_nodes -= lost_num_nodes
+
+        new_num_instances_set: dict[PipelineTemplate, int] = defaultdict(int)
+        new_ranks_list: list[list[int]] = []
+
+        # Prepare new instances set.
+        for pipeline in self._pipelines:
+            ranks = [rank for rank in pipeline._ranks if rank not in lost_ranks]
+            target_pipeline_template = get_pipeline_template(ranks)
+
+            # If there is an available template, use it.
+            if target_pipeline_template is not None:
+                new_num_instances_set[target_pipeline_template] += 1
+                new_ranks_list.append(ranks)
+                continue
+
+            # This pipeline needs more ranks
+            # TODO: borrow ranks or merge pipelines
+            assert False, "Not implemented yet."
+
+            while len(ranks) < self._min_num_ranks:
+                # Find a pipeline that has the most number of ranks.
+                bigger_pipeline = self._find_biggest_pipeline(self._pipelines)
+                if bigger_pipeline is None:
+                    # No more big pipeline. Skip
+                    break
+
+                ranks.extend(bigger_pipeline._ranks[: self.engine._num_gpus_per_node])
+                bigger_pipeline._ranks = bigger_pipeline._ranks[
+                    self.engine._num_gpus_per_node :
+                ]
+
+            if len(ranks) >= self._min_num_ranks:
+                # If it could borrow enough node, use it.
+                target_pipeline_template = get_pipeline_template(ranks)
+                assert target_pipeline_template is not None
+                new_num_instances_set[target_pipeline_template] += 1
+                new_ranks_list.append(ranks)
+                continue
+
+            self.merge_pipelines()
+
+        global_num_microbatch = (
+            self.engine._args.global_microbatch_size
+            // self.engine._args.microbatch_size
+        )
+        instantiator = PipelineInstantiator()
+        execution_plan: HeterogeneousPipelinesExecutionPlan = (
+            instantiator.get_new_execution_plan(
+                new_num_instances_set=new_num_instances_set,
+                allreduce_across_nodes=[
+                    layer._allreduce_across_nodes
+                    for layer in self.engine._profile_results.get()
+                ],
+                global_num_microbatch=global_num_microbatch,
+            )
+        )
+        (
+            self.engine._pipeline,
+            self._pipelines,
+            process_groups_dp,
+        ) = execution_plan.instantiate(
+            model=self.engine._model,
+            dataloader=self.engine._dataset,
+            training_args=self.engine._hf_training_args,
+            num_gpus_per_node=self.engine._num_gpus_per_node,
+            step=self.engine._pipeline._global_step,
+        )
+        self._dp_engine = DataParallelEngine(self, process_groups_dp)
+
+    def _find_biggest_pipeline(
+        self, pipelines: list[OobleckPipeline]
+    ) -> OobleckPipeline | None:
+        biggest_pipeline: OobleckPipeline | None = None
+        for pipeline in pipelines:
+            if biggest_pipeline is None or len(pipeline._ranks) > len(
+                biggest_pipeline._ranks
+            ):
+                biggest_pipeline = pipeline
+
+        # Check if this pipeline can yield a node
+        if biggest_pipeline and len(biggest_pipeline._ranks) > self._min_num_ranks:
+            return biggest_pipeline
+
+        return None
 
 
 class DataParallelEngine:
@@ -201,7 +318,7 @@ class OobleckEngine:
         self._pipeline: OobleckPipeline
         # layer_index -> dict of [fsdp_index -> list of ranks]
         process_groups_dp: dict[int, dict[int, dist.ProcessGroup]]
-        self._pipeline, process_groups_dp = execution_plan.instantiate(
+        self._pipeline, pipelines, process_groups_dp = execution_plan.instantiate(
             model=self._model,
             dataloader=dataloader,
             training_args=self._hf_training_args,
@@ -210,6 +327,7 @@ class OobleckEngine:
         )
 
         self._dp_engine = DataParallelEngine(self, process_groups_dp)
+        self._reconfiguration = ReconfigurationEngine(self, pipelines)
 
     def _train_step(self):
         self._pipeline.train()

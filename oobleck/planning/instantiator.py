@@ -208,6 +208,28 @@ class PipelineInstantiator:
         logger.info(f"Best execution plan: {result}")
         return result
 
+    def get_new_execution_plan(
+        self,
+        new_num_instances_set: dict[PipelineTemplate, int],
+        allreduce_across_nodes: list[dict[int, float]],
+        global_num_microbatch: int,
+    ) -> HeterogeneousPipelinesExecutionPlan:
+        num_microbatches_set: dict[PipelineTemplate, int] = self._distribute_batch(
+            global_num_microbatch, new_num_instances_set
+        )
+
+        execution_plan: HeterogeneousPipelinesExecutionPlan = (
+            HeterogeneousPipelinesExecutionPlan(
+                list(new_num_instances_set.keys()),
+                new_num_instances_set,
+                num_microbatches_set,
+                allreduce_across_nodes,
+            )
+        )
+
+        logger.info(f"New execution plan: {execution_plan}")
+        return execution_plan
+
     def _enumerate_instantiation_options(
         self,
         pipeline_templates: list[PipelineTemplate],
