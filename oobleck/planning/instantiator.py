@@ -108,7 +108,9 @@ class HeterogeneousPipelinesExecutionPlan:
         num_gpus_per_node: int,
         step: int = 0,
         # layer_index -> dict of [fsdp_index -> ProcessGroup]
-    ) -> tuple[OobleckPipeline, dict[int, dict[int, dist.ProcessGroup]]]:
+    ) -> tuple[
+        OobleckPipeline, list[OobleckPipeline], dict[int, dict[int, dist.ProcessGroup]]
+    ]:
         my_pipeline: Optional[OobleckPipeline] = None
         pipeline_index: int = 0
         num_ranks_used = 0
@@ -117,6 +119,7 @@ class HeterogeneousPipelinesExecutionPlan:
         # layer_index -> dict of (fsdp_index -> list of ranks)
         ranks_grid: dict[int, dict[int, list[int]]] = defaultdict(dict)
 
+        all_pipelines: list[OobleckPipeline] = []
         for pipeline_template, num_instances in self.num_instances_set.items():
             for _ in range(num_instances):
                 ranks: list[int] = list(
@@ -148,13 +151,12 @@ class HeterogeneousPipelinesExecutionPlan:
                             ranks_grid[layer_index][fsdp_index] = []
                         ranks_grid[layer_index][fsdp_index].append(rank)
 
+                all_pipelines.append(pipeline)
                 if pipeline.my_pipeline:
                     my_pipeline = pipeline
 
                 pipeline_index += 1
                 num_ranks_used += len(ranks)
-
-        assert my_pipeline is not None
 
         # Create process groups for data parallelism
         dp_pg_grid: dict[int, dict[int, dist.ProcessGroup]] = defaultdict(dict)
@@ -163,7 +165,7 @@ class HeterogeneousPipelinesExecutionPlan:
                 dp_pg_grid[layer_index][fsdp_index] = dist.new_group(ranks)
 
         assert my_pipeline is not None
-        return my_pipeline, dp_pg_grid
+        return my_pipeline, all_pipelines, dp_pg_grid
 
 
 class PipelineInstantiator:

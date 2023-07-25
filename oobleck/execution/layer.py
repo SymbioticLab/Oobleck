@@ -25,6 +25,9 @@ class Layer(torch.nn.Module):
         process_group: torch.distributed.ProcessGroup,
     ):
         super().__init__()
+
+        assert torch.distributed.get_rank(process_group) >= 0
+
         device = torch.device("cuda", torch.cuda.current_device())
         self._layer_id = layer_id
         layer.to(device)
