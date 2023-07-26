@@ -1768,9 +1768,9 @@ class Simulator:
         # print(f"Ending delta: {delta}")
         total = self.effective_time + self.checkpoint_time + self.restart_time + \
                 self.sum_gpu_overhead + self.fallback_loss_time
-        print(
-            f"Sum of breakdowns: {total}"
-        )
+        # print(
+        #     f"Sum of breakdowns: {total}"
+        # )
         print("Effective Time:{}, {}".format(self.effective_time, self.effective_time/total))
         print("checkpoint_time:{}, {}".format(self.checkpoint_time, self.checkpoint_time/total))
         print("restart_time:{}, {}".format(self.restart_time, self.restart_time/total))
