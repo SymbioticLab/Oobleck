@@ -185,10 +185,15 @@ class PipelineInstantiator:
             dict[PipelineTemplate, int]
         ] = self._enumerate_instantiation_options(pipeline_templates, num_nodes)
 
-        num_microbatches_set_list: list[dict[PipelineTemplate, int]] = [
-            self._distribute_batch(global_num_microbatch, num_instances_set)
-            for num_instances_set in num_instances_set_list
-        ]
+        num_microbatches_set_list: list[dict[PipelineTemplate, int]] = []
+        for num_instances_set in num_instances_set_list:
+            try:
+                num_microbatches_set = self._distribute_batch(
+                    global_num_microbatch, num_instances_set
+                )
+                num_microbatches_set_list.append(num_microbatches_set)
+            except ValueError:
+                num_microbatches_set_list.append(None)
 
         execution_plans: list[HeterogeneousPipelinesExecutionPlan] = [
             HeterogeneousPipelinesExecutionPlan(
@@ -202,6 +207,8 @@ class PipelineInstantiator:
             )
             if num_instances_set is not None and num_microbatches_set is not None
         ]
+
+        assert execution_plans, "No feasible execution plan found."
 
         result: HeterogeneousPipelinesExecutionPlan = min(
             execution_plans, key=lambda plan: plan.iteration_time

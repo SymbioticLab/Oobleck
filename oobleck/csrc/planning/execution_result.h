@@ -57,7 +57,8 @@ class LayerExecutionResults
  * StageExecutionResult is the aggregation of LayerExecutionResults.
  * A stage can only be executed in one node.
  */
-class StageExecutionResult {
+class StageExecutionResult
+    : public std::enable_shared_from_this<StageExecutionResult> {
  public:
   StageExecutionResult(
       const std::shared_ptr<LayerExecutionResults> layer_results,
@@ -69,21 +70,28 @@ class StageExecutionResult {
     assert(layer_end_index <= layer_results->size());
 
     for (int i = layer_start_index; i < layer_end_index; ++i) {
-      layer_indices_.push_back(layer_results->at(i).layer_index_);
-      forward_ += layer_results->at(i).forward_ / num_gpus_;
-      backward_ += layer_results->at(i).backward_ / num_gpus_;
+      auto& layer = layer_results->at(i);
+      assert(layer.forward_ > 0);
+      assert(layer.backward_ > 0);
+
+      layer_indices_.push_back(layer.layer_index_);
+      forward_ += layer.forward_ / num_gpus_;
+      backward_ += layer.backward_ / num_gpus_;
 
       if (num_gpus_ > 1) {
-        forward_ += layer_results->at(i).allreduce_in_node_.at(num_gpus_ - 1);
-        backward_ += layer_results->at(i).allreduce_in_node_.at(num_gpus_ - 1);
+        forward_ += layer.allreduce_in_node_.at(num_gpus_ - 1);
+        backward_ += layer.allreduce_in_node_.at(num_gpus_ - 1);
       }
 
-      for (const auto& it : layer_results->at(i).allreduce_across_nodes_) {
+      for (const auto& it : layer.allreduce_across_nodes_) {
         allreduce_across_nodes_[it.first] += it.second;
       }
-      mem_required_ += std::get<0>(layer_results->at(i).mem_required_) * 6;
-      mem_required_ += std::get<1>(layer_results->at(i).mem_required_);
+      mem_required_ += std::get<0>(layer.mem_required_) * 6;
+      mem_required_ += std::get<1>(layer.mem_required_);
     }
+
+    assert(forward_ > 0);
+    assert(backward_ > 0);
   }
 
   int num_layers() const { return layer_indices_.size(); }

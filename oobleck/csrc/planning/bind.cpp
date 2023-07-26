@@ -40,6 +40,8 @@ PYBIND11_MODULE(pipeline_template, m) {
                     const std::tuple<int, int>&, const int>())
       .def_readonly("_num_gpus", &StageExecutionResult::num_gpus_)
       .def_readonly("_layer_indices", &StageExecutionResult::layer_indices_)
+      .def_readonly("_forward", &StageExecutionResult::forward_)
+      .def_readonly("_backward", &StageExecutionResult::backward_)
       .def_property_readonly("_num_layers", &StageExecutionResult::num_layers)
       .def_readonly("_mem_required", &StageExecutionResult::mem_required_);
 
