@@ -563,9 +563,37 @@ class TestOobleckReconfigurationClass(OobleckSingleProcessTestCase):
         # [0,1],[2,3,4],[5,6,7,8],[9,10,11,12,13]
         reconfigure_engine.on_reconfigure(failed_ranks)
 
-        # New pipelines must have: 2, 2, 4, 5 stages
-        assert len(reconfigure_engine._pipelines) == 4
-        for pipeline, expected_ranks in zip(
+        assert len(reconfigure_engine._pipelines) == len(expected_ranks)
+        for pipeline, expected_rank in zip(
             reconfigure_engine._pipelines, expected_ranks
         ):
-            assert pipeline._ranks == expected_ranks
+            assert pipeline._ranks == expected_rank
+
+    [0, 1], [2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12, 13]
+
+    @pytest.mark.parametrize(
+        ["failed_ranks", "expected_ranks"],
+        [
+            ([1], [[0, 13], [2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]]),
+            ([1, 3, 4], [[0, 13], [2, 8], [5, 6, 7], [9, 10, 11, 12]]),
+            ([2, 4, 6, 7, 8], [[0, 1], [3, 13], [5, 12], [9, 10, 11]]),
+        ],
+    )
+    def test_reconfigure_borrow_nodes(
+        self,
+        fake_engine: TestOobleckReconfigurationClass.FakeEngine,
+        failed_ranks: list[int],
+        expected_ranks: list[list[int]],
+    ):
+        pipelines = fake_engine.init_pipelines()
+        assert len(pipelines) == 4
+        assert sum(len(pipeline._ranks) for pipeline in pipelines) == 14
+        reconfigure_engine = ReconfigurationEngine(fake_engine, pipelines)
+
+        reconfigure_engine.on_reconfigure(failed_ranks)
+
+        assert len(reconfigure_engine._pipelines) == len(expected_ranks)
+        for pipeline, expected_rank in zip(
+            reconfigure_engine._pipelines, expected_ranks
+        ):
+            assert pipeline._ranks == expected_rank

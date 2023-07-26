@@ -4,6 +4,8 @@ import logging
 import socket
 import weakref
 from collections import defaultdict
+from dataclasses import dataclass
+from enum import Enum
 from multiprocessing import connection
 
 import deepspeed.comm as dist
@@ -20,6 +22,7 @@ from oobleck.elastic.message_util import DistributionInfo
 from oobleck.elastic.training_util import TrainingArguments as OobleckArguments
 from oobleck.execution.dataloader import LoaderType, OobleckDataLoader
 from oobleck.execution.dataset import OobleckDataset
+from oobleck.execution.layer import Layer
 from oobleck.execution.pipeline import OobleckPipeline
 from oobleck.module.model import OobleckModel
 from oobleck.planning.instantiator import (
@@ -29,6 +32,17 @@ from oobleck.planning.instantiator import (
 
 
 class ReconfigurationEngine:
+    class LayerAvailability(Enum):
+        AVAILABLE: 0
+        NOT_AVAILABLE: 1
+        PENDING: 2
+
+    @dataclass
+    class LayerStatus:
+        layer: Layer
+        rank: int
+        availability: ReconfigurationEngine.LayerAvailability
+
     def __init__(self, engine: OobleckEngine, pipelines: list[OobleckPipeline]):
         self._engine = weakref.ref(engine)
         self._pipelines = pipelines
@@ -64,20 +78,44 @@ class ReconfigurationEngine:
         new_num_instances_set: dict[PipelineTemplate, int] = defaultdict(int)
         new_ranks_list: list[list[int]] = []
 
+        # Update ranks first
+        for pipeline in self._pipelines:
+            pipeline._ranks = [
+                rank for rank in pipeline._ranks if rank not in lost_ranks
+            ]
+
         # Prepare new instances set.
         for pipeline in self._pipelines:
-            ranks = [rank for rank in pipeline._ranks if rank not in lost_ranks]
-            target_pipeline_template = get_pipeline_template(
-                ranks, self.engine._pipeline_templates
-            )
+            ranks = pipeline._ranks
 
             # If there is an available template, use it.
-            if target_pipeline_template is not None:
+            if len(ranks) >= self._min_num_ranks:
+                target_pipeline_template = get_pipeline_template(
+                    ranks, self.engine._pipeline_templates
+                )
+                assert target_pipeline_template
                 new_num_instances_set[target_pipeline_template] += 1
                 new_ranks_list.append(ranks)
                 continue
 
             # This pipeline needs more ranks
+            biggest_pipeline: OobleckPipeline = None
+            while len(ranks) < self._min_num_ranks:
+                biggest_pipeline = self._find_biggest_pipeline(self._pipelines)
+                assert biggest_pipeline, "No pipeline can be used to borrow ranks."
+
+                while (
+                    len(biggest_pipeline._ranks) > self._min_num_ranks
+                    and len(ranks) < self._min_num_ranks
+                ):
+                    ranks.append(biggest_pipeline._ranks.pop())
+
+            new_num_instances_set[
+                get_pipeline_template(ranks, self.engine._pipeline_templates)
+            ] += 1
+            new_ranks_list.append(ranks)
+            continue
+
             # TODO: borrow ranks or merge pipelines
             assert False, "Not implemented yet."
 
