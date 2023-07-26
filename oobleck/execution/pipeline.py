@@ -487,11 +487,22 @@ class OobleckPipeline:
 
         self._global_step += 1
 
-    def _initialize_execution(
+    def initialize_execution(
         self,
-        layers: list[torch.fx.GraphModule],
-        shard_id: int,
+        model: OobleckModel,
     ):
+        assert self._per_layer_pgs, "Must call initialize_distributed_fsdp() first"
+
+        layers: list[Layer] = []
+        shard_id: int = -1
+        for layer_id, pg in self._per_layer_pgs.items():
+            id = torch.distributed.get_rank(pg)
+            if id < 0:
+                continue
+
+            layers.append(Layer(layer_id, model.layers[layer_id], pg))
+            shard_id = id
+
         self.execution = PipelineExecution(
             pipeline=self,
             layers=layers,
@@ -531,7 +542,7 @@ class OobleckPipeline:
             "outputs": [None for _ in range(num_pipe_buffers)],
         }
 
-    def initialize_distributed_fsdp(self, model: OobleckModel):
+    def initialize_distributed_fsdp(self):
         """Initialize torch.distributed.process_groups per layer.
         Even I am not involved in a group, torch.distributed requires all ranks to call
         `new_group()`. Thus this method should be called by everyone.
@@ -541,31 +552,10 @@ class OobleckPipeline:
         self._per_layer_pgs: dict[int, ProcessGroup] = {}
         self.execution: PipelineExecution | None = None
 
-        layers: list[Layer] = []
-        shard_id: int = -1
-        my_rank = dist.get_rank()
         for layer_id, ranks in self.rank_grid.items():
             # Remove potential duplicates
             pg = dist.new_group(list(set(ranks)))
             self._per_layer_pgs[layer_id] = pg
-
-            # Get layer if this rank is involved in this layer
-            if my_rank in ranks:
-                layer = Layer(layer_id, model.layers[layer_id], pg)
-                layers.append(layer)
-                shard_id = torch.distributed.get_rank(group=pg)
-
-        if layers:
-            assert shard_id >= 0, "shard id is not set while fsdp_layers have layers."
-            self._initialize_execution(layers, shard_id)
-
-        assert len(self._per_layer_pgs) == len(
-            model.layers
-        ), "Number of per-layer process groups and model layers must match."
-        assert all(
-            layer_index in self._per_layer_pgs
-            for layer_index in range(len(model.layers))
-        ), "Process groups for some layers are not initialized."
 
         # self.execution may not be initialized at this moment. Don't add assertion here.
 

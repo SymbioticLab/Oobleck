@@ -164,6 +164,15 @@ class ReconfigurationEngine:
             ranks=new_ranks_list,
             step=self.engine._pipeline._global_step,
         )
+
+        for pipeline in pipelines:
+            pipeline.initialize_distributed_fsdp()
+            pipeline.initialize_distributed_pipeline()
+
+        # Copy model states here
+
+        self.engine._pipeline.initialize_execution(self.engine._model)
+
         self.engine._dp_engine = DataParallelEngine(self.engine, process_groups_dp)
         self._pipelines = pipelines
 
@@ -412,6 +421,11 @@ class OobleckEngine:
             num_gpus_per_node=self._num_gpus_per_node,
             step=0,
         )
+
+        for pipeline in pipelines:
+            pipeline.initialize_distributed_fsdp()
+            pipeline.initialize_distributed_pipeline()
+        self._pipeline.initialize_execution(self._model)
 
         self._dp_engine = DataParallelEngine(self, process_groups_dp)
         self._reconfiguration = ReconfigurationEngine(self, pipelines)

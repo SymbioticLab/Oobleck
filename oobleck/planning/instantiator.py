@@ -146,8 +146,6 @@ class HeterogeneousPipelinesExecutionPlan:
                     step=step,
                     training_args=training_args,
                 )
-                pipeline.initialize_distributed_fsdp(model)
-                pipeline.initialize_distributed_pipeline()
 
                 for layer_index, ranks_per_layer in pipeline.rank_grid.items():
                     for fsdp_index, rank in enumerate(ranks_per_layer):
