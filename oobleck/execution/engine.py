@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 import socket
 import weakref
@@ -57,11 +58,15 @@ class ReconfigurationEngine:
                 None,
             )
 
+        # Copy existing ranks list to use it for data copy
+        # layer index -> list of ranks
+        old_rank_grid: dict[int, list[int]] = [
+            copy.deepcopy(pipeline.rank_grid) for pipeline in self._pipelines
+        ]
+
         # Update number of nodes
         lost_num_nodes = len(lost_ranks) // self.engine._num_gpus_per_node
         self.engine._num_nodes -= lost_num_nodes
-
-        new_ranks_list: list[list[int]] = []
 
         # Update ranks first
         for pipeline in self._pipelines:
@@ -70,6 +75,7 @@ class ReconfigurationEngine:
             ]
 
         need_merge: bool = False
+        new_ranks_list: list[list[int]] = []
         # Prepare new instances set.
         for pipeline in self._pipelines:
             ranks = pipeline._ranks
@@ -104,22 +110,23 @@ class ReconfigurationEngine:
         if need_merge:
             new_ranks_list = self._merge_pipelines(new_ranks_list)
 
+        # Sort ranks by length so that smaller pipeline ranks always come first.
+        new_ranks_list.sort(key=lambda ranks: len(ranks))
+
         # Creae new instances set
         new_num_instances_set: dict[PipelineTemplate, int] = defaultdict(int)
         for ranks in new_ranks_list:
             template = get_pipeline_template(ranks, self.engine._pipeline_templates)
             new_num_instances_set[template] += 1
 
-        self._reinstantiate(new_num_instances_set, new_ranks_list)
+        self._reinstantiate(new_num_instances_set, old_rank_grid, new_ranks_list)
 
     def _reinstantiate(
         self,
         num_instances_set: dict[PipelineTemplate, int],
-        ranks_list: list[list[int]],
+        old_rank_grid: dict[int, list[int]],
+        new_ranks_list: list[list[int]],
     ):
-        # Sort ranks by length so that smaller pipeline ranks always come first.
-        ranks_list.sort(key=lambda ranks: len(ranks))
-
         global_num_microbatch = (
             self.engine._args.global_microbatch_size
             // self.engine._args.microbatch_size
@@ -135,6 +142,10 @@ class ReconfigurationEngine:
                 global_num_microbatch=global_num_microbatch,
             )
         )
+
+        # Copy model states before initializing pipelines
+        self._copy_model_states(old_rank_grid, new_ranks_list)
+
         (
             self.engine._pipeline,
             pipelines,
@@ -144,11 +155,20 @@ class ReconfigurationEngine:
             dataloader=self.engine._dataset,
             training_args=self.engine._hf_training_args,
             num_gpus_per_node=self.engine._num_gpus_per_node,
-            ranks=ranks_list,
+            ranks=new_ranks_list,
             step=self.engine._pipeline._global_step,
         )
         self.engine._dp_engine = DataParallelEngine(self.engine, process_groups_dp)
         self._pipelines = pipelines
+
+    def _copy_model_states(
+        self, old_rank_grid: dict[int, list[int]], new_rank_list: list[list[int]]
+    ):
+        """
+        Copy missing model states in the GPU due to reconfiguration into self.engine._model.
+        Then remove unused tensors from the GPU.
+        """
+        pass
 
     def _merge_pipelines(self, ranks_list: list[list[int]]) -> list[list[int]]:
         """
@@ -190,7 +210,7 @@ class ReconfigurationEngine:
     ) -> OobleckPipeline | None:
         biggest_pipeline: OobleckPipeline | None = None
         for pipeline in pipelines:
-            if biggest_pipeline is None or len(pipeline._ranks) > len(
+            if biggest_pipeline is None or len(pipeline._ranks) >= len(
                 biggest_pipeline._ranks
             ):
                 biggest_pipeline = pipeline
