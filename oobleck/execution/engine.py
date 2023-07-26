@@ -143,17 +143,8 @@ class ReconfigurationEngine:
             )
         )
 
-        # Copy model states before initializing pipelines
-        new_rank_grids: list[dict[int, list[int]]] = []
-        for new_ranks, (pipeline_template, num_instance) in zip(
-            new_ranks_list, num_instances_set.items()
-        ):
-            for _ in range(num_instance):
-                new_rank_grids.append(pipeline_template.get_rank_grid(new_ranks))
-        self._copy_model_states(old_rank_grids, new_rank_grids)
-
         (
-            self.engine._pipeline,
+            new_pipeline,
             pipelines,
             process_groups_dp,
         ) = execution_plan.instantiate(
@@ -170,9 +161,16 @@ class ReconfigurationEngine:
             pipeline.initialize_distributed_pipeline()
 
         # Copy model states here
+        new_rank_grids: list[dict[int, list[int]]] = []
+        for new_ranks, (pipeline_template, num_instance) in zip(
+            new_ranks_list, num_instances_set.items()
+        ):
+            for _ in range(num_instance):
+                new_rank_grids.append(pipeline_template.get_rank_grid(new_ranks))
+        self._copy_model_states(old_rank_grids, new_rank_grids)
 
-        self.engine._pipeline.initialize_execution(self.engine._model)
-
+        new_pipeline.initialize_execution(self.engine._model)
+        self.engine._pipeline = new_pipeline
         self.engine._dp_engine = DataParallelEngine(self.engine, process_groups_dp)
         self._pipelines = pipelines
 
@@ -185,8 +183,7 @@ class ReconfigurationEngine:
         Copy missing model states in the GPU due to reconfiguration into self.engine._model.
         Then remove unused tensors from the GPU.
         """
-        for old_rank_grid, new_rank_grid in zip(old_rank_grids, new_rank_grids):
-            pass
+        pass
 
     def _merge_pipelines(self, ranks_list: list[list[int]]) -> list[list[int]]:
         """
