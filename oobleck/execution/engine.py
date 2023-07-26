@@ -60,7 +60,7 @@ class ReconfigurationEngine:
 
         # Copy existing ranks list to use it for data copy
         # layer index -> list of ranks
-        old_rank_grid: dict[int, list[int]] = [
+        old_rank_grids: list[dict[int, list[int]]] = [
             copy.deepcopy(pipeline.rank_grid) for pipeline in self._pipelines
         ]
 
@@ -119,12 +119,12 @@ class ReconfigurationEngine:
             template = get_pipeline_template(ranks, self.engine._pipeline_templates)
             new_num_instances_set[template] += 1
 
-        self._reinstantiate(new_num_instances_set, old_rank_grid, new_ranks_list)
+        self._reinstantiate(new_num_instances_set, old_rank_grids, new_ranks_list)
 
     def _reinstantiate(
         self,
         num_instances_set: dict[PipelineTemplate, int],
-        old_rank_grid: dict[int, list[int]],
+        old_rank_grids: list[dict[int, list[int]]],
         new_ranks_list: list[list[int]],
     ):
         global_num_microbatch = (
@@ -144,7 +144,13 @@ class ReconfigurationEngine:
         )
 
         # Copy model states before initializing pipelines
-        self._copy_model_states(old_rank_grid, new_ranks_list)
+        new_rank_grids: list[dict[int, list[int]]] = []
+        for new_ranks, (pipeline_template, num_instance) in zip(
+            new_ranks_list, num_instances_set.items()
+        ):
+            for _ in range(num_instance):
+                new_rank_grids.append(pipeline_template.get_rank_grid(new_ranks))
+        self._copy_model_states(old_rank_grids, new_rank_grids)
 
         (
             self.engine._pipeline,
@@ -162,13 +168,16 @@ class ReconfigurationEngine:
         self._pipelines = pipelines
 
     def _copy_model_states(
-        self, old_rank_grid: dict[int, list[int]], new_rank_list: list[list[int]]
+        self,
+        old_rank_grids: list[dict[int, list[int]]],
+        new_rank_grids: list[dict[int, list[int]]],
     ):
         """
         Copy missing model states in the GPU due to reconfiguration into self.engine._model.
         Then remove unused tensors from the GPU.
         """
-        pass
+        for old_rank_grid, new_rank_grid in zip(old_rank_grids, new_rank_grids):
+            pass
 
     def _merge_pipelines(self, ranks_list: list[list[int]]) -> list[list[int]]:
         """

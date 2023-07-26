@@ -452,30 +452,9 @@ class OobleckPipeline:
         self.my_pipeline = bool(dist.get_rank() in ranks)
 
         # Construct a 2D rank grid for this pipeline.
+        # layer index -> list of ranks
         # First dimension is for layer index, second dimension is for rank.
-        self.rank_grid: dict[int, list[int]] = {}
-        for stage in pipeline_template.get_stages():
-            stage_ranks = ranks[: stage._num_gpus]
-            ranks = ranks[stage._num_gpus :]
-
-            # If length of `stage_ranks` is less than num_gpus_per_node, adjust it
-            # so that it conforms a full 2D grid
-            if stage._num_gpus < pipeline_template._num_gpus_per_node:
-                stage_ranks = [
-                    list(
-                        itertools.repeat(
-                            rank,
-                            pipeline_template._num_gpus_per_node // len(stage_ranks),
-                        )
-                    )
-                    for rank in stage_ranks
-                ]
-                stage_ranks = list(itertools.chain.from_iterable(stage_ranks))
-
-            for layer_index in stage._layer_indices:
-                self.rank_grid[layer_index] = stage_ranks
-
-        assert len(ranks) == 0, "Not all ranks were assigned to a stage."
+        self.rank_grid: dict[int, list[int]] = pipeline_template.get_rank_grid(ranks)
 
     def train(self):
         # A map of PipeInstruction types to methods. Each method will be executed with the

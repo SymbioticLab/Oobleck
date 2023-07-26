@@ -448,28 +448,9 @@ class TestOobleckReconfigurationClass(OobleckSingleProcessTestCase):
 
             # copy from pipeline __init__
             # layer_index -> ranks
-            self.rank_grid: dict[int, list[int]] = {}
-            for stage in pipeline_template.get_stages():
-                stage_ranks = ranks[: stage._num_gpus]
-                ranks = ranks[stage._num_gpus :]
-
-                if stage._num_gpus < pipeline_template._num_gpus_per_node:
-                    stage_ranks = [
-                        list(
-                            itertools.repeat(
-                                rank,
-                                pipeline_template._num_gpus_per_node
-                                // len(stage_ranks),
-                            )
-                        )
-                        for rank in stage_ranks
-                    ]
-                    stage_ranks = list(itertools.chain.from_iterable(stage_ranks))
-
-                for layer_index in stage._layer_indices:
-                    self.rank_grid[layer_index] = stage_ranks
-
-            assert len(ranks) == 0, "Not all ranks were assigned to a stage."
+            self.rank_grid: dict[int, list[int]] = pipeline_template.get_rank_grid(
+                self._ranks
+            )
 
         def initialize_distributed_fsdp(self, *args):
             pass
