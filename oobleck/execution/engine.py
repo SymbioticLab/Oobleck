@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import logging
 import socket
 import weakref
@@ -75,7 +76,6 @@ class ReconfigurationEngine:
         lost_num_nodes = len(lost_ranks) // self.engine._num_gpus_per_node
         self.engine._num_nodes -= lost_num_nodes
 
-        new_num_instances_set: dict[PipelineTemplate, int] = defaultdict(int)
         new_ranks_list: list[list[int]] = []
 
         # Update ranks first
@@ -84,17 +84,17 @@ class ReconfigurationEngine:
                 rank for rank in pipeline._ranks if rank not in lost_ranks
             ]
 
+        need_merge: bool = False
         # Prepare new instances set.
         for pipeline in self._pipelines:
             ranks = pipeline._ranks
 
+            # If all ranks are gone, skip it.
+            if len(ranks) == 0:
+                continue
+
             # If there is an available template, use it.
             if len(ranks) >= self._min_num_ranks:
-                target_pipeline_template = get_pipeline_template(
-                    ranks, self.engine._pipeline_templates
-                )
-                assert target_pipeline_template
-                new_num_instances_set[target_pipeline_template] += 1
                 new_ranks_list.append(ranks)
                 continue
 
@@ -102,7 +102,10 @@ class ReconfigurationEngine:
             biggest_pipeline: OobleckPipeline = None
             while len(ranks) < self._min_num_ranks:
                 biggest_pipeline = self._find_biggest_pipeline(self._pipelines)
-                assert biggest_pipeline, "No pipeline can be used to borrow ranks."
+                if biggest_pipeline is None:
+                    # No pipelines can yield a rank. Simply add it and handle later.
+                    need_merge = True
+                    break
 
                 while (
                     len(biggest_pipeline._ranks) > self._min_num_ranks
@@ -110,39 +113,27 @@ class ReconfigurationEngine:
                 ):
                     ranks.append(biggest_pipeline._ranks.pop())
 
-            new_num_instances_set[
-                get_pipeline_template(ranks, self.engine._pipeline_templates)
-            ] += 1
             new_ranks_list.append(ranks)
-            continue
 
-            # TODO: borrow ranks or merge pipelines
-            assert False, "Not implemented yet."
+        # Merge pipelines if needed
+        if need_merge:
+            new_ranks_list = self._merge_pipelines(new_ranks_list)
 
-            while len(ranks) < self._min_num_ranks:
-                # Find a pipeline that has the most number of ranks.
-                bigger_pipeline = self._find_biggest_pipeline(self._pipelines)
-                if bigger_pipeline is None:
-                    # No more big pipeline. Skip
-                    break
+        # Creae new instances set
+        new_num_instances_set: dict[PipelineTemplate, int] = defaultdict(int)
+        for ranks in new_ranks_list:
+            template = get_pipeline_template(ranks, self.engine._pipeline_templates)
+            new_num_instances_set[template] += 1
 
-                ranks.extend(bigger_pipeline._ranks[: self.engine._num_gpus_per_node])
-                bigger_pipeline._ranks = bigger_pipeline._ranks[
-                    self.engine._num_gpus_per_node :
-                ]
+        self._reinstantiate(new_num_instances_set, new_ranks_list)
 
-            if len(ranks) >= self._min_num_ranks:
-                # If it could borrow enough node, use it.
-                target_pipeline_template = get_pipeline_template(ranks)
-                assert target_pipeline_template is not None
-                new_num_instances_set[target_pipeline_template] += 1
-                new_ranks_list.append(ranks)
-                continue
-
-            self.merge_pipelines()
-
+    def _reinstantiate(
+        self,
+        num_instances_set: dict[PipelineTemplate, int],
+        ranks_list: list[list[int]],
+    ):
         # Sort ranks by length so that smaller pipeline ranks always come first.
-        new_ranks_list.sort(key=lambda ranks: len(ranks))
+        ranks_list.sort(key=lambda ranks: len(ranks))
 
         global_num_microbatch = (
             self.engine._args.global_microbatch_size
@@ -151,7 +142,7 @@ class ReconfigurationEngine:
         instantiator = PipelineInstantiator()
         execution_plan: HeterogeneousPipelinesExecutionPlan = (
             instantiator.get_new_execution_plan(
-                new_num_instances_set=new_num_instances_set,
+                new_num_instances_set=num_instances_set,
                 allreduce_across_nodes=[
                     layer._allreduce_across_nodes
                     for layer in self.engine._profile_results.get()
@@ -168,11 +159,46 @@ class ReconfigurationEngine:
             dataloader=self.engine._dataset,
             training_args=self.engine._hf_training_args,
             num_gpus_per_node=self.engine._num_gpus_per_node,
-            ranks=new_ranks_list,
+            ranks=ranks_list,
             step=self.engine._pipeline._global_step,
         )
         self.engine._dp_engine = DataParallelEngine(self.engine, process_groups_dp)
         self._pipelines = pipelines
+
+    def _merge_pipelines(self, ranks_list: list[list[int]]) -> list[list[int]]:
+        """
+        When this method is called, all pipelines cannot yield a rank
+        but still there is a pipeline that needs more ranks.
+        Solve this problem by merging at least two pipelines.
+
+        Return: list of ranks for a merged pipeline and remaining pipelines.
+        """
+        ranks_to_merge: list[list[int]] = []
+        results: list[list[int]] = []
+        for ranks in ranks_list:
+            ranks_to_merge.append(ranks) if len(
+                ranks
+            ) < self._min_num_ranks else results.append(ranks)
+
+        try:
+            # Merge pipelines
+            while ranks_to_merge:
+                ranks = ranks_to_merge.pop(0)
+                try:
+                    while len(ranks) < self._min_num_ranks:
+                        ranks.extend(ranks_to_merge.pop(0))
+                except IndexError:
+                    # No more ranks to merge.
+                    # Get ranks from result pipeline
+                    ranks.extend(results.pop(0))
+
+                assert len(ranks) >= self._min_num_ranks
+                results.append(ranks)
+        except IndexError:
+            raise RuntimeError("Ranks are insufficient")
+
+        assert ranks_to_merge == []
+        return results
 
     def _find_biggest_pipeline(
         self, pipelines: list[OobleckPipeline]

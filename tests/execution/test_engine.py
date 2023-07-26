@@ -597,3 +597,33 @@ class TestOobleckReconfigurationClass(OobleckSingleProcessTestCase):
             reconfigure_engine._pipelines, expected_ranks
         ):
             assert pipeline._ranks == expected_rank
+
+    [0, 1], [2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12, 13]
+
+    @pytest.mark.parametrize(
+        ["failed_ranks", "expected_ranks"],
+        [
+            ([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], [[0, 12, 13]]),
+            ([1, 2, 3, 5, 6, 7, 9, 11, 12, 13], [[0, 4], [8, 10]]),
+            ([1, 2, 3, 4, 5, 6, 7, 8], [[0, 13], [9, 10, 11, 12]]),
+            ([1, 2, 3, 5, 6, 7, 9, 10, 11], [[0, 4], [8, 12, 13]]),
+        ],
+    )
+    def test_reconfigure_merge_pipelines(
+        self,
+        fake_engine: TestOobleckReconfigurationClass.FakeEngine,
+        failed_ranks: list[int],
+        expected_ranks: list[list[int]],
+    ):
+        pipelines = fake_engine.init_pipelines()
+        assert len(pipelines) == 4
+        assert sum(len(pipeline._ranks) for pipeline in pipelines) == 14
+        reconfigure_engine = ReconfigurationEngine(fake_engine, pipelines)
+
+        reconfigure_engine.on_reconfigure(failed_ranks)
+
+        assert len(reconfigure_engine._pipelines) == len(expected_ranks)
+        for pipeline, expected_rank in zip(
+            reconfigure_engine._pipelines, expected_ranks
+        ):
+            assert pipeline._ranks == expected_rank
