@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import itertools
 import logging
 import socket
 import weakref
 from collections import defaultdict
-from dataclasses import dataclass
-from enum import Enum
 from multiprocessing import connection
 
 import deepspeed.comm as dist
@@ -23,7 +20,6 @@ from oobleck.elastic.message_util import DistributionInfo
 from oobleck.elastic.training_util import TrainingArguments as OobleckArguments
 from oobleck.execution.dataloader import LoaderType, OobleckDataLoader
 from oobleck.execution.dataset import OobleckDataset
-from oobleck.execution.layer import Layer
 from oobleck.execution.pipeline import OobleckPipeline
 from oobleck.module.model import OobleckModel
 from oobleck.planning.instantiator import (
@@ -33,17 +29,6 @@ from oobleck.planning.instantiator import (
 
 
 class ReconfigurationEngine:
-    class LayerAvailability(Enum):
-        AVAILABLE: 0
-        NOT_AVAILABLE: 1
-        PENDING: 2
-
-    @dataclass
-    class LayerStatus:
-        layer: Layer
-        rank: int
-        availability: ReconfigurationEngine.LayerAvailability
-
     def __init__(self, engine: OobleckEngine, pipelines: list[OobleckPipeline]):
         self._engine = weakref.ref(engine)
         self._pipelines = pipelines
