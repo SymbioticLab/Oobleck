@@ -119,12 +119,21 @@ class ReconfigurationEngine:
             template = get_pipeline_template(ranks, self.engine._pipeline_templates)
             new_num_instances_set[template] += 1
 
-        self._reinstantiate(new_num_instances_set, old_rank_grids, new_ranks_list)
+        self._reinstantiate(new_num_instances_set, new_ranks_list)
+
+        # Copy model states here
+        new_rank_grids: list[dict[int, list[int]]] = []
+        for pipeline_template, num_instance in new_num_instances_set.items():
+            for _ in range(num_instance):
+                rank_grid = pipeline_template.get_rank_grid(new_ranks_list.pop(0))
+                new_rank_grids.append(rank_grid)
+        self._copy_model_states(old_rank_grids, new_rank_grids)
+
+        self.engine._pipeline.initialize_execution(self.engine._model)
 
     def _reinstantiate(
         self,
         num_instances_set: dict[PipelineTemplate, int],
-        old_rank_grids: list[dict[int, list[int]]],
         new_ranks_list: list[list[int]],
     ):
         global_num_microbatch = (
@@ -160,16 +169,6 @@ class ReconfigurationEngine:
             pipeline.initialize_distributed_fsdp()
             pipeline.initialize_distributed_pipeline()
 
-        # Copy model states here
-        new_rank_grids: list[dict[int, list[int]]] = []
-        for new_ranks, (pipeline_template, num_instance) in zip(
-            new_ranks_list, num_instances_set.items()
-        ):
-            for _ in range(num_instance):
-                new_rank_grids.append(pipeline_template.get_rank_grid(new_ranks))
-        self._copy_model_states(old_rank_grids, new_rank_grids)
-
-        new_pipeline.initialize_execution(self.engine._model)
         self.engine._pipeline = new_pipeline
         self.engine._dp_engine = DataParallelEngine(self.engine, process_groups_dp)
         self._pipelines = pipelines
@@ -183,7 +182,53 @@ class ReconfigurationEngine:
         Copy missing model states in the GPU due to reconfiguration into self.engine._model.
         Then remove unused tensors from the GPU.
         """
-        pass
+
+        # Iterate all layers to copy model states
+        for layer_index in range(len(old_rank_grids[0])):
+            old_ranks: list[list[int]] = [
+                ranks[layer_index] for ranks in old_rank_grids
+            ]
+            new_ranks: list[list[int]] = [
+                ranks[layer_index] for ranks in new_rank_grids
+            ]
+
+            # Check if it is not necessary to copy data.
+            if old_ranks == new_ranks:
+                continue
+
+            # One of the following sets of ranks will send data.
+            alive_ranks_in_layer: list[list[int]] = [
+                ranks for ranks in old_ranks if ranks not in new_ranks
+            ]
+            if not alive_ranks_in_layer:
+                raise RuntimeError(
+                    f"No alive ranks for the layer {layer_index}. Terminating."
+                )
+
+            # Pick any set of ranks to send model states.
+            # TODO: optimize data communication
+            rank_with_fewest_pending_works: list[int] = alive_ranks_in_layer[0]
+
+            my_rank = dist.get_rank()
+            for ranks_recv in new_ranks:
+                if my_rank in ranks_recv:
+                    fsdp_index = ranks_recv.index(my_rank)
+                    dp_group = self.engine._dp_engine._dp_process_groups[layer_index][
+                        fsdp_index
+                    ]
+                    dist.broadcast(
+                        self.engine._pipeline.execution._layers[
+                            layer_index
+                        ]._param_handle.flat_param,
+                        src=rank_with_fewest_pending_works[fsdp_index],
+                        group=dp_group,
+                        async_op=True,
+                    )
+
+        print("hihi")
+
+        dist.barrier()
+        torch.cuda.synchronize()
 
     def _merge_pipelines(self, ranks_list: list[list[int]]) -> list[list[int]]:
         """

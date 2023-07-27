@@ -458,6 +458,9 @@ class TestOobleckReconfigurationClass(OobleckSingleProcessTestCase):
         def initialize_distributed_pipeline(self, *args):
             pass
 
+        def initialize_execution(self, *args):
+            pass
+
     class FakeEngine:
         def __init__(
             self,
@@ -517,6 +520,10 @@ class TestOobleckReconfigurationClass(OobleckSingleProcessTestCase):
         )
         mocker.patch(
             "deepspeed.comm.new_group",
+            return_value=None,
+        )
+        mocker.patch(
+            "oobleck.execution.engine.ReconfigurationEngine._copy_model_states",
             return_value=None,
         )
         yield self.FakeEngine(self, sample_args)
