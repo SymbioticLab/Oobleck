@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import itertools
+import copy
 import multiprocessing
 import socket
 import threading
@@ -419,6 +419,156 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
         self.run_in_parallel(
             len(agent_ips),
             self._run_data_parallel_allreduce,
+            num_stages,
+            num_gpus_per_node,
+            [p[1] for p in pipes],
+            agent_ips,
+            sample_args,
+        )
+        thread.join()
+
+    @staticmethod
+    def _run_reconfiguration(
+        factory: OobleckStaticClassFactory,
+        rank: int,
+        num_stages: int,
+        num_gpus_per_node: int,
+        pipe: list[connection.Connection],
+        agent_ips: list[str],
+        arguments: OobleckArguments,
+    ):
+        pipe = pipe[rank]
+        global_num_microbatch = (
+            arguments.global_microbatch_size // arguments.microbatch_size
+        )
+
+        my_ip = agent_ips[rank]
+        socket_patcher = patch("socket.gethostbyname", return_value=my_ip)
+        socket_patcher.start()
+
+        if num_stages == 1:
+            pt_patcher = patch(
+                "oobleck.execution.engine.PipelineTemplateGenerator.create_pipeline_templates",
+                return_value=[
+                    factory.get_dummy_pipeline_template(
+                        num_stages=1,
+                        num_gpus_per_node=num_gpus_per_node,
+                        num_nodes=1,
+                    )
+                ],
+            )
+        elif num_stages == 2:
+            pt_patcher = patch(
+                "oobleck.execution.engine.PipelineTemplateGenerator.create_pipeline_templates",
+                return_value=[
+                    factory.get_dummy_pipeline_template(
+                        num_stages=1,
+                        num_gpus_per_node=num_gpus_per_node,
+                        num_nodes=1,
+                    ),
+                    factory.get_dummy_pipeline_template(
+                        num_stages=2,
+                        num_gpus_per_node=num_gpus_per_node,
+                        num_nodes=2,
+                    ),
+                ],
+            )
+        else:
+            pt_patcher = patch(
+                "oobleck.execution.engine.PipelineTemplateGenerator.create_pipeline_templates",
+                return_value=[
+                    factory.get_dummy_pipeline_template(
+                        num_stages=4,
+                        num_gpus_per_node=num_gpus_per_node,
+                        num_nodes=4,
+                    ),
+                ],
+            )
+        pt_patcher.start()
+
+        engine = OobleckEngine(pipe, arguments)
+        engine.initialize_distributed()
+        engine.instantiate_pipelines(global_num_microbatch)
+
+        assert engine._dp_engine
+        assert engine._reconfiguration
+
+        assert torch.distributed.get_world_size() == 4
+
+        if rank == 3:
+            return
+
+        # reinitialize distributed
+        engine.initialize_distributed()
+
+        if num_stages == 1:
+            # No copy happens. Expect dist.broadcast call number 0.
+            with patch.object(
+                torch.distributed, "broadcast", wraps=torch.distributed.broadcast
+            ) as broadcast_spy:
+                engine._reconfiguration.on_reconfigure([3])
+                assert broadcast_spy.call_count == 0
+        elif num_stages == 2:
+            # We should have one 1-stage pipeline and one 2-stage pipeline.
+            # Copy must happen. Check rank grids.
+            engine._reconfiguration.on_reconfigure([3])
+
+            model = factory.get_model()
+            for pipeline in engine._reconfiguration._pipelines:
+                assert len(pipeline._template.get_stages()) in [1, 2]
+                if len(pipeline._template.get_stages()) == 1:
+                    for layer_index, ranks in pipeline.rank_grid.items():
+                        # This test didn't use FSDP
+                        assert len(ranks) == 1
+                        assert ranks[0] == 2
+                else:
+                    for layer_index, ranks in pipeline.rank_grid.items():
+                        # This test didn't use FSDP
+                        assert len(ranks) == 1
+                        assert ranks[0] == (
+                            0 if layer_index < len(model.layers) // 2 else 1
+                        )
+
+        else:
+            # We only have one pipeline and lose one node.
+            # Cannot recover from it
+            with pytest.raises(RuntimeError):
+                engine._reconfiguration.on_reconfigure([3])
+
+    def test_distribued_engine_reconfiguration(
+        self, num_stages: int, sample_args: OobleckArguments
+    ):
+        # adjust global microbatch size so that batch distribution
+        # works after losing 1 node.
+        sample_args = copy.deepcopy(sample_args)
+        sample_args.global_microbatch_size = 24 * TRAIN_BATCH_SIZE
+
+        num_gpus_per_node = 1
+        ctx = multiprocessing.get_context("spawn")
+        agent_ips: list[str] = ["127.0.0.1", "127.0.0.2", "127.0.0.3", "127.0.0.4"]
+        pipes = [ctx.Pipe(duplex=True) for _ in range(len(agent_ips))]
+
+        def broadcast_rank0_port():
+            for pipe, _ in pipes:
+                # max num GPUs
+                pipe.send(num_gpus_per_node)
+                # DistributionInfo
+                pipe.send(DistributionInfo(agent_ips, len(agent_ips)))
+
+            self.broadcast_rank0_port(pipes)
+
+            # Send distribution info again, but without rank 3
+            for pipe, _ in pipes:
+                pipe.send(DistributionInfo(agent_ips[:-1], len(agent_ips) - 1))
+
+            self.broadcast_rank0_port(pipes)
+
+        thread = threading.Thread(target=broadcast_rank0_port)
+        thread.start()
+
+        self.run_in_parallel(
+            len(agent_ips),
+            self._run_reconfiguration,
             num_stages,
             num_gpus_per_node,
             [p[1] for p in pipes],

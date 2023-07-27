@@ -19,7 +19,7 @@ from oobleck.csrc.planning.pipeline_template import (
 )
 from oobleck.elastic.message_util import DistributionInfo
 from oobleck.elastic.training_util import TrainingArguments as OobleckArguments
-from oobleck.execution.dataloader import LoaderType, OobleckDataLoader
+from oobleck.execution.dataloader import LoaderType, OobleckDataLoader, OobleckSampler
 from oobleck.execution.dataset import OobleckDataset
 from oobleck.execution.pipeline import OobleckPipeline
 from oobleck.module.model import OobleckModel
@@ -63,10 +63,6 @@ class ReconfigurationEngine:
         old_rank_grids: list[dict[int, list[int]]] = [
             copy.deepcopy(pipeline.rank_grid) for pipeline in self._pipelines
         ]
-
-        # Update number of nodes
-        lost_num_nodes = len(lost_ranks) // self.engine._num_gpus_per_node
-        self.engine._num_nodes -= lost_num_nodes
 
         # Update ranks first
         for pipeline in self._pipelines:
@@ -119,7 +115,7 @@ class ReconfigurationEngine:
             template = get_pipeline_template(ranks, self.engine._pipeline_templates)
             new_num_instances_set[template] += 1
 
-        self._reinstantiate(new_num_instances_set, new_ranks_list)
+        new_pipeline = self._reinstantiate(new_num_instances_set, new_ranks_list)
 
         # Copy model states here
         new_rank_grids: list[dict[int, list[int]]] = []
@@ -127,15 +123,15 @@ class ReconfigurationEngine:
             for _ in range(num_instance):
                 rank_grid = pipeline_template.get_rank_grid(new_ranks_list.pop(0))
                 new_rank_grids.append(rank_grid)
-        self._copy_model_states(old_rank_grids, new_rank_grids)
+        self._copy_model_states(old_rank_grids, new_rank_grids, new_pipeline)
 
-        self.engine._pipeline.initialize_execution(self.engine._model)
+        self.engine._pipeline = new_pipeline
 
     def _reinstantiate(
         self,
         num_instances_set: dict[PipelineTemplate, int],
         new_ranks_list: list[list[int]],
-    ):
+    ) -> OobleckPipeline:
         global_num_microbatch = (
             self.engine._args.global_microbatch_size
             // self.engine._args.microbatch_size
@@ -152,13 +148,26 @@ class ReconfigurationEngine:
             )
         )
 
+        existing_sampler: OobleckSampler = (
+            self.engine._pipeline._dataloader.batch_sampler
+        )
+        new_dataloader: OobleckDataLoader = OobleckDataLoader(
+            args=self.engine._hf_training_args,
+            datasets=self.engine._dataset,
+            dataloader_type=LoaderType.Training,
+            pipeline_index=execution_plan.my_pipeline_index,
+            num_microbatches=execution_plan.num_microbatches,
+            num_iterations_done=existing_sampler.num_iterations_done,
+            epoch=existing_sampler.epoch,
+        )
+
         (
             new_pipeline,
             pipelines,
             process_groups_dp,
         ) = execution_plan.instantiate(
             model=self.engine._model,
-            dataloader=self.engine._dataset,
+            dataloader=new_dataloader,
             training_args=self.engine._hf_training_args,
             num_gpus_per_node=self.engine._num_gpus_per_node,
             ranks=new_ranks_list,
@@ -168,15 +177,18 @@ class ReconfigurationEngine:
         for pipeline in pipelines:
             pipeline.initialize_distributed_fsdp()
             pipeline.initialize_distributed_pipeline()
+        new_pipeline.initialize_execution(self.engine._model)
 
-        self.engine._pipeline = new_pipeline
         self.engine._dp_engine = DataParallelEngine(self.engine, process_groups_dp)
         self._pipelines = pipelines
+
+        return new_pipeline
 
     def _copy_model_states(
         self,
         old_rank_grids: list[dict[int, list[int]]],
         new_rank_grids: list[dict[int, list[int]]],
+        new_pipeline: OobleckPipeline,
     ):
         """
         Copy missing model states in the GPU due to reconfiguration into self.engine._model.
@@ -193,12 +205,12 @@ class ReconfigurationEngine:
             ]
 
             # Check if it is not necessary to copy data.
-            if old_ranks == new_ranks:
+            if all(rank in old_ranks for rank in new_ranks):
                 continue
 
             # One of the following sets of ranks will send data.
             alive_ranks_in_layer: list[list[int]] = [
-                ranks for ranks in old_ranks if ranks not in new_ranks
+                ranks for ranks in old_ranks if ranks in new_ranks
             ]
             if not alive_ranks_in_layer:
                 raise RuntimeError(
@@ -207,7 +219,7 @@ class ReconfigurationEngine:
 
             # Pick any set of ranks to send model states.
             # TODO: optimize data communication
-            rank_with_fewest_pending_works: list[int] = alive_ranks_in_layer[0]
+            ranks_to_send: list[int] = alive_ranks_in_layer[0]
 
             my_rank = dist.get_rank()
             for ranks_recv in new_ranks:
@@ -216,16 +228,31 @@ class ReconfigurationEngine:
                     dp_group = self.engine._dp_engine._dp_process_groups[layer_index][
                         fsdp_index
                     ]
+
+                    if my_rank == ranks_to_send[fsdp_index]:
+                        param = next(
+                            layer
+                            for layer in self.engine._pipeline.execution._layers
+                            if layer._layer_id == layer_index
+                        )._param_handle.flat_param
+                        next(
+                            layer
+                            for layer in new_pipeline.execution._layers
+                            if layer._layer_id == layer_index
+                        )._param_handle.flat_param.data = param.data
+                    else:
+                        param = next(
+                            layer
+                            for layer in new_pipeline.execution._layers
+                            if layer._layer_id == layer_index
+                        )._param_handle.flat_param
+
                     dist.broadcast(
-                        self.engine._pipeline.execution._layers[
-                            layer_index
-                        ]._param_handle.flat_param,
-                        src=rank_with_fewest_pending_works[fsdp_index],
+                        tensor=param,
+                        src=ranks_to_send[fsdp_index],
                         group=dp_group,
                         async_op=True,
                     )
-
-        print("hihi")
 
         dist.barrier()
         torch.cuda.synchronize()
@@ -381,7 +408,6 @@ class OobleckEngine:
             # TODO: destroying process group should be done in C++ backend
             logging.info("Destroying distributed process group...")
             torch.distributed.destroy_process_group()
-            dist.destroy_process_group()
             dist.cdb = None
 
         dist_info: DistributionInfo = self._agent_pipe.recv()
@@ -468,6 +494,9 @@ class OobleckEngine:
             pipeline.initialize_distributed_fsdp()
             pipeline.initialize_distributed_pipeline()
         self._pipeline.initialize_execution(self._model)
+
+        assert self._pipeline.communication is not None
+        assert self._pipeline.execution is not None
 
         self._dp_engine = DataParallelEngine(self, process_groups_dp)
         self._reconfiguration = ReconfigurationEngine(self, pipelines)
