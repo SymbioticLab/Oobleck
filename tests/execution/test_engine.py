@@ -247,6 +247,15 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
         except Exception as e:
             queue.put({"error": str(e) + "\n" + traceback.format_exc()})
 
+    # Agent should re-broadcast the port
+    @staticmethod
+    def broadcast_rank0_port(
+        pipes: list[tuple[connection.Connection, connection.Connection]]
+    ):
+        port: int = pipes[0][0].recv()
+        for pipe, _ in pipes:
+            pipe.send(port)
+
     # All target methods must have the following signature:
     # (factory, rank, *args)
     @staticmethod
@@ -316,13 +325,7 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
             # DistributionInfo
             pipe.send(DistributionInfo(agent_ips, len(agent_ips)))
 
-        # Agent should re-broadcast the port
-        def broadcast_rank0_port():
-            port: int = pipes[0][0].recv()
-            for pipe, _ in pipes:
-                pipe.send(port)
-
-        thread = threading.Thread(target=broadcast_rank0_port)
+        thread = threading.Thread(target=self.broadcast_rank0_port, args=(pipes,))
         thread.start()
 
         self.run_in_parallel(
@@ -410,12 +413,7 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
             # DistributionInfo
             pipe.send(DistributionInfo(agent_ips, len(agent_ips)))
 
-        def broadcast_rank0_port():
-            port: int = pipes[0][0].recv()
-            for pipe, _ in pipes:
-                pipe.send(port)
-
-        thread = threading.Thread(target=broadcast_rank0_port)
+        thread = threading.Thread(target=self.broadcast_rank0_port, args=(pipes,))
         thread.start()
 
         self.run_in_parallel(
