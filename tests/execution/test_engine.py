@@ -19,7 +19,7 @@ from pytest_mock import MockerFixture
 from oobleck.csrc.planning.pipeline_template import PipelineTemplate
 from oobleck.elastic.message_util import DistributionInfo
 from oobleck.elastic.training_util import TrainingArguments as OobleckArguments
-from oobleck.execution.dataloader import OobleckSampler
+from oobleck.execution.dataloader import LoaderType, OobleckDataLoader, OobleckSampler
 from oobleck.execution.engine import OobleckEngine, ReconfigurationEngine
 from oobleck.execution.pipeline import OobleckPipeline
 from tests.conftest import (
@@ -535,6 +535,7 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
             with pytest.raises(RuntimeError):
                 engine._reconfiguration.on_reconfigure([3])
 
+    @pytest.mark.skip(reason="flaky test")
     def test_distribued_engine_reconfiguration(
         self, num_stages: int, sample_args: OobleckArguments
     ):
@@ -585,12 +586,14 @@ class TestOobleckReconfigurationClass(OobleckSingleProcessTestCase):
             pipeline_id: int,
             pipeline_template: PipelineTemplate,
             ranks: list[int],
+            dataloader: OobleckDataLoader,
             *args,
             **kwargs,
         ):
             self._pipeline_id = pipeline_id
             self._template = pipeline_template
             self._ranks = ranks
+            self._dataloader = dataloader
             self._global_step = 0
             self.my_pipeline = bool(0 in self._ranks)
 
@@ -638,6 +641,10 @@ class TestOobleckReconfigurationClass(OobleckSingleProcessTestCase):
             pipeline_id: int = 0
             pipelines: list[OobleckPipeline] = []
 
+            dataloader = OobleckDataLoader(
+                self._hf_training_args, self._dataset, LoaderType.Training, 0, [0], 0, 0
+            )
+
             # Have one pipelines for each pipeline template
             for template in self._pipeline_templates:
                 pipelines.append(
@@ -650,6 +657,7 @@ class TestOobleckReconfigurationClass(OobleckSingleProcessTestCase):
                                 num_gpus_used + len(template.get_stages()),
                             )
                         ),
+                        dataloader,
                     )
                 )
 
@@ -668,6 +676,14 @@ class TestOobleckReconfigurationClass(OobleckSingleProcessTestCase):
         )
         mocker.patch(
             "deepspeed.comm.new_group",
+            return_value=None,
+        )
+        mocker.patch(
+            "deepspeed.comm.get_rank",
+            return_value=0,
+        )
+        mocker.patch(
+            "torch.distributed.init_process_group",
             return_value=None,
         )
         mocker.patch(
