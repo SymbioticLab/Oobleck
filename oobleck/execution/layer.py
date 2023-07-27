@@ -25,6 +25,9 @@ class Layer(torch.nn.Module):
         process_group: torch.distributed.ProcessGroup,
     ):
         super().__init__()
+
+        assert torch.distributed.get_rank(process_group) >= 0
+
         device = torch.device("cuda", torch.cuda.current_device())
         self._layer_id = layer_id
         layer.to(device)
@@ -41,7 +44,7 @@ class Layer(torch.nn.Module):
             mp_reduce_dtype=torch.float32,
             keep_low_precision_grads=False,
             process_group=process_group,
-            use_orig_params=False,
+            use_orig_params=True,
         )
         self._param_handle.shard()
         self._param_handle.init_flat_param_attributes()

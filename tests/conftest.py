@@ -252,8 +252,9 @@ class OobleckDynamicClassFactory:
             training_args=training_args,
         )
 
-        pipeline.initialize_distributed_fsdp(model)
+        pipeline.initialize_distributed_fsdp()
         pipeline.initialize_distributed_pipeline()
+        pipeline.initialize_execution(model)
 
         return pipeline
 

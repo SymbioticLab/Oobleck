@@ -48,8 +48,8 @@ PYBIND11_MODULE(pipeline_template, m) {
   py::class_<PipelineTemplate>(m, "PipelineTemplate")
       .def(py::init<const std::vector<std::shared_ptr<StageExecutionResult>>&,
                     const double, const int, const int, const int>())
-      .def("get_ranks", &PipelineTemplate::get_ranks, py::arg("rank_offset"))
       .def("get_stages", &PipelineTemplate::get_stages)
+      .def("get_rank_grid", &PipelineTemplate::get_rank_grid, py::arg("ranks"))
       .def_property_readonly("_iteration_time",
                              &PipelineTemplate::get_iteration_time)
       .def_property_readonly("_num_nodes", &PipelineTemplate::get_num_nodes)
