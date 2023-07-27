@@ -5,10 +5,11 @@
 Oobleck evaluation was done in our own cluster, which can only be accessed via University network.
 For artifact evaluation, we instead provide a [CameleonCloud](https://www.chameleoncloud.org/) instance with multiple NVIDIA GPUs.
 
+To access the node, store a certificate to `<name>.pem` anywhere (including `-----BEGIN RSA PRIVATE KEY-----` and `-----END RSA PRIVATE KEY-----`) that we provided in bidding instructions section. Then, access the node using the provided username and IP address in the same section.
+
 Our evaluation consists of
 - Functional correctness evaluation via unit tests
 - Paper figure correctness evaluation via simulation results and plotter
-
 
 ## Prerequisite
 
@@ -25,6 +26,10 @@ Although we provide preconfigured environment to you, you can reconfigure the en
 
 Using `conda` on Ubuntu Linux:
 ```bash
+git clone https://github.com/SymbioticLab/oobleck -b sosp23-artifact
+cd oobleck
+git submodule update --init --recursive
+
 conda env create -f environment.yml
 conda activate oobleck
 (oobleck) pip install .
@@ -34,7 +39,7 @@ Successfully installed oobleck-0.1.0
 
 ## Functional Correctness Evaluation
 
-We provide tests for each Oobleck components based on pytest. Tests in the [`sosp23-artifact` branch](https://github.com/insujang/oobleck/tree/sosp23-artifact) are specialized in printing internal information (while normal tests don't) to help you understand its behavior and check if it matches with the paper explanation.
+We provide a set of unit tests for each Oobleck components based on pytest. Other than 90+ tests for Oobleck testing, tests in the [`sosp23-artifact` branch](https://github.com/insujang/oobleck/tree/sosp23-artifact) are specialized in printing internal information (while normal tests don't) to help you understand its behavior and check if it matches with the paper explanation.
 
 > To simply run all artifact tests and check if all is passed, run: `pytest tests/sosp23-artifact`.
 
@@ -44,7 +49,6 @@ We categorize tests as:
     1. If Oobleck can produce pipelines for any number of GPUs
     2. If execution time of instantiated pipelines are balanced via batch distribution.
 3. **Dynamic reconfiguration (Section 5)**: Oobleck dynamically reconfigures pipelines when a set of GPUs is lost by reusing the pre-generated set of pipeline templates. Tests check a set of pipeline template can be used for reconfiguration and if Oobleck can continue training with a new pipeline set.
-4. **Hybrid parallelism execution**: We provide an integration test that executes two pipelines with 2 GPUs each for the same model. GPUs are only used in this test.
 
 ### Pipeline template generation
 
@@ -99,6 +103,42 @@ INFO     oobleck-sosp23:test_instantiate_pipeline.py:94 PIPELINE INSTANTIATION R
         Total number of microbatches: 4096 (expected: 4096)
 ```
 
+### Dynamic Reconfiguration
+```python
+pytest --disable-warnings --log-cli-level=INFO tests/sosp23/test_dynamic_reconfiguration.py 
+```
+
+When we lose GPU(s), Oobleck reinstantiate pipelines reusing the set of pipeline templates. Reconfiguration falls into the following three conditions:
+
+1. For pipelines with failed ranks, if there is still a feasible pipeline template with the number of remaining ranks, reinstantiate it.
+2. If the number of remaining ranks is insufficient, borrow some ranks from other pipelines. In this case, the pipeline that yields ranks also needs to be reconfigured.
+3. If all other pipelines have minimum number of ranks and still some pipeline lacks ranks, merge pipelines.
+
+Sample output:
+```
+INFO     oobleck-sosp23:test_dynamic_reconfiguration.py:27 PIPELINE RECONFIGURATION
+        Number of pipelines: 4
+        Number of ranks used by each pipelines: [2, 3, 4, 5] 
+        Pipeline rank distribution: [[0, 1], [2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12, 13]]
+        Reconfiguration start after losing [2] ranks
+        ==============================
+        
+INFO     oobleck-sosp23:test_dynamic_reconfiguration.py:40 PIPELINE CONDITION AFTER FAILURES
+            Pipeline 1: [0, 1]              (no change)
+            Pipeline 2: [3, 4]              (lost one rank. need reconfiguration)
+            Pipeline 3: [5, 6, 7, 8]        (no change)
+            Pipeline 4: [9, 10, 11, 12, 13] (no change)
+            ==============================
+            
+INFO     oobleck-sosp23:test_dynamic_reconfiguration.py:50 AFTER PIPELINE RECONFIGURATION (case 1)
+            - Pipeline 2: reinstantiate 2-stage pipeline template
+            Expected rank distribution: [[0, 1], [3, 4], [5, 6, 7, 8], [9, 10, 11, 12, 13]]
+            Rank distribution         : [[0, 1], [3, 4], [5, 6, 7, 8], [9, 10, 11, 12, 13]]
+            ==============================
+```
+
+
 ## Paper Figure Correctness Evaluation
 
-We modified [Bamboo simulator](https://github.com/uclasystem/bamboo/blob/main/project_pactum/simulation/simulator.py) and used it for evaluation. We provide the link of our simulator code and Jupyter Notebooks that plot figures.
+We modified [Bamboo simulator](https://github.com/uclasystem/bamboo/blob/main/project_pactum/simulation/simulator.py) and used it for evaluation.
+Please refer to `tools/simulator/README.md`.
