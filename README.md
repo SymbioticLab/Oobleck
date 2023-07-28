@@ -1,5 +1,7 @@
 # Oobleck: Resilient Distributed Training Framework
 
+Oobleck is in refactoring for better code quality.
+
 ## Install
 
 Using `conda` on Ubuntu or Debian Linux
