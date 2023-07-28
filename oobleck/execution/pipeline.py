@@ -490,6 +490,7 @@ class OobleckPipeline:
     def initialize_execution(
         self,
         model: OobleckModel,
+        existing_pipeline: OobleckPipeline | None = None,
     ):
         assert self._per_layer_pgs, "Must call initialize_distributed_fsdp() first"
 
@@ -500,8 +501,16 @@ class OobleckPipeline:
             if id < 0:
                 continue
 
-            layers.append(Layer(layer_id, model.layers[layer_id], pg))
             shard_id = id
+            try:
+                existing_layer = next(
+                    layer
+                    for layer in existing_pipeline.execution._layers
+                    if layer._layer_id == layer_id
+                )
+                layers.append(Layer.create_layer_from_layer(existing_layer, pg))
+            except Exception:
+                layers.append(Layer(layer_id, model.layers[layer_id], pg))
 
         self.execution = PipelineExecution(
             pipeline=self,

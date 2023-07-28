@@ -177,7 +177,7 @@ class ReconfigurationEngine:
         for pipeline in pipelines:
             pipeline.initialize_distributed_fsdp()
             pipeline.initialize_distributed_pipeline()
-        new_pipeline.initialize_execution(self.engine._model)
+        new_pipeline.initialize_execution(self.engine._model, self.engine._pipeline)
 
         self.engine._dp_engine = DataParallelEngine(self.engine, process_groups_dp)
         self._pipelines = pipelines
