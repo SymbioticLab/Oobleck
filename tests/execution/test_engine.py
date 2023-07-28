@@ -528,14 +528,29 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
                         assert ranks[0] == (
                             0 if layer_index < len(model.layers) // 2 else 1
                         )
-
+            rank = dist.get_rank()
+            for layer_id, ranks_per_layer in engine._pipeline.rank_grid.items():
+                if rank in ranks_per_layer:
+                    layer = next(
+                        layer
+                        for layer in engine._pipeline.execution._layers
+                        if layer._layer_id == layer_id
+                    )
+                    assert layer._param_handle.flat_param is not None
+                    assert layer._param_handle.world_size == len(ranks_per_layer)
+                else:
+                    with pytest.raises(StopIteration):
+                        next(
+                            layer
+                            for layer in engine._pipeline.execution._layers
+                            if layer._layer_id == layer_id
+                        )
         else:
             # We only have one pipeline and lose one node.
             # Cannot recover from it
             with pytest.raises(RuntimeError):
                 engine._reconfiguration.on_reconfigure([3])
 
-    @pytest.mark.skip(reason="flaky test")
     def test_distribued_engine_reconfiguration(
         self, num_stages: int, sample_args: OobleckArguments
     ):

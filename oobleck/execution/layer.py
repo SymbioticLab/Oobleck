@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import torch
 import torch.distributed
 import torch.fx
@@ -18,6 +20,19 @@ def is_checkpointable(layer: torch.fx.GraphModule) -> bool:
 
 
 class Layer(torch.nn.Module):
+    @classmethod
+    def create_layer_from_layer(
+        cls,
+        existing_layer: Layer,
+        process_group: torch.distributed.ProcessGroup,
+    ) -> Layer:
+        assert torch.distributed.get_rank(process_group) >= 0
+
+        layer = cls.__new__(cls)
+        layer._layer_id = existing_layer._layer_id
+        layer._param_handle = existing_layer._param_handle
+        return layer
+
     def __init__(
         self,
         layer_id: int,
