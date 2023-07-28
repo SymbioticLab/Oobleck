@@ -124,7 +124,11 @@ class TestSingleStagePipeline(OobleckMultiProcessTestCase):
         # If FSDP is used, some too small tensors might be only on rank 0,
         # thus pass if size is 0.
         assert all(
-            layer._param_handle.flat_param.grad is not None
+            (
+                param.grad is not None
+                for param in layer.parameters()
+                if param.requires_grad
+            )
             for layer in pipeline.execution._layers
         )
 

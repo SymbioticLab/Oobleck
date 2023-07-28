@@ -116,7 +116,9 @@ class PipelineExecution:
 
         # TODO: use HF arguments to initialize optimizer and LR properly
         self._optimizer = AdamW(
-            [l._param_handle.flat_param for l in layers],
+            itertools.chain.from_iterable(
+                [l._param_handle._fully_sharded_module.parameters() for l in layers]
+            ),
             lr=self._training_args.learning_rate,
             betas=(self._training_args.adam_beta1, self._training_args.adam_beta2),
             eps=self._training_args.adam_epsilon,

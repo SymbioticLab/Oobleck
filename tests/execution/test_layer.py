@@ -1,4 +1,5 @@
 import copy
+import itertools
 
 import pytest
 import torch.distributed
@@ -84,10 +85,11 @@ class TestNoshardedLayer(OobleckMultiProcessTestCase):
 
         # grad must be set after executing backward
         for layer in layers:
-            if layer._param_handle.flat_param.requires_grad:
-                assert layer._param_handle.flat_param.grad is not None
-            else:
-                assert layer._param_handle.flat_param.grad is None
+            for param in layer._param_handle._fully_sharded_module.parameters():
+                if param.requires_grad:
+                    assert param.grad is not None
+                else:
+                    assert param.grad is None
 
     @staticmethod
     def step(
@@ -98,7 +100,9 @@ class TestNoshardedLayer(OobleckMultiProcessTestCase):
             factory, torch.distributed.group.WORLD
         )
 
-        params = [l._param_handle.flat_param for l in layers]
+        params = itertools.chain.from_iterable(
+            [l._param_handle._fully_sharded_module.parameters() for l in layers]
+        )
         optimizer = torch.optim.AdamW(params, lr=1e-3)
 
         output: tuple[torch.Tensor]
@@ -117,7 +121,6 @@ class TestNoshardedLayer(OobleckMultiProcessTestCase):
         optimizer.step()
 
         # optimizer must have internal data for now
-        assert len(layers) == len(optimizer.param_groups[0]["params"])
         p: torch.Tensor
         for p in optimizer.param_groups[0]["params"]:
             # If FSDP is used, some too small tensors might be only on rank 0,
