@@ -125,6 +125,10 @@ class ReconfigurationEngine:
                 new_rank_grids.append(rank_grid)
         self._copy_model_states(old_rank_grids, new_rank_grids, new_pipeline)
 
+        # Before deleting the old pipeline, remove all GPU tensors
+        for layer in self.engine._pipeline.execution._layers:
+            layer.remove_tensors()
+
         self.engine._pipeline = new_pipeline
 
     def _reinstantiate(
