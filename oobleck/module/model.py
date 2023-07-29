@@ -2,6 +2,7 @@ import random
 from typing import Any, Dict, List, Optional, Type
 
 import torch
+from accelerate import init_empty_weights
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -67,10 +68,11 @@ class OobleckModel:
             model_name, **config_args
         )
         model: Optional[Type[PreTrainedModel]] = None
-        for key, automodel in automodel_dict.items():
-            if key in model_name:
-                model = automodel.from_config(model_config)
-                break
+        with init_empty_weights():
+            for key, automodel in automodel_dict.items():
+                if key in model_name:
+                    model = automodel.from_config(model_config)
+                    break
 
         assert model, f"Given model {model_name} is not supported yet."
 

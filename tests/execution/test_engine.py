@@ -595,6 +595,9 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
 
 
 class TestOobleckReconfigurationClass(OobleckSingleProcessTestCase):
+    class Execution:
+        _layers: list[None] = []
+
     class FakePipeline:
         def __init__(
             self,
@@ -610,6 +613,7 @@ class TestOobleckReconfigurationClass(OobleckSingleProcessTestCase):
             self._ranks = ranks
             self._dataloader = dataloader
             self._global_step = 0
+            self.execution = TestOobleckReconfigurationClass.Execution()
             self.my_pipeline = bool(0 in self._ranks)
 
             # copy from pipeline __init__
