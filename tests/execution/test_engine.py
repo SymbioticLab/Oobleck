@@ -24,13 +24,13 @@ from oobleck.execution.engine import OobleckEngine, ReconfigurationEngine
 from oobleck.execution.pipeline import OobleckPipeline
 from tests.conftest import (
     TRAIN_BATCH_SIZE,
-    OobleckElasticTestCase,
     OobleckMultiProcessTestCase,
     OobleckSingleProcessTestCase,
     OobleckStaticClassFactory,
     datasets,
     model_args,
 )
+from tests.elastic.conftest import OobleckElasticTestCase
 
 
 @pytest.fixture(scope="module")
@@ -48,7 +48,6 @@ def sample_args(model_name_fixture: str) -> OobleckArguments:
     )
 
 
-@pytest.mark.skip(reason="asyncio hangs when running multiple tests")
 class TestOobleckEngineClass(OobleckElasticTestCase):
     factory: OobleckStaticClassFactory
 

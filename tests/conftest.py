@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import copy
 import logging
 import math
@@ -14,7 +13,6 @@ from unittest.mock import patch
 
 import deepspeed.comm as dist
 import pytest
-import pytest_asyncio
 import torch
 import torch.distributed
 from pytest_mock import MockerFixture
@@ -26,8 +24,6 @@ from oobleck.csrc.planning.pipeline_template import (
     PipelineTemplate,
     StageExecutionResult,
 )
-from oobleck.elastic.agent import OobleckAgent
-from oobleck.elastic.master import OobleckMasterDaemon, _AgentInfo, _Job
 from oobleck.execution.dataloader import LoaderType, OobleckDataLoader
 from oobleck.execution.dataset import OobleckDataset
 from oobleck.execution.pipeline import OobleckPipeline
@@ -449,29 +445,3 @@ class OobleckMultiProcessTestCase:
             raise e
 
         return results
-
-
-class OobleckElasticTestCase:
-    @pytest_asyncio.fixture(autouse=True)
-    async def daemon(
-        self, event_loop: asyncio.AbstractEventLoop
-    ) -> OobleckMasterDaemon:
-        daemon = await OobleckMasterDaemon.create()
-        event_loop.create_task(daemon.run())
-
-        yield daemon
-
-        if not daemon._server.is_serving():
-            return
-        daemon._server.close()
-        await daemon._server.wait_closed()
-
-    @pytest_asyncio.fixture
-    async def agent(self, daemon: OobleckMasterDaemon) -> OobleckAgent:
-        daemon._job = _Job("test", [_AgentInfo("127.0.0.1", [0])])
-
-        agent = OobleckAgent()
-        await agent.connect_to_master("localhost", daemon.port)
-        yield agent
-        agent.conn_[1].close()
-        await agent.conn_[1].wait_closed()
