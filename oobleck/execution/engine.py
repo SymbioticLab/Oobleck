@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import os
 import socket
 import weakref
 from collections import defaultdict
@@ -334,7 +335,13 @@ class DataParallelEngine:
 
 
 class OobleckEngine:
-    def __init__(self, pipe: connection.Connection, args: OobleckArguments):
+    def __init__(
+        self,
+        local_rank: int,
+        num_gpus_per_node: int,
+        pipe: connection.Connection,
+        args: OobleckArguments,
+    ):
         assert (
             not dist.is_initialized()
         ), "torch.distributed must not be initialized when initializing OobleckEngine."
@@ -346,12 +353,15 @@ class OobleckEngine:
             "per_device_train_batch_size": args.microbatch_size,
             "no_cuda": True,  # don't use cuda in HFTrainingArguments
             "log_level": "error",  # omit warning messages from HFTrainingArguments
+            # do not set gradient_accumulation_steps in HFTrainingArguments
+            "max_steps": args.steps,
         }
         self._hf_training_args: HFTrainingArguments = HFTrainingArguments(
             **training_args
         )
 
-        self._num_gpus_per_node: int = pipe.recv()
+        self._local_rank: int = local_rank
+        self._num_gpus_per_node: int = num_gpus_per_node
 
         # Initialize without distributed
         self._dataset: OobleckDataset
@@ -395,9 +405,7 @@ class OobleckEngine:
             self._hf_training_args.per_device_train_batch_size,
         )
 
-        num_gpus_per_node: int = torch.cuda.device_count()
-        # Calculate num_gpus_range based on profile results
-
+        # TODO: Calculate num_gpus_range based on profile results
         template_generator = PipelineTemplateGenerator()
         pipeline_templates: list[
             PipelineTemplate
@@ -420,9 +428,8 @@ class OobleckEngine:
 
         self._num_nodes = len(dist_info.agent_ips)
         self._world_size = dist_info.world_size
-        self._local_rank = torch.cuda.current_device()
         self._rank = (
-            dist_info.agent_ips.index(my_ip) * torch.cuda.device_count()
+            dist_info.agent_ips.index(my_ip) * self._num_gpus_per_node
             + self._local_rank
         )
 
@@ -513,5 +520,6 @@ class OobleckEngine:
     def train(self):
         assert self._hf_training_args.max_steps > 0
 
-        for _ in range(self._hf_training_args.max_steps):
+        for step in range(self._hf_training_args.max_steps):
+            logging.info(f"Step {step}")
             self._train_step()

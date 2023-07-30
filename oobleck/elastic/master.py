@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 import oobleck.elastic.message_util as message_util
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class _Job:
@@ -63,7 +65,7 @@ class OobleckMasterDaemon:
         return daemon
 
     async def run(self) -> OobleckMasterDaemon:
-        logging.info(f"Master daemon is running on port {self._port}...")
+        logger.info(f"Master daemon is running on port {self._port}...")
         async with self._server:
             await self._server.serve_forever()
 
@@ -77,7 +79,7 @@ class OobleckMasterDaemon:
         result: message_util.Response
         try:
             if self._job:
-                logging.warning("Job already exists.")
+                logger.warning("Job already exists.")
                 result = message_util.Response.FAILURE
             else:
                 self._job = await message_util.recv(r, need_pickle=True)
@@ -98,7 +100,7 @@ class OobleckMasterDaemon:
         Return distributed information stored in job launch.
         """
         if not self._job:
-            logging.warning("No job exists.")
+            logger.warning("No job exists.")
             await message_util.send_response(
                 w,
                 message_util.RequestType.GET_DIST_INFO,
@@ -109,14 +111,14 @@ class OobleckMasterDaemon:
         # put client into waiting list
         self._nodes_to_rendezvous.add(w)
 
-        logging.debug(
+        logger.debug(
             f"Putting agent into waiting list "
             f"({len(self._nodes_to_rendezvous)} / {len(self._job.agent_info)})"
         )
 
         # if all clients are waiting, send dist info
         if len(self._nodes_to_rendezvous) == len(self._job.agent_info):
-            logging.debug("Sending distributed information to agents")
+            logger.debug("Sending distributed information to agents")
 
             dist_info = message_util.DistributionInfo(
                 agent_ips=[agent.ip for agent in self._job.agent_info],
@@ -138,10 +140,19 @@ class OobleckMasterDaemon:
         self, r: asyncio.StreamReader, w: asyncio.StreamWriter
     ):
         port: int = await message_util.recv(r, need_pickle=True)
-        logging.debug(f"Received rank0 port: {port}")
+        logger.debug(f"Received rank0 port: {port}")
         for agent in self._job.agent_info:
+            await message_util.send_response(
+                agent.streams[1],
+                message_util.RequestType.UNDEFINED,
+                message_util.Response.FORWARD_RANK0_PORT,
+                close=False,
+            )
             await message_util.send(
-                agent.streams[1], port, need_pickle=True, close=False
+                agent.streams[1],
+                port,
+                need_pickle=True,
+                close=False,
             )
 
     async def register_agent_handler(
@@ -155,7 +166,7 @@ class OobleckMasterDaemon:
         )
 
         if agent is None:
-            logging.warning(f"Unknown agent: {client_ip}")
+            logger.warning(f"Unknown agent: {client_ip}")
             await message_util.send_response(
                 w,
                 message_util.RequestType.REGISTER_AGENT,
@@ -166,7 +177,7 @@ class OobleckMasterDaemon:
 
         # TODO: register callback on agent reader disconnection
         agent.streams = (r, w)
-        logging.info("Registering agent stream")
+        logger.info("Registering agent stream")
 
         self._server.get_loop().create_task(self.agent_handler(agent))
 
@@ -201,7 +212,7 @@ class OobleckMasterDaemon:
                 for agent in self._job.agent_info
                 if agent.streams and agent.streams[1] == w
             )
-            logging.info("Sending pong")
+            logger.info("Sending pong")
             await message_util.send_response(
                 agent.streams[1],
                 message_util.RequestType.PING,
@@ -209,7 +220,7 @@ class OobleckMasterDaemon:
                 close=False,
             )
         except (AttributeError, StopIteration) as e:
-            logging.warning(f"Unknown agent: {w.get_extra_info('peername')[0]}")
+            logger.warning(f"Unknown agent: {w.get_extra_info('peername')[0]}")
             w.close()
             await w.wait_closed()
 
@@ -223,14 +234,14 @@ class OobleckMasterDaemon:
                 if request_type == message_util.RequestType.PING:
                     await self.pong(w)
                 elif request_type == message_util.RequestType.GET_DIST_INFO:
-                    loop.create_task(self.get_dist_info_handler(r, w))
+                    await self.get_dist_info_handler(r, w)
                 elif request_type == message_util.RequestType.FORWARD_RANK0_PORT:
-                    loop.create_task(self.forward_rank0_port_handler(r, w))
+                    await self.forward_rank0_port_handler(r, w)
                 else:
-                    logging.warning(f"Unknown request type: {request_type}")
+                    logger.warning(f"Unknown request type: {request_type}")
                     continue
         except asyncio.IncompleteReadError:
-            logging.warning("Agent disconnected")
+            logger.warning("Agent disconnected")
             await self.close_agent(agent)
 
     async def on_connected(self, r: asyncio.StreamReader, w: asyncio.StreamWriter):
@@ -241,18 +252,18 @@ class OobleckMasterDaemon:
             request_type = await message_util.recv_request_type(r)
             loop = self._server.get_loop()
 
-            logging.info(f"Received request: {request_type}")
+            logger.info(f"Received request: {request_type}")
 
             if request_type == message_util.RequestType.LAUNCH_JOB:
                 loop.create_task(self.request_job_handler(r, w))
             elif request_type == message_util.RequestType.REGISTER_AGENT:
                 loop.create_task(self.register_agent_handler(r, w))
             else:
-                logging.warning(f"Unknown request type: {request_type}")
+                logger.warning(f"Unknown request type: {request_type}")
                 w.close()
                 await w.wait_closed()
         except asyncio.IncompleteReadError:
-            logging.warning("Connection closed unexpectedly.")
+            logger.warning("Connection closed unexpectedly.")
             w.close()
             await w.wait_closed()
 
@@ -263,5 +274,5 @@ async def main():
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    logger.setLevel(logging.INFO)
     asyncio.run(main())

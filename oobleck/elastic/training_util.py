@@ -13,3 +13,4 @@ class OobleckArguments(Serializable):
     microbatch_size: int = 1
     global_microbatch_size: int = 128
     model_args: dict[str, any] | None = None
+    steps: int = 50

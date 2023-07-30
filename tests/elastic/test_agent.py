@@ -1,13 +1,21 @@
 import asyncio
-from unittest.mock import AsyncMock
+import functools
+import os
+from multiprocessing import connection
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
-import pytest_asyncio
+import torch
+from pytest_mock import MockerFixture
 
 import oobleck.elastic.message_util as message_util
 from oobleck.elastic.agent import OobleckAgent
-from oobleck.elastic.master import OobleckMasterDaemon, _AgentInfo, _Job
-from tests.conftest import OobleckElasticTestCase
+from oobleck.elastic.master import OobleckMasterDaemon, _AgentInfo
+from oobleck.elastic.training_util import OobleckArguments
+from oobleck.elastic.worker import worker_main
+from tests.conftest import OobleckStaticClassFactory, datasets, model_args
+from tests.elastic.conftest import OobleckElasticTestCase
 
 
 class TestOobleckAgentClassWithNoDaemon:
@@ -59,3 +67,86 @@ class TestOobleckAgentClass(OobleckElasticTestCase):
         agent2.conn_[1].close()
         await asyncio.sleep(0.1)
         agent.on_receive_reconfiguration.assert_called()
+
+    @staticmethod
+    def fake_worker_main(
+        my_ip: str,
+        path: Path,
+        local_rank: int,
+        num_gpus_per_node: int,
+        pipe: connection.Connection,
+        args: OobleckArguments,
+    ):
+        factory = OobleckStaticClassFactory(args.model_name, path)
+        with patch("socket.gethostbyname", return_value=my_ip), patch(
+            "oobleck.execution.engine.PipelineTemplateGenerator.create_pipeline_templates",
+            autospec=True,
+            return_value=[
+                factory.get_dummy_pipeline_template(
+                    num_stages=num_gpus_per_node,
+                    num_gpus_per_node=num_gpus_per_node,
+                    num_nodes=1,
+                )
+            ],
+        ), patch(
+            "oobleck.execution.engine.get_profile_results",
+            autospec=True,
+            return_value=factory.get_dummy_profile(),
+        ), patch(
+            "oobleck.execution.engine.OobleckDataset",
+            autospec=True,
+            return_value=factory.get_dataset(),
+        ), patch(
+            "oobleck.execution.engine.OobleckModel",
+            autospec=True,
+            return_value=factory.get_model(),
+        ):
+            worker_main(local_rank, num_gpus_per_node, pipe, args)
+
+    @pytest.mark.asyncio
+    async def test_launch_workers(
+        self,
+        agent: OobleckAgent,
+        model_name_fixture: str,
+        tmp_path: Path,
+        mocker: MockerFixture,
+    ):
+        await agent.register_agent()
+
+        dataset_path, dataset_name = datasets[model_name_fixture]
+        fake_args = OobleckArguments(
+            model_name=model_name_fixture,
+            model_tag="elastic_test",
+            dataset_path=dataset_path,
+            dataset_name=dataset_name,
+            fault_threshold=1,
+            model_args=model_args[model_name_fixture],
+            global_microbatch_size=8,
+            steps=10,
+        )
+
+        my_ip: str = "127.0.0.1"
+        mocker.patch("socket.gethostbyname", return_value=my_ip)
+
+        mocker.patch(
+            "oobleck.elastic.agent.worker_main",
+            functools.partial(self.fake_worker_main, my_ip, tmp_path),
+        )
+        await agent.launch_workers(4, fake_args)
+
+        # Assume master already sent dist info
+        # Agent can get dist info via:
+        # await agent.get_dist_info()
+
+        # Send dist info to workers
+        dist_info = message_util.DistributionInfo([my_ip], 4)
+        for worker in agent._workers:
+            worker.pipe.send(dist_info)
+
+        # Because this agent has rank 0, it should forward worker port
+        if dist_info.agent_ips.index(my_ip) == 0:
+            await agent.forward_worker_port(agent._workers[0].pipe)
+
+        loop = asyncio.get_running_loop()
+        for worker in agent._workers:
+            await loop.run_in_executor(None, worker.process.join)

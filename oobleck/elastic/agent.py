@@ -6,15 +6,16 @@ import os
 import signal
 from dataclasses import dataclass
 from multiprocessing import connection
-from pathlib import Path
+from typing import Any
 
 import simple_parsing
-import yaml
 from multiprocess.context import SpawnProcess
 
 import oobleck.elastic.message_util as message_util
-from oobleck.elastic.training_util import TrainingArguments
+from oobleck.elastic.training_util import OobleckArguments
 from oobleck.elastic.worker import worker_main
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -24,10 +25,10 @@ class Worker:
 
 
 @dataclass
-class AgentArguments:
+class OobleckAgentArguments:
     master_ip: str
     master_port: int
-    training_args: Path
+    oobleck_training_args: dict[str, Any]
     num_workers: int
 
 
@@ -48,7 +49,7 @@ class OobleckAgent:
 
     def __init__(self):
         self.conn_: tuple[asyncio.StreamReader, asyncio.StreamWriter] | None = None
-        self.workers_: list[Worker] = []
+        self._workers: list[Worker] = []
         self.response_callbacks_: dict[message_util.RequestType, callable] = {}
 
     async def connect_to_master(self, master_ip: str, master_port: int):
@@ -73,49 +74,39 @@ class OobleckAgent:
         asyncio.create_task(self.ping())
         asyncio.create_task(self.on_receive_response())
 
-    # TODO: change Path to serialized object.
-    # It is not scalable if we use multiple nodes.
-    async def launch_workers(self, num_workers: int, training_args: Path):
+    async def launch_workers(self, num_workers: int, args: OobleckArguments):
         context = mp.get_context("spawn")
         loop = asyncio.get_running_loop()
-        for _ in range(num_workers):
+        for index in range(num_workers):
             # TODO: add all arguments. Arguments should be passed from the master
             # via command line arguments.
             pipe, child_pipe = context.Pipe()
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(index)
             worker = context.Process(
-                target=worker_main, args=(child_pipe, training_args), daemon=False
+                target=worker_main,
+                args=(index, num_workers, child_pipe, args),
+                daemon=False,
             )
             worker.start()
-            self.workers_.append(Worker(pipe, worker))
+            self._workers.append(Worker(pipe, worker))
 
-        with concurrent.futures.ThreadPoolExecutor(num_workers) as pool:
-            for worker in self.workers_:
-                loop.run_in_executor(pool, self.forward_worker_port, worker.pipe)
-
-        await self.get_dist_info()
+        os.environ.pop("CUDA_VISIBLE_DEVICES")
 
         # TODO: detect worker failure and report it to the master.
         # For now only consider node failure, not worker failure.
 
     async def forward_worker_port(self, pipe: connection.Connection):
-        r, w = self.conn_
-        loop = asyncio.get_running_loop()
-        try:
-            while loop.is_running():
-                port: int = pipe.recv()
-                await message_util.send_request_type(
-                    w, message_util.RequestType.FORWARD_RANK0_PORT
-                )
-                await message_util.send(
-                    w, port, need_pickle=True, drain=True, close=False
-                )
-        except asyncio.CancelledError:
-            pass
+        _, w = self.conn_
+        port: int = pipe.recv()
+        await message_util.send_request_type(
+            w, message_util.RequestType.FORWARD_RANK0_PORT
+        )
+        await message_util.send(w, port, need_pickle=True, drain=True, close=False)
 
     async def on_receive_worker_port(self):
         r, w = self.conn_
         port: int = await message_util.recv(r, need_pickle=True)
-        for worker in self.workers_:
+        for worker in self._workers:
             worker.pipe.send(port)
 
     async def send_request(
@@ -125,7 +116,7 @@ class OobleckAgent:
         callback: callable = None,
     ):
         if request in self.response_callbacks_:
-            logging.warning(
+            logger.warning(
                 f"Already pending request for the same request type {request}"
             )
             return
@@ -145,18 +136,18 @@ class OobleckAgent:
         )
 
     async def on_receive_dist_info(self):
-        logging.debug("on_receive_dist_info")
+        logger.debug("on_receive_dist_info")
         agent_info: message_util.DistributionInfo = await message_util.recv(
             self.conn_[0], need_pickle=True
         )
 
-        for worker in self.workers_:
+        for worker in self._workers:
             worker.pipe.send(agent_info)
 
     async def on_receive_reconfiguration(self):
-        logging.debug("reconfiguration request received")
+        logger.debug("reconfiguration request received")
         # Send SIGUSR1 signal to workers
-        for worker in self.workers_:
+        for worker in self._workers:
             os.kill(worker.process.pid, signal.SIGUSR1)
 
     async def on_receive_response(self):
@@ -165,7 +156,7 @@ class OobleckAgent:
         try:
             while loop.is_running():
                 result = await message_util.recv_response(r, timeout=None)
-                logging.debug(f"Receiving: {result}")
+                logger.debug(f"Receiving: {result}")
 
                 if result == (
                     message_util.Response.PONG,
@@ -177,22 +168,27 @@ class OobleckAgent:
                     message_util.Response.RECONFIGURATION,
                     message_util.RequestType.UNDEFINED,
                 ):
-                    loop.create_task(self.on_receive_reconfiguration())
+                    await self.on_receive_reconfiguration()
 
+                elif result == (
+                    message_util.Response.FORWARD_RANK0_PORT,
+                    message_util.RequestType.UNDEFINED,
+                ):
+                    await self.on_receive_worker_port()
                 elif result[0] == message_util.Response.SUCCESS:
                     response, request = result
                     if request not in self.response_callbacks_:
-                        logging.warning(f"Unexpected response: {request}")
+                        logger.warning(f"Unexpected response: {request}")
                         continue
 
                     callback = self.response_callbacks_.pop(request)
                     await callback()
                 else:
-                    logging.warning(f"Unexpected response: {result}")
+                    logger.warning(f"Unexpected response: {result}")
                     continue
 
         except asyncio.IncompleteReadError:
-            logging.info("Connection closed by master")
+            logger.info("Connection closed by master")
             return
 
     async def ping(self):
@@ -200,30 +196,25 @@ class OobleckAgent:
         try:
             while loop.is_running():
                 await asyncio.sleep(0.4)
-                logging.debug("Sending ping")
+                logger.debug("Sending ping")
                 await self.send_request(message_util.RequestType.PING, None, None)
         except asyncio.CancelledError:
             pass
 
 
 async def main():
-    args: AgentArguments = simple_parsing.parse(AgentArguments)
-
-    # check the given path is a valid yaml file
-    try:
-        TrainingArguments.load_yaml(args.training_args)
-    except yaml.YAMLError as e:
-        logging.error("Error parsing yaml file.")
-        raise e
+    args: OobleckAgentArguments = simple_parsing.parse(OobleckAgentArguments)
 
     agent = OobleckAgent()
     await agent.connect_to_master(args.master_ip, args.master_port)
     await agent.register_agent()
-    agent.launch_workers(args.num_workers, args)
+    agent.launch_workers(
+        args.num_workers, OobleckArguments(**args.oobleck_training_args)
+    )
     await agent.get_dist_info()
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    logger.setLevel(logging.INFO)
 
     asyncio.run(main())
