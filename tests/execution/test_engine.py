@@ -65,14 +65,10 @@ class TestOobleckEngineClass(OobleckElasticTestCase):
     def setup_class(
         cls,
         class_mocker: MockerFixture,
-        pipe: tuple[connection.Connection, connection.Connection],
         model_name_fixture: str,
         tmp_path_factory: pytest.TempPathFactory,
         request: pytest.FixtureRequest,
     ) -> None:
-        # max num GPUs
-        pipe[0].send(4)
-
         directory = tmp_path_factory.getbasetemp()
         request.cls.factory = OobleckStaticClassFactory(model_name_fixture, directory)
 
@@ -113,6 +109,10 @@ class TestOobleckEngineClass(OobleckElasticTestCase):
     ) -> OobleckEngine:
         monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
         mocker.patch("torch.cuda.device_count", return_value=1)
+
+        # max num GPUs
+        pipe[0].send(4)
+
         engine = OobleckEngine(pipe[1], sample_args)
         yield engine
 
