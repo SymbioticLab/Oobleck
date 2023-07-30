@@ -4,7 +4,7 @@ from simple_parsing import Serializable
 
 
 @dataclass
-class TrainingArguments(Serializable):
+class OobleckArguments(Serializable):
     model_name: str
     model_tag: str
     dataset_path: str

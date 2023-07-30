@@ -18,7 +18,7 @@ from pytest_mock import MockerFixture
 
 from oobleck.csrc.planning.pipeline_template import PipelineTemplate
 from oobleck.elastic.message_util import DistributionInfo
-from oobleck.elastic.training_util import TrainingArguments as OobleckArguments
+from oobleck.elastic.training_util import OobleckArguments
 from oobleck.execution.dataloader import LoaderType, OobleckDataLoader, OobleckSampler
 from oobleck.execution.engine import OobleckEngine, ReconfigurationEngine
 from oobleck.execution.pipeline import OobleckPipeline

@@ -18,7 +18,7 @@ from oobleck.csrc.planning.pipeline_template import (
     get_profile_results,
 )
 from oobleck.elastic.message_util import DistributionInfo
-from oobleck.elastic.training_util import TrainingArguments as OobleckArguments
+from oobleck.elastic.training_util import OobleckArguments
 from oobleck.execution.dataloader import LoaderType, OobleckDataLoader, OobleckSampler
 from oobleck.execution.dataset import OobleckDataset
 from oobleck.execution.pipeline import OobleckPipeline

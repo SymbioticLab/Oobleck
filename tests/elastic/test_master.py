@@ -7,7 +7,7 @@ import pytest_asyncio
 
 import oobleck.elastic.message_util as message_util
 from oobleck.elastic.master import OobleckMasterDaemon, _AgentInfo, _Job
-from tests.conftest import OobleckElasticTestCase
+from tests.elastic.conftest import OobleckElasticTestCase
 
 
 class TestOobleckMasterDaemonClass(OobleckElasticTestCase):
