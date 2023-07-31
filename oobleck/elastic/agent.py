@@ -146,8 +146,11 @@ class OobleckAgent:
 
     async def on_receive_reconfiguration(self):
         logger.debug("reconfiguration request received")
+        lost_ranks: list[int] = await message_util.recv(self.conn_[0], need_pickle=True)
+
         # Send SIGUSR1 signal to workers
         for worker in self._workers:
+            worker.pipe.send(lost_ranks)
             os.kill(worker.process.pid, signal.SIGUSR1)
 
     async def on_receive_response(self):

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 import logging
-import os
+import signal
 import socket
 import weakref
 from collections import defaultdict
@@ -41,10 +41,25 @@ class ReconfigurationEngine:
             engine._pipeline_templates[0]._num_nodes
             * engine._pipeline_templates[0]._num_gpus_per_node
         )
+        signal.signal(signal.SIGUSR1, self._on_receive_reconfiguration_signal)
 
     @property
     def engine(self):
         return self._engine()
+
+    def _on_receive_reconfiguration_signal(self, signum: signal.Signals, frame):
+        """A method that will be executed in a separate thread
+        Waiting for an event from the agent to reconfigure the pipeline.
+
+        Once receive a signal from the agent, the worker will:
+        1. destroy current process group
+        2. reconfigure the pipeline with lost rank information
+        """
+        assert signum == signal.SIGUSR1
+
+        # This isn't a low level signal handler, so it doesn't have to finish quick.
+        lost_ranks: list[int] = self.engine._agent_pipe.recv()
+        self.on_reconfigure(lost_ranks)
 
     def on_reconfigure(self, lost_ranks: list[int]):
         def get_pipeline_template(
