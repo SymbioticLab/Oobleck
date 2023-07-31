@@ -1,12 +1,12 @@
 import asyncio
 import functools
-import os
+import signal
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from multiprocessing import connection
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
-import torch
 from pytest_mock import MockerFixture
 
 import oobleck.elastic.message_util as message_util
@@ -150,3 +150,42 @@ class TestOobleckAgentClass(OobleckElasticTestCase):
         loop = asyncio.get_running_loop()
         for worker in agent._workers:
             await loop.run_in_executor(None, worker.process.join)
+
+    @staticmethod
+    def fake_worker_main_wait_for_signal(*args, **kawrgs):
+        signal.sigwait([signal.SIGUSR1])
+
+    @pytest.mark.asyncio
+    async def test_signal_to_workers(
+        self,
+        agent: OobleckAgent,
+        mocker: MockerFixture,
+    ):
+        await agent.register_agent()
+
+        mocker.patch(
+            "oobleck.elastic.agent.worker_main",
+            self.fake_worker_main_wait_for_signal,
+        )
+        fake_args = OobleckArguments(
+            model_name="",
+            model_tag="",
+            dataset_path="",
+            dataset_name=None,
+            fault_threshold=1,
+            model_args=None,
+            global_microbatch_size=0,
+            steps=0,
+        )
+        await agent.launch_workers(4, fake_args)
+
+        mocker.patch("oobleck.elastic.agent.message_util.recv", return_value=[2])
+        await agent.on_receive_reconfiguration()
+
+        futures: list[Future] = []
+        with ThreadPoolExecutor(len(agent._workers)) as executor:
+            for worker in agent._workers:
+                futures.append(executor.submit(worker.process.join))
+
+        _, not_done = wait(futures, timeout=30)
+        assert len(not_done) == 0
