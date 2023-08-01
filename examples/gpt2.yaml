@@ -1,0 +1,14 @@
+# python -m oobleck.run --config_path examples/gpt2.yaml --master_ip ip --master_port port --node_ips=[node_ips]
+
+node_ips:
+  - 127.0.0.1
+
+job_config:
+  model_name: gpt2
+  model_tag: medium
+  dataset_path: wikitext
+  dataset_name: wikitext-2-raw-v1
+  fault_threshold: 3
+  microbatch_size: 2
+  global_microbatch_size: 128
+  steps: 30

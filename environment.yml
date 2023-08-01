@@ -38,3 +38,4 @@ dependencies:
     - pytest-asyncio
     - pytest-mock
     - simple-parsing
+    - asyncssh

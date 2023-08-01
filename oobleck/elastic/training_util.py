@@ -14,3 +14,11 @@ class OobleckArguments(Serializable):
     global_microbatch_size: int = 128
     model_args: dict[str, any] | None = None
     steps: int = 50
+
+
+@dataclass
+class DistributedJobConfiguration(Serializable):
+    node_ips: list[str]
+    arguments: OobleckArguments
+    node_port: int = 22
+    username: str | None = None

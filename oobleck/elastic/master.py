@@ -2,17 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
+import time
 from dataclasses import dataclass
+from pathlib import Path
+
+import asyncssh
 
 import oobleck.elastic.message_util as message_util
+from oobleck.elastic.training_util import DistributedJobConfiguration, OobleckArguments
 
 logger = logging.getLogger(__name__)
 
-
-@dataclass
-class _Job:
-    name: str
-    agent_info: list[_AgentInfo]
+max_num_nodes: int = 32
 
 
 @dataclass
@@ -45,7 +47,7 @@ class OobleckMasterDaemon:
     def __init__(self):
         self._server: asyncio.Server | None = None
         self._port: int | None = None
-        self._job: _Job | None = None
+        self._job: DistributedJobConfiguration | None = None
 
         self._nodes_to_rendezvous: set[asyncio.StreamWriter] = set()
 
@@ -69,6 +71,25 @@ class OobleckMasterDaemon:
         async with self._server:
             await self._server.serve_forever()
 
+    async def run_node_agent(
+        self,
+        ip: str,
+        port: int,
+        username: str,
+        job_config: OobleckArguments,
+        log_path: Path,
+    ):
+        master_ip = socket.gethostbyname(socket.gethostname())
+        async with asyncssh.connect(ip, port, username=username) as conn:
+            return await conn.run(
+                '/bin/bash -ic "conda run -n oobleck python -m oobleck.elastic.agent '
+                f"--master_ip={master_ip}, --master_port={self._port} "
+                f'--num_workers=4 --oobleck_training_args={job_config.to_dict()}"',
+                check=True,
+                term_type="xterm",
+                stdout=log_path / f"{ip}.out",
+            )
+
     async def request_job_handler(
         self, r: asyncio.StreamReader, w: asyncio.StreamWriter
     ):
@@ -79,13 +100,33 @@ class OobleckMasterDaemon:
         result: message_util.Response
         try:
             if self._job:
-                logger.warning("Job already exists.")
-                result = message_util.Response.FAILURE
+                raise RuntimeError("Job already exists.")
             else:
-                self._job = await message_util.recv(r, need_pickle=True)
-                # TODO: Implement job launch.
+                self._job: DistributedJobConfiguration = await message_util.recv(
+                    r, need_pickle=True
+                )
+
+                current_time = time.localtime(time.time())
+                current_time = time.strftime("%m-%d-%Y-%H-%M-%S", current_time)
+
+                log_path = Path(
+                    f"/tmp/oobleck/logs/{current_time}-{self._job.arguments.model_name}"
+                )
+                log_path.mkdir(parents=True, exist_ok=False)
+
+                for node_ip in self._job.node_ips:
+                    logger.info(f"Launching an agent on {node_ip}")
+                    await self.run_node_agent(
+                        node_ip,
+                        self._job.node_port,
+                        self._job.username,
+                        self._job.arguments,
+                        log_path,
+                    )
+
                 result = message_util.Response.SUCCESS
         except Exception as e:
+            logging.warning(e)
             result = message_util.Response.FAILURE
         finally:
             await message_util.send_response(
@@ -274,5 +315,5 @@ async def main():
 
 
 if __name__ == "__main__":
-    logger.setLevel(logging.INFO)
+    logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
