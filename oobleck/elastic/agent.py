@@ -5,13 +5,12 @@ import os
 import signal
 from dataclasses import dataclass
 from multiprocessing import connection
-from typing import Any
 
 import simple_parsing
 from multiprocess.context import SpawnProcess
 
 import oobleck.elastic.message_util as message_util
-from oobleck.elastic.training_util import OobleckArguments
+from oobleck.elastic.training_util import OobleckAgentArguments, OobleckArguments
 from oobleck.elastic.worker import worker_main
 
 logger = logging.getLogger(__name__)
@@ -21,14 +20,6 @@ logger = logging.getLogger(__name__)
 class Worker:
     pipe: connection.Connection
     process: SpawnProcess
-
-
-@dataclass
-class OobleckAgentArguments:
-    master_ip: str
-    master_port: int
-    oobleck_training_args: dict[str, Any]
-    num_workers: int
 
 
 class OobleckAgent:
@@ -210,9 +201,7 @@ async def main():
     agent = OobleckAgent()
     await agent.connect_to_master(args.master_ip, args.master_port)
     await agent.register_agent()
-    agent.launch_workers(
-        args.num_workers, OobleckArguments(**args.oobleck_training_args)
-    )
+    agent.launch_workers(args.num_workers, args)
     await agent.get_dist_info()
 
 

@@ -38,10 +38,10 @@ class OobleckClient:
             raise RuntimeError("Job launch request is rejected by the master.")
 
 
-async def main(job_config: DistributedJobConfiguration, master: tuple[str, int]):
+async def main(args: DistributedJobConfiguration):
     client = OobleckClient()
-    await client.connect_to_master(master[0], master[1])
-    await client.request_job_launch(job_config)
+    await client.connect_to_master(args.master_ip, args.master_port)
+    await client.request_job_launch(args)
 
 
 """
@@ -53,22 +53,10 @@ Information to send
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
-    parser = simple_parsing.ArgumentParser()
-    parser.add_arguments(OobleckArguments, dest="job_config")
-    parser.add_argument("--username", type=str, default="")
-    parser.add_argument("--node-port", type=int)
-    parser.add_argument("--node-ips", type=str, nargs="+", required=True)
-    parser.add_argument("--master-ip", type=str, required=True)
-    parser.add_argument("--master-port", type=int, required=True)
-    parser.add_config_path_arg = True
+    args: DistributedJobConfiguration = simple_parsing.parse(
+        DistributedJobConfiguration, add_config_path_arg=True
+    )
 
-    args = parser.parse_args()
     if not args.username:
         args.username = getpass.getuser()
-    job_config: DistributedJobConfiguration = DistributedJobConfiguration(
-        node_ips=args.node_ips,
-        node_port=args.node_port,
-        arguments=args.job_config,
-        username=args.username,
-    )
-    asyncio.run(main(job_config, (args.master_ip, args.master_port)))
+    asyncio.run(main(args))

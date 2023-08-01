@@ -4,30 +4,36 @@ import asyncio
 import logging
 import socket
 import time
-from dataclasses import dataclass
+from dataclasses import asdict
 from pathlib import Path
 
+import aiofiles
 import asyncssh
 
 import oobleck.elastic.message_util as message_util
-from oobleck.elastic.training_util import DistributedJobConfiguration, OobleckArguments
+from oobleck.elastic.training_util import (
+    DistributedJobConfiguration,
+    OobleckAgentArguments,
+    OobleckArguments,
+    flatten_configurations,
+)
 
 logger = logging.getLogger(__name__)
 
 max_num_nodes: int = 32
 
 
-@dataclass
-class _AgentInfo:
-    """
-    OobleckAgent information.
-    A list of agent information is generated when a user requests a job to be launched.
-    First connected is set False, but will be set True when the agent connects to the master.
-    """
+# @dataclass
+# class _AgentInfo:
+#     """
+#     OobleckAgent information.
+#     A list of agent information is generated when a user requests a job to be launched.
+#     First connected is set False, but will be set True when the agent connects to the master.
+#     """
 
-    ip: str
-    ranks: list[int]
-    streams: tuple[asyncio.StreamReader, asyncio.StreamWriter] | None = None
+#     ip: str
+#     ranks: list[int]
+#     streams: tuple[asyncio.StreamReader, asyncio.StreamWriter] | None = None
 
 
 class OobleckMasterDaemon:
@@ -48,8 +54,9 @@ class OobleckMasterDaemon:
         self._server: asyncio.Server | None = None
         self._port: int | None = None
         self._job: DistributedJobConfiguration | None = None
-
-        self._nodes_to_rendezvous: set[asyncio.StreamWriter] = set()
+        self._agent_connections: dict[
+            str, tuple[asyncio.StreamReader, asyncio.StreamWriter]
+        ] = {}
 
     @property
     def port(self) -> int:
@@ -81,14 +88,24 @@ class OobleckMasterDaemon:
     ):
         master_ip = socket.gethostbyname(socket.gethostname())
         async with asyncssh.connect(ip, port, username=username) as conn:
-            return await conn.run(
-                '/bin/bash -ic "conda run -n oobleck python -m oobleck.elastic.agent '
-                f"--master_ip={master_ip}, --master_port={self._port} "
-                f'--num_workers=4 --oobleck_training_args={job_config.to_dict()}"',
-                check=True,
-                term_type="xterm",
-                stdout=log_path / f"{ip}.out",
+            cmd = '/bin/bash -ic "conda run -n oobleck python -m oobleck.elastic.agent '
+
+            agent_args = OobleckAgentArguments(
+                master_ip=master_ip,
+                master_port=self._port,
+                job_args=job_config,
+                num_workers=4,
             )
+            cmd += " ".join(
+                [f"--{k}={v}" for k, v in flatten_configurations(agent_args).items()]
+            )
+
+            log_file_path = log_path / f"{ip}.out"
+            async with conn.create_process(
+                cmd, term_type="xterm"
+            ) as process, aiofiles.open(log_file_path, "w") as log_file:
+                output = await process.stdout.readline()
+                await log_file.write(output)
 
     async def request_job_handler(
         self, r: asyncio.StreamReader, w: asyncio.StreamWriter
@@ -110,18 +127,20 @@ class OobleckMasterDaemon:
                 current_time = time.strftime("%m-%d-%Y-%H-%M-%S", current_time)
 
                 log_path = Path(
-                    f"/tmp/oobleck/logs/{current_time}-{self._job.arguments.model_name}"
+                    f"/tmp/oobleck/logs/{current_time}-{self._job.job_args.model_name}"
                 )
                 log_path.mkdir(parents=True, exist_ok=False)
 
                 for node_ip in self._job.node_ips:
                     logger.info(f"Launching an agent on {node_ip}")
-                    await self.run_node_agent(
-                        node_ip,
-                        self._job.node_port,
-                        self._job.username,
-                        self._job.arguments,
-                        log_path,
+                    asyncio.create_task(
+                        self.run_node_agent(
+                            node_ip,
+                            self._job.node_port,
+                            self._job.username,
+                            self._job.job_args,
+                            log_path,
+                        )
                     )
 
                 result = message_util.Response.SUCCESS

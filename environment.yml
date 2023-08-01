@@ -39,3 +39,4 @@ dependencies:
     - pytest-mock
     - simple-parsing
     - asyncssh
+    - aiofiles
