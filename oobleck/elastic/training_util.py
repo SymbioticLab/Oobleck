@@ -28,6 +28,7 @@ class OobleckAgentArguments(Serializable):
 
     master_ip: str
     master_port: int
+    node_ips: list[str]
     job_args: OobleckArguments
     num_workers: int
 

@@ -38,22 +38,22 @@ class OobleckAgent:
     """
 
     def __init__(self):
-        self.conn_: tuple[asyncio.StreamReader, asyncio.StreamWriter] | None = None
+        self._conn: tuple[asyncio.StreamReader, asyncio.StreamWriter] | None = None
         self._workers: list[Worker] = []
         self.response_callbacks_: dict[message_util.RequestType, callable] = {}
 
     async def connect_to_master(self, master_ip: str, master_port: int):
         # TODO: add timeout in connection
-        self.conn_ = await asyncio.wait_for(
+        self._conn = await asyncio.wait_for(
             asyncio.open_connection(master_ip, master_port),
             timeout=message_util.TIMEOUT,
         )
 
     async def register_agent(self):
         await message_util.send_request_type(
-            self.conn_[1], message_util.RequestType.REGISTER_AGENT
+            self._conn[1], message_util.RequestType.REGISTER_AGENT
         )
-        result, req = await message_util.recv_response(self.conn_[0])
+        result, req = await message_util.recv_response(self._conn[0])
         if (
             result is not message_util.Response.SUCCESS
             or req is not message_util.RequestType.REGISTER_AGENT
@@ -86,7 +86,7 @@ class OobleckAgent:
         # For now only consider node failure, not worker failure.
 
     async def forward_worker_port(self, pipe: connection.Connection):
-        _, w = self.conn_
+        _, w = self._conn
         port: int = pipe.recv()
         await message_util.send_request_type(
             w, message_util.RequestType.FORWARD_RANK0_PORT
@@ -94,7 +94,7 @@ class OobleckAgent:
         await message_util.send(w, port, need_pickle=True, drain=True, close=False)
 
     async def on_receive_worker_port(self):
-        r, w = self.conn_
+        r, w = self._conn
         port: int = await message_util.recv(r, need_pickle=True)
         for worker in self._workers:
             worker.pipe.send(port)
@@ -113,11 +113,11 @@ class OobleckAgent:
 
         if request is not message_util.RequestType.PING:
             self.response_callbacks_[request] = callback
-        await message_util.send_request_type(self.conn_[1], request)
+        await message_util.send_request_type(self._conn[1], request)
 
         if args is not None:
             await message_util.send(
-                self.conn_[1], args, need_pickle=True, drain=True, close=False
+                self._conn[1], args, need_pickle=True, drain=True, close=False
             )
 
     async def get_dist_info(self):
@@ -128,7 +128,7 @@ class OobleckAgent:
     async def on_receive_dist_info(self):
         logger.debug("on_receive_dist_info")
         agent_info: message_util.DistributionInfo = await message_util.recv(
-            self.conn_[0], need_pickle=True
+            self._conn[0], need_pickle=True
         )
 
         for worker in self._workers:
@@ -136,7 +136,7 @@ class OobleckAgent:
 
     async def on_receive_reconfiguration(self):
         logger.debug("reconfiguration request received")
-        lost_ranks: list[int] = await message_util.recv(self.conn_[0], need_pickle=True)
+        lost_ranks: list[int] = await message_util.recv(self._conn[0], need_pickle=True)
 
         # Send SIGUSR1 signal to workers
         for worker in self._workers:
@@ -144,7 +144,7 @@ class OobleckAgent:
             os.kill(worker.process.pid, signal.SIGUSR1)
 
     async def on_receive_response(self):
-        r, w = self.conn_
+        r, w = self._conn
         loop = asyncio.get_running_loop()
         try:
             while loop.is_running():
