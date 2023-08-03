@@ -56,7 +56,8 @@ class TestOobleckAgentClass(OobleckElasticTestCase):
         await agent._register_agent()
         await agent._launch_workers(self.sample_num_workers, daemon._job.job_args)
         assert len(agent._workers) == self.sample_num_workers
-        await asyncio.wait([worker.process for worker in agent._workers])
+        for worker in agent._workers:
+            worker.process.join()
 
     @staticmethod
     def fake_worker_main_echo_lost_ranks(

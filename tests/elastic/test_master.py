@@ -8,7 +8,7 @@ from pytest_mock import MockerFixture
 import oobleck.elastic.message_util as message_util
 from oobleck.elastic.agent import OobleckAgent
 from oobleck.elastic.master import OobleckMasterDaemon
-from oobleck.elastic.training_util import DistributedJobConfiguration
+from oobleck.elastic.training_util import OobleckAgentArguments
 from tests.elastic.conftest import OobleckElasticTestCase
 
 """
@@ -84,10 +84,17 @@ class TestOobleckMasterDaemonClass(OobleckElasticTestCase):
         close_agent_handler_spy = mocker.spy(daemon, "close_agent")
 
         agents: list[OobleckAgent] = []
+        args = OobleckAgentArguments(
+            master_ip=daemon._job.master_ip,
+            master_port=daemon.port,
+            node_ips=daemon._job.node_ips,
+            job_args=daemon._job.job_args,
+            num_workers=self.sample_num_workers,
+        )
 
         for agent_ip in ["127.0.0.1", "127.0.0.2"]:
-            agent = OobleckAgent()
-            await agent.connect_to_master("localhost", daemon.port)
+            agent = OobleckAgent(args)
+            await agent._connect_to_master(args.master_ip, args.master_port)
             mocker.patch(
                 "asyncio.StreamWriter.get_extra_info", return_value=(agent_ip, 0)
             )
