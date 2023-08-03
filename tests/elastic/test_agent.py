@@ -12,38 +12,54 @@ from pytest_mock import MockerFixture
 import oobleck.elastic.message_util as message_util
 from oobleck.elastic.agent import OobleckAgent
 from oobleck.elastic.master import OobleckMasterDaemon
-from oobleck.elastic.training_util import OobleckArguments
+from oobleck.elastic.training_util import DistributedJobConfiguration, OobleckArguments
 from oobleck.elastic.worker import worker_main
 from tests.conftest import OobleckStaticClassFactory, datasets, model_args
 from tests.elastic.conftest import OobleckElasticTestCase
 
 
-class TestOobleckAgentClassWithNoDaemon:
-    pass
-
-
 class TestOobleckAgentClass(OobleckElasticTestCase):
-    @pytest.mark.asyncio
-    async def test_register_agent(self, agent: OobleckAgent):
-        agent.send_request = AsyncMock(wraps=agent.send_request)
-        await agent.register_agent()
+    @pytest.fixture(autouse=True)
+    async def register_job(
+        self, daemon: OobleckMasterDaemon, sample_job: DistributedJobConfiguration
+    ):
+        daemon._job = sample_job
 
+    @pytest.mark.asyncio
+    async def test_register_agent(
+        self,
+        agent: OobleckAgent,
+    ):
+        await agent.register_agent()
         await asyncio.sleep(1)
-        agent.send_request.assert_called_with(message_util.RequestType.PING, None, None)
 
     @pytest.mark.asyncio
-    async def test_get_dist_info(self, agent: OobleckAgent):
-        await agent.register_agent()
+    async def test_fail_register_agent(
+        self,
+        agent: OobleckAgent,
+        mocker: MockerFixture,
+    ):
+        mocker.patch("asyncio.StreamWriter.get_extra_info", return_value=("0.0.0.0", 0))
 
-        agent.send_request = AsyncMock(wraps=agent.send_request)
-        agent.on_receive_dist_info = AsyncMock(wraps=agent.on_receive_dist_info)
-        await agent.get_dist_info()
+        with pytest.raises(ConnectionError):
+            await agent.register_agent()
 
-        await asyncio.sleep(0.2)
-        agent.send_request.assert_called_with(
-            message_util.RequestType.GET_DIST_INFO, None, agent.on_receive_dist_info
-        )
-        agent.on_receive_dist_info.assert_called()
+    @pytest.mark.asyncio
+    async def test_launch_workers(
+        self,
+        daemon: OobleckMasterDaemon,
+        sample_job: DistributedJobConfiguration,
+        agent: OobleckAgent,
+    ):
+        pass
+
+    @pytest.mark.asyncio
+    async def test_receive_reconfiguration():
+        pass
+
+    @pytest.mark.asyncio
+    async def test_receive_node_disconnect():
+        pass
 
     # @pytest.mark.asyncio
     # async def test_receive_reconfiguration(

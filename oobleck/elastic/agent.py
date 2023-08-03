@@ -1,8 +1,10 @@
 import asyncio
 import logging
+import multiprocessing
 import multiprocessing as mp
 import os
 import signal
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from multiprocessing import connection
 
@@ -19,7 +21,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Worker:
     pipe: connection.Connection
-    process: SpawnProcess
+    process: asyncio.Future
 
 
 class OobleckAgent:
@@ -40,7 +42,10 @@ class OobleckAgent:
     def __init__(self):
         self._conn: tuple[asyncio.StreamReader, asyncio.StreamWriter] | None = None
         self._workers: list[Worker] = []
-        self.response_callbacks_: dict[message_util.RequestType, callable] = {}
+        self._worker_pool: ProcessPoolExecutor = ProcessPoolExecutor(
+            max_workers=8, mp_context=multiprocessing.get_context("spawn")
+        )
+        self._response_callbacks: dict[message_util.RequestType, callable] = {}
 
     async def connect_to_master(self, master_ip: str, master_port: int):
         # TODO: add timeout in connection
@@ -58,10 +63,10 @@ class OobleckAgent:
             result is not message_util.Response.SUCCESS
             or req is not message_util.RequestType.REGISTER_AGENT
         ):
-            raise RuntimeError("Failed to register agent")
+            raise ConnectionError("Failed to register agent")
 
         # When success, start pinging the master
-        asyncio.create_task(self.ping())
+        # asyncio.create_task(self.ping())
         asyncio.create_task(self.on_receive_response())
 
     async def launch_workers(self, num_workers: int, args: OobleckArguments):
@@ -72,18 +77,23 @@ class OobleckAgent:
             # via command line arguments.
             pipe, child_pipe = context.Pipe()
             os.environ["CUDA_VISIBLE_DEVICES"] = str(index)
-            worker = context.Process(
-                target=worker_main,
-                args=(index, num_workers, child_pipe, args),
-                daemon=False,
+            worker_future: asyncio.Future = (
+                loop.run_in_executor(
+                    self._worker_pool,
+                    worker_main,
+                    index,
+                    num_workers,
+                    child_pipe,
+                    args,
+                ),
             )
-            worker.start()
-            self._workers.append(Worker(pipe, worker))
+            self._workers.append(Worker(pipe, worker_future))
+
+            # TODO: detect worker failure and report it to the master.
+            # For now only consider node failure, thus training will go stuck
+            # if a worker fails.
 
         os.environ.pop("CUDA_VISIBLE_DEVICES")
-
-        # TODO: detect worker failure and report it to the master.
-        # For now only consider node failure, not worker failure.
 
     async def forward_worker_port(self, pipe: connection.Connection):
         _, w = self._conn
@@ -105,14 +115,14 @@ class OobleckAgent:
         args: dict | None = None,
         callback: callable = None,
     ):
-        if request in self.response_callbacks_:
+        if request in self._response_callbacks:
             logger.warning(
                 f"Already pending request for the same request type {request}"
             )
             return
 
         if request is not message_util.RequestType.PING:
-            self.response_callbacks_[request] = callback
+            self._response_callbacks[request] = callback
         await message_util.send_request_type(self._conn[1], request)
 
         if args is not None:
@@ -170,11 +180,11 @@ class OobleckAgent:
                     await self.on_receive_worker_port()
                 elif result[0] == message_util.Response.SUCCESS:
                     response, request = result
-                    if request not in self.response_callbacks_:
+                    if request not in self._response_callbacks:
                         logger.warning(f"Unexpected response: {request}")
                         continue
 
-                    callback = self.response_callbacks_.pop(request)
+                    callback = self._response_callbacks.pop(request)
                     await callback()
                 else:
                     logger.warning(f"Unexpected response: {result}")

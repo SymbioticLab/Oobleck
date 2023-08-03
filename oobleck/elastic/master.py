@@ -163,6 +163,15 @@ class OobleckMasterDaemon:
         # TODO: find another unique identifier than IP address.
         client_ip = w.get_extra_info("peername")[0]
 
+        if self._job is None or client_ip not in self._job.node_ips:
+            logger.warning(f"Agent {client_ip} is not registered")
+            return await message_util.send_response(
+                w,
+                message_util.RequestType.REGISTER_AGENT,
+                message_util.Response.FAILURE,
+                close=True,
+            )
+
         if client_ip in self._agent_connections:
             logger.warning(f"Agent {client_ip} already registered")
             return await message_util.send_response(
