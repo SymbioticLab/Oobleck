@@ -1,15 +1,14 @@
 import asyncio
 import logging
 import multiprocessing
-import multiprocessing as mp
 import os
 import signal
-from concurrent.futures import ProcessPoolExecutor
+import socket
+import sys
 from dataclasses import dataclass
 from multiprocessing import connection
 
 import simple_parsing
-from multiprocess.context import SpawnProcess
 
 import oobleck.elastic.message_util as message_util
 from oobleck.elastic.training_util import OobleckAgentArguments, OobleckArguments
@@ -21,7 +20,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Worker:
     pipe: connection.Connection
-    process: asyncio.Future
+    process: multiprocessing.Process
 
 
 class OobleckAgent:
@@ -39,22 +38,29 @@ class OobleckAgent:
        the agent queries a new distribution information from the master and forward it to workers.
     """
 
-    def __init__(self):
+    def __init__(self, args: OobleckAgentArguments):
+        self._args = args
+        self._rank_map: dict[str, list[int]] = {
+            ip: list(range(i * args.num_workers, (i + 1) * args.num_workers))
+            for i, ip in enumerate(args.node_ips)
+        }
         self._conn: tuple[asyncio.StreamReader, asyncio.StreamWriter] | None = None
         self._workers: list[Worker] = []
-        self._worker_pool: ProcessPoolExecutor = ProcessPoolExecutor(
-            max_workers=8, mp_context=multiprocessing.get_context("spawn")
-        )
         self._response_callbacks: dict[message_util.RequestType, callable] = {}
 
-    async def connect_to_master(self, master_ip: str, master_port: int):
+    async def run(self):
+        await self._connect_to_master(self._args.master_ip, self._args.master_port)
+        await self._register_agent()
+        await self._launch_workers(self._args.num_workers, self._args)
+
+    async def _connect_to_master(self, master_ip: str, master_port: int):
         # TODO: add timeout in connection
         self._conn = await asyncio.wait_for(
             asyncio.open_connection(master_ip, master_port),
             timeout=message_util.TIMEOUT,
         )
 
-    async def register_agent(self):
+    async def _register_agent(self):
         await message_util.send_request_type(
             self._conn[1], message_util.RequestType.REGISTER_AGENT
         )
@@ -69,25 +75,23 @@ class OobleckAgent:
         # asyncio.create_task(self.ping())
         asyncio.create_task(self.on_receive_response())
 
-    async def launch_workers(self, num_workers: int, args: OobleckArguments):
-        context = mp.get_context("spawn")
+    async def _launch_workers(self, num_workers: int, args: OobleckArguments):
         loop = asyncio.get_running_loop()
+        ctx = multiprocessing.get_context("spawn")
         for index in range(num_workers):
             # TODO: add all arguments. Arguments should be passed from the master
             # via command line arguments.
-            pipe, child_pipe = context.Pipe()
+            pipe, child_pipe = ctx.Pipe()
             os.environ["CUDA_VISIBLE_DEVICES"] = str(index)
-            worker_future: asyncio.Future = (
-                loop.run_in_executor(
-                    self._worker_pool,
-                    worker_main,
-                    index,
-                    num_workers,
-                    child_pipe,
-                    args,
-                ),
+
+            process = ctx.Process(
+                target=worker_main,
+                args=(index, num_workers, child_pipe, args),
+                daemon=True,
             )
-            self._workers.append(Worker(pipe, worker_future))
+            process.start()
+
+            self._workers.append(Worker(pipe, process))
 
             # TODO: detect worker failure and report it to the master.
             # For now only consider node failure, thus training will go stuck
@@ -130,34 +134,29 @@ class OobleckAgent:
                 self._conn[1], args, need_pickle=True, drain=True, close=False
             )
 
-    async def get_dist_info(self):
-        await self.send_request(
-            message_util.RequestType.GET_DIST_INFO, None, self.on_receive_dist_info
-        )
-
-    async def on_receive_dist_info(self):
-        logger.debug("on_receive_dist_info")
-        agent_info: message_util.DistributionInfo = await message_util.recv(
-            self._conn[0], need_pickle=True
-        )
-
-        for worker in self._workers:
-            worker.pipe.send(agent_info)
-
     async def on_receive_reconfiguration(self):
         logger.debug("reconfiguration request received")
-        lost_ranks: list[int] = await message_util.recv(self._conn[0], need_pickle=True)
+        lost_node: str = await message_util.recv(self._conn[0], need_pickle=True)
 
-        # Send SIGUSR1 signal to workers
-        for worker in self._workers:
-            worker.pipe.send(lost_ranks)
-            os.kill(worker.process.pid, signal.SIGUSR1)
+        # This is for emulating a lost node by sending a command from the master.
+        # Won't happen in normal case.
+        if lost_node == socket.gethostbyname(socket.gethostname()):
+            logger.info("I'm the lost node. I'll terminate myself.")
+            for worker in self._workers:
+                worker.process.terminate()
+            sys.exit(1)
+
+        else:
+            # Send SIGUSR1 signal to workers
+            lost_ranks: list[int] = self._rank_map.pop(lost_node)
+            for worker in self._workers:
+                worker.pipe.send(lost_ranks)
+                os.kill(worker.process.pid, signal.SIGUSR1)
 
     async def on_receive_response(self):
         r, w = self._conn
-        loop = asyncio.get_running_loop()
         try:
-            while loop.is_running():
+            while not r.at_eof():
                 result = await message_util.recv_response(r, timeout=None)
                 logger.debug(f"Receiving: {result}")
 
@@ -205,17 +204,10 @@ class OobleckAgent:
             pass
 
 
-async def main():
-    args: OobleckAgentArguments = simple_parsing.parse(OobleckAgentArguments)
-
-    agent = OobleckAgent()
-    await agent.connect_to_master(args.master_ip, args.master_port)
-    await agent.register_agent()
-    agent.launch_workers(args.num_workers, args)
-    await agent.get_dist_info()
-
-
 if __name__ == "__main__":
     logger.setLevel(logging.INFO)
 
-    asyncio.run(main())
+    args: OobleckAgentArguments = simple_parsing.parse(OobleckAgentArguments)
+    agent = OobleckAgent(args)
+
+    asyncio.run(agent.run())

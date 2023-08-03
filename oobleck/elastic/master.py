@@ -195,9 +195,6 @@ class OobleckMasterDaemon:
         )
 
     async def close_agent(self, agent_ip: str):
-        _, w = self._agent_connections[agent_ip]
-        w.close()
-        await w.wait_closed()
         self._agent_connections.pop(agent_ip)
 
         # Broadcast reconfiguration event
@@ -208,6 +205,7 @@ class OobleckMasterDaemon:
                 message_util.Response.RECONFIGURATION,
                 close=False,
             )
+            await message_util.send(w, agent_ip, need_pickle=True, close=False)
 
     async def pong(self, w: asyncio.StreamWriter):
         logger.info("Sending pong")
@@ -231,8 +229,8 @@ class OobleckMasterDaemon:
                 else:
                     logger.warning(f"Unknown request type: {request_type}")
                     continue
-        except asyncio.IncompleteReadError:
-            logger.warning("Agent disconnected")
+        except (asyncio.IncompleteReadError, ConnectionResetError):
+            logger.warning(f"Agent {agent_ip} disconnected")
             await self.close_agent(agent_ip)
 
     async def on_connected(self, r: asyncio.StreamReader, w: asyncio.StreamWriter):

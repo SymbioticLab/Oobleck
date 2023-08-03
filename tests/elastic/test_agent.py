@@ -1,37 +1,37 @@
 import asyncio
-import functools
+import logging
+import multiprocessing
+import os
 import signal
-from concurrent.futures import Future, ThreadPoolExecutor, wait
-from multiprocessing import connection
-from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from multiprocessing.connection import Connection
+from unittest.mock import patch
 
 import pytest
 from pytest_mock import MockerFixture
 
-import oobleck.elastic.message_util as message_util
-from oobleck.elastic.agent import OobleckAgent
+from oobleck.elastic.agent import OobleckAgent, OobleckAgentArguments
 from oobleck.elastic.master import OobleckMasterDaemon
-from oobleck.elastic.training_util import DistributedJobConfiguration, OobleckArguments
-from oobleck.elastic.worker import worker_main
-from tests.conftest import OobleckStaticClassFactory, datasets, model_args
+from oobleck.elastic.training_util import OobleckArguments
 from tests.elastic.conftest import OobleckElasticTestCase
 
 
 class TestOobleckAgentClass(OobleckElasticTestCase):
     @pytest.fixture(autouse=True)
-    async def register_job(
-        self, daemon: OobleckMasterDaemon, sample_job: DistributedJobConfiguration
-    ):
-        daemon._job = sample_job
+    def setup_method(self, mocker: MockerFixture):
+        mocker.patch(
+            "asyncio.StreamWriter.get_extra_info",
+            return_value=(self.sample_ip, "12345"),
+        )
 
     @pytest.mark.asyncio
     async def test_register_agent(
         self,
+        daemon: OobleckMasterDaemon,
         agent: OobleckAgent,
     ):
-        await agent.register_agent()
+        await agent._register_agent()
         await asyncio.sleep(1)
+        assert self.sample_ip in daemon._agent_connections
 
     @pytest.mark.asyncio
     async def test_fail_register_agent(
@@ -42,166 +42,74 @@ class TestOobleckAgentClass(OobleckElasticTestCase):
         mocker.patch("asyncio.StreamWriter.get_extra_info", return_value=("0.0.0.0", 0))
 
         with pytest.raises(ConnectionError):
-            await agent.register_agent()
+            await agent._register_agent()
 
     @pytest.mark.asyncio
     async def test_launch_workers(
         self,
         daemon: OobleckMasterDaemon,
-        sample_job: DistributedJobConfiguration,
         agent: OobleckAgent,
+        mocker: MockerFixture,
     ):
-        pass
+        mocker.patch("oobleck.elastic.agent.worker_main", new_callable=lambda: 0)
 
-    @pytest.mark.asyncio
-    async def test_receive_reconfiguration():
-        pass
-
-    @pytest.mark.asyncio
-    async def test_receive_node_disconnect():
-        pass
-
-    # @pytest.mark.asyncio
-    # async def test_receive_reconfiguration(
-    #     self, daemon: OobleckMasterDaemon, agent: OobleckAgent
-    # ):
-    #     await agent.register_agent()
-    #     # TODO: daemon only check IP when registering agent, then use streams.
-    #     # To open another connection, we change the agent's ip.
-    #     daemon._job.agent_info[0].ip = "127.0.0.2"
-    #     daemon._job.agent_info.append(_AgentInfo("127.0.0.1", [1]))
-
-    #     agent2 = OobleckAgent()
-    #     await agent2.connect_to_master("localhost", daemon.port)
-    #     await agent2.register_agent()
-
-    #     agent.on_receive_reconfiguration = AsyncMock(
-    #         wraps=agent.on_receive_reconfiguration
-    #     )
-
-    #     # disconnect agent2
-    #     agent2.conn_[1].close()
-    #     await asyncio.sleep(0.1)
-    #     agent.on_receive_reconfiguration.assert_called()
+        await agent._register_agent()
+        await agent._launch_workers(self.sample_num_workers, daemon._job.job_args)
+        assert len(agent._workers) == self.sample_num_workers
+        await asyncio.wait([worker.process for worker in agent._workers])
 
     @staticmethod
-    def fake_worker_main(
-        my_ip: str,
-        path: Path,
-        local_rank: int,
-        num_gpus_per_node: int,
-        pipe: connection.Connection,
+    def fake_worker_main_echo_lost_ranks(
+        index: int,
+        num_workers: int,
+        pipe: Connection,
         args: OobleckArguments,
     ):
-        factory = OobleckStaticClassFactory(args.model_name, path)
-        with patch("socket.gethostbyname", return_value=my_ip), patch(
-            "oobleck.execution.engine.PipelineTemplateGenerator.create_pipeline_templates",
-            autospec=True,
-            return_value=[
-                factory.get_dummy_pipeline_template(
-                    num_stages=num_gpus_per_node,
-                    num_gpus_per_node=num_gpus_per_node,
-                    num_nodes=1,
-                )
-            ],
-        ), patch(
-            "oobleck.execution.engine.get_profile_results",
-            autospec=True,
-            return_value=factory.get_dummy_profile(),
-        ), patch(
-            "oobleck.execution.engine.OobleckDataset",
-            autospec=True,
-            return_value=factory.get_dataset(),
-        ), patch(
-            "oobleck.execution.engine.OobleckModel",
-            autospec=True,
-            return_value=factory.get_model(),
-        ):
-            worker_main(local_rank, num_gpus_per_node, pipe, args)
-
-    @pytest.mark.asyncio
-    async def test_launch_workers(
-        self,
-        agent: OobleckAgent,
-        model_name_fixture: str,
-        tmp_path: Path,
-        mocker: MockerFixture,
-    ):
-        await agent.register_agent()
-
-        dataset_path, dataset_name = datasets[model_name_fixture]
-        fake_args = OobleckArguments(
-            model_name=model_name_fixture,
-            model_tag="elastic_test",
-            dataset_path=dataset_path,
-            dataset_name=dataset_name,
-            fault_threshold=1,
-            model_args=model_args[model_name_fixture],
-            global_microbatch_size=8,
-            steps=10,
-        )
-
-        my_ip: str = "127.0.0.1"
-        mocker.patch("socket.gethostbyname", return_value=my_ip)
-
-        mocker.patch(
-            "oobleck.elastic.agent.worker_main",
-            functools.partial(self.fake_worker_main, my_ip, tmp_path),
-        )
-        await agent.launch_workers(4, fake_args)
-
-        # Assume master already sent dist info
-        # Agent can get dist info via:
-        # await agent.get_dist_info()
-
-        # Send dist info to workers
-        dist_info = message_util.DistributionInfo([my_ip], 4)
-        for worker in agent._workers:
-            worker.pipe.send(dist_info)
-
-        # Because this agent has rank 0, it should forward worker port
-        if dist_info.agent_ips.index(my_ip) == 0:
-            await agent.forward_worker_port(agent._workers[0].pipe)
-
-        loop = asyncio.get_running_loop()
-        for worker in agent._workers:
-            await loop.run_in_executor(None, worker.process.join)
-
-    @staticmethod
-    def fake_worker_main_wait_for_signal(*args, **kawrgs):
+        # To notify main process that it is ready
+        pipe.send(0)
         signal.sigwait([signal.SIGUSR1])
 
-    @pytest.mark.asyncio
-    async def test_signal_to_workers(
-        self,
-        agent: OobleckAgent,
-        mocker: MockerFixture,
-    ):
-        await agent.register_agent()
+    @staticmethod
+    def agent_process_fn(args: OobleckAgentArguments):
+        logging.basicConfig(level=logging.INFO)
+        agent = OobleckAgent(args)
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(
+            agent._connect_to_master(args.master_ip, args.master_port)
+        )
+        loop.run_until_complete(agent._register_agent())
 
+    @pytest.mark.asyncio
+    async def test_receive_reconfiguration(
+        self, daemon: OobleckMasterDaemon, agent: OobleckAgent, mocker: MockerFixture
+    ):
         mocker.patch(
             "oobleck.elastic.agent.worker_main",
-            self.fake_worker_main_wait_for_signal,
+            new=TestOobleckAgentClass.fake_worker_main_echo_lost_ranks,
         )
-        fake_args = OobleckArguments(
-            model_name="",
-            model_tag="",
-            dataset_path="",
-            dataset_name=None,
-            fault_threshold=1,
-            model_args=None,
-            global_microbatch_size=0,
-            steps=0,
-        )
-        await agent.launch_workers(4, fake_args)
+        kill_spy = mocker.spy(os, "kill")
 
-        mocker.patch("oobleck.elastic.agent.message_util.recv", return_value=[2])
-        await agent.on_receive_reconfiguration()
+        await agent._register_agent()
+        await agent._launch_workers(self.sample_num_workers, daemon._job.job_args)
+        pipe_spy = mocker.spy(agent._workers[0].pipe, "send")
 
-        futures: list[Future] = []
-        with ThreadPoolExecutor(len(agent._workers)) as executor:
-            for worker in agent._workers:
-                futures.append(executor.submit(worker.process.join))
+        assert list(agent._rank_map.keys()) == daemon._job.node_ips
+        expected_lost_ranks = agent._rank_map["127.0.0.2"]
 
-        _, not_done = wait(futures, timeout=30)
-        assert len(not_done) == 0
+        for worker in agent._workers:
+            worker.pipe.recv()
+
+        with patch(
+            "asyncio.StreamWriter.get_extra_info", return_value=("127.0.0.2", "12345")
+        ):
+            agent2 = multiprocessing.get_context("spawn").Process(
+                target=self.agent_process_fn, args=(agent._args,)
+            )
+            agent2.start()
+            future = asyncio.get_running_loop().run_in_executor(None, agent2.join)
+            await asyncio.wait([future])
+        await asyncio.sleep(1)
+
+        assert "127.0.0.2" not in agent._rank_map
+        assert kill_spy.call_count == self.sample_num_workers
+        pipe_spy.assert_called_with(expected_lost_ranks)

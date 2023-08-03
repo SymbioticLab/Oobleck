@@ -36,9 +36,12 @@ class TestOobleckMasterDaemonClass(OobleckElasticTestCase):
         self,
         daemon: OobleckMasterDaemon,
         client_conns: tuple[asyncio.StreamReader, asyncio.StreamWriter],
-        sample_job: DistributedJobConfiguration,
         mocker: MockerFixture,
     ):
+        job = daemon._job
+        # Daemon must not have a job config
+        daemon._job = None
+
         mock_run_agents = mocker.patch.object(
             daemon, "run_node_agent", return_value=AsyncMock(return_value=None)
         )
@@ -46,7 +49,7 @@ class TestOobleckMasterDaemonClass(OobleckElasticTestCase):
         r, w = client_conns
         """Cehck if master launches agents."""
         await message_util.send_request_type(w, message_util.RequestType.LAUNCH_JOB)
-        await message_util.send(w, sample_job, need_pickle=True, close=False)
+        await message_util.send(w, job, need_pickle=True, close=False)
 
         result = await message_util.recv_response(r)
         assert result == (
@@ -54,47 +57,23 @@ class TestOobleckMasterDaemonClass(OobleckElasticTestCase):
             message_util.RequestType.LAUNCH_JOB,
         )
 
+        assert mock_run_agents.call_count == len(job.node_ips)
+        assert daemon._job == job
+
         w.close()
         await w.wait_closed()
-
-        assert mock_run_agents.call_count == len(sample_job.node_ips)
-        assert daemon._job == sample_job
 
     @pytest.mark.asyncio
     async def test_request_job_fail(
         self,
-        daemon: OobleckMasterDaemon,
         client_conns: tuple[asyncio.StreamReader, asyncio.StreamWriter],
-        sample_job: DistributedJobConfiguration,
     ):
-        # If daemon already has a job, it should return failure.
-        daemon._job = sample_job
-
         r, w = client_conns
         await message_util.send_request_type(w, message_util.RequestType.LAUNCH_JOB)
         assert (await message_util.recv_response(r)) == (
             message_util.Response.FAILURE,
             message_util.RequestType.LAUNCH_JOB,
         )
-
-    @pytest.mark.asyncio
-    async def test_register_agent(
-        self,
-        daemon: OobleckMasterDaemon,
-        agent: OobleckAgent,
-        sample_job: DistributedJobConfiguration,
-    ):
-        daemon._job = sample_job
-        assert not daemon._agent_connections
-
-        r, w = agent._conn
-        await message_util.send_request_type(w, message_util.RequestType.REGISTER_AGENT)
-        assert await message_util.recv_response(r) == (
-            message_util.Response.SUCCESS,
-            message_util.RequestType.REGISTER_AGENT,
-        )
-
-        assert "127.0.0.1" in daemon._agent_connections
 
     @pytest.mark.asyncio
     async def test_agent_disconnect(
