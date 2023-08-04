@@ -1,5 +1,4 @@
 import asyncio
-import logging
 import multiprocessing
 import os
 import signal
@@ -9,12 +8,15 @@ from dataclasses import dataclass
 from multiprocessing import connection
 
 import simple_parsing
+from deepspeed.utils.logging import LoggerFactory
 
 import oobleck.elastic.message_util as message_util
+from oobleck.csrc.planning.pipeline_template import get_profile_results
 from oobleck.elastic.training_util import OobleckAgentArguments, OobleckArguments
 from oobleck.elastic.worker import worker_main
+from oobleck.planning.profiler import profile
 
-logger = logging.getLogger(__name__)
+logger = LoggerFactory.create_logger("oobleck_agent")
 
 
 @dataclass
@@ -51,7 +53,7 @@ class OobleckAgent:
     async def run(self):
         await self._connect_to_master(self._args.master_ip, self._args.master_port)
         await self._register_agent()
-        await self._launch_workers(self._args.num_workers, self._args)
+        await self._launch_workers(self._args.num_workers, self._args.job_args)
 
     async def _connect_to_master(self, master_ip: str, master_port: int):
         # TODO: add timeout in connection
@@ -75,10 +77,41 @@ class OobleckAgent:
         # asyncio.create_task(self.ping())
         asyncio.create_task(self.on_receive_response())
 
+    def _run_profiler(self, num_workers: int, args: OobleckArguments):
+        ctx = multiprocessing.get_context("spawn")
+        profiler_processes: list[multiprocessing.Process] = []
+
+        for index in range(num_workers):
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(index)
+            my_ip = socket.gethostbyname(socket.gethostname())
+            master_ip = self._args.node_ips[0]
+            master_port = 23456
+            world_size = len(self._args.node_ips) * num_workers
+            rank = self._args.node_ips.index(my_ip) * num_workers + index
+            process = ctx.Process(
+                target=profile,
+                args=(args, master_ip, master_port, num_workers, world_size, rank),
+            )
+            process.start()
+            profiler_processes.append(process)
+
+        for process in profiler_processes:
+            process.join()
+
     async def _launch_workers(self, num_workers: int, args: OobleckArguments):
-        loop = asyncio.get_running_loop()
+        # Test if profile data exists
+        try:
+            get_profile_results(args.model_name, args.model_tag, args.microbatch_size)
+        except Exception:
+            # Run profiler
+            logger.warning(
+                f"Profile data for model {args.model_name} not found. Launching profiler..."
+            )
+            self._run_profiler(num_workers, args)
+
         ctx = multiprocessing.get_context("spawn")
         for index in range(num_workers):
+            logger.info(f"Launching worker {index}...")
             # TODO: add all arguments. Arguments should be passed from the master
             # via command line arguments.
             pipe, child_pipe = ctx.Pipe()
@@ -86,7 +119,13 @@ class OobleckAgent:
 
             process = ctx.Process(
                 target=worker_main,
-                args=(index, num_workers, child_pipe, args),
+                args=(
+                    index,
+                    len(self._args.node_ips) * num_workers,
+                    1,
+                    child_pipe,
+                    args,
+                ),
                 daemon=True,
             )
             process.start()
@@ -98,6 +137,10 @@ class OobleckAgent:
             # if a worker fails.
 
         os.environ.pop("CUDA_VISIBLE_DEVICES")
+
+        # test
+        for worker in self._workers:
+            worker.process.join()
 
     async def forward_worker_port(self, pipe: connection.Connection):
         _, w = self._conn
@@ -205,9 +248,9 @@ class OobleckAgent:
 
 
 if __name__ == "__main__":
-    logger.setLevel(logging.INFO)
-
     args: OobleckAgentArguments = simple_parsing.parse(OobleckAgentArguments)
     agent = OobleckAgent(args)
+
+    logger.info(f"Arguments: {args.to_dict()}")
 
     asyncio.run(agent.run())

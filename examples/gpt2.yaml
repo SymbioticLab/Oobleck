@@ -1,8 +1,4 @@
-# python -m oobleck.run --config_path examples/gpt2.yaml --master_ip ip --master_port port
-
-
-node_ips:
-  - 127.0.0.1
+# python -m oobleck.run --config_path examples/gpt2.yaml --node_ips [agent_ips] --master_ip ip --master_port port
 
 job_args:
   model_name: gpt2

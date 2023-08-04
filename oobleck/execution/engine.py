@@ -353,6 +353,7 @@ class OobleckEngine:
     def __init__(
         self,
         local_rank: int,
+        num_nodes: int,
         num_gpus_per_node: int,
         pipe: connection.Connection,
         args: OobleckArguments,
@@ -376,6 +377,7 @@ class OobleckEngine:
         )
 
         self._local_rank: int = local_rank
+        self._num_nodes: int = num_nodes
         self._num_gpus_per_node: int = num_gpus_per_node
 
         # Initialize without distributed
@@ -387,10 +389,10 @@ class OobleckEngine:
             self._model,
             self._profile_results,
             self._pipeline_templates,
-        ) = self.initialize_engine(self._num_gpus_per_node)
+        ) = self._initialize_engine(self._num_nodes, self._num_gpus_per_node)
 
-    def initialize_engine(
-        self, num_gpus_per_node: int
+    def _initialize_engine(
+        self, num_nodes: int, num_gpus_per_node: int
     ) -> tuple[
         OobleckDataset,
         OobleckModel,
@@ -425,7 +427,7 @@ class OobleckEngine:
         pipeline_templates: list[
             PipelineTemplate
         ] = template_generator.create_pipeline_templates(
-            profile_results, (1, num_gpus_per_node), num_gpus_per_node
+            profile_results, (1, num_nodes), 1
         )
 
         return dataset, model, profile_results, pipeline_templates

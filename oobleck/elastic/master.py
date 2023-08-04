@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import socket
 import time
 from pathlib import Path
+from typing import Any, Optional
 
 import aiofiles
 import asyncssh
+import simple_parsing
+from deepspeed.utils.logging import LoggerFactory
 
 import oobleck.elastic.message_util as message_util
 from oobleck.elastic.training_util import (
@@ -16,7 +18,7 @@ from oobleck.elastic.training_util import (
     flatten_configurations,
 )
 
-logger = logging.getLogger(__name__)
+logger = LoggerFactory.create_logger("oobleck_master")
 
 max_num_nodes: int = 32
 
@@ -42,26 +44,24 @@ class OobleckMasterDaemon:
         self._agent_connections: dict[
             str, tuple[asyncio.StreamReader, asyncio.StreamWriter]
         ] = {}
+        self._workers: list[
+            tuple[asyncssh.SSHClientConnection, asyncssh.SSHClientProcess]
+        ] = []
 
     @property
     def port(self) -> int:
         return self._port
 
     @classmethod
-    async def create(cls, master_port: int = 0) -> OobleckMasterDaemon:
+    async def create(cls, ip: str | None, port: int) -> OobleckMasterDaemon:
         daemon = OobleckMasterDaemon()
         server: asyncio.Server = await asyncio.start_server(
-            daemon.on_connected, "127.0.0.1", master_port
+            daemon.on_connected, ip, port
         )
         daemon._server = server
         daemon._port = server.sockets[0].getsockname()[1]
 
         return daemon
-
-    async def run(self) -> OobleckMasterDaemon:
-        logger.info(f"Master daemon is running on port {self._port}...")
-        async with self._server:
-            await self._server.serve_forever()
 
     async def run_node_agent(
         self,
@@ -71,28 +71,40 @@ class OobleckMasterDaemon:
     ):
         master_ip = socket.gethostbyname(socket.gethostname())
         node_ip = job_config.node_ips[index]
-        async with asyncssh.connect(
+        conn = await asyncssh.connect(
             node_ip, job_config.node_port, username=job_config.username
-        ) as conn:
-            cmd = '/bin/bash -ic "conda run -n oobleck python -m oobleck.elastic.agent '
+        )
 
-            agent_args = OobleckAgentArguments(
-                master_ip=master_ip,
-                master_port=self._port,
-                node_ips=job_config.node_ips,
-                job_args=job_config.job_args,
-                num_workers=4,
-            )
-            cmd += " ".join(
-                [f"--{k}={v}" for k, v in flatten_configurations(agent_args).items()]
-            )
+        cmd = '/bin/bash -ic "conda run -n oobleck python -m oobleck.elastic.agent '
+        agent_args = OobleckAgentArguments(
+            master_ip=master_ip,
+            master_port=self._port,
+            node_ips=job_config.node_ips,
+            job_args=job_config.job_args,
+            num_workers=4,
+        )
+        cmd += " ".join(
+            [f"--{k}={v}" for k, v in flatten_configurations(agent_args).items()]
+        )
+        cmd += '"'
+        logger.info(f"Launching an agent on {node_ip}: {cmd}")
 
-            log_file_path = log_path / f"{node_ip}.out"
-            async with conn.create_process(
-                cmd, term_type="xterm"
-            ) as process, aiofiles.open(log_file_path, "w") as log_file:
-                output = await process.stdout.readline()
-                await log_file.write(output)
+        # log_file_path = log_path / f"{node_ip}.out"
+        # file = await aiofiles.open(log_file_path, "w")
+        process = await conn.create_process(cmd, term_type="xterm")
+        self._workers.append((conn, process))
+
+        while True:
+            data = await process.stdout.readline()
+            print(data)
+
+        # async with conn.create_process(
+        #     cmd,
+        #     term_type="xterm",
+        # ) as process, aiofiles.open(log_file_path, "w") as log_file:
+        #     while not process.is_closing():
+        #         output = await process.stdout.readline()
+        #         await log_file.write(output)
 
     async def request_job_handler(
         self, r: asyncio.StreamReader, w: asyncio.StreamWriter
@@ -119,7 +131,6 @@ class OobleckMasterDaemon:
                 log_path.mkdir(parents=True, exist_ok=False)
 
                 for index in range(len(self._job.node_ips)):
-                    logger.info(f"Launching an agent on {self._job.node_ips[index]}")
                     asyncio.create_task(
                         self.run_node_agent(
                             index,
@@ -130,7 +141,7 @@ class OobleckMasterDaemon:
 
                 result = message_util.Response.SUCCESS
         except Exception as e:
-            logging.warning(e)
+            logger.warning(e)
             result = message_util.Response.FAILURE
         finally:
             await message_util.send_response(
@@ -232,6 +243,9 @@ class OobleckMasterDaemon:
         except (asyncio.IncompleteReadError, ConnectionResetError):
             logger.warning(f"Agent {agent_ip} disconnected")
             await self.close_agent(agent_ip)
+            if not self._agent_connections:
+                logger.warning("No agent alive. Cancel job.")
+                self._job = None
 
     async def on_connected(self, r: asyncio.StreamReader, w: asyncio.StreamWriter):
         """
@@ -257,11 +271,17 @@ class OobleckMasterDaemon:
             await w.wait_closed()
 
 
-async def main():
-    daemon = await OobleckMasterDaemon.create()
-    await daemon.run()
+async def main(ip: str | None, port: int):
+    daemon = await OobleckMasterDaemon.create(ip, port)
+    logger.info(f"Master daemon is running on port {daemon._port}...")
+    await daemon._server.serve_forever()
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    asyncio.run(main())
+    parser = simple_parsing.ArgumentParser()
+    parser.add_argument("--ip", type=Optional[str], default=None)
+    parser.add_argument("--port", type=int, default=0)
+
+    args = parser.parse_args()
+
+    asyncio.run(main(args.ip, args.port))

@@ -55,6 +55,11 @@ def flatten_configurations(
     for k, v in asdict(dataclass).items():
         if is_dataclass(v):
             result.update(flatten_configurations(v))
+        elif isinstance(v, dict):
+            v = {k: v for k, v in v.items() if v is not None}
+            result.update(v)
+        elif isinstance(v, list):
+            result[k] = ",".join(v)
         else:
             result[k] = v
     return result

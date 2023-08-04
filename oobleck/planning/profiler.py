@@ -1,21 +1,26 @@
 import gc
 import json
+import logging
 import math
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 import torch.fx
-from deepspeed.utils.logging import logger
+from deepspeed.utils.logging import LoggerFactory
 
+from oobleck.elastic.training_util import OobleckArguments
+from oobleck.execution.dataset import OobleckDataset
+from oobleck.execution.layer import init_tensors
 from oobleck.module.model import OobleckModel
 
 PROFILE_CACHE = "/tmp/oobleck/profiles"
 num_warmup = 2
 num_iteration = 3
+
+logger = LoggerFactory.create_logger("oobleck_profiler")
 
 
 class Profiler:
@@ -28,19 +33,23 @@ class Profiler:
     def __init__(
         self,
         model: OobleckModel,
+        num_workers_per_node: int,
+        world_size: int,
     ):
         self.model = model
+        self.num_workers_per_node = num_workers_per_node
+        self.world_size = world_size
 
-    def profile_execution_layers(self, batch_size: int) -> List[Dict[str, float]]:
+    def profile_execution_layers(self, batch_size: int) -> list[dict[str, float]]:
         assert dist.is_initialized()
         import copy
 
-        results: List[List[int]] = [
+        results: list[list[int]] = [
             [0.0, 0.0, 0.0, 0.0] for _ in range(len(self.model.layers))
         ]
         if dist.get_rank() == 0:
             for i in range(num_warmup + 1):
-                logger.info(f"Profiling layer execution ltency: {i} iteration")
+                logger.info(f"Profiling layer execution latency: {i} iteration")
                 input = tuple(
                     [
                         t.detach().clone().to("cuda")
@@ -131,33 +140,30 @@ class Profiler:
         del tensor
         return (end - start) / 1_000_000
 
-    def profile_allreduce_across_nodes(self) -> List[Dict[int, float]]:
+    def profile_allreduce_across_nodes(self) -> list[dict[int, float]]:
         """Profile allreduce latency across nodes,
         \# nodes = 2, 3, ... N.
         Actual measurement is done only on global rank 0,
         later others will receive the result from the rank.
 
         Returns:
-            List[Dict[int, float]]: A list of allreduce latency,
+            list[dict[int, float]]: A list of allreduce latency,
             where key is the number of nodes and value is the latency,
             for every layer.
         """
         assert dist.is_initialized()
-        logger.info(
-            f"Profile allreduce acorss {os.environ['WORLD_SIZE']} nodes latency"
-        )
+        logger.info(f"Profile allreduce across {self.world_size} nodes latency")
 
-        num_gpus_per_node = torch.cuda.device_count()
         ranks = list(range(0, dist.get_world_size()))
 
-        process_groups: List[Tuple(bool, dist.ProcessGroup)] = []
-        for i in range(0, len(ranks), num_gpus_per_node):
-            pg_ranks = ranks[i : i + num_gpus_per_node]
+        process_groups: list[tuple(bool, dist.ProcessGroup)] = []
+        for i in range(0, len(ranks), self.num_workers_per_node):
+            pg_ranks = ranks[i : i + self.num_workers_per_node]
             process_groups.append(
                 (dist.get_rank() in pg_ranks, dist.new_group(pg_ranks))
             )
 
-        results: List[List[int]] = [
+        results: list[list[int]] = [
             [0] * len(process_groups) for _ in range(len(self.model.layers))
         ]
         for layer_index, layer in enumerate(self.model.layers):
@@ -180,14 +186,14 @@ class Profiler:
             for result in results.tolist()
         ]
 
-    def profile_allreduce_in_node(self) -> List[Dict[int, float]]:
+    def profile_allreduce_in_node(self) -> list[dict[int, float]]:
         """Profile allreduce latency between GPUs in node,
         \# nodes = 1, 2, 4, ....
         Actual measurement is done only on global rank 0,
         later others will receive the result from the rank.
 
         Returns:
-            List[Dict[int, float]]: A list of allreduce latency,
+            list[dict[int, float]]: A list of allreduce latency,
             where key is the number of GPUs and value is the latency,
             for every layer.
         """
@@ -199,14 +205,14 @@ class Profiler:
         num_gpus_list = [2**i for i in range(int(math.log2(num_gpus_per_node)) + 1)]
         ranks = list(range(num_gpus_per_node))
 
-        process_groups: List[Tuple(bool, dist.ProcessGroup)] = []
+        process_groups: list[tuple(bool, dist.ProcessGroup)] = []
         for i in range(len(num_gpus_list)):
             pg_ranks = ranks[: num_gpus_list[i]]
             process_groups.append(
                 (dist.get_rank() in pg_ranks, dist.new_group(pg_ranks))
             )
 
-        results: List[List[int]] = [
+        results: list[list[int]] = [
             [0] * len(process_groups) for _ in range(len(self.model.layers))
         ]
         for layer_index, layer in enumerate(self.model.layers):
@@ -230,17 +236,17 @@ class Profiler:
         ]
 
 
+def get_profile_path(model_name: str, model_tag: str) -> Path:
+    return Path(PROFILE_CACHE) / f"{model_name}-{model_tag}"
+
+
 def profile(
-    model_name: str,
-    sample_inputs: Dict[str, Any],
+    arguments: OobleckArguments,
     master_addr: str,
     master_port: int,
+    num_workers_per_node: int,
     world_size: int,
     rank: int,
-    local_rank: int,
-    microbatch_size: int,
-    model_tag: Optional[str] = None,
-    model_args: Optional[Dict[str, Any]] = None,
 ):
     """Profile the given model and return a list of execution result
     per layer.
@@ -250,29 +256,47 @@ def profile(
     Result is stored in cache for future use.
     Path: /tmp/oobleck/profiles/{model_name}-{tag}/{layers|allreduce_in_node|allreduce_across_nodes}
     """
-    os.environ["MASTER_ADDR"] = master_addr
-    os.environ["MASTER_PORT"] = str(master_port)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    os.environ["RANK"] = str(rank)
-    os.environ["LOCAL_RANK"] = str(local_rank)
-
-    directory = Path(f"{PROFILE_CACHE}/{model_name}-{model_tag}")
+    directory = get_profile_path(arguments.model_name, arguments.model_tag)
     directory.mkdir(parents=True, exist_ok=True)
 
-    logger.info("Profiling model %s", model_name)
+    logger.info("Profiling model %s", arguments.model_name)
 
-    model = OobleckModel(model_name, sample_inputs, None, model_tag, model_args)
-    profiler = Profiler(model)
+    dataset = OobleckDataset(
+        arguments.model_name, arguments.dataset_path, arguments.dataset_name
+    )
+    model = OobleckModel(
+        arguments.model_name,
+        dataset.sample,
+        None,
+        arguments.model_tag,
+        arguments.model_args,
+    )
+    device = torch.device("cuda")
+    for layer in model.layers:
+        init_tensors(layer, device)
+
+    profiler = Profiler(model, num_workers_per_node, world_size)
 
     assert not dist.is_initialized(), "Distributed is already initialized."
-    dist.init_process_group(backend="nccl")
+    store = dist.TCPStore(
+        host_name=master_addr,
+        port=master_port,
+        world_size=world_size,
+        is_master=bool(rank == 0),
+        wait_for_workers=False,
+    )
+    dist.init_process_group(
+        backend="nccl", store=store, rank=rank, world_size=world_size
+    )
 
-    path = directory.joinpath(f"mb{microbatch_size}.json")
+    path = directory.joinpath(f"mb{arguments.microbatch_size}.json")
     if path.exists():
         logger.info("Skip profiling execution latency.")
     else:
         logger.info("Profiling model execution latency.")
-        layer_execution_result = profiler.profile_execution_layers(microbatch_size)
+        layer_execution_result = profiler.profile_execution_layers(
+            arguments.microbatch_size
+        )
         # In each node, the first process writes a file.
         if "0" in os.environ["CUDA_VISIBLE_DEVICES"]:
             with path.open(mode="w") as f:
