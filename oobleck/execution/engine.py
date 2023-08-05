@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import logging
 import signal
 import socket
 import weakref
@@ -10,6 +9,7 @@ from multiprocessing import connection
 
 import deepspeed.comm as dist
 import torch.distributed
+from deepspeed.utils.logging import LoggerFactory
 from transformers.training_args import TrainingArguments as HFTrainingArguments
 
 from oobleck.csrc.planning.pipeline_template import (
@@ -28,6 +28,8 @@ from oobleck.planning.instantiator import (
     HeterogeneousPipelinesExecutionPlan,
     PipelineInstantiator,
 )
+
+logger = LoggerFactory.create_logger("oobleck_engine")
 
 
 class ReconfigurationEngine:
@@ -427,7 +429,7 @@ class OobleckEngine:
         pipeline_templates: list[
             PipelineTemplate
         ] = template_generator.create_pipeline_templates(
-            profile_results, (1, num_nodes), 1
+            profile_results, (1, num_nodes), num_gpus_per_node
         )
 
         return dataset, model, profile_results, pipeline_templates
@@ -435,7 +437,7 @@ class OobleckEngine:
     def initialize_distributed(self):
         if dist.is_initialized():
             # TODO: destroying process group should be done in C++ backend
-            logging.info("Destroying distributed process group...")
+            logger.info("Destroying distributed process group...")
             torch.distributed.destroy_process_group()
             dist.cdb = None
 
@@ -458,12 +460,15 @@ class OobleckEngine:
                 is_master=True,
                 wait_for_workers=False,
             )
+            logger.info(f"Creating a TCP store on port: {store.port}")
             self._agent_pipe.send(store.port)
             # Agent will send back this information. Discard it
             self._agent_pipe.recv()
         else:
+            logger.info("Waiting for a port information...")
             # wait for rank 0's port information
             port: int = self._agent_pipe.recv()
+            logger.info(f"Received torch master: {dist_info.agent_ips[0]}.{port}")
             store = torch.distributed.TCPStore(
                 host_name=dist_info.agent_ips[0],
                 port=port,
@@ -479,6 +484,8 @@ class OobleckEngine:
         )
         dist.init_distributed(dist_backend="nccl", dist_init_required=False)
         assert torch.distributed.is_initialized() and dist.is_initialized()
+
+        logger.info(f"[rank: {self._rank}] Distributed initialization is done.")
 
         # TODO: create pipeline and continue training
 
@@ -538,5 +545,5 @@ class OobleckEngine:
         assert self._hf_training_args.max_steps > 0
 
         for step in range(self._hf_training_args.max_steps):
-            logging.info(f"Step {step}")
+            logger.info(f"Step {step}")
             self._train_step()

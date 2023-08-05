@@ -44,9 +44,6 @@ class OobleckMasterDaemon:
         self._agent_connections: dict[
             str, tuple[asyncio.StreamReader, asyncio.StreamWriter]
         ] = {}
-        self._workers: list[
-            tuple[asyncssh.SSHClientConnection, asyncssh.SSHClientProcess]
-        ] = []
 
     @property
     def port(self) -> int:
@@ -71,43 +68,41 @@ class OobleckMasterDaemon:
     ):
         master_ip = socket.gethostbyname(socket.gethostname())
         node_ip = job_config.node_ips[index]
-        conn = await asyncssh.connect(
+
+        async with asyncssh.connect(
             node_ip, job_config.node_port, username=job_config.username
-        )
+        ) as conn:
+            cmd = '/bin/bash -ic "conda run --no-capture-output -n oobleck '
+            cmd += "python -m oobleck.elastic.agent "
+            agent_args = OobleckAgentArguments(
+                master_ip=master_ip,
+                master_port=self._port,
+                node_ips=job_config.node_ips,
+                job_args=job_config.job_args,
+                num_workers=4,
+            )
+            cmd += " ".join(
+                [f"--{k}={v}" for k, v in flatten_configurations(agent_args).items()]
+            )
+            cmd += '"'
+            logger.info(f"Launching an agent on {node_ip}: {cmd}")
 
-        cmd = '/bin/bash -ic "conda run -n oobleck python -m oobleck.elastic.agent '
-        agent_args = OobleckAgentArguments(
-            master_ip=master_ip,
-            master_port=self._port,
-            node_ips=job_config.node_ips,
-            job_args=job_config.job_args,
-            num_workers=4,
-        )
-        cmd += " ".join(
-            [f"--{k}={v}" for k, v in flatten_configurations(agent_args).items()]
-        )
-        cmd += '"'
-        logger.info(f"Launching an agent on {node_ip}: {cmd}")
-
-        # log_file_path = log_path / f"{node_ip}.out"
-        # file = await aiofiles.open(log_file_path, "w")
-        process = await conn.create_process(cmd, term_type="xterm")
-        self._workers.append((conn, process))
-
-        while True:
-            data = await process.stdout.readline()
-            print(data)
-
-        # async with conn.create_process(
-        #     cmd,
-        #     term_type="xterm",
-        # ) as process, aiofiles.open(log_file_path, "w") as log_file:
-        #     while not process.is_closing():
-        #         output = await process.stdout.readline()
-        #         await log_file.write(output)
+            log_file_path = log_path / f"{node_ip}.out"
+            async with aiofiles.open(
+                log_file_path, "w"
+            ) as log_file, conn.create_process(
+                cmd,
+                term_type="xterm",
+            ) as process:
+                while not process.is_closing():
+                    output = await process.stdout.readline()
+                    await log_file.write(output)
 
     async def request_job_handler(
-        self, r: asyncio.StreamReader, w: asyncio.StreamWriter
+        self,
+        job: DistributedJobConfiguration,
+        r: asyncio.StreamReader,
+        w: asyncio.StreamWriter,
     ):
         """
         Temporary request handler without maintaining the connection.
@@ -117,29 +112,27 @@ class OobleckMasterDaemon:
         try:
             if self._job:
                 raise RuntimeError("Job already exists.")
-            else:
-                self._job: DistributedJobConfiguration = await message_util.recv(
-                    r, need_pickle=True
-                )
 
-                current_time = time.localtime(time.time())
-                current_time = time.strftime("%m-%d-%Y-%H-%M-%S", current_time)
+            self._job = job
+            current_time = time.localtime(time.time())
+            current_time = time.strftime("%m-%d-%Y-%H-%M-%S", current_time)
 
-                log_path = Path(
-                    f"/tmp/oobleck/logs/{current_time}-{self._job.job_args.model_name}"
-                )
-                log_path.mkdir(parents=True, exist_ok=False)
+            log_path = Path(
+                f"/tmp/oobleck/logs/{current_time}-{self._job.job_args.model_name}"
+            )
+            log_path.mkdir(parents=True, exist_ok=False)
 
-                for index in range(len(self._job.node_ips)):
-                    asyncio.create_task(
-                        self.run_node_agent(
-                            index,
-                            self._job,
-                            log_path,
-                        )
+            loop = self._server.get_loop()
+            for index in range(len(self._job.node_ips)):
+                loop.create_task(
+                    self.run_node_agent(
+                        index,
+                        self._job,
+                        log_path,
                     )
+                )
 
-                result = message_util.Response.SUCCESS
+            result = message_util.Response.SUCCESS
         except Exception as e:
             logger.warning(e)
             result = message_util.Response.FAILURE
@@ -149,9 +142,8 @@ class OobleckMasterDaemon:
             )
 
     async def forward_rank0_port_handler(
-        self, r: asyncio.StreamReader, w: asyncio.StreamWriter
+        self, port: int, r: asyncio.StreamReader, w: asyncio.StreamWriter
     ):
-        port: int = await message_util.recv(r, need_pickle=True)
         logger.debug(f"Received rank0 port: {port}")
 
         for _, writer in self._agent_connections.values():
@@ -228,6 +220,7 @@ class OobleckMasterDaemon:
         )
 
     async def agent_handler(self, agent_ip: str):
+        loop = self._server.get_loop()
         r, w = self._agent_connections[agent_ip]
         try:
             while True:
@@ -236,7 +229,8 @@ class OobleckMasterDaemon:
                 if request_type == message_util.RequestType.PING:
                     await self.pong(w)
                 elif request_type == message_util.RequestType.FORWARD_RANK0_PORT:
-                    await self.forward_rank0_port_handler(r, w)
+                    port: int = await message_util.recv(r, need_pickle=True)
+                    loop.create_task(self.forward_rank0_port_handler(port, r, w))
                 else:
                     logger.warning(f"Unknown request type: {request_type}")
                     continue
@@ -258,7 +252,10 @@ class OobleckMasterDaemon:
             logger.info(f"Received request: {request_type}")
 
             if request_type == message_util.RequestType.LAUNCH_JOB:
-                loop.create_task(self.request_job_handler(r, w))
+                job: DistributedJobConfiguration = await message_util.recv(
+                    r, need_pickle=True
+                )
+                loop.create_task(self.request_job_handler(job, r, w))
             elif request_type == message_util.RequestType.REGISTER_AGENT:
                 loop.create_task(self.register_agent_handler(r, w))
             else:

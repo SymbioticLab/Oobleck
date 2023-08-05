@@ -49,11 +49,15 @@ class OobleckAgent:
         self._conn: tuple[asyncio.StreamReader, asyncio.StreamWriter] | None = None
         self._workers: list[Worker] = []
         self._response_callbacks: dict[message_util.RequestType, callable] = {}
+        self._job_done: bool = False
 
     async def run(self):
         await self._connect_to_master(self._args.master_ip, self._args.master_port)
         await self._register_agent()
         await self._launch_workers(self._args.num_workers, self._args.job_args)
+
+        while not self._job_done:
+            await self.on_receive_response()
 
     async def _connect_to_master(self, master_ip: str, master_port: int):
         # TODO: add timeout in connection
@@ -109,6 +113,11 @@ class OobleckAgent:
             )
             self._run_profiler(num_workers, args)
 
+        dist_info = message_util.DistributionInfo(
+            agent_ips=self._args.node_ips,
+            world_size=len(self._args.node_ips) * self._args.num_workers,
+        )
+
         ctx = multiprocessing.get_context("spawn")
         for index in range(num_workers):
             logger.info(f"Launching worker {index}...")
@@ -131,28 +140,30 @@ class OobleckAgent:
             process.start()
 
             self._workers.append(Worker(pipe, process))
+            pipe.send(dist_info)
 
             # TODO: detect worker failure and report it to the master.
             # For now only consider node failure, thus training will go stuck
             # if a worker fails.
-
         os.environ.pop("CUDA_VISIBLE_DEVICES")
 
-        # test
-        for worker in self._workers:
-            worker.process.join()
+        # If a worker has rank 0, it should forward its port to the master
+        my_ip: str = socket.gethostbyname(socket.gethostname())
+        if my_ip == self._args.node_ips[0]:
+            await self.forward_worker_port(self._workers[0].pipe)
 
     async def forward_worker_port(self, pipe: connection.Connection):
         _, w = self._conn
         port: int = pipe.recv()
+        logger.info(f"Received worker port: {port}. Forwarding it to master...")
         await message_util.send_request_type(
             w, message_util.RequestType.FORWARD_RANK0_PORT
         )
         await message_util.send(w, port, need_pickle=True, drain=True, close=False)
 
-    async def on_receive_worker_port(self):
+    async def on_receive_worker_port(self, port: int):
         r, w = self._conn
-        port: int = await message_util.recv(r, need_pickle=True)
+
         for worker in self._workers:
             worker.pipe.send(port)
 
@@ -177,9 +188,8 @@ class OobleckAgent:
                 self._conn[1], args, need_pickle=True, drain=True, close=False
             )
 
-    async def on_receive_reconfiguration(self):
-        logger.debug("reconfiguration request received")
-        lost_node: str = await message_util.recv(self._conn[0], need_pickle=True)
+    async def on_receive_reconfiguration(self, lost_node: str):
+        logger.debug(f"reconfiguration request received due to node failure: {str}")
 
         # This is for emulating a lost node by sending a command from the master.
         # Won't happen in normal case.
@@ -198,6 +208,7 @@ class OobleckAgent:
 
     async def on_receive_response(self):
         r, w = self._conn
+        loop = asyncio.get_running_loop()
         try:
             while not r.at_eof():
                 result = await message_util.recv_response(r, timeout=None)
@@ -213,13 +224,17 @@ class OobleckAgent:
                     message_util.Response.RECONFIGURATION,
                     message_util.RequestType.UNDEFINED,
                 ):
-                    await self.on_receive_reconfiguration()
+                    lost_node: str = await message_util.recv(
+                        self._conn[0], need_pickle=True
+                    )
+                    loop.create_task(self.on_receive_reconfiguration(lost_node))
 
                 elif result == (
                     message_util.Response.FORWARD_RANK0_PORT,
                     message_util.RequestType.UNDEFINED,
                 ):
-                    await self.on_receive_worker_port()
+                    port: int = await message_util.recv(r, need_pickle=True)
+                    loop.create_task(self.on_receive_worker_port(port))
                 elif result[0] == message_util.Response.SUCCESS:
                     response, request = result
                     if request not in self._response_callbacks:
@@ -234,6 +249,7 @@ class OobleckAgent:
 
         except asyncio.IncompleteReadError:
             logger.info("Connection closed by master")
+            self._job_done = True
             return
 
     async def ping(self):
