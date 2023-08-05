@@ -1,7 +1,7 @@
 import asyncio
 
-import pytest
 import pytest_asyncio
+from pytest_mock import MockerFixture
 
 from oobleck.elastic.agent import OobleckAgent
 from oobleck.elastic.master import OobleckMasterDaemon
@@ -21,7 +21,7 @@ class OobleckElasticTestCase:
         self,
         event_loop: asyncio.AbstractEventLoop,
     ) -> OobleckMasterDaemon:
-        daemon = await OobleckMasterDaemon.create()
+        daemon = await OobleckMasterDaemon.create("127.0.0.1", 0)
         daemon._job = DistributedJobConfiguration(
             master_ip="127.0.0.1",
             master_port=daemon.port,
@@ -34,7 +34,7 @@ class OobleckElasticTestCase:
             ),
             username="test",
         )
-        event_loop.create_task(daemon.run())
+        event_loop.create_task(daemon._server.serve_forever())
 
         yield daemon
 
@@ -44,7 +44,9 @@ class OobleckElasticTestCase:
         await daemon._server.wait_closed()
 
     @pytest_asyncio.fixture
-    async def agent(self, daemon: OobleckMasterDaemon) -> OobleckAgent:
+    async def agent(
+        self, daemon: OobleckMasterDaemon, mocker: MockerFixture
+    ) -> OobleckAgent:
         args = OobleckAgentArguments(
             master_ip=daemon._job.master_ip,
             master_port=daemon.port,
@@ -54,5 +56,9 @@ class OobleckElasticTestCase:
         )
 
         agent = OobleckAgent(args)
+
+        future = asyncio.Future()
+        future.set_result(None)
+        mocker.patch.object(agent, "_run_profiler", return_value=future)
         await agent._connect_to_master(args.master_ip, args.master_port)
         yield agent

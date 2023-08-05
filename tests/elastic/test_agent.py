@@ -1,17 +1,15 @@
 import asyncio
 import logging
 import multiprocessing
-import os
-import signal
-from multiprocessing.connection import Connection
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
 from unittest.mock import patch
 
 import pytest
 from pytest_mock import MockerFixture
 
-from oobleck.elastic.agent import OobleckAgent, OobleckAgentArguments
+from oobleck.elastic.agent import OobleckAgent, OobleckAgentArguments, Worker
 from oobleck.elastic.master import OobleckMasterDaemon
-from oobleck.elastic.training_util import OobleckArguments
 from tests.elastic.conftest import OobleckElasticTestCase
 
 
@@ -60,17 +58,6 @@ class TestOobleckAgentClass(OobleckElasticTestCase):
             worker.process.join()
 
     @staticmethod
-    def fake_worker_main_echo_lost_ranks(
-        index: int,
-        num_workers: int,
-        pipe: Connection,
-        args: OobleckArguments,
-    ):
-        # To notify main process that it is ready
-        pipe.send(0)
-        signal.sigwait([signal.SIGUSR1])
-
-    @staticmethod
     def agent_process_fn(args: OobleckAgentArguments):
         logging.basicConfig(level=logging.INFO)
         agent = OobleckAgent(args)
@@ -80,37 +67,42 @@ class TestOobleckAgentClass(OobleckElasticTestCase):
         )
         loop.run_until_complete(agent._register_agent())
 
+    @dataclass
+    class FakeProcess:
+        def __init__(self, pid: int):
+            self.pid = pid
+
+        pid: int
+
     @pytest.mark.asyncio
     async def test_receive_reconfiguration(
         self, daemon: OobleckMasterDaemon, agent: OobleckAgent, mocker: MockerFixture
     ):
-        mocker.patch(
-            "oobleck.elastic.agent.worker_main",
-            new=TestOobleckAgentClass.fake_worker_main_echo_lost_ranks,
-        )
-        kill_spy = mocker.spy(os, "kill")
+        num_workers = 4
 
         await agent._register_agent()
-        await agent._launch_workers(self.sample_num_workers, daemon._job.job_args)
-        pipe_spy = mocker.spy(agent._workers[0].pipe, "send")
-
         assert list(agent._rank_map.keys()) == daemon._job.node_ips
-        expected_lost_ranks = agent._rank_map["127.0.0.2"]
+        # Fake worker processes
+        pipe = multiprocessing.Pipe()
+        for i in range(num_workers):
+            agent._workers.append(Worker(pipe[1], TestOobleckAgentClass.FakeProcess(i)))
+        pipe_spy = mocker.spy(agent._workers[0].pipe, "send")
+        kill_mock = mocker.patch("os.kill", return_value=None)
 
-        for worker in agent._workers:
-            worker.pipe.recv()
+        expected_lost_ranks = agent._rank_map["127.0.0.2"]
 
         with patch(
             "asyncio.StreamWriter.get_extra_info", return_value=("127.0.0.2", "12345")
-        ):
-            agent2 = multiprocessing.get_context("spawn").Process(
-                target=self.agent_process_fn, args=(agent._args,)
+        ), ProcessPoolExecutor(max_workers=1) as executor:
+            loop = asyncio.get_running_loop()
+            future = loop.run_in_executor(
+                executor, TestOobleckAgentClass.agent_process_fn, agent._args
             )
-            agent2.start()
-            future = asyncio.get_running_loop().run_in_executor(None, agent2.join)
             await asyncio.wait([future])
-        await asyncio.sleep(1)
 
-        assert "127.0.0.2" not in agent._rank_map
-        assert kill_spy.call_count == self.sample_num_workers
+        # Yield context so that agent can receive reconfiguration message
+        while "127.0.0.2" in agent._rank_map:
+            await asyncio.sleep(1)
+
+        assert kill_mock.call_count == self.sample_num_workers
         pipe_spy.assert_called_with(expected_lost_ranks)

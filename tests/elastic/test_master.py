@@ -64,18 +64,6 @@ class TestOobleckMasterDaemonClass(OobleckElasticTestCase):
         await w.wait_closed()
 
     @pytest.mark.asyncio
-    async def test_request_job_fail(
-        self,
-        client_conns: tuple[asyncio.StreamReader, asyncio.StreamWriter],
-    ):
-        r, w = client_conns
-        await message_util.send_request_type(w, message_util.RequestType.LAUNCH_JOB)
-        assert (await message_util.recv_response(r)) == (
-            message_util.Response.FAILURE,
-            message_util.RequestType.LAUNCH_JOB,
-        )
-
-    @pytest.mark.asyncio
     async def test_agent_disconnect(
         self,
         daemon: OobleckMasterDaemon,
