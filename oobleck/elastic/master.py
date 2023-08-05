@@ -79,7 +79,7 @@ class OobleckMasterDaemon:
                 master_port=self._port,
                 node_ips=job_config.node_ips,
                 job_args=job_config.job_args,
-                num_workers=4,
+                num_workers=1,
             )
             cmd += " ".join(
                 [f"--{k}={v}" for k, v in flatten_configurations(agent_args).items()]
@@ -94,9 +94,12 @@ class OobleckMasterDaemon:
                 cmd,
                 term_type="xterm",
             ) as process:
-                while not process.is_closing():
-                    output = await process.stdout.readline()
-                    await log_file.write(output)
+                logger.info(
+                    f"Agent {node_ip} output will be written at {log_file_path}."
+                )
+                async for data in process.stdout:
+                    await log_file.write(data)
+                    await log_file.flush()
 
     async def request_job_handler(
         self,
