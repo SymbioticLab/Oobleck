@@ -77,10 +77,6 @@ class OobleckAgent:
         ):
             raise ConnectionError("Failed to register agent")
 
-        # When success, start pinging the master
-        # asyncio.create_task(self.ping())
-        asyncio.create_task(self.on_receive_response())
-
     def _run_profiler(self, num_workers: int, args: OobleckArguments):
         ctx = multiprocessing.get_context("spawn")
         profiler_processes: list[multiprocessing.Process] = []
