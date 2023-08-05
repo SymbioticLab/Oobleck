@@ -22,6 +22,20 @@ def is_checkpointable(layer: torch.fx.GraphModule) -> bool:
     return True
 
 
+def init_tensors(layer: torch.fx.GraphModule, device: torch.device):
+    """
+    Initialize meta tensors and move it to GPU.
+    TODO: must use checkpointed data
+    """
+    for param_name, param in layer.named_parameters():
+        set_module_tensor_to_device(layer, param_name, device, torch.rand(param.shape))
+
+    for buffer_name, buffer in layer.named_buffers():
+        set_module_tensor_to_device(
+            layer, buffer_name, device, torch.rand(buffer.shape)
+        )
+
+
 class Layer(torch.nn.Module):
     @classmethod
     def create_layer_from_layer(
@@ -41,21 +55,6 @@ class Layer(torch.nn.Module):
             self._param_handle.flat_param.grad.data = torch.tensor([])
         self._param_handle.flat_param.data = torch.tensor([])
 
-    def _init_tensors(self, layer: torch.fx.GraphModule, device: torch.device):
-        """
-        Initialize meta tensors and move it to GPU.
-        TODO: must use checkpointed data
-        """
-        for param_name, param in layer.named_parameters():
-            set_module_tensor_to_device(
-                layer, param_name, device, torch.rand(param.shape)
-            )
-
-        for buffer_name, buffer in layer.named_buffers():
-            set_module_tensor_to_device(
-                layer, buffer_name, device, torch.rand(buffer.shape)
-            )
-
     def __init__(
         self,
         layer_id: int,
@@ -69,7 +68,7 @@ class Layer(torch.nn.Module):
         device = torch.device("cuda", torch.cuda.current_device())
         self._layer_id = layer_id
         layer = copy.deepcopy(layer)
-        self._init_tensors(layer, device)
+        init_tensors(layer, device)
         if is_checkpointable(layer):
             layer = checkpoint_wrapper(layer)
 

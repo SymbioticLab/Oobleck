@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import copy
-import logging
+import signal
 import socket
 import weakref
 from collections import defaultdict
@@ -9,6 +9,7 @@ from multiprocessing import connection
 
 import deepspeed.comm as dist
 import torch.distributed
+from deepspeed.utils.logging import LoggerFactory
 from transformers.training_args import TrainingArguments as HFTrainingArguments
 
 from oobleck.csrc.planning.pipeline_template import (
@@ -18,7 +19,7 @@ from oobleck.csrc.planning.pipeline_template import (
     get_profile_results,
 )
 from oobleck.elastic.message_util import DistributionInfo
-from oobleck.elastic.training_util import TrainingArguments as OobleckArguments
+from oobleck.elastic.training_util import OobleckArguments
 from oobleck.execution.dataloader import LoaderType, OobleckDataLoader, OobleckSampler
 from oobleck.execution.dataset import OobleckDataset
 from oobleck.execution.pipeline import OobleckPipeline
@@ -27,6 +28,8 @@ from oobleck.planning.instantiator import (
     HeterogeneousPipelinesExecutionPlan,
     PipelineInstantiator,
 )
+
+logger = LoggerFactory.create_logger("oobleck_engine")
 
 
 class ReconfigurationEngine:
@@ -40,10 +43,25 @@ class ReconfigurationEngine:
             engine._pipeline_templates[0]._num_nodes
             * engine._pipeline_templates[0]._num_gpus_per_node
         )
+        signal.signal(signal.SIGUSR1, self._on_receive_reconfiguration_signal)
 
     @property
     def engine(self):
         return self._engine()
+
+    def _on_receive_reconfiguration_signal(self, signum: signal.Signals, frame):
+        """A method that will be executed in a separate thread
+        Waiting for an event from the agent to reconfigure the pipeline.
+
+        Once receive a signal from the agent, the worker will:
+        1. destroy current process group
+        2. reconfigure the pipeline with lost rank information
+        """
+        assert signum == signal.SIGUSR1
+
+        # This isn't a low level signal handler, so it doesn't have to finish quick.
+        lost_ranks: list[int] = self.engine._agent_pipe.recv()
+        self.on_reconfigure(lost_ranks)
 
     def on_reconfigure(self, lost_ranks: list[int]):
         def get_pipeline_template(
@@ -334,7 +352,14 @@ class DataParallelEngine:
 
 
 class OobleckEngine:
-    def __init__(self, pipe: connection.Connection, args: OobleckArguments):
+    def __init__(
+        self,
+        local_rank: int,
+        num_nodes: int,
+        num_gpus_per_node: int,
+        pipe: connection.Connection,
+        args: OobleckArguments,
+    ):
         assert (
             not dist.is_initialized()
         ), "torch.distributed must not be initialized when initializing OobleckEngine."
@@ -346,12 +371,16 @@ class OobleckEngine:
             "per_device_train_batch_size": args.microbatch_size,
             "no_cuda": True,  # don't use cuda in HFTrainingArguments
             "log_level": "error",  # omit warning messages from HFTrainingArguments
+            # do not set gradient_accumulation_steps in HFTrainingArguments
+            "max_steps": args.steps,
         }
         self._hf_training_args: HFTrainingArguments = HFTrainingArguments(
             **training_args
         )
 
-        self._num_gpus_per_node: int = pipe.recv()
+        self._local_rank: int = local_rank
+        self._num_nodes: int = num_nodes
+        self._num_gpus_per_node: int = num_gpus_per_node
 
         # Initialize without distributed
         self._dataset: OobleckDataset
@@ -362,10 +391,10 @@ class OobleckEngine:
             self._model,
             self._profile_results,
             self._pipeline_templates,
-        ) = self.initialize_engine(self._num_gpus_per_node)
+        ) = self._initialize_engine(self._num_nodes, self._num_gpus_per_node)
 
-    def initialize_engine(
-        self, num_gpus_per_node: int
+    def _initialize_engine(
+        self, num_nodes: int, num_gpus_per_node: int
     ) -> tuple[
         OobleckDataset,
         OobleckModel,
@@ -395,14 +424,12 @@ class OobleckEngine:
             self._hf_training_args.per_device_train_batch_size,
         )
 
-        num_gpus_per_node: int = torch.cuda.device_count()
-        # Calculate num_gpus_range based on profile results
-
+        # TODO: Calculate num_gpus_range based on profile results
         template_generator = PipelineTemplateGenerator()
         pipeline_templates: list[
             PipelineTemplate
         ] = template_generator.create_pipeline_templates(
-            profile_results, (1, num_gpus_per_node), num_gpus_per_node
+            profile_results, (1, num_nodes), num_gpus_per_node
         )
 
         return dataset, model, profile_results, pipeline_templates
@@ -410,7 +437,7 @@ class OobleckEngine:
     def initialize_distributed(self):
         if dist.is_initialized():
             # TODO: destroying process group should be done in C++ backend
-            logging.info("Destroying distributed process group...")
+            logger.info("Destroying distributed process group...")
             torch.distributed.destroy_process_group()
             dist.cdb = None
 
@@ -420,9 +447,8 @@ class OobleckEngine:
 
         self._num_nodes = len(dist_info.agent_ips)
         self._world_size = dist_info.world_size
-        self._local_rank = torch.cuda.current_device()
         self._rank = (
-            dist_info.agent_ips.index(my_ip) * torch.cuda.device_count()
+            dist_info.agent_ips.index(my_ip) * self._num_gpus_per_node
             + self._local_rank
         )
 
@@ -434,12 +460,15 @@ class OobleckEngine:
                 is_master=True,
                 wait_for_workers=False,
             )
+            logger.info(f"Creating a TCP store on port: {store.port}")
             self._agent_pipe.send(store.port)
             # Agent will send back this information. Discard it
             self._agent_pipe.recv()
         else:
+            logger.info("Waiting for a port information...")
             # wait for rank 0's port information
             port: int = self._agent_pipe.recv()
+            logger.info(f"Received torch master: {dist_info.agent_ips[0]}.{port}")
             store = torch.distributed.TCPStore(
                 host_name=dist_info.agent_ips[0],
                 port=port,
@@ -455,6 +484,8 @@ class OobleckEngine:
         )
         dist.init_distributed(dist_backend="nccl", dist_init_required=False)
         assert torch.distributed.is_initialized() and dist.is_initialized()
+
+        logger.info(f"[rank: {self._rank}] Distributed initialization is done.")
 
         # TODO: create pipeline and continue training
 
@@ -513,5 +544,6 @@ class OobleckEngine:
     def train(self):
         assert self._hf_training_args.max_steps > 0
 
-        for _ in range(self._hf_training_args.max_steps):
+        for step in range(self._hf_training_args.max_steps):
+            logger.info(f"Step {step}")
             self._train_step()
