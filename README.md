@@ -41,7 +41,7 @@ Successfully installed oobleck-0.1.0
 
 We provide a set of unit tests for each Oobleck components based on pytest. Other than 90+ tests for Oobleck testing, tests in the [`sosp23-artifact` branch](https://github.com/insujang/oobleck/tree/sosp23-artifact) are specialized in printing internal information (while normal tests don't) to help you understand its behavior and check if it matches with the paper explanation.
 
-> To simply run all artifact tests and check if all is passed, run: `pytest tests/sosp23-artifact`.
+> To simply run all artifact tests and check if all is passed, run: `pytest tests/sosp23`.
 
 We categorize tests as:
 1. **Generating pipeline templates (Section 4.1)**: based on profiled model data (layer execution time, communication time) and number of GPUs available, we create a set of pipeline templates. Tests check if stages in each pipeline template are balanced so that in pipeline parallel execution there is no straggler stage.
