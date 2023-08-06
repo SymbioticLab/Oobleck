@@ -155,6 +155,11 @@ def sample_args() -> OobleckArguments:
     )
 
 
+class FakeExecution:
+    def __init__(self):
+        self._layers = []
+
+
 class FakePipeline:
     def __init__(
         self,
@@ -171,6 +176,7 @@ class FakePipeline:
         self._dataloader = dataloader
         self._global_step = 0
         self.my_pipeline = bool(0 in self._ranks)
+        self.execution = FakeExecution()
 
         # copy from pipeline __init__
         # layer_index -> ranks
