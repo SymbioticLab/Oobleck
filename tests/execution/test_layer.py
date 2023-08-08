@@ -196,8 +196,45 @@ class TestShardedLayer(OobleckMultiProcessTestCase):
         for layer in layers:
             assert layer._param_handle.needs_unshard()
 
+    @staticmethod
+    def backward(
+        factory: OobleckStaticClassFactory,
+        dfactory: OobleckDynamicClassFactory,
+    ):
+        layers, input = TestNoshardedLayer.get_layers_and_inputs(
+            factory, torch.distributed.group.WORLD
+        )
+
+        output: tuple[torch.Tensor]
+        for layer in layers:
+            layer.unshard_params(HandleTrainingState.FORWARD)
+            torch.cuda.default_stream().wait_stream(layer.shard_stream)
+            output = layer(input)
+            input = output
+
+        # grad must be None before executing backward
+        for layer in layers:
+            assert layer._param_handle.flat_param.grad is None
+
+        # TODO: unshard and shard params for backward
+
+        for layer in layers:
+            layer._param_handle._training_state = HandleTrainingState.BACKWARD_PRE
+            layer._param_handle.prepare_gradient_for_backward()
+
+        # Begin test
+        output[0].backward()
+
+        # grad must be set after executing backward
+        for layer in layers:
+            assert (
+                layer._param_handle.flat_param.grad is not None
+                if layer._param_handle.flat_param.requires_grad
+                else None
+            )
+
     # @pytest.mark.parametrize("function", ["forward", "backward", "step"])
-    @pytest.mark.parametrize("function", ["forward"])
+    @pytest.mark.parametrize("function", ["forward", "backward"])
     def test_layer(self, function: str):
         func = getattr(self, function)
         self.run_in_parallel(4, func)

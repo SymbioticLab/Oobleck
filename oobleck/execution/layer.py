@@ -54,6 +54,12 @@ class Layer(torch.nn.Module):
         layer.shard_stream = layer.shard_stream
 
         layer._param_handle = existing_layer._param_handle
+        # layer.register_full_backward_pre_hook(
+        #     functools.partial(layer.pre_backward_hook, layer)
+        # )
+        # layer.register_full_backward_hook(
+        #     functools.partial(layer.post_backward_hook, layer)
+        # )
         return layer
 
     def remove_tensors(self):
@@ -100,6 +106,12 @@ class Layer(torch.nn.Module):
         )
         self._param_handle.shard()
         self._param_handle.init_flat_param_attributes()
+        # self.register_full_backward_pre_hook(
+        #     functools.partial(self.pre_backward_hook, self)
+        # )
+        # self.register_full_backward_hook(
+        #     functools.partial(self.post_backward_hook, self)
+        # )
 
     def unshard_params(self, state: HandleTrainingState):
         if self._param_handle._sharding_strategy == HandleShardingStrategy.NO_SHARD:
@@ -130,6 +142,27 @@ class Layer(torch.nn.Module):
 
     def forward(self, input: tuple[torch.Tensor]) -> tuple[torch.Tensor]:
         return self._param_handle._fully_sharded_module(*input)
+
+    @staticmethod
+    def pre_backward_hook(
+        self: Layer,
+        grad_output: torch.Tensor,
+    ):
+        self.unshard_params(HandleTrainingState.BACKWARD_PRE)
+        torch.cuda.default_stream().wait_stream(self.shard_stream)
+        self._param_handle.prepare_gradient_for_backward()
+
+    @staticmethod
+    def post_backward_hook(
+        self: Layer,
+        grad_output: torch.Tensor,
+    ):
+        self._param_handle._training_state = HandleTrainingState.BACKWARD_POST
+        self.shard_stream.wait_stream(torch.cuda.default_stream())
+
+        unsharded_grad = grad_output.data
+        with torch.cuda.stream(self.shard_stream):
+            self._param_handle.reshard_grad()
 
     def backward(
         self,
