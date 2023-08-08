@@ -9,6 +9,7 @@ from accelerate.utils.modeling import set_module_tensor_to_device
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
+from torch.distributed.fsdp._common_utils import HandleTrainingState
 from torch.distributed.fsdp.flat_param import FlatParamHandle, HandleShardingStrategy
 
 
@@ -46,7 +47,12 @@ class Layer(torch.nn.Module):
         assert torch.distributed.get_rank(process_group) >= 0
 
         layer = cls.__new__(cls)
-        layer._layer_id = existing_layer._layer_id
+        layer.layer_id = existing_layer.layer_id
+        layer._rank_index = torch.distributed.get_rank(process_group)
+        layer._group_size = torch.distributed.get_world_size(process_group)
+
+        layer.shard_stream = layer.shard_stream
+
         layer._param_handle = existing_layer._param_handle
         return layer
 
@@ -60,13 +66,19 @@ class Layer(torch.nn.Module):
         layer_id: int,
         layer: torch.fx.GraphModule,
         process_group: torch.distributed.ProcessGroup,
+        shard_stream: torch.cuda.Stream,
     ):
         super().__init__()
 
         assert torch.distributed.get_rank(process_group) >= 0
 
         device = torch.device("cuda", torch.cuda.current_device())
-        self._layer_id = layer_id
+        self.layer_id = layer_id
+        self._rank_index = torch.distributed.get_rank(process_group)
+        self._group_size = torch.distributed.get_world_size(process_group)
+
+        self.shard_stream = shard_stream
+
         layer = copy.deepcopy(layer)
         init_tensors(layer, device)
         if is_checkpointable(layer):
@@ -76,7 +88,9 @@ class Layer(torch.nn.Module):
             params=layer.parameters(),
             fully_sharded_module=layer,
             device=device,
-            sharding_strategy=HandleShardingStrategy.NO_SHARD,
+            sharding_strategy=HandleShardingStrategy.FULL_SHARD
+            if self._group_size > 1
+            else HandleShardingStrategy.NO_SHARD,
             offload_params=False,
             mp_param_dtype=torch.float32,  # TODO: change to bf16
             mp_reduce_dtype=torch.float32,
@@ -86,6 +100,33 @@ class Layer(torch.nn.Module):
         )
         self._param_handle.shard()
         self._param_handle.init_flat_param_attributes()
+
+    def unshard_params(self, state: HandleTrainingState):
+        if self._param_handle._sharding_strategy == HandleShardingStrategy.NO_SHARD:
+            return
+
+        assert state in [
+            HandleTrainingState.FORWARD,
+            HandleTrainingState.BACKWARD_PRE,
+        ], f"Invalid training state {self._param_handle._training_state}"
+        self._param_handle._training_state = state
+
+        # all further kernel execution will wait `all_gather_into_tensor()` to finish
+        with torch.cuda.stream(self.shard_stream):
+            self._param_handle.pre_unshard()
+            self._param_handle.unshard()
+            self._param_handle.post_unshard()
+
+    def reshard_params(self):
+        if (
+            self._param_handle._sharding_strategy == HandleShardingStrategy.NO_SHARD
+            or self._param_handle.needs_unshard()
+        ):
+            return
+
+        with torch.cuda.stream(self.shard_stream):
+            self._param_handle.reshard(True)
+            self._param_handle.post_reshard()
 
     def forward(self, input: tuple[torch.Tensor]) -> tuple[torch.Tensor]:
         return self._param_handle._fully_sharded_module(*input)

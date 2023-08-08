@@ -3,6 +3,7 @@ import itertools
 
 import pytest
 import torch.distributed
+from torch.distributed.fsdp._common_utils import HandleTrainingState
 
 from oobleck.execution.layer import Layer
 from oobleck.module.model import OobleckModel
@@ -17,8 +18,9 @@ def get_layers(model: OobleckModel, pgs: list[torch.distributed.ProcessGroup]):
     assert len(model.layers) == len(pgs)
 
     layers: list[Layer] = []
+    shard_stream = torch.cuda.Stream()
     for layer_id, (pg, layer) in enumerate(zip(pgs, model.layers)):
-        layers.append(Layer(layer_id, layer, pg))
+        layers.append(Layer(layer_id, layer, pg, shard_stream))
 
     return layers
 
@@ -137,3 +139,65 @@ class TestNoshardedLayer(OobleckMultiProcessTestCase):
     def test_layer(self, function: str):
         func = getattr(self, function)
         self.run_in_parallel(1, func)
+
+
+class TestShardedLayer(OobleckMultiProcessTestCase):
+    @staticmethod
+    def get_layers_and_inputs(
+        factory: OobleckStaticClassFactory,
+        process_group: torch.distributed.ProcessGroup,
+    ) -> tuple[list[Layer], tuple[torch.Tensor]]:
+        model = copy.deepcopy(factory.get_model())
+        pgs = [process_group] * len(model.layers)
+
+        layers = get_layers(model, pgs)
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        inputs: tuple[torch.Tensor, ...] = tuple(
+            [tensor.to(device) for tensor in model.sample_inputs.values()]
+        )
+
+        # reentrant based activation checkpointing requires
+        # input to require grad
+        for i in inputs:
+            i.requires_grad = i.is_floating_point()
+
+        return layers, inputs
+
+    @staticmethod
+    def forward(
+        factory: OobleckStaticClassFactory,
+        dfactory: OobleckDynamicClassFactory,
+    ):
+        layers, input = TestNoshardedLayer.get_layers_and_inputs(
+            factory, torch.distributed.group.WORLD
+        )
+
+        layers[0].unshard_params(HandleTrainingState.FORWARD)
+
+        output: tuple[torch.Tensor]
+        for layer in layers:
+            torch.cuda.default_stream().wait_stream(layer.shard_stream)
+
+            # Prefetch next layer unsharding
+            if layer.layer_id < len(layers) - 1:
+                layers[layer.layer_id + 1].unshard_params(HandleTrainingState.FORWARD)
+
+            output = layer(input)
+            input = output
+
+            layer.shard_stream.wait_stream(torch.cuda.default_stream())
+            layer.reshard_params()
+
+        # input[0]: loss, input[1]: logits
+        assert isinstance(input[0], torch.Tensor)
+
+        # Check all layers are sharded
+        for layer in layers:
+            assert layer._param_handle.needs_unshard()
+
+    # @pytest.mark.parametrize("function", ["forward", "backward", "step"])
+    @pytest.mark.parametrize("function", ["forward"])
+    def test_layer(self, function: str):
+        func = getattr(self, function)
+        self.run_in_parallel(4, func)
