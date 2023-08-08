@@ -18,19 +18,19 @@ from pytest_mock import MockerFixture
 
 from oobleck.csrc.planning.pipeline_template import PipelineTemplate
 from oobleck.elastic.message_util import DistributionInfo
-from oobleck.elastic.training_util import TrainingArguments as OobleckArguments
+from oobleck.elastic.training_util import OobleckArguments
 from oobleck.execution.dataloader import LoaderType, OobleckDataLoader, OobleckSampler
 from oobleck.execution.engine import OobleckEngine, ReconfigurationEngine
 from oobleck.execution.pipeline import OobleckPipeline
 from tests.conftest import (
     TRAIN_BATCH_SIZE,
-    OobleckElasticTestCase,
     OobleckMultiProcessTestCase,
     OobleckSingleProcessTestCase,
     OobleckStaticClassFactory,
     datasets,
     model_args,
 )
+from tests.elastic.conftest import OobleckElasticTestCase
 
 
 @pytest.fixture(scope="module")
@@ -48,7 +48,6 @@ def sample_args(model_name_fixture: str) -> OobleckArguments:
     )
 
 
-@pytest.mark.skip(reason="asyncio hangs when running multiple tests")
 class TestOobleckEngineClass(OobleckElasticTestCase):
     factory: OobleckStaticClassFactory
 
@@ -66,14 +65,10 @@ class TestOobleckEngineClass(OobleckElasticTestCase):
     def setup_class(
         cls,
         class_mocker: MockerFixture,
-        pipe: tuple[connection.Connection, connection.Connection],
         model_name_fixture: str,
         tmp_path_factory: pytest.TempPathFactory,
         request: pytest.FixtureRequest,
     ) -> None:
-        # max num GPUs
-        pipe[0].send(4)
-
         directory = tmp_path_factory.getbasetemp()
         request.cls.factory = OobleckStaticClassFactory(model_name_fixture, directory)
 
@@ -114,8 +109,13 @@ class TestOobleckEngineClass(OobleckElasticTestCase):
     ) -> OobleckEngine:
         monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
         mocker.patch("torch.cuda.device_count", return_value=1)
-        engine = OobleckEngine(pipe[1], sample_args)
+
+        engine = OobleckEngine(0, 1, 1, pipe[1], sample_args)
         yield engine
+
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+            dist.cdb = None
 
     def test_init_engine(self, engine: OobleckEngine):
         assert not torch.distributed.is_initialized()
@@ -263,6 +263,7 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
         factory: OobleckStaticClassFactory,
         rank: int,
         num_stages: int,
+        num_nodes: int,
         num_gpus_per_node: int,
         pipe: list[connection.Connection],
         agent_ips: list[str],
@@ -286,7 +287,7 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
         )
         pt_patcher.start()
 
-        engine = OobleckEngine(pipe, arguments)
+        engine = OobleckEngine(0, num_nodes, num_gpus_per_node, pipe, arguments)
         engine.initialize_distributed()
         assert dist.get_rank() < dist.get_world_size()
         assert dist.get_world_size() == 4, "This test must run with 4 GPUs"
@@ -320,8 +321,6 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
         agent_ips: list[str] = ["127.0.0.1", "127.0.0.2", "127.0.0.3", "127.0.0.4"]
         pipes = [ctx.Pipe(duplex=True) for _ in range(len(agent_ips))]
         for pipe, _ in pipes:
-            # max num GPUs
-            pipe.send(num_gpus_per_node)
             # DistributionInfo
             pipe.send(DistributionInfo(agent_ips, len(agent_ips)))
 
@@ -332,6 +331,7 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
             len(agent_ips),
             self._run_distributed_engine,
             num_stages,
+            len(agent_ips),
             num_gpus_per_node,
             [p[1] for p in pipes],
             agent_ips,
@@ -347,6 +347,7 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
         factory: OobleckStaticClassFactory,
         rank: int,
         num_stages: int,
+        num_nodes: int,
         num_gpus_per_node: int,
         pipe: list[connection.Connection],
         agent_ips: list[str],
@@ -373,7 +374,7 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
         )
         pt_patcher.start()
 
-        engine = OobleckEngine(pipe, arguments)
+        engine = OobleckEngine(0, num_nodes, num_gpus_per_node, pipe, arguments)
         engine.initialize_distributed()
         engine.instantiate_pipelines(global_num_microbatch)
 
@@ -408,8 +409,6 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
         agent_ips: list[str] = ["127.0.0.1", "127.0.0.2", "127.0.0.3", "127.0.0.4"]
         pipes = [ctx.Pipe(duplex=True) for _ in range(len(agent_ips))]
         for pipe, _ in pipes:
-            # max num GPUs
-            pipe.send(num_gpus_per_node)
             # DistributionInfo
             pipe.send(DistributionInfo(agent_ips, len(agent_ips)))
 
@@ -420,6 +419,7 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
             len(agent_ips),
             self._run_data_parallel_allreduce,
             num_stages,
+            len(agent_ips),
             num_gpus_per_node,
             [p[1] for p in pipes],
             agent_ips,
@@ -432,6 +432,7 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
         factory: OobleckStaticClassFactory,
         rank: int,
         num_stages: int,
+        num_nodes: int,
         num_gpus_per_node: int,
         pipe: list[connection.Connection],
         agent_ips: list[str],
@@ -486,7 +487,7 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
             )
         pt_patcher.start()
 
-        engine = OobleckEngine(pipe, arguments)
+        engine = OobleckEngine(0, num_nodes, num_gpus_per_node, pipe, arguments)
         engine.initialize_distributed()
         engine.instantiate_pipelines(global_num_microbatch)
 
@@ -566,8 +567,6 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
 
         def broadcast_rank0_port():
             for pipe, _ in pipes:
-                # max num GPUs
-                pipe.send(num_gpus_per_node)
                 # DistributionInfo
                 pipe.send(DistributionInfo(agent_ips, len(agent_ips)))
 
@@ -586,6 +585,7 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
             len(agent_ips),
             self._run_reconfiguration,
             num_stages,
+            len(agent_ips),
             num_gpus_per_node,
             [p[1] for p in pipes],
             agent_ips,
@@ -595,6 +595,9 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
 
 
 class TestOobleckReconfigurationClass(OobleckSingleProcessTestCase):
+    class Execution:
+        _layers: list[None] = []
+
     class FakePipeline:
         def __init__(
             self,
@@ -610,6 +613,7 @@ class TestOobleckReconfigurationClass(OobleckSingleProcessTestCase):
             self._ranks = ranks
             self._dataloader = dataloader
             self._global_step = 0
+            self.execution = TestOobleckReconfigurationClass.Execution()
             self.my_pipeline = bool(0 in self._ranks)
 
             # copy from pipeline __init__

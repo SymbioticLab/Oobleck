@@ -16,7 +16,7 @@ from oobleck.csrc.planning.pipeline_template import (
     get_profile_results,
 )
 from oobleck.module.model import OobleckModel
-from oobleck.planning.profiler import Profiler, profile
+from oobleck.planning.profiler import Profiler
 from tests.conftest import OobleckMultiProcessTestCase, OobleckSingleProcessTestCase
 
 

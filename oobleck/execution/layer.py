@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import copy
+
 import torch
 import torch.distributed
 import torch.fx
+from accelerate.utils.modeling import set_module_tensor_to_device
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
@@ -19,6 +22,20 @@ def is_checkpointable(layer: torch.fx.GraphModule) -> bool:
     return True
 
 
+def init_tensors(layer: torch.fx.GraphModule, device: torch.device):
+    """
+    Initialize meta tensors and move it to GPU.
+    TODO: must use checkpointed data
+    """
+    for param_name, param in layer.named_parameters():
+        set_module_tensor_to_device(layer, param_name, device, torch.rand(param.shape))
+
+    for buffer_name, buffer in layer.named_buffers():
+        set_module_tensor_to_device(
+            layer, buffer_name, device, torch.rand(buffer.shape)
+        )
+
+
 class Layer(torch.nn.Module):
     @classmethod
     def create_layer_from_layer(
@@ -33,6 +50,11 @@ class Layer(torch.nn.Module):
         layer._param_handle = existing_layer._param_handle
         return layer
 
+    def remove_tensors(self):
+        if self._param_handle.flat_param.grad is not None:
+            self._param_handle.flat_param.grad.data = torch.tensor([])
+        self._param_handle.flat_param.data = torch.tensor([])
+
     def __init__(
         self,
         layer_id: int,
@@ -45,7 +67,8 @@ class Layer(torch.nn.Module):
 
         device = torch.device("cuda", torch.cuda.current_device())
         self._layer_id = layer_id
-        layer.to(device)
+        layer = copy.deepcopy(layer)
+        init_tensors(layer, device)
         if is_checkpointable(layer):
             layer = checkpoint_wrapper(layer)
 

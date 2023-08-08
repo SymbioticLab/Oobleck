@@ -1,10 +1,10 @@
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
-import shutil
 
-from setuptools import Extension, setup
+from setuptools import Extension, find_packages, setup
 from setuptools.command.build_ext import build_ext
 
 __version__ = "0.1.0"
@@ -119,4 +119,5 @@ setup(
     cmdclass={"build_ext": CmakeBuild},
     zip_safe=False,
     python_requires=">=3.8",
+    packages=find_packages(),
 )
