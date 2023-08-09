@@ -225,6 +225,8 @@ class TestShardedLayer(OobleckMultiProcessTestCase):
                 == layer._param_handle.flat_param._saved_grad_shard.shape
             )
 
+            layer.remove_post_backward_hooks()
+
     @staticmethod
     def step(
         factory: OobleckStaticClassFactory,

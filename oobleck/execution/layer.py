@@ -51,18 +51,13 @@ class Layer(torch.nn.Module):
         layer.layer_id = existing_layer.layer_id
         layer._rank_index = torch.distributed.get_rank(process_group)
         layer._group_size = torch.distributed.get_world_size(process_group)
-
+        layer._param_handle = existing_layer._param_handle
         layer.shard_stream = layer.shard_stream
 
-        layer._param_handle = existing_layer._param_handle
-        layer.register_forward_pre_hook(
-            functools.partial(layer.pre_forward_hook, layer)
-        )
-        layer.register_forward_hook(functools.partial(layer.post_forward_hook, layer))
-        layer.register_full_backward_pre_hook(
-            functools.partial(layer.pre_backward_hook, layer)
-        )
-        layer._register_post_backward_hook()
+        layer.register_forward_pre_hook(layer.pre_forward_hook)
+        layer.register_forward_hook(layer.post_forward_hook)
+        layer.register_full_backward_pre_hook(layer.pre_backward_hook)
+
         return layer
 
     def remove_tensors(self):
@@ -108,12 +103,11 @@ class Layer(torch.nn.Module):
             use_orig_params=True,
         )
         self._param_handle.shard()
-        layer.register_forward_pre_hook(functools.partial(self.pre_forward_hook, self))
-        layer.register_forward_hook(functools.partial(self.post_forward_hook, self))
         self._param_handle.init_flat_param_attributes()
-        self.register_full_backward_pre_hook(
-            functools.partial(self.pre_backward_hook, self)
-        )
+
+        self.register_forward_pre_hook(self.pre_forward_hook)
+        self.register_forward_hook(self.post_forward_hook)
+        self.register_full_backward_pre_hook(self.pre_backward_hook)
 
     def unshard_params(self, state: HandleTrainingState):
         if self._param_handle._sharding_strategy == HandleShardingStrategy.NO_SHARD:
@@ -145,30 +139,23 @@ class Layer(torch.nn.Module):
     def forward(self, input: tuple[torch.Tensor]) -> tuple[torch.Tensor]:
         return self._param_handle._fully_sharded_module(*input)
 
-    @staticmethod
-    def pre_forward_hook(self: Layer, *unused):
+    def pre_forward_hook(self, *unused):
         self.unshard_params(HandleTrainingState.FORWARD)
         torch.cuda.current_stream().wait_stream(self.shard_stream)
+        self.register_post_backward_hooks()
 
-    @staticmethod
-    def post_forward_hook(self: Layer, *unused):
+    def post_forward_hook(self, *unused):
         self.shard_stream.wait_stream(torch.cuda.current_stream())
         self.reshard_params()
 
-        self._register_post_backward_hook()
-
-    @staticmethod
-    def pre_backward_hook(self: Layer, *unused):
-        print(f"layer {self.layer_id} pre_backward_hook")
-
+    def pre_backward_hook(self, *unused):
         self.unshard_params(HandleTrainingState.BACKWARD_PRE)
         torch.cuda.current_stream().wait_stream(self.shard_stream)
 
         self._param_handle._clear_grads_if_needed()
         self._param_handle.prepare_gradient_for_backward()
 
-    @staticmethod
-    def post_backward_hook(self: Layer, *unused):
+    def post_backward_hook(self, *unused):
         """
         Code adopted from torch.distributed.fsdp._runtime_utils.py::_post_backward_hook
 
@@ -188,20 +175,13 @@ class Layer(torch.nn.Module):
 
         # Code adopted from torch.distributed.fsdp._runtime_utils.py::_post_backward_hook
         with torch.cuda.stream(self.shard_stream):
-            print(f"layer {self.layer_id} post_backward_hook")
-
             if (
                 self._param_handle.flat_param.requires_grad is False
                 or self._param_handle.flat_param.grad is None
             ):
-                print(
-                    f"layer {self.layer_id} post_backward_hook: exiting due to "
-                    f"requires grad: {self._param_handle.flat_param.requires_grad} or grad: {self._param_handle.flat_param.grad}"
-                )
                 return
 
             self.reshard_params()
-            print(f"layer {self.layer_id} post_backward_hook: reshard done")
 
             if self._param_handle.uses_sharded_strategy:
                 unsharded_grad = self._param_handle.flat_param.grad
@@ -232,23 +212,28 @@ class Layer(torch.nn.Module):
             self._param_handle._reset_is_grad_none()
             self._param_handle._use_sharded_grad_views()
 
-    def _register_post_backward_hook(self):
+    def register_post_backward_hooks(self):
         """Code adopted from torch.distributed.fsdp._runtime_utils.py::_register_post_backward_hooks"""
         flat_param = self._param_handle.flat_param
-        if not flat_param.requires_grad or hasattr(
+
+        if flat_param.requires_grad and not hasattr(
             flat_param, "_post_backward_hook_state"
         ):
-            return
+            # post backward hook
+            flat_param = flat_param.expand_as(flat_param)
+            assert flat_param.grad_fn is not None
 
-        flat_param = flat_param.expand_as(flat_param)
-        assert flat_param.grad_fn is not None
+            acc_grad = flat_param.grad_fn.next_functions[0][0]
+            assert acc_grad is not None
+            hook_handle = acc_grad.register_hook(self.post_backward_hook)
+            flat_param._post_backward_hook_state = (acc_grad, hook_handle)
 
-        acc_grad = flat_param.grad_fn.next_functions[0][0]
-        assert acc_grad is not None
-        hook_handle = acc_grad.register_hook(
-            functools.partial(self.post_backward_hook, self)
-        )
-        flat_param._post_backward_hook_state = (acc_grad, hook_handle)
+    def remove_post_backward_hooks(self):
+        flat_param = self._param_handle.flat_param
+        if hasattr(flat_param, "_post_backward_hook_state"):
+            acc_grad, hook_handle = flat_param._post_backward_hook_state
+            acc_grad.unregister_hook(hook_handle)
+            del flat_param._post_backward_hook_state
 
     def backward(
         self,
