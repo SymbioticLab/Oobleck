@@ -55,12 +55,14 @@ class Layer(torch.nn.Module):
         layer.shard_stream = layer.shard_stream
 
         layer._param_handle = existing_layer._param_handle
+        layer.register_forward_pre_hook(
+            functools.partial(layer.pre_forward_hook, layer)
+        )
+        layer.register_forward_hook(functools.partial(layer.post_forward_hook, layer))
         layer.register_full_backward_pre_hook(
             functools.partial(layer.pre_backward_hook, layer)
         )
-        layer.register_full_backward_hook(
-            functools.partial(layer.post_backward_hook, layer)
-        )
+        layer._register_post_backward_hook()
         return layer
 
     def remove_tensors(self):
@@ -106,12 +108,11 @@ class Layer(torch.nn.Module):
             use_orig_params=True,
         )
         self._param_handle.shard()
+        layer.register_forward_pre_hook(functools.partial(self.pre_forward_hook, self))
+        layer.register_forward_hook(functools.partial(self.post_forward_hook, self))
         self._param_handle.init_flat_param_attributes()
         self.register_full_backward_pre_hook(
             functools.partial(self.pre_backward_hook, self)
-        )
-        self.register_full_backward_hook(
-            functools.partial(self.post_backward_hook, self)
         )
 
     def unshard_params(self, state: HandleTrainingState):
@@ -145,25 +146,32 @@ class Layer(torch.nn.Module):
         return self._param_handle._fully_sharded_module(*input)
 
     @staticmethod
-    def pre_backward_hook(
-        self: Layer,
-        module: torch.nn.Module,
-        grad_output: torch.Tensor,
-    ):
+    def pre_forward_hook(self: Layer, *unused):
+        self.unshard_params(HandleTrainingState.FORWARD)
+        torch.cuda.current_stream().wait_stream(self.shard_stream)
+
+    @staticmethod
+    def post_forward_hook(self: Layer, *unused):
+        self.shard_stream.wait_stream(torch.cuda.current_stream())
+        self.reshard_params()
+
+        self._register_post_backward_hook()
+
+    @staticmethod
+    def pre_backward_hook(self: Layer, *unused):
+        print(f"layer {self.layer_id} pre_backward_hook")
+
         self.unshard_params(HandleTrainingState.BACKWARD_PRE)
-        torch.cuda.default_stream().wait_stream(self.shard_stream)
+        torch.cuda.current_stream().wait_stream(self.shard_stream)
 
         self._param_handle._clear_grads_if_needed()
         self._param_handle.prepare_gradient_for_backward()
 
     @staticmethod
-    def post_backward_hook(
-        self: Layer,
-        module: torch.nn.Module,
-        grad_input: torch.Tensor,
-        grad_output: torch.Tensor,
-    ):
+    def post_backward_hook(self: Layer, *unused):
         """
+        Code adopted from torch.distributed.fsdp._runtime_utils.py::_post_backward_hook
+
         Reduce-scatters the gradient of `self._param_handle.flat_param`.
 
         Precondition: The `FlatParameter`s `.grad` attribute contains
@@ -176,20 +184,27 @@ class Layer(torch.nn.Module):
         reduced sharded gradient (accumulating with any existing gradient).
         """
         self._param_handle._training_state = HandleTrainingState.BACKWARD_POST
-        self.shard_stream.wait_stream(torch.cuda.default_stream())
-
-        if (
-            not self._param_handle.flat_param.requires_grad
-            or self._param_handle.flat_param.grad is None
-        ):
-            return
-
-        self.reshard_params()
+        self.shard_stream.wait_stream(torch.cuda.current_stream())
 
         # Code adopted from torch.distributed.fsdp._runtime_utils.py::_post_backward_hook
         with torch.cuda.stream(self.shard_stream):
+            print(f"layer {self.layer_id} post_backward_hook")
+
+            if (
+                self._param_handle.flat_param.requires_grad is False
+                or self._param_handle.flat_param.grad is None
+            ):
+                print(
+                    f"layer {self.layer_id} post_backward_hook: exiting due to "
+                    f"requires grad: {self._param_handle.flat_param.requires_grad} or grad: {self._param_handle.flat_param.grad}"
+                )
+                return
+
+            self.reshard_params()
+            print(f"layer {self.layer_id} post_backward_hook: reshard done")
+
             if self._param_handle.uses_sharded_strategy:
-                unsharded_grad = self._param_handle.flat_param.grad.data
+                unsharded_grad = self._param_handle.flat_param.grad
                 self._param_handle.flat_param.grad = None
                 chunks = list(unsharded_grad.chunk(self._group_size))
                 numel_to_pad = (
@@ -202,7 +217,7 @@ class Layer(torch.nn.Module):
                 )
                 new_sharded_grad = torch.empty_like(chunks[0])  # padded
 
-                torch.distributed.reduce_scatter(
+                torch.distributed.reduce_scatter_tensor(
                     new_sharded_grad,
                     padded_unsharded_grad,
                     group=self._param_handle.process_group,
@@ -215,7 +230,25 @@ class Layer(torch.nn.Module):
                     self._param_handle.flat_param._saved_grad_shard = new_sharded_grad
 
             self._param_handle._reset_is_grad_none()
-            self._param_handle.prepare_gradient_for_backward()
+            self._param_handle._use_sharded_grad_views()
+
+    def _register_post_backward_hook(self):
+        """Code adopted from torch.distributed.fsdp._runtime_utils.py::_register_post_backward_hooks"""
+        flat_param = self._param_handle.flat_param
+        if not flat_param.requires_grad or hasattr(
+            flat_param, "_post_backward_hook_state"
+        ):
+            return
+
+        flat_param = flat_param.expand_as(flat_param)
+        assert flat_param.grad_fn is not None
+
+        acc_grad = flat_param.grad_fn.next_functions[0][0]
+        assert acc_grad is not None
+        hook_handle = acc_grad.register_hook(
+            functools.partial(self.post_backward_hook, self)
+        )
+        flat_param._post_backward_hook_state = (acc_grad, hook_handle)
 
     def backward(
         self,

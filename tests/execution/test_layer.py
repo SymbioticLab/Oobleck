@@ -1,5 +1,7 @@
 import copy
 import itertools
+import time
+from unittest.mock import patch
 
 import pytest
 import torch.distributed
@@ -173,24 +175,12 @@ class TestShardedLayer(OobleckMultiProcessTestCase):
             factory, torch.distributed.group.WORLD
         )
 
-        layers[0].unshard_params(HandleTrainingState.FORWARD)
-
         output: tuple[torch.Tensor]
         for layer in layers:
-            # default stream waits for shard stream that waits for NCCL stream
-            torch.cuda.default_stream().wait_stream(layer.shard_stream)
-
-            # Prefetch next layer unsharding
-            if layer.layer_id < len(layers) - 1:
-                layers[layer.layer_id + 1].unshard_params(HandleTrainingState.FORWARD)
-
             output = layer(input)
             input = output
 
-            # resharding should wait for forward to finish
-            layer.shard_stream.wait_stream(torch.cuda.default_stream())
-            layer.reshard_params()
-
+        torch.cuda.synchronize()
         # input[0]: loss, input[1]: logits
         assert isinstance(input[0], torch.Tensor)
 
@@ -207,10 +197,10 @@ class TestShardedLayer(OobleckMultiProcessTestCase):
             factory, torch.distributed.group.WORLD
         )
 
+        layers[0].unshard_params(HandleTrainingState.FORWARD)
+
         output: tuple[torch.Tensor]
         for layer in layers:
-            layer.unshard_params(HandleTrainingState.FORWARD)
-            torch.cuda.default_stream().wait_stream(layer.shard_stream)
             output = layer(input)
             input = output
 
@@ -218,21 +208,67 @@ class TestShardedLayer(OobleckMultiProcessTestCase):
         for layer in layers:
             assert layer._param_handle.flat_param.grad is None
 
-        # TODO: unshard and shard params for backward
-
         # Begin test
-        output[0].backward()
+        layers[-1].backward(output[0])
+        torch.cuda.synchronize()
 
-        # grad must be set after executing backward
         for layer in layers:
+            # flat_param.grad must be cleared
+            assert layer._param_handle.flat_param.grad is None
+
+            # Instead, grad must be stored in _saved_grad_shard
+            assert layer._param_handle.flat_param._saved_grad_shard is not None
+
+            # grad shape must be equal to the sharded size
             assert (
-                layer._param_handle.flat_param.grad is not None
-                if layer._param_handle.flat_param.requires_grad
-                else None
+                layer._param_handle.flat_param._sharded_size
+                == layer._param_handle.flat_param._saved_grad_shard.shape
             )
 
+    @staticmethod
+    def step(
+        factory: OobleckStaticClassFactory,
+        dfactory: OobleckDynamicClassFactory,
+    ):
+        layers, input = TestNoshardedLayer.get_layers_and_inputs(
+            factory, torch.distributed.group.WORLD
+        )
+
+        params = itertools.chain.from_iterable(
+            [l._param_handle._fully_sharded_module.parameters() for l in layers]
+        )
+        optimizer = torch.optim.AdamW(params, lr=1e-3)
+
+        output: tuple[torch.Tensor]
+        for layer in layers:
+            output = layer(input)
+            input = output
+        output[0].backward()
+
+        # Begin test
+        # optimizer must not have internal data
+        for p in optimizer.param_groups[0]["params"]:
+            assert len(optimizer.state[p]) == 0
+
+        for l in layers:
+            l._param_handle.prepare_gradient_for_optim()
+        optimizer.step()
+
+        # optimizer must have internal data for now
+        p: torch.Tensor
+        for p in optimizer.param_groups[0]["params"]:
+            # If FSDP is used, some too small tensors might be only on rank 0,
+            # thus pass if size is 0.
+            if p.numel() == 0:
+                continue
+            assert all(
+                key in optimizer.state[p] for key in ["step", "exp_avg", "exp_avg_sq"]
+            )
+            assert p.shape == optimizer.state[p]["exp_avg"].shape
+            assert p.shape == optimizer.state[p]["exp_avg_sq"].shape
+
     # @pytest.mark.parametrize("function", ["forward", "backward", "step"])
-    @pytest.mark.parametrize("function", ["forward", "backward"])
+    @pytest.mark.parametrize("function", ["forward", "backward", "step"])
     def test_layer(self, function: str):
         func = getattr(self, function)
         self.run_in_parallel(4, func)
