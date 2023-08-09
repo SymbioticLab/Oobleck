@@ -177,6 +177,7 @@ class TestShardedLayer(OobleckMultiProcessTestCase):
 
         output: tuple[torch.Tensor]
         for layer in layers:
+            # default stream waits for shard stream that waits for NCCL stream
             torch.cuda.default_stream().wait_stream(layer.shard_stream)
 
             # Prefetch next layer unsharding
@@ -186,6 +187,7 @@ class TestShardedLayer(OobleckMultiProcessTestCase):
             output = layer(input)
             input = output
 
+            # resharding should wait for forward to finish
             layer.shard_stream.wait_stream(torch.cuda.default_stream())
             layer.reshard_params()
 
@@ -217,10 +219,6 @@ class TestShardedLayer(OobleckMultiProcessTestCase):
             assert layer._param_handle.flat_param.grad is None
 
         # TODO: unshard and shard params for backward
-
-        for layer in layers:
-            layer._param_handle._training_state = HandleTrainingState.BACKWARD_PRE
-            layer._param_handle.prepare_gradient_for_backward()
 
         # Begin test
         output[0].backward()
