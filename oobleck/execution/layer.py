@@ -140,8 +140,11 @@ class Layer(torch.nn.Module):
         return self._param_handle._fully_sharded_module(*input)
 
     def pre_forward_hook(self, *unused):
-        self.unshard_params(HandleTrainingState.FORWARD)
-        torch.cuda.current_stream().wait_stream(self.shard_stream)
+        with torch.autograd.profiler.record_function(
+            "FullyShardedDataParallel.pre_forward_hook"
+        ):
+            self.unshard_params(HandleTrainingState.FORWARD)
+            torch.cuda.current_stream().wait_stream(self.shard_stream)
         self.register_post_backward_hooks()
 
     def post_forward_hook(self, *unused):
@@ -149,11 +152,14 @@ class Layer(torch.nn.Module):
         self.reshard_params()
 
     def pre_backward_hook(self, *unused):
-        self.unshard_params(HandleTrainingState.BACKWARD_PRE)
-        torch.cuda.current_stream().wait_stream(self.shard_stream)
+        with torch.autograd.profiler.record_function(
+            "FullyShardedDataParallel.pre_backward_hook"
+        ):
+            self.unshard_params(HandleTrainingState.BACKWARD_PRE)
+            torch.cuda.current_stream().wait_stream(self.shard_stream)
 
-        self._param_handle._clear_grads_if_needed()
-        self._param_handle.prepare_gradient_for_backward()
+            self._param_handle._clear_grads_if_needed()
+            self._param_handle.prepare_gradient_for_backward()
 
     def post_backward_hook(self, *unused):
         """
@@ -174,7 +180,11 @@ class Layer(torch.nn.Module):
         self.shard_stream.wait_stream(torch.cuda.current_stream())
 
         # Code adopted from torch.distributed.fsdp._runtime_utils.py::_post_backward_hook
-        with torch.cuda.stream(self.shard_stream):
+        with torch.cuda.stream(
+            self.shard_stream
+        ), torch.autograd.profiler.record_function(
+            "FullyShardedDataParallel.post_backward_hook"
+        ):
             if (
                 self._param_handle.flat_param.requires_grad is False
                 or self._param_handle.flat_param.grad is None
