@@ -6,6 +6,7 @@ import torch
 import torch.distributed
 import torch.fx
 from accelerate.utils.modeling import set_module_tensor_to_device
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
@@ -168,7 +169,6 @@ class Layer(torch.nn.Module):
         ):
             self.unshard_params(HandleTrainingState.FORWARD)
             torch.cuda.current_stream().wait_stream(self.pre_stream)
-        self.remove_post_backward_hooks()
         self.register_post_backward_hooks()
 
     def post_forward_hook(self, *unused):
@@ -243,6 +243,7 @@ class Layer(torch.nn.Module):
 
             self._param_handle._reset_is_grad_none()
             self._param_handle._use_sharded_grad_views()
+            self._param_handle.flat_param._post_backward_called = True
 
     def register_post_backward_hooks(self):
         """Code adopted from torch.distributed.fsdp._runtime_utils.py::_register_post_backward_hooks"""
@@ -280,9 +281,27 @@ class Layer(torch.nn.Module):
             torch.autograd.backward(output, gradients)
 
     def reduce_gradients(self, process_groups: list[torch.distributed.ProcessGroup]):
+        torch.cuda.current_stream().wait_stream(self.post_stream)
+        self._param_handle.prepare_gradient_for_optim()
         for process_group in process_groups:
             if torch.distributed.get_rank(process_group) < 0:
                 continue
-            torch.distributed.all_reduce(
-                self._param_handle.flat_param.grad, group=process_group
-            )
+
+            if self._param_handle.uses_sharded_strategy:
+                torch.distributed.all_reduce(
+                    self._param_handle.flat_param._saved_grad_shard,
+                    group=process_group,
+                )
+            else:
+                flat_grad = _flatten_dense_tensors(
+                    [
+                        p.grad
+                        for p in self._param_handle._fully_sharded_module.parameters()
+                        if p.requires_grad
+                    ]
+                )
+                torch.distributed.all_reduce(flat_grad, group=process_group)
+                _unflatten_dense_tensors(
+                    flat_grad,
+                    list(self._param_handle._fully_sharded_module.parameters()),
+                )
