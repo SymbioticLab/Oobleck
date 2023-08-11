@@ -38,5 +38,5 @@ dependencies:
     - pytest-asyncio
     - pytest-mock
     - simple-parsing
-    - matploblib
+    - matplotlib
     - colorama
