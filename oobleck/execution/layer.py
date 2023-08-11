@@ -111,6 +111,8 @@ class Layer(torch.nn.Module):
         self.register_forward_hook(self.post_forward_hook)
         self.register_full_backward_pre_hook(self.pre_backward_hook)
 
+        self._tensors: list[torch.Tensor] = None
+
     def unshard_params(self, state: HandleTrainingState):
         if self._param_handle._sharding_strategy == HandleShardingStrategy.NO_SHARD:
             return
@@ -123,9 +125,28 @@ class Layer(torch.nn.Module):
 
         # all further kernel execution will wait `all_gather_into_tensor()` to finish
         with torch.cuda.stream(self.pre_stream):
+            """
+            In pipeline execution, backward can be executed in a row without forward,
+            which current FSDP doesn't support.
+            `self._param_handle.flat_param._tensors` are cleaned in post backward hook
+            (torch.distributed.fsdp.flat_param.py::_used_sharded_views),
+            which is needed in pre_backward and set in forward pass
+            (torch.distributed.fsdp.flat_param.py::_use_unsharded_views).
+            Oobleck manually sets the tensors so that in consecutive backward passes,
+            assertion can be passed.
+            """
+            if self._tensors is not None and state == HandleTrainingState.BACKWARD_PRE:
+                for i, view in enumerate(self._tensors):
+                    self._param_handle.flat_param._tensors[i] = view
+
             self._param_handle.pre_unshard()
             self._param_handle.unshard()
             self._param_handle.post_unshard()
+
+            if state == HandleTrainingState.FORWARD:
+                self._tensors = list(
+                    self._param_handle._get_unflat_views(self._param_handle.flat_param)
+                )
 
     def reshard_params(self):
         if (
@@ -147,6 +168,7 @@ class Layer(torch.nn.Module):
         ):
             self.unshard_params(HandleTrainingState.FORWARD)
             torch.cuda.current_stream().wait_stream(self.pre_stream)
+        self.remove_post_backward_hooks()
         self.register_post_backward_hooks()
 
     def post_forward_hook(self, *unused):

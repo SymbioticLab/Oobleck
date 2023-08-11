@@ -6,6 +6,7 @@ import pytest
 import torch
 import torch.distributed
 from deepspeed.runtime.lr_schedules import WarmupLR
+from torch.distributed.fsdp.flat_param import HandleShardingStrategy
 from torch.optim import AdamW
 
 from tests.conftest import (
@@ -360,4 +361,40 @@ class TestMultiStagePipeline(OobleckMultiProcessTestCase):
             TestMultiStagePipeline.pipeline_train,
             num_stages,
             num_gpus_per_node,
+        )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="4 GPUs are required")
+class TestFullyShardedDataParallelPipeline(OobleckMultiProcessTestCase):
+    @staticmethod
+    def fsdp_train(
+        factory: OobleckStaticClassFactory,
+        dfactory: OobleckDynamicClassFactory,
+        num_stages: int,
+    ):
+        pipeline = dfactory.get_dummy_pipeline(
+            num_stages=num_stages,
+            num_gpus_per_node=4,
+            num_nodes=1,
+        )
+
+        # Check layers properly use FSDP
+        for layer in pipeline.execution._layers:
+            assert (
+                layer._param_handle._sharding_strategy
+                == HandleShardingStrategy.FULL_SHARD
+            )
+            assert layer._group_size > 1
+
+        pipeline.train()
+
+    @pytest.mark.parametrize("num_stages", [1, 2], ids=["1stage", "2stages"])
+    def test_fsdp_train(self, num_stages: int):
+        """
+        Test FSDP enabled pipeline train, by putting more than 1 GPU to each stage.
+        """
+        self.run_in_parallel(
+            4,
+            TestFullyShardedDataParallelPipeline.fsdp_train,
+            num_stages,
         )
