@@ -497,6 +497,8 @@ class OobleckPipeline:
         assert self._per_layer_pgs, "Must call initialize_distributed_fsdp() first"
 
         layers: list[Layer] = []
+        pre_stream = torch.cuda.Stream()
+        post_stream = torch.cuda.Stream()
         shard_id: int = -1
         for layer_id, pg in self._per_layer_pgs.items():
             id = torch.distributed.get_rank(pg)
@@ -512,7 +514,9 @@ class OobleckPipeline:
                 )
                 layers.append(Layer.create_layer_from_layer(existing_layer, pg))
             except Exception:
-                layers.append(Layer(layer_id, model.layers[layer_id], pg))
+                layers.append(
+                    Layer(layer_id, model.layers[layer_id], pg, pre_stream, post_stream)
+                )
 
         self.execution = PipelineExecution(
             pipeline=self,
