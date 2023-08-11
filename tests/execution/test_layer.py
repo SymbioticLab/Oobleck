@@ -20,9 +20,10 @@ def get_layers(model: OobleckModel, pgs: list[torch.distributed.ProcessGroup]):
     assert len(model.layers) == len(pgs)
 
     layers: list[Layer] = []
-    shard_stream = torch.cuda.Stream()
+    pre_stream = torch.cuda.Stream()
+    post_stream = torch.cuda.Stream()
     for layer_id, (pg, layer) in enumerate(zip(pgs, model.layers)):
-        layers.append(Layer(layer_id, layer, pg, shard_stream))
+        layers.append(Layer(layer_id, layer, pg, pre_stream, post_stream))
 
     return layers
 
@@ -269,7 +270,6 @@ class TestShardedLayer(OobleckMultiProcessTestCase):
             assert p.shape == optimizer.state[p]["exp_avg"].shape
             assert p.shape == optimizer.state[p]["exp_avg_sq"].shape
 
-    # @pytest.mark.parametrize("function", ["forward", "backward", "step"])
     @pytest.mark.parametrize("function", ["forward", "backward", "step"])
     def test_layer(self, function: str):
         func = getattr(self, function)
