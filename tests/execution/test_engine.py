@@ -535,7 +535,7 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
                     layer = next(
                         layer
                         for layer in engine._pipeline.execution._layers
-                        if layer._layer_id == layer_id
+                        if layer.layer_id == layer_id
                     )
                     assert layer._param_handle.flat_param is not None
                     assert layer._param_handle.world_size == len(ranks_per_layer)
@@ -544,7 +544,7 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
                         next(
                             layer
                             for layer in engine._pipeline.execution._layers
-                            if layer._layer_id == layer_id
+                            if layer.layer_id == layer_id
                         )
         else:
             # We only have one pipeline and lose one node.

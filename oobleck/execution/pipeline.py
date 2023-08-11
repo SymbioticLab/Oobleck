@@ -510,7 +510,7 @@ class OobleckPipeline:
                 existing_layer = next(
                     layer
                     for layer in existing_pipeline.execution._layers
-                    if layer._layer_id == layer_id
+                    if layer.layer_id == layer_id
                 )
                 layers.append(Layer.create_layer_from_layer(existing_layer, pg))
             except Exception:

@@ -255,18 +255,18 @@ class ReconfigurationEngine:
                         param = next(
                             layer
                             for layer in self.engine._pipeline.execution._layers
-                            if layer._layer_id == layer_index
+                            if layer.layer_id == layer_index
                         )._param_handle.flat_param
                         next(
                             layer
                             for layer in new_pipeline.execution._layers
-                            if layer._layer_id == layer_index
+                            if layer.layer_id == layer_index
                         )._param_handle.flat_param.data = param.data
                     else:
                         param = next(
                             layer
                             for layer in new_pipeline.execution._layers
-                            if layer._layer_id == layer_index
+                            if layer.layer_id == layer_index
                         )._param_handle.flat_param
 
                     dist.broadcast(
@@ -347,7 +347,7 @@ class DataParallelEngine:
 
     def do_allreduce(self):
         for layer in self.engine._pipeline.execution._layers:
-            process_groups_per_layer = self._dp_process_groups[layer._layer_id]
+            process_groups_per_layer = self._dp_process_groups[layer.layer_id]
             layer.reduce_gradients(list(process_groups_per_layer.values()))
 
 
