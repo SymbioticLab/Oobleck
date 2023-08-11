@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import functools
 
 import torch
 import torch.distributed
@@ -52,7 +51,8 @@ class Layer(torch.nn.Module):
         layer._rank_index = torch.distributed.get_rank(process_group)
         layer._group_size = torch.distributed.get_world_size(process_group)
         layer._param_handle = existing_layer._param_handle
-        layer.shard_stream = layer.shard_stream
+        layer.pre_stream = existing_layer.pre_stream
+        layer.post_stream = existing_layer.post_stream
 
         layer.register_forward_pre_hook(layer.pre_forward_hook)
         layer.register_forward_hook(layer.post_forward_hook)
@@ -70,7 +70,8 @@ class Layer(torch.nn.Module):
         layer_id: int,
         layer: torch.fx.GraphModule,
         process_group: torch.distributed.ProcessGroup,
-        shard_stream: torch.cuda.Stream,
+        pre_stream: torch.cuda.Stream,
+        post_stream: torch.cuda.Stream,
     ):
         super().__init__()
 
@@ -81,7 +82,8 @@ class Layer(torch.nn.Module):
         self._rank_index = torch.distributed.get_rank(process_group)
         self._group_size = torch.distributed.get_world_size(process_group)
 
-        self.shard_stream = shard_stream
+        self.pre_stream = pre_stream
+        self.post_stream = post_stream
 
         layer = copy.deepcopy(layer)
         init_tensors(layer, device)
@@ -120,7 +122,7 @@ class Layer(torch.nn.Module):
         self._param_handle._training_state = state
 
         # all further kernel execution will wait `all_gather_into_tensor()` to finish
-        with torch.cuda.stream(self.shard_stream):
+        with torch.cuda.stream(self.pre_stream):
             self._param_handle.pre_unshard()
             self._param_handle.unshard()
             self._param_handle.post_unshard()
@@ -132,7 +134,7 @@ class Layer(torch.nn.Module):
         ):
             return
 
-        with torch.cuda.stream(self.shard_stream):
+        with torch.cuda.stream(self.pre_stream):
             self._param_handle.reshard(True)
             self._param_handle.post_reshard()
 
@@ -144,11 +146,10 @@ class Layer(torch.nn.Module):
             "FullyShardedDataParallel.pre_forward_hook"
         ):
             self.unshard_params(HandleTrainingState.FORWARD)
-            torch.cuda.current_stream().wait_stream(self.shard_stream)
+            torch.cuda.current_stream().wait_stream(self.pre_stream)
         self.register_post_backward_hooks()
 
     def post_forward_hook(self, *unused):
-        self.shard_stream.wait_stream(torch.cuda.current_stream())
         self.reshard_params()
 
     def pre_backward_hook(self, *unused):
@@ -156,7 +157,6 @@ class Layer(torch.nn.Module):
             "FullyShardedDataParallel.pre_backward_hook"
         ):
             self.unshard_params(HandleTrainingState.BACKWARD_PRE)
-            torch.cuda.current_stream().wait_stream(self.shard_stream)
 
             self._param_handle._clear_grads_if_needed()
             self._param_handle.prepare_gradient_for_backward()
@@ -177,11 +177,11 @@ class Layer(torch.nn.Module):
         reduced sharded gradient (accumulating with any existing gradient).
         """
         self._param_handle._training_state = HandleTrainingState.BACKWARD_POST
-        self.shard_stream.wait_stream(torch.cuda.current_stream())
+        self.post_stream.wait_stream(torch.cuda.current_stream())
 
         # Code adopted from torch.distributed.fsdp._runtime_utils.py::_post_backward_hook
         with torch.cuda.stream(
-            self.shard_stream
+            self.post_stream
         ), torch.autograd.profiler.record_function(
             "FullyShardedDataParallel.post_backward_hook"
         ):
