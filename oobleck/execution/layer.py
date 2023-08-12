@@ -269,11 +269,6 @@ class Layer(torch.nn.Module):
         self._param_handle.prepare_gradient_for_optim()
 
         assert torch.distributed.get_rank(process_group) >= 0
-
-        grad = (
-            self._param_handle.flat_param._saved_grad_shard
-            if self._param_handle.uses_sharded_strategy
-            else self._param_handle.flat_param.grad
+        torch.distributed.all_reduce(
+            tensor=self._param_handle.flat_param.grad, group=process_group
         )
-
-        torch.distributed.all_reduce(tensor=grad, group=process_group)
