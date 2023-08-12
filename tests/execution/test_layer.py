@@ -90,11 +90,10 @@ class TestNoshardedLayer(OobleckMultiProcessTestCase):
 
         # grad must be set after executing backward
         for layer in layers:
-            for param in layer._param_handle._fully_sharded_module.parameters():
-                if param.requires_grad:
-                    assert param.grad is not None
-                else:
-                    assert param.grad is None
+            if layer._param_handle.flat_param.requires_grad:
+                assert layer._param_handle.flat_param.grad is not None
+            else:
+                assert layer._param_handle.flat_param.grad is None
 
     @staticmethod
     def step(
@@ -105,9 +104,7 @@ class TestNoshardedLayer(OobleckMultiProcessTestCase):
             factory, torch.distributed.group.WORLD
         )
 
-        params = itertools.chain.from_iterable(
-            [l._param_handle._fully_sharded_module.parameters() for l in layers]
-        )
+        params = [l._param_handle.flat_param for l in layers]
         optimizer = torch.optim.AdamW(params, lr=1e-3)
 
         output: tuple[torch.Tensor]
@@ -226,8 +223,6 @@ class TestShardedLayer(OobleckMultiProcessTestCase):
                 == layer._param_handle.flat_param._saved_grad_shard.shape
             )
 
-            layer.remove_post_backward_hooks()
-
     @staticmethod
     def step(
         factory: OobleckStaticClassFactory,
@@ -237,9 +232,7 @@ class TestShardedLayer(OobleckMultiProcessTestCase):
             factory, torch.distributed.group.WORLD
         )
 
-        params = itertools.chain.from_iterable(
-            [l._param_handle._fully_sharded_module.parameters() for l in layers]
-        )
+        params = [l._param_handle.flat_param for l in layers]
         optimizer = torch.optim.AdamW(params, lr=1e-3)
 
         output: tuple[torch.Tensor]

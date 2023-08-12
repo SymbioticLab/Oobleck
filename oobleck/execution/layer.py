@@ -103,7 +103,7 @@ class Layer(torch.nn.Module):
             mp_reduce_dtype=torch.float32,
             keep_low_precision_grads=False,
             process_group=process_group,
-            use_orig_params=True,
+            use_orig_params=False,
         )
         self._param_handle.shard()
         self._param_handle.init_flat_param_attributes()
@@ -115,31 +115,17 @@ class Layer(torch.nn.Module):
         self._tensors: list[torch.Tensor] = None
 
     def unshard_params(self, state: HandleTrainingState):
-        if self._param_handle._sharding_strategy == HandleShardingStrategy.NO_SHARD:
-            return
-
         assert state in [
             HandleTrainingState.FORWARD,
             HandleTrainingState.BACKWARD_PRE,
         ], f"Invalid training state {self._param_handle._training_state}"
         self._param_handle._training_state = state
 
+        if self._param_handle._sharding_strategy == HandleShardingStrategy.NO_SHARD:
+            return
+
         # all further kernel execution will wait `all_gather_into_tensor()` to finish
         with torch.cuda.stream(self.pre_stream):
-            """
-            In pipeline execution, backward can be executed in a row without forward,
-            which current FSDP doesn't support.
-            `self._param_handle.flat_param._tensors` are cleaned in post backward hook
-            (torch.distributed.fsdp.flat_param.py::_used_sharded_views),
-            which is needed in pre_backward and set in forward pass
-            (torch.distributed.fsdp.flat_param.py::_use_unsharded_views).
-            Oobleck manually sets the tensors so that in consecutive backward passes,
-            assertion can be passed.
-            """
-            if self._tensors is not None and state == HandleTrainingState.BACKWARD_PRE:
-                for i, view in enumerate(self._tensors):
-                    self._param_handle.flat_param._tensors[i] = view
-
             self._param_handle.pre_unshard()
             self._param_handle.unshard()
             self._param_handle.post_unshard()
@@ -241,8 +227,6 @@ class Layer(torch.nn.Module):
                 else:
                     self._param_handle.flat_param._saved_grad_shard = new_sharded_grad
 
-            self._param_handle._reset_is_grad_none()
-            self._param_handle._use_sharded_grad_views()
             self._param_handle.flat_param._post_backward_called = True
 
     def register_post_backward_hooks(self):
@@ -280,28 +264,16 @@ class Layer(torch.nn.Module):
             output, gradients = tensor
             torch.autograd.backward(output, gradients)
 
-    def reduce_gradients(self, process_groups: list[torch.distributed.ProcessGroup]):
+    def reduce_gradients(self, process_group: torch.distributed.ProcessGroup):
         torch.cuda.current_stream().wait_stream(self.post_stream)
         self._param_handle.prepare_gradient_for_optim()
-        for process_group in process_groups:
-            if torch.distributed.get_rank(process_group) < 0:
-                continue
 
-            if self._param_handle.uses_sharded_strategy:
-                torch.distributed.all_reduce(
-                    self._param_handle.flat_param._saved_grad_shard,
-                    group=process_group,
-                )
-            else:
-                flat_grad = _flatten_dense_tensors(
-                    [
-                        p.grad
-                        for p in self._param_handle._fully_sharded_module.parameters()
-                        if p.requires_grad
-                    ]
-                )
-                torch.distributed.all_reduce(flat_grad, group=process_group)
-                _unflatten_dense_tensors(
-                    flat_grad,
-                    list(self._param_handle._fully_sharded_module.parameters()),
-                )
+        assert torch.distributed.get_rank(process_group) >= 0
+
+        grad = (
+            self._param_handle.flat_param._saved_grad_shard
+            if self._param_handle.uses_sharded_strategy
+            else self._param_handle.flat_param.grad
+        )
+
+        torch.distributed.all_reduce(tensor=grad, group=process_group)
