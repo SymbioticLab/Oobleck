@@ -124,8 +124,13 @@ class ReconfigurationEngine:
         if need_merge:
             new_ranks_list = self._merge_pipelines(new_ranks_list)
 
+        # sort ranks for each list of ranks
+        for ranks in new_ranks_list:
+            ranks.sort()
+
         # Sort ranks by length so that smaller pipeline ranks always come first.
-        new_ranks_list.sort(key=lambda ranks: len(ranks))
+        # For pipelines with the same number of ranks, a pipeline with smaller rank id comes first.
+        new_ranks_list.sort(key=lambda ranks: (len(ranks), ranks[0]))
 
         # Creae new instances set
         new_num_instances_set: dict[PipelineTemplate, int] = defaultdict(int)
