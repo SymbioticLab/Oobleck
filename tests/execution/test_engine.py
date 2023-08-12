@@ -8,7 +8,7 @@ import threading
 import traceback
 from multiprocessing import connection
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import deepspeed.comm as dist
 import pytest
@@ -725,6 +725,10 @@ class TestOobleckReconfigurationClass(OobleckSingleProcessTestCase):
         def initialize_execution(self, *args):
             pass
 
+    class FakeProcessGroup:
+        def __init__(self, ranks: list[int]):
+            self.ranks = ranks
+
     class FakeEngine:
         def __init__(
             self,
@@ -789,7 +793,7 @@ class TestOobleckReconfigurationClass(OobleckSingleProcessTestCase):
         )
         mocker.patch(
             "deepspeed.comm.new_group",
-            return_value=None,
+            new=TestOobleckReconfigurationClass.FakeProcessGroup,
         )
         mocker.patch(
             "deepspeed.comm.get_rank",
@@ -797,11 +801,15 @@ class TestOobleckReconfigurationClass(OobleckSingleProcessTestCase):
         )
         mocker.patch(
             "torch.distributed.init_process_group",
-            return_value=None,
+            new=TestOobleckReconfigurationClass.FakeProcessGroup,
         )
         mocker.patch(
             "oobleck.execution.engine.ReconfigurationEngine._copy_model_states",
             return_value=None,
+        )
+        mocker.patch(
+            "oobleck.execution.engine.DataParallelEngine",
+            return_value=MagicMock(),
         )
         yield self.FakeEngine(self, sample_args)
 
