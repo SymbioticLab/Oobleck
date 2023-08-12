@@ -15,6 +15,7 @@ import pytest
 import torch._C._distributed_c10d as c10d
 import torch.distributed
 from pytest_mock import MockerFixture
+from torch.distributed.fsdp.flat_param import HandleShardingStrategy
 
 from oobleck.csrc.planning.pipeline_template import PipelineTemplate
 from oobleck.elastic.message_util import DistributionInfo
@@ -44,7 +45,7 @@ def sample_args(model_name_fixture: str) -> OobleckArguments:
         fault_threshold=1,
         model_args=model_args[model_name_fixture],
         microbatch_size=TRAIN_BATCH_SIZE,
-        global_microbatch_size=16 * TRAIN_BATCH_SIZE,
+        global_microbatch_size=4 * TRAIN_BATCH_SIZE,
     )
 
 
@@ -428,6 +429,99 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
         thread.join()
 
     @staticmethod
+    def _run_fsdp_allreduce(
+        factory: OobleckStaticClassFactory,
+        rank: int,
+        num_stages: int,
+        num_nodes: int,
+        pipe: list[connection.Connection],
+        my_ip: str,
+        arguments: OobleckArguments,
+    ):
+        # Assume all GPUs are in one GPUs
+        num_gpus_per_node = 4
+        num_nodes_per_pipeline = 1
+        pipe = pipe[rank]
+        global_num_microbatch = (
+            arguments.global_microbatch_size // arguments.microbatch_size
+        )
+
+        socket_patcher = patch("socket.gethostbyname", return_value=my_ip)
+        socket_patcher.start()
+        pt_patcher = patch(
+            "oobleck.execution.engine.PipelineTemplateGenerator.create_pipeline_templates",
+            return_value=[
+                factory.get_dummy_pipeline_template(
+                    num_stages=num_stages,
+                    num_gpus_per_node=num_gpus_per_node,
+                    num_nodes=num_nodes_per_pipeline,
+                )
+            ],
+        )
+        pt_patcher.start()
+
+        engine = OobleckEngine(rank, num_nodes, num_gpus_per_node, pipe, arguments)
+        engine.initialize_distributed()
+        engine.instantiate_pipelines(global_num_microbatch)
+
+        # Check only one pipelines are instantiated
+        assert len(engine._reconfiguration._pipelines) == 1
+
+        # Check all 4 GPUs are used
+        assert len(engine._pipeline._ranks) == 4
+
+        # Check FSDP is used
+        for layer in engine._pipeline.execution._layers:
+            if num_stages == 4:
+                assert (
+                    layer._param_handle._sharding_strategy
+                    == HandleShardingStrategy.NO_SHARD
+                )
+                assert layer._group_size == 1
+            else:
+                assert (
+                    layer._param_handle._sharding_strategy
+                    == HandleShardingStrategy.FULL_SHARD
+                )
+                assert layer._group_size == 4 // num_stages
+
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ]
+        ) as prof:
+            engine._train_step()
+
+        prof.export_chrome_trace(f"/tmp/rank{rank}.json")
+
+        torch.cuda.synchronize()
+        print(f"Rank {rank} finished training step")
+
+    def test_fsdp_engine_train(self, num_stages: int, sample_args: OobleckArguments):
+        ctx = multiprocessing.get_context("spawn")
+        agent_ip: str = "127.0.0.1"
+        pipes = [ctx.Pipe(duplex=True) for _ in range(4)]
+        for pipe, _ in pipes:
+            # DistributionInfo
+            pipe.send(DistributionInfo([agent_ip], 4))
+
+        thread = threading.Thread(target=self.broadcast_rank0_port, args=(pipes,))
+        thread.start()
+
+        num_gpus_per_node = 4 // num_stages
+        self.run_in_parallel(
+            4,
+            self._run_fsdp_allreduce,
+            num_stages,
+            4,
+            [p[1] for p in pipes],
+            agent_ip,
+            sample_args,
+        )
+        thread.join()
+
+    @staticmethod
     def _run_reconfiguration(
         factory: OobleckStaticClassFactory,
         rank: int,
@@ -535,7 +629,7 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
                     layer = next(
                         layer
                         for layer in engine._pipeline.execution._layers
-                        if layer._layer_id == layer_id
+                        if layer.layer_id == layer_id
                     )
                     assert layer._param_handle.flat_param is not None
                     assert layer._param_handle.world_size == len(ranks_per_layer)
@@ -544,7 +638,7 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
                         next(
                             layer
                             for layer in engine._pipeline.execution._layers
-                            if layer._layer_id == layer_id
+                            if layer.layer_id == layer_id
                         )
         else:
             # We only have one pipeline and lose one node.

@@ -255,18 +255,18 @@ class ReconfigurationEngine:
                         param = next(
                             layer
                             for layer in self.engine._pipeline.execution._layers
-                            if layer._layer_id == layer_index
+                            if layer.layer_id == layer_index
                         )._param_handle.flat_param
                         next(
                             layer
                             for layer in new_pipeline.execution._layers
-                            if layer._layer_id == layer_index
+                            if layer.layer_id == layer_index
                         )._param_handle.flat_param.data = param.data
                     else:
                         param = next(
                             layer
                             for layer in new_pipeline.execution._layers
-                            if layer._layer_id == layer_index
+                            if layer.layer_id == layer_index
                         )._param_handle.flat_param
 
                     dist.broadcast(
@@ -340,6 +340,13 @@ class DataParallelEngine:
     ):
         self._engine = weakref.ref(engine)
         self._dp_process_groups = dp_process_groups
+        self._fsdp_index = next(
+            i
+            for i, process_group in dp_process_groups[
+                self.engine._pipeline.execution._layers[0].layer_id
+            ].items()
+            if dist.get_rank(process_group) >= 0
+        )
 
     @property
     def engine(self):
@@ -347,8 +354,8 @@ class DataParallelEngine:
 
     def do_allreduce(self):
         for layer in self.engine._pipeline.execution._layers:
-            process_groups_per_layer = self._dp_process_groups[layer._layer_id]
-            layer.reduce_gradients(list(process_groups_per_layer.values()))
+            process_group = self._dp_process_groups[layer.layer_id][self._fsdp_index]
+            layer.reduce_gradients(process_group)
 
 
 class OobleckEngine:
