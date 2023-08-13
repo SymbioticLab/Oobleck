@@ -509,11 +509,11 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
         num_stages: int,
         num_nodes: int,
         num_gpus_per_node: int,
-        pipe: list[connection.Connection],
+        pipes: list[connection.Connection],
         agent_ips: list[str],
         arguments: OobleckArguments,
     ):
-        pipe = pipe[rank]
+        pipe = pipes[rank]
         global_num_microbatch = (
             arguments.global_microbatch_size // arguments.microbatch_size
         )
@@ -562,6 +562,13 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
             )
         pt_patcher.start()
 
+        # The test manually calls reconfiguration code. Remove listener.
+        listener_mock = patch(
+            "oobleck.execution.engine.ReconfigurationEngine._start_reconfiguration_listener",
+            return_value=None,
+        )
+        listener_mock.start()
+
         engine = OobleckEngine(0, num_nodes, num_gpus_per_node, pipe, arguments)
         engine.initialize_distributed()
         engine.instantiate_pipelines(global_num_microbatch)
@@ -569,25 +576,24 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
         assert engine._dp_engine
         assert engine._reconfiguration
 
+        assert engine._dist_info.agent_ips == agent_ips
+        assert engine._dist_info.world_size == 4
         assert torch.distributed.get_world_size() == 4
 
         if rank == 3:
             return
-
-        # reinitialize distributed
-        engine.initialize_distributed()
 
         if num_stages == 1:
             # No copy happens. Expect dist.broadcast call number 0.
             with patch.object(
                 torch.distributed, "broadcast", wraps=torch.distributed.broadcast
             ) as broadcast_spy:
-                engine._reconfiguration.on_reconfigure([3])
+                engine._reconfiguration._on_receive_reconfiguration_notification()
                 assert broadcast_spy.call_count == 0
         elif num_stages == 2:
             # We should have one 1-stage pipeline and one 2-stage pipeline.
             # Copy must happen. Check rank grids.
-            engine._reconfiguration.on_reconfigure([3])
+            engine._reconfiguration._on_receive_reconfiguration_notification()
 
             model = factory.get_model()
             for pipeline in engine._reconfiguration._pipelines:
@@ -625,7 +631,10 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
             # We only have one pipeline and lose one node.
             # Cannot recover from it
             with pytest.raises(RuntimeError):
-                engine._reconfiguration.on_reconfigure([3])
+                engine._reconfiguration._on_receive_reconfiguration_notification()
+
+        assert engine._dist_info.agent_ips == agent_ips[:3]
+        assert engine._dist_info.world_size == 3
 
     def test_distribued_engine_reconfiguration(
         self, num_stages: int, sample_args: OobleckArguments
@@ -645,12 +654,14 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
                 # DistributionInfo
                 pipe.send(DistributionInfo(agent_ips, len(agent_ips)))
 
+            # Rebroadcast rank 0 port.
             self.broadcast_rank0_port(pipes)
 
-            # Send distribution info again, but without rank 3
             for pipe, _ in pipes:
-                pipe.send(DistributionInfo(agent_ips[:-1], len(agent_ips) - 1))
+                # Broadcast that we lost node 3.
+                pipe.send(agent_ips[3])
 
+            # Rebroadcast rank 0 port again.
             self.broadcast_rank0_port(pipes)
 
         thread = threading.Thread(target=broadcast_rank0_port)

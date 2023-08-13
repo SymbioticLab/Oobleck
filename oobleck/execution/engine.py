@@ -68,7 +68,7 @@ class ReconfigurationEngine:
             engine = self.engine
             lost_node: str = engine._agent_pipe.recv()
             lost_ranks = self.remove_lost_node_from_dist_info(lost_node)
-            
+
             engine.initialize_distributed()
 
             self.on_reconfigure(lost_ranks)
@@ -82,7 +82,7 @@ class ReconfigurationEngine:
         assert (
             hasattr(engine, "_dist_info") and engine._dist_info is not None
         ), "Distributed is not initialized yet."
-        engine._dist_info.agent_ips.pop(lost_node_ip)
+        engine._dist_info.agent_ips.remove(lost_node_ip)
         engine._dist_info.world_size -= engine._num_gpus_per_node
         return engine._rank_map.pop(lost_node_ip)
 
@@ -485,7 +485,7 @@ class OobleckEngine:
             torch.distributed.destroy_process_group(torch.distributed.group.WORLD)
             dist.cdb = None
 
-        if hasattr(self, "_dist_info") and self._dist_info is not None:
+        if not (hasattr(self, "_dist_info") and self._dist_info is not None):
             self._dist_info: DistributionInfo = self._agent_pipe.recv()
             self._rank_map: dict[str, list[int]] = {
                 ip: list(
