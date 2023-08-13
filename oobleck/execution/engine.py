@@ -64,9 +64,27 @@ class ReconfigurationEngine:
         1. destroy current process group
         2. reconfigure the pipeline with lost rank information
         """
-        lost_ranks: list[int] = self.engine._agent_pipe.recv()
-        self.on_reconfigure(lost_ranks)
-        self._reconfiguration_listener = self._start_reconfiguration_listener()
+        try:
+            engine = self.engine
+            lost_node: str = engine._agent_pipe.recv()
+            lost_ranks = self.remove_lost_node_from_dist_info(lost_node)
+            
+            engine.initialize_distributed()
+
+            self.on_reconfigure(lost_ranks)
+            self._reconfiguration_listener = self._start_reconfiguration_listener()
+        except EOFError:
+            # Connection reset by agent. Can happen in tests.
+            pass
+
+    def remove_lost_node_from_dist_info(self, lost_node_ip: str) -> list[int]:
+        engine = self.engine
+        assert (
+            hasattr(engine, "_dist_info") and engine._dist_info is not None
+        ), "Distributed is not initialized yet."
+        engine._dist_info.agent_ips.pop(lost_node_ip)
+        engine._dist_info.world_size -= engine._num_gpus_per_node
+        return engine._rank_map.pop(lost_node_ip)
 
     def on_reconfigure(self, lost_ranks: list[int]):
         def get_pipeline_template(
@@ -80,13 +98,6 @@ class ReconfigurationEngine:
                 ),
                 None,
             )
-
-        # Destroy all process groups
-        # TODO: if we try to destroy a process group where some operation is stuck,
-        # destroying it might be stuck as well.
-        # If this is witnessed, change it to destryoing all process groups
-        # manually gathered in ThreadPoolExecutor.
-        torch.distributed.destroy_process_group(group=None)
 
         # Copy existing ranks list to use it for data copy
         # layer index -> list of ranks
@@ -459,24 +470,41 @@ class OobleckEngine:
         return dataset, model, profile_results, pipeline_templates
 
     def initialize_distributed(self):
+        """
+        At the beginning, `dist_info` is None.
+        During reconfiguration, `dist_info` is given in
+        `ReconfigurationEngine._on_receive_reconfiguration_notification`.
+        """
         if dist.is_initialized():
-            # TODO: destroying process group should be done in C++ backend
+            # Destroy all process groups
+            # TODO: if we try to destroy a process group where some operation is stuck,
+            # destroying it might be stuck as well.
+            # If this is witnessed, change it to destryoing all process groups
+            # manually gathered in ThreadPoolExecutor.
             logger.info("Destroying distributed process group...")
-            torch.distributed.destroy_process_group()
+            torch.distributed.destroy_process_group(torch.distributed.group.WORLD)
             dist.cdb = None
 
-        dist_info: DistributionInfo = self._agent_pipe.recv()
+        if hasattr(self, "_dist_info") and self._dist_info is not None:
+            self._dist_info: DistributionInfo = self._agent_pipe.recv()
+            self._rank_map: dict[str, list[int]] = {
+                ip: list(
+                    range(
+                        i * self._num_gpus_per_node, (i + 1) * self._num_gpus_per_node
+                    )
+                )
+                for i, ip in enumerate(self._dist_info.agent_ips)
+            }
+        dist_info = self._dist_info
+
         my_ip: str = socket.gethostbyname(socket.gethostname())
         assert my_ip in dist_info.agent_ips, "My IP is not in dist info."
 
         self._num_nodes = len(dist_info.agent_ips)
         self._world_size = dist_info.world_size
-        self._rank = (
-            dist_info.agent_ips.index(my_ip) * self._num_gpus_per_node
-            + self._local_rank
-        )
+        self._rank = self._rank_map[my_ip][self._local_rank]
 
-        if self._rank == 0:
+        if next(iter(self._rank_map)) == my_ip and self._local_rank == 0:
             store = torch.distributed.TCPStore(
                 host_name=my_ip,
                 port=0,

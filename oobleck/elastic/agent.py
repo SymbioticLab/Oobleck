@@ -41,10 +41,6 @@ class OobleckAgent:
 
     def __init__(self, args: OobleckAgentArguments):
         self._args = args
-        self._rank_map: dict[str, list[int]] = {
-            ip: list(range(i * args.num_workers, (i + 1) * args.num_workers))
-            for i, ip in enumerate(args.node_ips)
-        }
         self._conn: tuple[asyncio.StreamReader, asyncio.StreamWriter] | None = None
         self._workers: list[Worker] = []
         self._response_callbacks: dict[message_util.RequestType, callable] = {}
@@ -196,9 +192,8 @@ class OobleckAgent:
 
         else:
             # Send notification to workers
-            lost_ranks: list[int] = self._rank_map.pop(lost_node)
             for worker in self._workers:
-                worker.pipe.send(lost_ranks)
+                worker.pipe.send(lost_node)
 
     async def on_receive_response(self):
         r, w = self._conn
