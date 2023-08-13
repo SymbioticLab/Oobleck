@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import copy
-import signal
 import socket
+import threading
 import weakref
 from collections import defaultdict
 from multiprocessing import connection
@@ -43,13 +43,20 @@ class ReconfigurationEngine:
             engine._pipeline_templates[0]._num_nodes
             * engine._pipeline_templates[0]._num_gpus_per_node
         )
-        signal.signal(signal.SIGUSR1, self._on_receive_reconfiguration_signal)
+        self._reconfiguration_listener = self._start_reconfiguration_listener()
+
+    def _start_reconfiguration_listener(self) -> threading.Thread:
+        thread = threading.Thread(
+            target=self._on_receive_reconfiguration_notification, daemon=True
+        )
+        thread.start()
+        return thread
 
     @property
     def engine(self):
         return self._engine()
 
-    def _on_receive_reconfiguration_signal(self, signum: signal.Signals, frame):
+    def _on_receive_reconfiguration_notification(self):
         """A method that will be executed in a separate thread
         Waiting for an event from the agent to reconfigure the pipeline.
 
@@ -57,11 +64,9 @@ class ReconfigurationEngine:
         1. destroy current process group
         2. reconfigure the pipeline with lost rank information
         """
-        assert signum == signal.SIGUSR1
-
-        # This isn't a low level signal handler, so it doesn't have to finish quick.
         lost_ranks: list[int] = self.engine._agent_pipe.recv()
         self.on_reconfigure(lost_ranks)
+        self._reconfiguration_listener = self._start_reconfiguration_listener()
 
     def on_reconfigure(self, lost_ranks: list[int]):
         def get_pipeline_template(
@@ -75,6 +80,13 @@ class ReconfigurationEngine:
                 ),
                 None,
             )
+
+        # Destroy all process groups
+        # TODO: if we try to destroy a process group where some operation is stuck,
+        # destroying it might be stuck as well.
+        # If this is witnessed, change it to destryoing all process groups
+        # manually gathered in ThreadPoolExecutor.
+        torch.distributed.destroy_process_group(group=None)
 
         # Copy existing ranks list to use it for data copy
         # layer index -> list of ranks

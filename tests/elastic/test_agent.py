@@ -58,14 +58,12 @@ class TestOobleckAgentClass(OobleckElasticTestCase):
             worker.process.join()
 
     @staticmethod
-    def agent_process_fn(args: OobleckAgentArguments):
-        logging.basicConfig(level=logging.INFO)
+    async def agent_process_fn(args: OobleckAgentArguments):
         agent = OobleckAgent(args)
-        loop = asyncio.new_event_loop()
-        loop.run_until_complete(
-            agent._connect_to_master(args.master_ip, args.master_port)
-        )
-        loop.run_until_complete(agent._register_agent())
+        await agent._connect_to_master(args.master_ip, args.master_port)
+        await agent._register_agent()
+        await asyncio.sleep(1)
+        agent._conn[1].close()
 
     @dataclass
     class FakeProcess:
@@ -87,22 +85,25 @@ class TestOobleckAgentClass(OobleckElasticTestCase):
         for i in range(num_workers):
             agent._workers.append(Worker(pipe[1], TestOobleckAgentClass.FakeProcess(i)))
         pipe_spy = mocker.spy(agent._workers[0].pipe, "send")
-        kill_mock = mocker.patch("os.kill", return_value=None)
 
         expected_lost_ranks = agent._rank_map["127.0.0.2"]
 
-        with patch(
+        # Create a new agent
+        new_agent = OobleckAgent(agent._args)
+        await new_agent._connect_to_master(
+            agent._args.master_ip, agent._args.master_port
+        )
+        mocker.patch(
             "asyncio.StreamWriter.get_extra_info", return_value=("127.0.0.2", "12345")
-        ), ProcessPoolExecutor(max_workers=1) as executor:
-            loop = asyncio.get_running_loop()
-            future = loop.run_in_executor(
-                executor, TestOobleckAgentClass.agent_process_fn, agent._args
-            )
-            await asyncio.wait([future])
+        )
+        await new_agent._register_agent()
+        new_agent._conn[1].close()
+        await new_agent._conn[1].wait_closed()
+
+        asyncio.create_task(agent.on_receive_response())
 
         # Yield context so that agent can receive reconfiguration message
         while "127.0.0.2" in agent._rank_map:
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.1)
 
-        assert kill_mock.call_count == self.sample_num_workers
         pipe_spy.assert_called_with(expected_lost_ranks)

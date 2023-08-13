@@ -62,3 +62,6 @@ class OobleckElasticTestCase:
         mocker.patch.object(agent, "_run_profiler", return_value=future)
         await agent._connect_to_master(args.master_ip, args.master_port)
         yield agent
+        if not agent._conn[1].is_closing():
+            agent._conn[1].close()
+            await agent._conn[1].wait_closed()

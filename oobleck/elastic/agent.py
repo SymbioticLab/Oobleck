@@ -1,7 +1,6 @@
 import asyncio
 import multiprocessing
 import os
-import signal
 import socket
 import sys
 from dataclasses import dataclass
@@ -196,11 +195,10 @@ class OobleckAgent:
             sys.exit(1)
 
         else:
-            # Send SIGUSR1 signal to workers
+            # Send notification to workers
             lost_ranks: list[int] = self._rank_map.pop(lost_node)
             for worker in self._workers:
                 worker.pipe.send(lost_ranks)
-                os.kill(worker.process.pid, signal.SIGUSR1)
 
     async def on_receive_response(self):
         r, w = self._conn
