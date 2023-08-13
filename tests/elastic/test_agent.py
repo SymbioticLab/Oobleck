@@ -1,9 +1,5 @@
 import asyncio
-import logging
 import multiprocessing
-from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
-from unittest.mock import patch
 
 import pytest
 from pytest_mock import MockerFixture
@@ -65,13 +61,6 @@ class TestOobleckAgentClass(OobleckElasticTestCase):
         await asyncio.sleep(1)
         agent._conn[1].close()
 
-    @dataclass
-    class FakeProcess:
-        def __init__(self, pid: int):
-            self.pid = pid
-
-        pid: int
-
     @pytest.mark.asyncio
     async def test_receive_reconfiguration(
         self, daemon: OobleckMasterDaemon, agent: OobleckAgent, mocker: MockerFixture
@@ -79,16 +68,16 @@ class TestOobleckAgentClass(OobleckElasticTestCase):
         num_workers = 4
 
         await agent._register_agent()
-        assert list(agent._rank_map.keys()) == daemon._job.node_ips
+        assert agent._args.node_ips == daemon._job.node_ips
         # Fake worker processes
         pipe = multiprocessing.Pipe()
         for i in range(num_workers):
-            agent._workers.append(Worker(pipe[1], TestOobleckAgentClass.FakeProcess(i)))
+            agent._workers.append(Worker(pipe[1], None))
         pipe_spy = mocker.spy(agent._workers[0].pipe, "send")
 
-        expected_lost_ranks = agent._rank_map["127.0.0.2"]
+        expected_lost_node = "127.0.0.2"
 
-        # Create a new agent
+        # Create a new agent, register it, and terminate it
         new_agent = OobleckAgent(agent._args)
         await new_agent._connect_to_master(
             agent._args.master_ip, agent._args.master_port
@@ -103,7 +92,7 @@ class TestOobleckAgentClass(OobleckElasticTestCase):
         asyncio.create_task(agent.on_receive_response())
 
         # Yield context so that agent can receive reconfiguration message
-        while "127.0.0.2" in agent._rank_map:
+        while "127.0.0.2" in agent._args.node_ips:
             await asyncio.sleep(0.1)
 
-        pipe_spy.assert_called_with(expected_lost_ranks)
+        pipe_spy.assert_called_with(expected_lost_node)

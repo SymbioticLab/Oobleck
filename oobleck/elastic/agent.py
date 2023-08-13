@@ -179,21 +179,22 @@ class OobleckAgent:
                 self._conn[1], args, need_pickle=True, drain=True, close=False
             )
 
-    async def on_receive_reconfiguration(self, lost_node: str):
+    async def on_receive_reconfiguration(self, lost_node_ip: str):
         logger.debug(f"reconfiguration request received due to node failure: {str}")
 
         # This is for emulating a lost node by sending a command from the master.
         # Won't happen in normal case.
-        if lost_node == socket.gethostbyname(socket.gethostname()):
+        if lost_node_ip == socket.gethostbyname(socket.gethostname()):
             logger.info("I'm the lost node. I'll terminate myself.")
             for worker in self._workers:
                 worker.process.terminate()
             sys.exit(1)
 
         else:
+            self._args.node_ips.remove(lost_node_ip)
             # Send notification to workers
             for worker in self._workers:
-                worker.pipe.send(lost_node)
+                worker.pipe.send(lost_node_ip)
 
     async def on_receive_response(self):
         r, w = self._conn
