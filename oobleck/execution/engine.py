@@ -43,18 +43,18 @@ class ReconfigurationEngine:
             engine._pipeline_templates[0]._num_nodes
             * engine._pipeline_templates[0]._num_gpus_per_node
         )
-        self._reconfiguration_listener = self._start_reconfiguration_listener()
-
-    def _start_reconfiguration_listener(self) -> threading.Thread:
-        thread = threading.Thread(
-            target=self._on_receive_reconfiguration_notification, daemon=True
+        self._reconfiguration_listener = threading.Thread(
+            target=self._reconfiguration_listener_fn, daemon=True
         )
-        thread.start()
-        return thread
+        self._reconfiguration_listener.start()
 
     @property
     def engine(self):
         return self._engine()
+
+    def _reconfiguration_listener_fn(self):
+        while True:
+            self._on_receive_reconfiguration_notification()
 
     def _on_receive_reconfiguration_notification(self):
         """A method that will be executed in a separate thread
@@ -70,11 +70,9 @@ class ReconfigurationEngine:
             lost_ranks = self.remove_lost_node_from_dist_info(lost_node)
 
             engine.initialize_distributed()
-
             self.on_reconfigure(lost_ranks)
-            self._reconfiguration_listener = self._start_reconfiguration_listener()
-        except EOFError:
-            # Connection reset by agent. Can happen in tests.
+        except (EOFError, ValueError):
+            # Connection closed. Exit.
             pass
 
     def remove_lost_node_from_dist_info(self, lost_node_ip: str) -> list[int]:

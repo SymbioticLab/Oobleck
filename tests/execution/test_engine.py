@@ -466,16 +466,7 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
                 )
                 assert layer._group_size == 4 // num_stages
 
-        with torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ]
-        ) as prof:
-            engine._train_step()
-
-        prof.export_chrome_trace(f"/tmp/rank{rank}.json")
-
+        engine._train_step()
         torch.cuda.synchronize()
         print(f"Rank {rank} finished training step")
 
@@ -563,11 +554,11 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
         pt_patcher.start()
 
         # The test manually calls reconfiguration code. Remove listener.
-        listener_mock = patch(
-            "oobleck.execution.engine.ReconfigurationEngine._start_reconfiguration_listener",
+        reconfig_mock = patch(
+            "oobleck.execution.engine.ReconfigurationEngine._reconfiguration_listener_fn",
             return_value=None,
         )
-        listener_mock.start()
+        reconfig_mock.start()
 
         engine = OobleckEngine(0, num_nodes, num_gpus_per_node, pipe, arguments)
         engine.initialize_distributed()
