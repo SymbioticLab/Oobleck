@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import socket
 import threading
 import weakref
@@ -457,12 +458,38 @@ class OobleckEngine:
             self._hf_training_args.per_device_train_batch_size,
         )
 
+        # Minimum number of nodes is determined by the memory capacity.
+        # TODO: calculate minimum number of nodes more precisely. This is still inaccurate
+        total_memory_consumption = 6 * sum(
+            [layer_result._mem_required[0] for layer_result in profile_results.get()]
+        )
+        total_memory_consumption += max(
+            [layer_result._mem_required[1] for layer_result in profile_results.get()]
+        )
+        min_num_nodes = max(
+            1,
+            math.ceil(
+                total_memory_consumption
+                / (
+                    torch.cuda.get_device_properties("cuda:0").total_memory
+                    * self._num_gpus_per_node
+                )
+            ),
+        )
+        max_num_nodes = num_nodes
+        assert min_num_nodes <= max_num_nodes, (
+            "Minimum required number of nodes is larger than maximum number of nodes "
+            f"(minimum required: {min_num_nodes}, you have: {max_num_nodes})."
+        )
+
+        logger.info(f"Number of nodes range: ({min_num_nodes}, {max_num_nodes})")
+
         # TODO: Calculate num_gpus_range based on profile results
         template_generator = PipelineTemplateGenerator()
         pipeline_templates: list[
             PipelineTemplate
         ] = template_generator.create_pipeline_templates(
-            profile_results, (1, num_nodes), num_gpus_per_node
+            profile_results, (min_num_nodes, max_num_nodes), num_gpus_per_node
         )
 
         return dataset, model, profile_results, pipeline_templates
