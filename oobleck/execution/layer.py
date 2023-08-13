@@ -52,6 +52,7 @@ class Layer(torch.nn.Module):
         layer._rank_index = torch.distributed.get_rank(process_group)
         layer._group_size = torch.distributed.get_world_size(process_group)
         layer._param_handle = existing_layer._param_handle
+        layer._param_handle.process_group = process_group
         layer.pre_stream = existing_layer.pre_stream
         layer.post_stream = existing_layer.post_stream
 

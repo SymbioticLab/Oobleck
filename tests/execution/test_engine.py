@@ -17,36 +17,17 @@ import torch.distributed
 from pytest_mock import MockerFixture
 from torch.distributed.fsdp.flat_param import HandleShardingStrategy
 
-from oobleck.csrc.planning.pipeline_template import PipelineTemplate
 from oobleck.elastic.message_util import DistributionInfo
 from oobleck.elastic.training_util import OobleckArguments
-from oobleck.execution.dataloader import LoaderType, OobleckDataLoader, OobleckSampler
-from oobleck.execution.engine import OobleckEngine, ReconfigurationEngine
+from oobleck.execution.dataloader import OobleckSampler
+from oobleck.execution.engine import OobleckEngine
 from oobleck.execution.pipeline import OobleckPipeline
 from tests.conftest import (
     TRAIN_BATCH_SIZE,
     OobleckMultiProcessTestCase,
-    OobleckSingleProcessTestCase,
     OobleckStaticClassFactory,
-    datasets,
-    model_args,
 )
 from tests.elastic.conftest import OobleckElasticTestCase
-
-
-@pytest.fixture(scope="module")
-def sample_args(model_name_fixture: str) -> OobleckArguments:
-    dataset: tuple[str, (str | None)] = datasets[model_name_fixture]
-    return OobleckArguments(
-        model_name=model_name_fixture,
-        model_tag="test",
-        dataset_path=dataset[0],
-        dataset_name=dataset[1],
-        fault_threshold=1,
-        model_args=model_args[model_name_fixture],
-        microbatch_size=TRAIN_BATCH_SIZE,
-        global_microbatch_size=4 * TRAIN_BATCH_SIZE,
-    )
 
 
 class TestOobleckEngineClass(OobleckElasticTestCase):
@@ -485,16 +466,7 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
                 )
                 assert layer._group_size == 4 // num_stages
 
-        with torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ]
-        ) as prof:
-            engine._train_step()
-
-        prof.export_chrome_trace(f"/tmp/rank{rank}.json")
-
+        engine._train_step()
         torch.cuda.synchronize()
         print(f"Rank {rank} finished training step")
 
@@ -528,11 +500,11 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
         num_stages: int,
         num_nodes: int,
         num_gpus_per_node: int,
-        pipe: list[connection.Connection],
+        pipes: list[connection.Connection],
         agent_ips: list[str],
         arguments: OobleckArguments,
     ):
-        pipe = pipe[rank]
+        pipe = pipes[rank]
         global_num_microbatch = (
             arguments.global_microbatch_size // arguments.microbatch_size
         )
@@ -581,6 +553,13 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
             )
         pt_patcher.start()
 
+        # The test manually calls reconfiguration code. Remove listener.
+        reconfig_mock = patch(
+            "oobleck.execution.engine.ReconfigurationEngine._reconfiguration_listener_fn",
+            return_value=None,
+        )
+        reconfig_mock.start()
+
         engine = OobleckEngine(0, num_nodes, num_gpus_per_node, pipe, arguments)
         engine.initialize_distributed()
         engine.instantiate_pipelines(global_num_microbatch)
@@ -588,25 +567,24 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
         assert engine._dp_engine
         assert engine._reconfiguration
 
+        assert engine._dist_info.agent_ips == agent_ips
+        assert engine._dist_info.world_size == 4
         assert torch.distributed.get_world_size() == 4
 
         if rank == 3:
             return
-
-        # reinitialize distributed
-        engine.initialize_distributed()
 
         if num_stages == 1:
             # No copy happens. Expect dist.broadcast call number 0.
             with patch.object(
                 torch.distributed, "broadcast", wraps=torch.distributed.broadcast
             ) as broadcast_spy:
-                engine._reconfiguration.on_reconfigure([3])
+                engine._reconfiguration._on_receive_reconfiguration_notification()
                 assert broadcast_spy.call_count == 0
         elif num_stages == 2:
             # We should have one 1-stage pipeline and one 2-stage pipeline.
             # Copy must happen. Check rank grids.
-            engine._reconfiguration.on_reconfigure([3])
+            engine._reconfiguration._on_receive_reconfiguration_notification()
 
             model = factory.get_model()
             for pipeline in engine._reconfiguration._pipelines:
@@ -644,7 +622,10 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
             # We only have one pipeline and lose one node.
             # Cannot recover from it
             with pytest.raises(RuntimeError):
-                engine._reconfiguration.on_reconfigure([3])
+                engine._reconfiguration._on_receive_reconfiguration_notification()
+
+        assert engine._dist_info.agent_ips == agent_ips[:3]
+        assert engine._dist_info.world_size == 3
 
     def test_distribued_engine_reconfiguration(
         self, num_stages: int, sample_args: OobleckArguments
@@ -664,12 +645,14 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
                 # DistributionInfo
                 pipe.send(DistributionInfo(agent_ips, len(agent_ips)))
 
+            # Rebroadcast rank 0 port.
             self.broadcast_rank0_port(pipes)
 
-            # Send distribution info again, but without rank 3
             for pipe, _ in pipes:
-                pipe.send(DistributionInfo(agent_ips[:-1], len(agent_ips) - 1))
+                # Broadcast that we lost node 3.
+                pipe.send(agent_ips[3])
 
+            # Rebroadcast rank 0 port again.
             self.broadcast_rank0_port(pipes)
 
         thread = threading.Thread(target=broadcast_rank0_port)
@@ -686,205 +669,3 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
             sample_args,
         )
         thread.join()
-
-
-class TestOobleckReconfigurationClass(OobleckSingleProcessTestCase):
-    class Execution:
-        _layers: list[None] = []
-
-    class FakePipeline:
-        def __init__(
-            self,
-            pipeline_id: int,
-            pipeline_template: PipelineTemplate,
-            ranks: list[int],
-            dataloader: OobleckDataLoader,
-            *args,
-            **kwargs,
-        ):
-            self._pipeline_id = pipeline_id
-            self._template = pipeline_template
-            self._ranks = ranks
-            self._dataloader = dataloader
-            self._global_step = 0
-            self.execution = TestOobleckReconfigurationClass.Execution()
-            self.my_pipeline = bool(0 in self._ranks)
-
-            # copy from pipeline __init__
-            # layer_index -> ranks
-            self.rank_grid: dict[int, list[int]] = pipeline_template.get_rank_grid(
-                self._ranks
-            )
-
-        def initialize_distributed_fsdp(self, *args):
-            pass
-
-        def initialize_distributed_pipeline(self, *args):
-            pass
-
-        def initialize_execution(self, *args):
-            pass
-
-    class FakeEngine:
-        def __init__(
-            self,
-            test_class: TestOobleckReconfigurationClass,
-            sample_args: OobleckArguments,
-        ):
-            self.test_class = test_class
-            self._agent_pipe: connection.Connection = None
-            self._args = sample_args
-            self._hf_training_args = test_class.factory._training_args
-            self._num_nodes = sum(range(2, 6))
-            self._num_gpus_per_node = 1
-            self._dataset = test_class.factory.get_dataset()
-            self._model = test_class.factory.get_model()
-            self._profile_results = test_class.factory.get_dummy_profile()
-            self._pipeline_templates = [
-                test_class.factory.get_dummy_pipeline_template(
-                    num_stages=i,
-                    num_gpus_per_node=1,
-                    num_nodes=i,
-                )
-                for i in range(2, 6)
-            ]
-
-        def init_pipelines(self) -> list[OobleckPipeline]:
-            num_gpus_used: int = 0
-            pipeline_id: int = 0
-            pipelines: list[OobleckPipeline] = []
-
-            dataloader = OobleckDataLoader(
-                self._hf_training_args, self._dataset, LoaderType.Training, 0, [0], 0, 0
-            )
-
-            # Have one pipelines for each pipeline template
-            for template in self._pipeline_templates:
-                pipelines.append(
-                    self.test_class.FakePipeline(
-                        pipeline_id,
-                        template,
-                        list(
-                            range(
-                                num_gpus_used,
-                                num_gpus_used + len(template.get_stages()),
-                            )
-                        ),
-                        dataloader,
-                    )
-                )
-
-                pipeline_id += 1
-                num_gpus_used += len(template.get_stages())
-            self._pipeline = pipelines[0]
-            return pipelines
-
-    @pytest.fixture
-    def fake_engine(
-        self, mocker: MockerFixture, sample_args: OobleckArguments
-    ) -> TestOobleckReconfigurationClass.FakeEngine:
-        mocker.patch(
-            "oobleck.planning.instantiator.OobleckPipeline",
-            new=TestOobleckReconfigurationClass.FakePipeline,
-        )
-        mocker.patch(
-            "deepspeed.comm.new_group",
-            return_value=None,
-        )
-        mocker.patch(
-            "deepspeed.comm.get_rank",
-            return_value=0,
-        )
-        mocker.patch(
-            "torch.distributed.init_process_group",
-            return_value=None,
-        )
-        mocker.patch(
-            "oobleck.execution.engine.ReconfigurationEngine._copy_model_states",
-            return_value=None,
-        )
-        yield self.FakeEngine(self, sample_args)
-
-    @pytest.mark.parametrize(
-        ["failed_ranks", "expected_ranks"],
-        [
-            ([2], [[0, 1], [3, 4], [5, 6, 7, 8], [9, 10, 11, 12, 13]]),
-            ([6, 8], [[0, 1], [5, 7], [2, 3, 4], [9, 10, 11, 12, 13]]),
-            ([10, 11], [[0, 1], [2, 3, 4], [9, 12, 13], [5, 6, 7, 8]]),
-        ],
-    )
-    def test_reconfigure_with_all_available_templates(
-        self,
-        fake_engine: TestOobleckReconfigurationClass.FakeEngine,
-        failed_ranks: list[int],
-        expected_ranks: list[list[int]],
-    ):
-        pipelines = fake_engine.init_pipelines()
-        assert len(pipelines) == 4
-        # 2 + 3 + 4 + 5
-        assert sum(len(pipeline._ranks) for pipeline in pipelines) == 14
-        reconfigure_engine = ReconfigurationEngine(fake_engine, pipelines)
-
-        # [0,1],[2,3,4],[5,6,7,8],[9,10,11,12,13]
-        reconfigure_engine.on_reconfigure(failed_ranks)
-
-        assert len(reconfigure_engine._pipelines) == len(expected_ranks)
-        for pipeline, expected_rank in zip(
-            reconfigure_engine._pipelines, expected_ranks
-        ):
-            assert pipeline._ranks == expected_rank
-
-    @pytest.mark.parametrize(
-        ["failed_ranks", "expected_ranks"],
-        [
-            ([1], [[0, 13], [2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]]),
-            ([1, 3, 4], [[0, 13], [2, 12], [9, 10, 11], [5, 6, 7, 8]]),
-            ([2, 4, 6, 7, 8], [[0, 1], [3, 13], [5, 12], [9, 10, 11]]),
-        ],
-    )
-    def test_reconfigure_borrow_nodes(
-        self,
-        fake_engine: TestOobleckReconfigurationClass.FakeEngine,
-        failed_ranks: list[int],
-        expected_ranks: list[list[int]],
-    ):
-        pipelines = fake_engine.init_pipelines()
-        assert len(pipelines) == 4
-        assert sum(len(pipeline._ranks) for pipeline in pipelines) == 14
-        reconfigure_engine = ReconfigurationEngine(fake_engine, pipelines)
-
-        reconfigure_engine.on_reconfigure(failed_ranks)
-
-        assert len(reconfigure_engine._pipelines) == len(expected_ranks)
-        for pipeline, expected_rank in zip(
-            reconfigure_engine._pipelines, expected_ranks
-        ):
-            assert pipeline._ranks == expected_rank
-
-    @pytest.mark.parametrize(
-        ["failed_ranks", "expected_ranks"],
-        [
-            ([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], [[0, 12, 13]]),
-            ([1, 2, 3, 5, 6, 7, 9, 11, 12, 13], [[0, 4], [8, 10]]),
-            ([1, 2, 3, 4, 5, 6, 7, 8], [[0, 13], [9, 10, 11, 12]]),
-            ([1, 2, 3, 5, 6, 7, 9, 10, 11], [[0, 4], [8, 12, 13]]),
-        ],
-    )
-    def test_reconfigure_merge_pipelines(
-        self,
-        fake_engine: TestOobleckReconfigurationClass.FakeEngine,
-        failed_ranks: list[int],
-        expected_ranks: list[list[int]],
-    ):
-        pipelines = fake_engine.init_pipelines()
-        assert len(pipelines) == 4
-        assert sum(len(pipeline._ranks) for pipeline in pipelines) == 14
-        reconfigure_engine = ReconfigurationEngine(fake_engine, pipelines)
-
-        reconfigure_engine.on_reconfigure(failed_ranks)
-
-        assert len(reconfigure_engine._pipelines) == len(expected_ranks)
-        for pipeline, expected_rank in zip(
-            reconfigure_engine._pipelines, expected_ranks
-        ):
-            assert pipeline._ranks == expected_rank

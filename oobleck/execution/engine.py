@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import copy
-import signal
 import socket
+import threading
 import weakref
 from collections import defaultdict
 from multiprocessing import connection
@@ -43,13 +43,20 @@ class ReconfigurationEngine:
             engine._pipeline_templates[0]._num_nodes
             * engine._pipeline_templates[0]._num_gpus_per_node
         )
-        signal.signal(signal.SIGUSR1, self._on_receive_reconfiguration_signal)
+        self._reconfiguration_listener = threading.Thread(
+            target=self._reconfiguration_listener_fn, daemon=True
+        )
+        self._reconfiguration_listener.start()
 
     @property
     def engine(self):
         return self._engine()
 
-    def _on_receive_reconfiguration_signal(self, signum: signal.Signals, frame):
+    def _reconfiguration_listener_fn(self):
+        while True:
+            self._on_receive_reconfiguration_notification()
+
+    def _on_receive_reconfiguration_notification(self):
         """A method that will be executed in a separate thread
         Waiting for an event from the agent to reconfigure the pipeline.
 
@@ -57,11 +64,25 @@ class ReconfigurationEngine:
         1. destroy current process group
         2. reconfigure the pipeline with lost rank information
         """
-        assert signum == signal.SIGUSR1
+        try:
+            engine = self.engine
+            lost_node: str = engine._agent_pipe.recv()
+            lost_ranks = self.remove_lost_node_from_dist_info(lost_node)
 
-        # This isn't a low level signal handler, so it doesn't have to finish quick.
-        lost_ranks: list[int] = self.engine._agent_pipe.recv()
-        self.on_reconfigure(lost_ranks)
+            engine.initialize_distributed()
+            self.on_reconfigure(lost_ranks)
+        except (EOFError, ValueError):
+            # Connection closed. Exit.
+            pass
+
+    def remove_lost_node_from_dist_info(self, lost_node_ip: str) -> list[int]:
+        engine = self.engine
+        assert (
+            hasattr(engine, "_dist_info") and engine._dist_info is not None
+        ), "Distributed is not initialized yet."
+        engine._dist_info.agent_ips.remove(lost_node_ip)
+        engine._dist_info.world_size -= engine._num_gpus_per_node
+        return engine._rank_map.pop(lost_node_ip)
 
     def on_reconfigure(self, lost_ranks: list[int]):
         def get_pipeline_template(
@@ -124,8 +145,13 @@ class ReconfigurationEngine:
         if need_merge:
             new_ranks_list = self._merge_pipelines(new_ranks_list)
 
+        # sort ranks for each list of ranks
+        for ranks in new_ranks_list:
+            ranks.sort()
+
         # Sort ranks by length so that smaller pipeline ranks always come first.
-        new_ranks_list.sort(key=lambda ranks: len(ranks))
+        # For pipelines with the same number of ranks, a pipeline with smaller rank id comes first.
+        new_ranks_list.sort(key=lambda ranks: (len(ranks), ranks[0]))
 
         # Creae new instances set
         new_num_instances_set: dict[PipelineTemplate, int] = defaultdict(int)
@@ -442,24 +468,41 @@ class OobleckEngine:
         return dataset, model, profile_results, pipeline_templates
 
     def initialize_distributed(self):
+        """
+        At the beginning, `dist_info` is None.
+        During reconfiguration, `dist_info` is given in
+        `ReconfigurationEngine._on_receive_reconfiguration_notification`.
+        """
         if dist.is_initialized():
-            # TODO: destroying process group should be done in C++ backend
+            # Destroy all process groups
+            # TODO: if we try to destroy a process group where some operation is stuck,
+            # destroying it might be stuck as well.
+            # If this is witnessed, change it to destryoing all process groups
+            # manually gathered in ThreadPoolExecutor.
             logger.info("Destroying distributed process group...")
-            torch.distributed.destroy_process_group()
+            torch.distributed.destroy_process_group(torch.distributed.group.WORLD)
             dist.cdb = None
 
-        dist_info: DistributionInfo = self._agent_pipe.recv()
+        if not (hasattr(self, "_dist_info") and self._dist_info is not None):
+            self._dist_info: DistributionInfo = self._agent_pipe.recv()
+            self._rank_map: dict[str, list[int]] = {
+                ip: list(
+                    range(
+                        i * self._num_gpus_per_node, (i + 1) * self._num_gpus_per_node
+                    )
+                )
+                for i, ip in enumerate(self._dist_info.agent_ips)
+            }
+        dist_info = self._dist_info
+
         my_ip: str = socket.gethostbyname(socket.gethostname())
         assert my_ip in dist_info.agent_ips, "My IP is not in dist info."
 
         self._num_nodes = len(dist_info.agent_ips)
         self._world_size = dist_info.world_size
-        self._rank = (
-            dist_info.agent_ips.index(my_ip) * self._num_gpus_per_node
-            + self._local_rank
-        )
+        self._rank = self._rank_map[my_ip][self._local_rank]
 
-        if self._rank == 0:
+        if next(iter(self._rank_map)) == my_ip and self._local_rank == 0:
             store = torch.distributed.TCPStore(
                 host_name=my_ip,
                 port=0,

@@ -1,7 +1,6 @@
 import asyncio
 import multiprocessing
 import os
-import signal
 import socket
 import sys
 from dataclasses import dataclass
@@ -42,10 +41,6 @@ class OobleckAgent:
 
     def __init__(self, args: OobleckAgentArguments):
         self._args = args
-        self._rank_map: dict[str, list[int]] = {
-            ip: list(range(i * args.num_workers, (i + 1) * args.num_workers))
-            for i, ip in enumerate(args.node_ips)
-        }
         self._conn: tuple[asyncio.StreamReader, asyncio.StreamWriter] | None = None
         self._workers: list[Worker] = []
         self._response_callbacks: dict[message_util.RequestType, callable] = {}
@@ -184,23 +179,22 @@ class OobleckAgent:
                 self._conn[1], args, need_pickle=True, drain=True, close=False
             )
 
-    async def on_receive_reconfiguration(self, lost_node: str):
+    async def on_receive_reconfiguration(self, lost_node_ip: str):
         logger.debug(f"reconfiguration request received due to node failure: {str}")
 
         # This is for emulating a lost node by sending a command from the master.
         # Won't happen in normal case.
-        if lost_node == socket.gethostbyname(socket.gethostname()):
+        if lost_node_ip == socket.gethostbyname(socket.gethostname()):
             logger.info("I'm the lost node. I'll terminate myself.")
             for worker in self._workers:
                 worker.process.terminate()
             sys.exit(1)
 
         else:
-            # Send SIGUSR1 signal to workers
-            lost_ranks: list[int] = self._rank_map.pop(lost_node)
+            self._args.node_ips.remove(lost_node_ip)
+            # Send notification to workers
             for worker in self._workers:
-                worker.pipe.send(lost_ranks)
-                os.kill(worker.process.pid, signal.SIGUSR1)
+                worker.pipe.send(lost_node_ip)
 
     async def on_receive_response(self):
         r, w = self._conn
