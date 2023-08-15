@@ -410,6 +410,71 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
         thread.join()
 
     @staticmethod
+    def _run_heterogeneous_pipelines(
+        factory: OobleckStaticClassFactory,
+        rank: int,
+        pipe: list[connection.Connection],
+        agent_ips: list[str],
+        arguments: OobleckArguments,
+    ):
+        pipe = pipe[rank]
+        global_num_microbatch = (
+            arguments.global_microbatch_size // arguments.microbatch_size
+        )
+
+        my_ip = agent_ips[rank]
+        socket_patcher = patch("socket.gethostbyname", return_value=my_ip)
+        socket_patcher.start()
+        pipeline_templates = [
+            factory.get_dummy_pipeline_template(
+                num_stages=1,
+                num_gpus_per_node=2,
+                num_nodes=1,
+            ),
+            factory.get_dummy_pipeline_template(
+                num_stages=2,
+                num_gpus_per_node=1,
+                num_nodes=2,
+            ),
+        ]
+        pt_patcher = patch(
+            "oobleck.execution.engine.PipelineTemplateGenerator.create_pipeline_templates",
+            return_value=pipeline_templates,
+        )
+        pt_patcher.start()
+        instance_set_patcher = patch(
+            "oobleck.planning.instantiator.PipelineInstantiator._enumerate_instantiation_options",
+            return_value=[{pipeline_templates[0]: 1, pipeline_templates[1]: 1}],
+        )
+        instance_set_patcher.start()
+
+        engine = OobleckEngine(rank % 2, 2, 2, pipe, arguments)
+        engine.initialize_distributed()
+        engine.instantiate_pipelines(global_num_microbatch)
+        assert len(engine._reconfiguration._pipelines) == 2
+
+    def test_heterogeneous_pipelines(
+        self, num_stages: int, sample_args: OobleckArguments
+    ):
+        ctx = multiprocessing.get_context("spawn")
+        agent_ips: list[str] = ["127.0.0.1", "127.0.0.1", "127.0.0.2", "127.0.0.2"]
+        pipes = [ctx.Pipe(duplex=True) for _ in range(len(agent_ips))]
+        for pipe, _ in pipes:
+            # DistributionInfo
+            pipe.send(DistributionInfo(["127.0.0.1", "127.0.0.2"], 4))
+
+        thread = threading.Thread(target=self.broadcast_rank0_port, args=(pipes,))
+        thread.start()
+
+        self.run_in_parallel(
+            len(agent_ips),
+            self._run_heterogeneous_pipelines,
+            [p[1] for p in pipes],
+            agent_ips,
+            sample_args,
+        )
+
+    @staticmethod
     def _run_fsdp_allreduce(
         factory: OobleckStaticClassFactory,
         rank: int,
