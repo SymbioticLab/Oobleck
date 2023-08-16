@@ -17,17 +17,144 @@ import torch.distributed
 from pytest_mock import MockerFixture
 from torch.distributed.fsdp.flat_param import HandleShardingStrategy
 
+from oobleck.csrc.planning.pipeline_template import PipelineTemplate
 from oobleck.elastic.message_util import DistributionInfo
 from oobleck.elastic.training_util import OobleckArguments
 from oobleck.execution.dataloader import OobleckSampler
-from oobleck.execution.engine import OobleckEngine
+from oobleck.execution.engine import DataParallelEngine, OobleckEngine
 from oobleck.execution.pipeline import OobleckPipeline
 from tests.conftest import (
     TRAIN_BATCH_SIZE,
     OobleckMultiProcessTestCase,
+    OobleckSingleProcessTestCase,
     OobleckStaticClassFactory,
 )
 from tests.elastic.conftest import OobleckElasticTestCase
+
+
+class TestOobleckDataParallelEngineClass(OobleckSingleProcessTestCase):
+    class FakeProcessGroup:
+        ranks: list[int]
+
+        def __init__(self, ranks: list[int]):
+            self.ranks = ranks
+
+        @classmethod
+        def new_group(
+            cls, ranks: list[int]
+        ) -> TestOobleckDataParallelEngineClass.FakeProcessGroup:
+            return cls(ranks)
+
+        def get_rank(self, rank) -> int:
+            return self.ranks.index(rank) if rank in self.ranks else -1
+
+        def world_size(self) -> int:
+            return len(self.ranks)
+
+    class FakeLayer:
+        def __init__(
+            self,
+            layer_id: int,
+            layer: torch.fx.GraphModule,
+            process_group: TestOobleckDataParallelEngineClass.FakeProcessGroup,  # For FSDP
+            *args,
+        ):
+            
+            self.layer_id = layer_id
+            self.process_group = process_group
+
+            # Fake layers follow FSDP flat param generation and sharding
+            # from torch.distributed.fsdp.flat_param.py
+            assert all([p.is_meta for p in layer.parameters()])
+
+            flat_params = [p.detach().reshape(-1) if isinstance(p, torch.nn.Parameter) else p.reshape(-1) for p in layer.parameters()]
+            flat_params = torch.cat(flat_params, dim=0)
+            chunks = torch.flatten(flat_params).chunk(process_group.world_size())
+            numels_to_pad = [chunk[0].numel() - chunk.numel() for chunk in chunks]
+            chunks = [torch.nn.functional.pad(chunk, [0, numel_to_pad]) for chunk, numel_to_pad in zip(chunks, numels_to_pad)]
+            self.tensor_size = [chunk.size() for chunk in chunks]
+
+        def reduce_gradients(
+            self, process_group: TestOobleckDataParallelEngineClass.FakeProcessGroup
+        ):
+            assert torch.distributed.get_rank() in process_group.ranks
+
+    @staticmethod
+    def fake_reduce_gradients(pg: TestOobleckDataParallelEngineClass.FakeProcessGroup):
+        """
+        Does nothing but raises an exception when rank is not in this group.
+        """
+        if torch.distributed.get_rank() not in pg.ranks:
+            raise RuntimeError("Rank is not in this group.")
+
+    @pytest.mark.parametrize(
+        ["num_gpus_per_node", "num_nodes", "num_pipelines", "num_stages"],
+        [(4, [2, 3], [1, 1], [4, 4])],
+    )
+    def test_data_parallel_groups(
+        self,
+        num_gpus_per_node: int,
+        num_nodes: list[int],
+        num_pipelines: list[int],
+        num_stages: list[int],
+        mocker: MockerFixture,
+    ):
+        mocker.patch("deepspeed.comm.is_initialized", return_value=True)
+        mocker.patch("deepspeed.comm.get_rank", return_value=0)
+        mocker.patch("deepspeed.comm.new_group", new=self.FakeProcessGroup)
+
+        pipeline_templates: list[PipelineTemplate] = []
+        for num_node, num_stages in zip(num_nodes, num_stages):
+            pipeline_templates.append(
+                self.factory.get_dummy_pipeline_template(
+                    num_stages, num_gpus_per_node, num_node
+                )
+            )
+
+        num_ranks = sum(
+            [
+                num_node * num_pipeline
+                for num_node, num_pipeline in zip(num_nodes, num_pipelines)
+            ]
+        )
+
+        # Required in initializing DataParallelEngine
+        model = self.factory.get_model()
+        engine_mock = mocker.MagicMock()
+
+        engine_mock._pipeline.execution._layers = model.layers
+        engine_mock._num_gpus_per_node = num_gpus_per_node
+
+        rank_used = 0
+        pipelines: list[OobleckPipeline] = []
+        for template, num_pipeline in zip(pipeline_templates, num_pipelines):
+            rank_for_pipeline = template._num_gpus_per_node * template._num_nodes
+            for _ in range(num_pipeline):
+                pipeline = OobleckPipeline(
+                    len(pipelines),
+                    template,
+                    list(range(rank_used, rank_used + rank_for_pipeline)),
+                    None,
+                    0,
+                    None,
+                )
+                pipeline.initialize_distributed_fsdp()
+                pipelines.append(pipeline)
+
+                # fake_layers = []
+                # for layer_id, layer in enumerate(model.layers):
+                #     fake_layers.append(
+                #         self.FakeLayer(layer_id, layer, pipeline._per_layer_pgs[layer_id])
+                #     )
+
+                rank_used += rank_for_pipeline
+
+        # pipeline._per_layer_pgs is a dictionary (layer_id -> process_group)
+
+        for rank in range(num_ranks):
+            with patch("torch.distributed.get_rank", return_value=rank):
+                dp_engine = DataParallelEngine(engine_mock, pipelines)
+                print(dp_engine)
 
 
 class TestOobleckEngineClass(OobleckElasticTestCase):
@@ -382,97 +509,6 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
             assert all(
                 key in optimizer.state[p] for key in ["step", "exp_avg", "exp_avg_sq"]
             )
-
-    def test_distributed_engine_train(
-        self, num_stages: int, sample_args: OobleckArguments
-    ):
-        num_gpus_per_node = 1
-        ctx = multiprocessing.get_context("spawn")
-        agent_ips: list[str] = ["127.0.0.1", "127.0.0.2", "127.0.0.3", "127.0.0.4"]
-        pipes = [ctx.Pipe(duplex=True) for _ in range(len(agent_ips))]
-        for pipe, _ in pipes:
-            # DistributionInfo
-            pipe.send(DistributionInfo(agent_ips, len(agent_ips)))
-
-        thread = threading.Thread(target=self.broadcast_rank0_port, args=(pipes,))
-        thread.start()
-
-        self.run_in_parallel(
-            len(agent_ips),
-            self._run_data_parallel_allreduce,
-            num_stages,
-            len(agent_ips),
-            num_gpus_per_node,
-            [p[1] for p in pipes],
-            agent_ips,
-            sample_args,
-        )
-        thread.join()
-
-    @staticmethod
-    def _run_heterogeneous_pipelines(
-        factory: OobleckStaticClassFactory,
-        rank: int,
-        pipe: list[connection.Connection],
-        agent_ips: list[str],
-        arguments: OobleckArguments,
-    ):
-        pipe = pipe[rank]
-        global_num_microbatch = (
-            arguments.global_microbatch_size // arguments.microbatch_size
-        )
-
-        my_ip = agent_ips[rank]
-        socket_patcher = patch("socket.gethostbyname", return_value=my_ip)
-        socket_patcher.start()
-        pipeline_templates = [
-            factory.get_dummy_pipeline_template(
-                num_stages=1,
-                num_gpus_per_node=2,
-                num_nodes=1,
-            ),
-            factory.get_dummy_pipeline_template(
-                num_stages=2,
-                num_gpus_per_node=1,
-                num_nodes=2,
-            ),
-        ]
-        pt_patcher = patch(
-            "oobleck.execution.engine.PipelineTemplateGenerator.create_pipeline_templates",
-            return_value=pipeline_templates,
-        )
-        pt_patcher.start()
-        instance_set_patcher = patch(
-            "oobleck.planning.instantiator.PipelineInstantiator._enumerate_instantiation_options",
-            return_value=[{pipeline_templates[0]: 1, pipeline_templates[1]: 1}],
-        )
-        instance_set_patcher.start()
-
-        engine = OobleckEngine(rank % 2, 2, 2, pipe, arguments)
-        engine.initialize_distributed()
-        engine.instantiate_pipelines(global_num_microbatch)
-        assert len(engine._reconfiguration._pipelines) == 2
-
-    def test_heterogeneous_pipelines(
-        self, num_stages: int, sample_args: OobleckArguments
-    ):
-        ctx = multiprocessing.get_context("spawn")
-        agent_ips: list[str] = ["127.0.0.1", "127.0.0.1", "127.0.0.2", "127.0.0.2"]
-        pipes = [ctx.Pipe(duplex=True) for _ in range(len(agent_ips))]
-        for pipe, _ in pipes:
-            # DistributionInfo
-            pipe.send(DistributionInfo(["127.0.0.1", "127.0.0.2"], 4))
-
-        thread = threading.Thread(target=self.broadcast_rank0_port, args=(pipes,))
-        thread.start()
-
-        self.run_in_parallel(
-            len(agent_ips),
-            self._run_heterogeneous_pipelines,
-            [p[1] for p in pipes],
-            agent_ips,
-            sample_args,
-        )
 
     @staticmethod
     def _run_fsdp_allreduce(
