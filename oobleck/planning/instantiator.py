@@ -109,16 +109,10 @@ class HeterogeneousPipelinesExecutionPlan:
         ranks: list[list[int]] | None = None,
         step: int = 0,
         # layer_index -> dict of [fsdp_index -> ProcessGroup]
-    ) -> tuple[
-        OobleckPipeline, list[OobleckPipeline], dict[int, dict[int, dist.ProcessGroup]]
-    ]:
+    ) -> tuple[OobleckPipeline, list[OobleckPipeline]]:
         my_pipeline: Optional[OobleckPipeline] = None
         pipeline_index: int = 0
         num_ranks_used = 0
-
-        # 2D grid of ranks involved in each layer, sharded by fsdp
-        # layer_index -> dict of (fsdp_index -> list of ranks)
-        ranks_grid: dict[int, dict[int, list[int]]] = defaultdict(dict)
 
         all_pipelines: list[OobleckPipeline] = []
         for pipeline_template, num_instances in self.num_instances_set.items():
@@ -147,12 +141,6 @@ class HeterogeneousPipelinesExecutionPlan:
                     training_args=training_args,
                 )
 
-                for layer_index, ranks_per_layer in pipeline.rank_grid.items():
-                    for fsdp_index, rank in enumerate(ranks_per_layer):
-                        if fsdp_index not in ranks_grid[layer_index]:
-                            ranks_grid[layer_index][fsdp_index] = []
-                        ranks_grid[layer_index][fsdp_index].append(rank)
-
                 all_pipelines.append(pipeline)
                 if pipeline.my_pipeline:
                     my_pipeline = pipeline
@@ -160,14 +148,8 @@ class HeterogeneousPipelinesExecutionPlan:
                 pipeline_index += 1
                 num_ranks_used += len(pipeline_ranks)
 
-        # Create process groups for data parallelism
-        dp_pg_grid: dict[int, dict[int, dist.ProcessGroup]] = defaultdict(dict)
-        for layer_index, ranks_per_layer in ranks_grid.items():
-            for fsdp_index, ranks in ranks_per_layer.items():
-                dp_pg_grid[layer_index][fsdp_index] = dist.new_group(ranks)
-
         assert my_pipeline is not None
-        return my_pipeline, all_pipelines, dp_pg_grid
+        return my_pipeline, all_pipelines
 
 
 class PipelineInstantiator:

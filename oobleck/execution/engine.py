@@ -361,18 +361,38 @@ class DataParallelEngine:
     def __init__(
         self,
         engine: OobleckEngine,
-        # layer_index -> dict of [fsdp_index -> list of ranks]
-        dp_process_groups: dict[int, dict[int, dist.ProcessGroup]],
+        pipelines: list[OobleckPipeline],
     ):
         self._engine = weakref.ref(engine)
+
+        # Create process groups for data parallelism
+        # 2D grid of ranks involved in each layer, sharded by fsdp
+        # layer_index -> dict of (fsdp_index -> list of ranks)
+        ranks_grid: dict[int, dict[int, list[int]]] = defaultdict(dict)
+
+        for pipeline in pipelines:
+            for layer_index, ranks in pipeline.rank_grid.items():
+                assert (
+                    isinstance(ranks, list) and len(ranks) == engine._num_gpus_per_node
+                )
+                for fsdp_index, rank in enumerate(ranks):
+                    if fsdp_index not in ranks_grid[layer_index]:
+                        ranks_grid[layer_index][fsdp_index] = []
+                    ranks_grid[layer_index][fsdp_index].append(rank)
+
+        # Create process groups for data parallelism
+        dp_process_groups: dict[int, dict[int, dist.ProcessGroup]] = defaultdict(dict)
+        fsdp_indices: list[int] = []
+        my_rank = dist.get_rank()
+        for layer_index, ranks_per_layer in ranks_grid.items():
+            for fsdp_index, ranks in ranks_per_layer.items():
+                dp_process_groups[layer_index][fsdp_index] = dist.new_group(ranks)
+
+                if my_rank in ranks:
+                    fsdp_indices.append(fsdp_index)
+
         self._dp_process_groups = dp_process_groups
-        self._fsdp_index = next(
-            i
-            for i, process_group in dp_process_groups[
-                self.engine._pipeline.execution._layers[0].layer_id
-            ].items()
-            if dist.get_rank(process_group) >= 0
-        )
+        self._fsdp_indices = fsdp_indices
 
     @property
     def engine(self):
@@ -565,9 +585,7 @@ class OobleckEngine:
         )
 
         self._pipeline: OobleckPipeline
-        # layer_index -> dict of [fsdp_index -> list of ranks]
-        process_groups_dp: dict[int, dict[int, dist.ProcessGroup]]
-        self._pipeline, pipelines, process_groups_dp = execution_plan.instantiate(
+        self._pipeline, pipelines = execution_plan.instantiate(
             model=self._model,
             dataloader=dataloader,
             training_args=self._hf_training_args,
@@ -583,7 +601,7 @@ class OobleckEngine:
         assert self._pipeline.communication is not None
         assert self._pipeline.execution is not None
 
-        self._dp_engine = DataParallelEngine(self, process_groups_dp)
+        self._dp_engine = DataParallelEngine(self, pipelines)
         self._reconfiguration = ReconfigurationEngine(self, pipelines)
 
     def _train_step(self):
