@@ -75,7 +75,7 @@ class PipelineTemplate {
 
       // push per-layer ranks to the result
       for (const int layer_index : stage->layer_indices_) {
-        rank_grid[layer_index] = stage_ranks;
+        rank_grid[layer_index] = layer_ranks;
       }
     }
 
