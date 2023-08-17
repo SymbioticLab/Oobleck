@@ -126,7 +126,9 @@ class TestOobleckDataParallelEngineClass(OobleckSingleProcessTestCase):
                 params, process_groups.items()
             ):
                 assert my_rank in process_group.ranks
-                allreduce_called[(my_rank, fsdp_index)].append(param.size())
+                allreduce_called[(tuple(process_group.ranks), fsdp_index)].append(
+                    param.size()
+                )
 
     @pytest.mark.parametrize(
         [
@@ -143,16 +145,80 @@ class TestOobleckDataParallelEngineClass(OobleckSingleProcessTestCase):
                 [1, 1],
                 [2, 2],
                 [
-                    [(0, 0), (4, 0)],
-                    [(0, 1), (5, 1)],
-                    [(1, 2), (6, 2)],
-                    [(1, 3), (7, 3)],
-                    [(2, 0), (8, 0)],
-                    [(2, 1), (9, 1)],
-                    [(3, 2), (10, 2)],
-                    [(3, 3), (11, 3)],
+                    [((0, 4), 0)],
+                    [((0, 5), 1)],
+                    [((1, 6), 2)],
+                    [((1, 7), 3)],
+                    [((2, 8), 0)],
+                    [((2, 9), 1)],
+                    [((3, 10), 2)],
+                    [((3, 11), 3)],
                 ],
-            )
+            ),
+            (
+                4,
+                [3],
+                [2],
+                [4],
+                [
+                    [((0, 12), 0)],
+                    [((0, 12), 1)],
+                    [((1, 13), 2)],
+                    [((1, 13), 3)],
+                    [((2, 14), 0)],
+                    [((2, 14), 1)],
+                    [((3, 15), 2)],
+                    [((3, 15), 3)],
+                    [((4, 16), 0)],
+                    [((5, 17), 1)],
+                    [((6, 18), 2)],
+                    [((7, 19), 3)],
+                    [((8, 20), 0)],
+                    [((9, 21), 1)],
+                    [((10, 22), 2)],
+                    [((11, 23), 3)],
+                ],
+            ),
+            (
+                4,
+                [3, 5],
+                [2, 1],
+                [4, 5],
+                [
+                    [((0, 12, 24), 0)],
+                    [((0, 12, 25), 1)],
+                    [((1, 13, 26), 2)],
+                    [((1, 13, 27), 3)],
+                    [((0, 12, 28), 0)],
+                    [((0, 12, 29), 1)],
+                    [((1, 13, 30), 2)],
+                    [((1, 13, 31), 3)],
+                    [((2, 14, 28), 0)],
+                    [((2, 14, 29), 1)],
+                    [((3, 15, 30), 2)],
+                    [((3, 15, 31), 3)],
+                    [((2, 14, 32), 0)],
+                    [((2, 14, 33), 1)],
+                    [((3, 15, 34), 2)],
+                    [((3, 15, 35), 3)],
+                    [((4, 16, 32), 0)],
+                    [((5, 17, 33), 1)],
+                    [((6, 18, 34), 2)],
+                    [((7, 19, 35), 3)],
+                    [((4, 16, 36), 0)],
+                    [((5, 17, 37), 1)],
+                    [((6, 18, 38), 2)],
+                    [((7, 19, 39), 3)],
+                    [((8, 20, 36), 0)],
+                    [((9, 21, 37), 1)],
+                    [((10, 22, 38), 2)],
+                    [((11, 23, 39), 3)],
+                    [((8, 20, 40), 0)],
+                    [((9, 21, 41), 1)],
+                    [((10, 22, 42), 2)],
+                    [((11, 23, 43), 3)],
+                ],
+            ),
         ],
     )
     def test_data_parallel_groups(
@@ -224,11 +290,12 @@ class TestOobleckDataParallelEngineClass(OobleckSingleProcessTestCase):
             dp_engine.do_allreduce()
 
         global allreduce_called
-        # TODO: check allreduce_called to see if allreduce is called correctly
         for dp_rank_sets in expected_dp_ranks:
             for rank, fsdp_index in dp_rank_sets:
                 key = (rank, fsdp_index)
+                # this rank should have called allreduce
                 assert key in allreduce_called
+                # all ranks in the dp should call allreduces for the same size of tensors in the same order
                 assert allreduce_called[dp_rank_sets[0]] == allreduce_called[key]
 
 
