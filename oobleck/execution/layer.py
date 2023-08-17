@@ -6,7 +6,6 @@ import torch
 import torch.distributed
 import torch.fx
 from accelerate.utils.modeling import set_module_tensor_to_device
-from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
@@ -113,8 +112,6 @@ class Layer(torch.nn.Module):
         self.register_forward_hook(self.post_forward_hook)
         self.register_full_backward_pre_hook(self.pre_backward_hook)
 
-        self._tensors: list[torch.Tensor] = None
-
     def unshard_params(self, state: HandleTrainingState):
         assert state in [
             HandleTrainingState.FORWARD,
@@ -130,11 +127,6 @@ class Layer(torch.nn.Module):
             self._param_handle.pre_unshard()
             self._param_handle.unshard()
             self._param_handle.post_unshard()
-
-            if state == HandleTrainingState.FORWARD:
-                self._tensors = list(
-                    self._param_handle._get_unflat_views(self._param_handle.flat_param)
-                )
 
     def reshard_params(self):
         if (
