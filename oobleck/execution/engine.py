@@ -382,14 +382,14 @@ class DataParallelEngine:
 
         # Create process groups for data parallelism
         dp_process_groups: dict[int, dict[int, dist.ProcessGroup]] = defaultdict(dict)
-        fsdp_indices: list[int] = []
+        fsdp_indices: list[list[int]] = defaultdict(list)
         my_rank = dist.get_rank()
         for layer_index, ranks_per_layer in ranks_grid.items():
             for fsdp_index, ranks in ranks_per_layer.items():
                 dp_process_groups[layer_index][fsdp_index] = dist.new_group(ranks)
 
                 if my_rank in ranks:
-                    fsdp_indices.append(fsdp_index)
+                    fsdp_indices[layer_index].append(fsdp_index)
 
         self._dp_process_groups = dp_process_groups
         self._fsdp_indices = fsdp_indices
@@ -400,8 +400,13 @@ class DataParallelEngine:
 
     def do_allreduce(self):
         for layer in self.engine._pipeline.execution._layers:
-            process_group = self._dp_process_groups[layer.layer_id][self._fsdp_index]
-            layer.reduce_gradients(process_group)
+            process_groups = {
+                fsdp_index: pg
+                for fsdp_index, pg in self._dp_process_groups[layer.layer_id].items()
+                if pg.rank() >= 0
+            }
+            if process_groups:
+                layer.reduce_gradients(process_groups)
 
 
 class OobleckEngine:

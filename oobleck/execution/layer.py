@@ -257,11 +257,33 @@ class Layer(torch.nn.Module):
             output, gradients = tensor
             torch.autograd.backward(output, gradients)
 
-    def reduce_gradients(self, process_group: torch.distributed.ProcessGroup):
+    def _shard_param(self, tensor: torch.Tensor, number: int) -> list[torch.Tensor]:
+        chunks = torch.flatten(tensor).chunk(number)
+        if len(chunks) < number:
+            chunks = chunks + [torch.zeros_like(chunks[0])] * (number - len(chunks))
+
+        numel_to_pad = chunks[0].numel() - chunks[-1].numel()
+        chunks[-1] = torch.nn.functional.pad(chunks[-1], [0, numel_to_pad])
+        return chunks
+
+    # process_groups: fsdp_index -> process_group
+    def reduce_gradients(
+        self, process_groups: dict[int, torch.distributed.ProcessGroup]
+    ):
         torch.cuda.current_stream().wait_stream(self.post_stream)
         self._param_handle.prepare_gradient_for_optim()
 
-        assert torch.distributed.get_rank(process_group) >= 0
-        torch.distributed.all_reduce(
-            tensor=self._param_handle.flat_param.grad, group=process_group
+        assert all(
+            torch.distributed.get_rank(process_group) >= 0
+            for process_group in process_groups.values()
         )
+
+        if len(process_groups) > 1:
+            grads = self._shard_param(
+                self._param_handle.flat_param.grad, len(process_groups)
+            )
+        else:
+            grads = [self._param_handle.flat_param.grad]
+
+        for grad, (fsdp_index, process_group) in zip(grads, process_groups.items()):
+            torch.distributed.all_reduce(tensor=grad, group=process_group)

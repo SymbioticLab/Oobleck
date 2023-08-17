@@ -161,18 +161,36 @@ class OobleckStaticClassFactory:
                 slicing_points.append((i, end))
             return slicing_points
 
+        def split_gpus(num_nodes: int, num_gpus: int, num_stages: int) -> list[int]:
+            num_nodes_remain = num_nodes
+            num_stages_remain = num_stages
+            subnumbers: list[int] = []
+            while num_nodes_remain < num_stages_remain:
+                subnumbers.append(num_gpus // 2)
+                subnumbers.append(num_gpus // 2)
+                num_nodes_remain -= 1
+                num_stages_remain -= 2
+
+            for _ in range(num_stages_remain):
+                subnumbers.append(num_gpus)
+
+            return subnumbers
+
+        assert num_stages >= num_nodes, "num_stages must be greater than num_nodes."
         assert (
-            num_nodes * num_gpus_per_node
-        ) % num_stages == 0, "Stages in dummy pipeline template must have equal size."
+            num_stages <= num_nodes * num_gpus_per_node
+        ), "num_stages must be less than or equal to num_nodes * num_gpus_per_node."
 
         key = (num_stages, num_nodes, num_gpus_per_node)
         if key not in self._pipeline_templates:
             layer_indices = slice_layers(self._profile.get(), num_stages)
+            num_gpus_per_stage = split_gpus(num_nodes, num_gpus_per_node, num_stages)
 
-            num_gpus_per_stage = (num_nodes * num_gpus_per_node) // num_stages
+            assert len(layer_indices) == len(num_gpus_per_stage)
+
             stages = [
-                StageExecutionResult(self._profile, indices, num_gpus_per_stage)
-                for indices in layer_indices
+                StageExecutionResult(self._profile, indices, num_gpus)
+                for indices, num_gpus in zip(layer_indices, num_gpus_per_stage)
             ]
 
             self._pipeline_templates[key] = PipelineTemplate(
@@ -425,8 +443,8 @@ class OobleckMultiProcessTestCase:
 
         try:
             for _ in range(len(processes)):
-                result = queue.get(timeout=120)
-                # result = queue.get()
+                # result = queue.get(timeout=120)
+                result = queue.get()
 
                 if "error" in result:
                     # If any process get an error,
