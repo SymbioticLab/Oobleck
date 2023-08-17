@@ -235,6 +235,10 @@ PipelineTemplateGenerator::divide_and_conquer(
       // Split GPUs in a node
       for (int num_gpus_left :
            std::ranges::iota_view<int, int>(1, num_gpus_per_node)) {
+        if (num_gpus_left != num_gpus_per_node - num_gpus_left) {
+          continue;
+        }
+
         for (int num_stages_left :
              std::ranges::iota_view<int, int>(1, num_stages)) {
           std::shared_ptr<DCExecutionResult> result_left(nullptr);
