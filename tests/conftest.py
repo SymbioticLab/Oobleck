@@ -6,6 +6,7 @@ import math
 import multiprocessing as mp
 import random
 import traceback
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -161,18 +162,44 @@ class OobleckStaticClassFactory:
                 slicing_points.append((i, end))
             return slicing_points
 
+        def split_gpus(num_nodes: int, num_gpus: int, num_stages: int) -> list[int]:
+            # num_gpus_per_stage -> num_stages with the num_gpus_per_stage
+            num_gpus_per_stage: dict[int, int] = defaultdict(int)
+            num_gpus_per_stage[1] = num_nodes * num_gpus
+
+            while sum(num_gpus_per_stage.values()) > num_stages:
+                min_num_gpus_per_stage = min(
+                    [n for n in num_gpus_per_stage.keys() if num_gpus_per_stage[n] >= 2]
+                )
+                num_gpus_per_stage[min_num_gpus_per_stage] -= 2
+                num_gpus_per_stage[min_num_gpus_per_stage * 2] += 1
+
+            assert (
+                sum([k * v for k, v in num_gpus_per_stage.items()])
+                == num_nodes * num_gpus
+            )
+
+            subnumbers: list[int] = []
+            for num_gpus in sorted(num_gpus_per_stage.keys()):
+                subnumbers.extend([num_gpus] * num_gpus_per_stage[num_gpus])
+
+            return subnumbers
+
+        assert num_stages >= num_nodes, "num_stages must be greater than num_nodes."
         assert (
-            num_nodes * num_gpus_per_node
-        ) % num_stages == 0, "Stages in dummy pipeline template must have equal size."
+            num_stages <= num_nodes * num_gpus_per_node
+        ), "num_stages must be less than or equal to num_nodes * num_gpus_per_node."
 
         key = (num_stages, num_nodes, num_gpus_per_node)
         if key not in self._pipeline_templates:
             layer_indices = slice_layers(self._profile.get(), num_stages)
+            num_gpus_per_stage = split_gpus(num_nodes, num_gpus_per_node, num_stages)
 
-            num_gpus_per_stage = (num_nodes * num_gpus_per_node) // num_stages
+            assert len(layer_indices) == len(num_gpus_per_stage)
+
             stages = [
-                StageExecutionResult(self._profile, indices, num_gpus_per_stage)
-                for indices in layer_indices
+                StageExecutionResult(self._profile, indices, num_gpus)
+                for indices, num_gpus in zip(layer_indices, num_gpus_per_stage)
             ]
 
             self._pipeline_templates[key] = PipelineTemplate(

@@ -504,17 +504,22 @@ class OobleckPipeline:
                 continue
 
             shard_id = id
-            try:
+            if existing_pipeline is not None:
                 existing_layer = next(
-                    layer
-                    for layer in existing_pipeline.execution._layers
-                    if layer.layer_id == layer_id
+                    (
+                        layer
+                        for layer in existing_pipeline.execution._layers
+                        if layer.layer_id == layer_id
+                    ),
+                    None,
                 )
-                layers.append(Layer.create_layer_from_layer(existing_layer, pg))
-            except Exception:
-                layers.append(
-                    Layer(layer_id, model.layers[layer_id], pg, pre_stream, post_stream)
-                )
+                if existing_layer is not None:
+                    layers.append(Layer.create_layer_from_layer(existing_layer, pg))
+                    continue
+
+            layers.append(
+                Layer(layer_id, model.layers[layer_id], pg, pre_stream, post_stream)
+            )
 
         self.execution = PipelineExecution(
             pipeline=self,

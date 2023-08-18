@@ -6,7 +6,6 @@ import torch
 import torch.distributed
 import torch.fx
 from accelerate.utils.modeling import set_module_tensor_to_device
-from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
@@ -48,6 +47,8 @@ class Layer(torch.nn.Module):
         assert torch.distributed.get_rank(process_group) >= 0
 
         layer = cls.__new__(cls)
+        super(Layer, cls).__init__(layer)
+
         layer.layer_id = existing_layer.layer_id
         layer._rank_index = torch.distributed.get_rank(process_group)
         layer._group_size = torch.distributed.get_world_size(process_group)
@@ -113,8 +114,6 @@ class Layer(torch.nn.Module):
         self.register_forward_hook(self.post_forward_hook)
         self.register_full_backward_pre_hook(self.pre_backward_hook)
 
-        self._tensors: list[torch.Tensor] = None
-
     def unshard_params(self, state: HandleTrainingState):
         assert state in [
             HandleTrainingState.FORWARD,
@@ -130,11 +129,6 @@ class Layer(torch.nn.Module):
             self._param_handle.pre_unshard()
             self._param_handle.unshard()
             self._param_handle.post_unshard()
-
-            if state == HandleTrainingState.FORWARD:
-                self._tensors = list(
-                    self._param_handle._get_unflat_views(self._param_handle.flat_param)
-                )
 
     def reshard_params(self):
         if (
@@ -265,11 +259,33 @@ class Layer(torch.nn.Module):
             output, gradients = tensor
             torch.autograd.backward(output, gradients)
 
-    def reduce_gradients(self, process_group: torch.distributed.ProcessGroup):
+    def _shard_param(self, tensor: torch.Tensor, number: int) -> list[torch.Tensor]:
+        chunks = list(torch.flatten(tensor).chunk(number))
+        if len(chunks) < number:
+            chunks = chunks + [torch.zeros_like(chunks[0])] * (number - len(chunks))
+
+        numel_to_pad = chunks[0].numel() - chunks[-1].numel()
+        chunks[-1] = torch.nn.functional.pad(chunks[-1], [0, numel_to_pad])
+        return chunks
+
+    # process_groups: fsdp_index -> process_group
+    def reduce_gradients(
+        self, process_groups: dict[int, torch.distributed.ProcessGroup]
+    ):
         torch.cuda.current_stream().wait_stream(self.post_stream)
         self._param_handle.prepare_gradient_for_optim()
 
-        assert torch.distributed.get_rank(process_group) >= 0
-        torch.distributed.all_reduce(
-            tensor=self._param_handle.flat_param.grad, group=process_group
+        assert all(
+            torch.distributed.get_rank(process_group) >= 0
+            for process_group in process_groups.values()
         )
+
+        if len(process_groups) > 1:
+            grads = self._shard_param(
+                self._param_handle.flat_param.grad, len(process_groups)
+            )
+        else:
+            grads = [self._param_handle.flat_param.grad]
+
+        for grad, (fsdp_index, process_group) in zip(grads, process_groups.items()):
+            torch.distributed.all_reduce(tensor=grad, group=process_group)

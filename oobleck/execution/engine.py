@@ -213,7 +213,6 @@ class ReconfigurationEngine:
         (
             new_pipeline,
             pipelines,
-            process_groups_dp,
         ) = execution_plan.instantiate(
             model=self.engine._model,
             dataloader=new_dataloader,
@@ -228,7 +227,7 @@ class ReconfigurationEngine:
             pipeline.initialize_distributed_pipeline()
         new_pipeline.initialize_execution(self.engine._model, self.engine._pipeline)
 
-        self.engine._dp_engine = DataParallelEngine(self.engine, process_groups_dp)
+        self.engine._dp_engine = DataParallelEngine(self.engine, pipelines)
         self._pipelines = pipelines
 
         return new_pipeline
@@ -362,18 +361,38 @@ class DataParallelEngine:
     def __init__(
         self,
         engine: OobleckEngine,
-        # layer_index -> dict of [fsdp_index -> list of ranks]
-        dp_process_groups: dict[int, dict[int, dist.ProcessGroup]],
+        pipelines: list[OobleckPipeline],
     ):
         self._engine = weakref.ref(engine)
+
+        # Create process groups for data parallelism
+        # 2D grid of ranks involved in each layer, sharded by fsdp
+        # layer_index -> dict of (fsdp_index -> list of ranks)
+        ranks_grid: dict[int, dict[int, list[int]]] = defaultdict(dict)
+
+        for pipeline in pipelines:
+            for layer_index, ranks in pipeline.rank_grid.items():
+                assert (
+                    isinstance(ranks, list) and len(ranks) == engine._num_gpus_per_node
+                )
+                for fsdp_index, rank in enumerate(ranks):
+                    if fsdp_index not in ranks_grid[layer_index]:
+                        ranks_grid[layer_index][fsdp_index] = []
+                    ranks_grid[layer_index][fsdp_index].append(rank)
+
+        # Create process groups for data parallelism
+        dp_process_groups: dict[int, dict[int, dist.ProcessGroup]] = defaultdict(dict)
+        fsdp_indices: list[list[int]] = defaultdict(list)
+        my_rank = dist.get_rank()
+        for layer_index, ranks_per_layer in ranks_grid.items():
+            for fsdp_index, ranks in ranks_per_layer.items():
+                dp_process_groups[layer_index][fsdp_index] = dist.new_group(ranks)
+
+                if my_rank in ranks:
+                    fsdp_indices[layer_index].append(fsdp_index)
+
         self._dp_process_groups = dp_process_groups
-        self._fsdp_index = next(
-            i
-            for i, process_group in dp_process_groups[
-                self.engine._pipeline.execution._layers[0].layer_id
-            ].items()
-            if dist.get_rank(process_group) >= 0
-        )
+        self._fsdp_indices = fsdp_indices
 
     @property
     def engine(self):
@@ -381,8 +400,13 @@ class DataParallelEngine:
 
     def do_allreduce(self):
         for layer in self.engine._pipeline.execution._layers:
-            process_group = self._dp_process_groups[layer.layer_id][self._fsdp_index]
-            layer.reduce_gradients(process_group)
+            process_groups = {
+                fsdp_index: pg
+                for fsdp_index, pg in self._dp_process_groups[layer.layer_id].items()
+                if torch.distributed.get_rank(pg) >= 0
+            }
+            if process_groups:
+                layer.reduce_gradients(process_groups)
 
 
 class OobleckEngine:
@@ -592,9 +616,7 @@ class OobleckEngine:
         )
 
         self._pipeline: OobleckPipeline
-        # layer_index -> dict of [fsdp_index -> list of ranks]
-        process_groups_dp: dict[int, dict[int, dist.ProcessGroup]]
-        self._pipeline, pipelines, process_groups_dp = execution_plan.instantiate(
+        self._pipeline, pipelines = execution_plan.instantiate(
             model=self._model,
             dataloader=dataloader,
             training_args=self._hf_training_args,
@@ -610,7 +632,7 @@ class OobleckEngine:
         assert self._pipeline.communication is not None
         assert self._pipeline.execution is not None
 
-        self._dp_engine = DataParallelEngine(self, process_groups_dp)
+        self._dp_engine = DataParallelEngine(self, pipelines)
         self._reconfiguration = ReconfigurationEngine(self, pipelines)
 
     def _train_step(self):

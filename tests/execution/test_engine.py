@@ -2,32 +2,39 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import functools
 import multiprocessing
 import re
 import socket
 import threading
 import traceback
-from contextlib import nullcontext
+from collections import defaultdict
 from dataclasses import dataclass
 from multiprocessing import connection
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import deepspeed.comm as dist
 import pytest
 import torch._C._distributed_c10d as c10d
 import torch.distributed
+import torch.fx
 from pytest_mock import MockerFixture
-from torch.distributed.fsdp.flat_param import HandleShardingStrategy
+from torch.distributed.fsdp.flat_param import (
+    FlatParameter,
+    FlatParamHandle,
+    HandleShardingStrategy,
+)
 
 from oobleck.csrc.planning.pipeline_template import (
     LayerExecutionResult,
     LayerExecutionResults,
+    PipelineTemplate,
 )
 from oobleck.elastic.message_util import DistributionInfo
 from oobleck.elastic.training_util import OobleckArguments
 from oobleck.execution.dataloader import OobleckSampler
-from oobleck.execution.engine import OobleckEngine
+from oobleck.execution.engine import DataParallelEngine, OobleckEngine
 from oobleck.execution.pipeline import OobleckPipeline
 from tests.conftest import (
     TRAIN_BATCH_SIZE,
@@ -36,6 +43,278 @@ from tests.conftest import (
     OobleckStaticClassFactory,
 )
 from tests.elastic.conftest import OobleckElasticTestCase
+
+# tuple of (rank, fsdp_index) -> list of sharded param sizes
+allreduce_called: dict[tuple[int, int], list[torch.Size]] = defaultdict(list)
+
+
+class TestOobleckDataParallelEngineClass(OobleckSingleProcessTestCase):
+    class FakeProcessGroup:
+        ranks: list[int]
+
+        def __init__(self, ranks: list[int]):
+            self.ranks = sorted(list(set(ranks)))
+
+        @classmethod
+        def new_group(
+            cls, ranks: list[int]
+        ) -> TestOobleckDataParallelEngineClass.FakeProcessGroup:
+            return cls(ranks)
+
+        def size(self) -> int:
+            return len(self.ranks)
+
+    class FakeLayer:
+        def __init__(
+            self,
+            layer_id: int,
+            layer: torch.fx.GraphModule,
+            fsdp_process_group: TestOobleckDataParallelEngineClass.FakeProcessGroup,  # For FSDP
+            *args,
+        ):
+            self.layer_id = layer_id
+            self.fsdp_process_group = fsdp_process_group
+
+            # Fake layers follow FSDP flat param generation and sharding
+            # from torch.distributed.fsdp.flat_param.py
+            assert all([p.is_meta for p in layer.parameters()])
+
+            # Create FlatParameter
+            params_to_flatten: list[torch.Tensor | torch.nn.Parameter] = []
+            for _, submodule in layer.named_modules():
+                for _, param in submodule.named_parameters(recurse=False):
+                    params_to_flatten.append(param)
+
+            self.flat_param: FlatParameter = FlatParamHandle.flatten_params(
+                params_to_flatten, requires_grad=False
+            )
+
+            world_size = fsdp_process_group.size()
+            # follow FlatParamHandle._get_shard to shard parameter
+            chunks = self._shard_param(self.flat_param, world_size)
+
+            assert len(chunks) == fsdp_process_group.size()
+            assert [chunk.is_meta for chunk in chunks]
+            assert [chunks[0].size() == chunk.size() for chunk in chunks]
+            self.sharded_flat_params = chunks
+
+        def _shard_param(self, tensor: torch.Tensor, number: int) -> list[torch.Tensor]:
+            chunks = list(torch.flatten(tensor).chunk(number))
+            if len(chunks) < number:
+                chunks = chunks + [torch.zeros_like(chunks[0])] * (number - len(chunks))
+
+            numel_to_pad = chunks[0].numel() - chunks[-1].numel()
+            chunks[-1] = torch.nn.functional.pad(chunks[-1], [0, numel_to_pad])
+            return chunks
+
+        def reduce_gradients(
+            self,
+            process_groups: dict[
+                int, TestOobleckDataParallelEngineClass.FakeProcessGroup
+            ],
+        ):
+            global allreduce_called
+            my_rank = torch.distributed.get_rank()
+
+            sharded_flat_param = self.sharded_flat_params[
+                torch.distributed.get_rank(self.fsdp_process_group)
+            ]
+            if len(process_groups) > 1:
+                params = self._shard_param(sharded_flat_param, len(process_groups))
+            else:
+                params = [sharded_flat_param]
+
+            for param, (fsdp_index, process_group) in zip(
+                params, process_groups.items()
+            ):
+                assert my_rank in process_group.ranks
+                allreduce_called[(tuple(process_group.ranks), fsdp_index)].append(
+                    param.size()
+                )
+
+    @pytest.mark.parametrize(
+        [
+            "num_gpus_per_node",
+            "num_nodes",
+            "num_pipelines",
+            "num_stages",
+            "expected_dp_ranks",
+        ],
+        [
+            (
+                4,
+                [1, 2],
+                [1, 1],
+                [2, 2],
+                [
+                    [((0, 4), 0)],
+                    [((0, 5), 1)],
+                    [((1, 6), 2)],
+                    [((1, 7), 3)],
+                    [((2, 8), 0)],
+                    [((2, 9), 1)],
+                    [((3, 10), 2)],
+                    [((3, 11), 3)],
+                ],
+            ),
+            (
+                4,
+                [3],
+                [2],
+                [4],
+                [
+                    [((0, 12), 0)],
+                    [((0, 12), 1)],
+                    [((1, 13), 2)],
+                    [((1, 13), 3)],
+                    [((2, 14), 0)],
+                    [((2, 14), 1)],
+                    [((3, 15), 2)],
+                    [((3, 15), 3)],
+                    [((4, 16), 0)],
+                    [((5, 17), 1)],
+                    [((6, 18), 2)],
+                    [((7, 19), 3)],
+                    [((8, 20), 0)],
+                    [((9, 21), 1)],
+                    [((10, 22), 2)],
+                    [((11, 23), 3)],
+                ],
+            ),
+            (
+                4,
+                [3, 5],
+                [2, 1],
+                [4, 5],
+                [
+                    [((0, 12, 24), 0)],
+                    [((0, 12, 25), 1)],
+                    [((1, 13, 26), 2)],
+                    [((1, 13, 27), 3)],
+                    [((0, 12, 28), 0)],
+                    [((0, 12, 29), 1)],
+                    [((1, 13, 30), 2)],
+                    [((1, 13, 31), 3)],
+                    [((2, 14, 28), 0)],
+                    [((2, 14, 29), 1)],
+                    [((3, 15, 30), 2)],
+                    [((3, 15, 31), 3)],
+                    [((2, 14, 32), 0)],
+                    [((2, 14, 33), 1)],
+                    [((3, 15, 34), 2)],
+                    [((3, 15, 35), 3)],
+                    [((4, 16, 32), 0)],
+                    [((5, 17, 33), 1)],
+                    [((6, 18, 34), 2)],
+                    [((7, 19, 35), 3)],
+                    [((4, 16, 36), 0)],
+                    [((5, 17, 37), 1)],
+                    [((6, 18, 38), 2)],
+                    [((7, 19, 39), 3)],
+                    [((8, 20, 36), 0)],
+                    [((9, 21, 37), 1)],
+                    [((10, 22, 38), 2)],
+                    [((11, 23, 39), 3)],
+                    [((8, 20, 40), 0)],
+                    [((9, 21, 41), 1)],
+                    [((10, 22, 42), 2)],
+                    [((11, 23, 43), 3)],
+                ],
+            ),
+        ],
+    )
+    def test_data_parallel_groups(
+        self,
+        num_gpus_per_node: int,
+        num_nodes: list[int],
+        num_pipelines: list[int],
+        num_stages: list[int],
+        expected_dp_ranks: list[list[tuple[int, int]]],
+        mocker: MockerFixture,
+    ):
+        """
+        This test checks if multiple heterogeneous pipelines can reduce their gradients
+        correctly in layer granularity.
+        """
+        mocker.patch("deepspeed.comm.is_initialized", return_value=True)
+        mocker.patch("deepspeed.comm.get_rank", return_value=0)
+        mocker.patch("deepspeed.comm.new_group", new=self.FakeProcessGroup)
+
+        pipeline_templates: list[PipelineTemplate] = []
+        for num_node, num_stages in zip(num_nodes, num_stages):
+            pipeline_templates.append(
+                self.factory.get_dummy_pipeline_template(
+                    num_stages, num_gpus_per_node, num_node
+                )
+            )
+
+        # Required in initializing DataParallelEngine
+        model = self.factory.get_model()
+        engine_mock = mocker.MagicMock()
+        engine_mock._num_gpus_per_node = num_gpus_per_node
+
+        rank_used = 0
+        pipelines: list[OobleckPipeline] = []
+        for template, num_pipeline in zip(pipeline_templates, num_pipelines):
+            rank_for_pipeline = template._num_gpus_per_node * template._num_nodes
+            for _ in range(num_pipeline):
+                pipeline = OobleckPipeline(
+                    len(pipelines),
+                    template,
+                    list(range(rank_used, rank_used + rank_for_pipeline)),
+                    [],
+                    0,
+                    None,
+                )
+                pipeline.initialize_distributed_fsdp()
+
+                pipeline.execution = MagicMock()
+                pipeline.execution._layers: list[self.FakeLayer] = []
+                for layer_id, pg in pipeline._per_layer_pgs.items():
+                    pipeline.execution._layers.append(
+                        self.FakeLayer(
+                            layer_id,
+                            model.layers[layer_id],
+                            pg,
+                        )
+                    )
+                pipelines.append(pipeline)
+                rank_used += rank_for_pipeline
+
+        def fake_get_rank(
+            my_rank: int,
+            process_group: TestOobleckDataParallelEngineClass.FakeProcessGroup = None,
+        ):
+            if process_group is None:
+                return my_rank
+            else:
+                return (
+                    process_group.ranks.index(my_rank)
+                    if my_rank in process_group.ranks
+                    else -1
+                )
+
+        for rank in range(rank_used):
+            my_pipeline = next(p for p in pipelines if rank in p._ranks)
+            engine_mock._pipeline = my_pipeline
+
+            mocker.patch(
+                "deepspeed.comm.get_rank", new=functools.partial(fake_get_rank, rank)
+            )
+            mocker.patch(
+                "torch.distributed.get_rank", new=functools.partial(fake_get_rank, rank)
+            )
+            dp_engine = DataParallelEngine(engine_mock, pipelines)
+            dp_engine.do_allreduce()
+
+        global allreduce_called
+        for dp_rank_sets in expected_dp_ranks:
+            for rank, fsdp_index in dp_rank_sets:
+                key = (rank, fsdp_index)
+                # this rank should have called allreduce
+                assert key in allreduce_called
+                # all ranks in the dp should call allreduces for the same size of tensors in the same order
+                assert allreduce_called[dp_rank_sets[0]] == allreduce_called[key]
 
 
 class TestOobleckNumNodeComputationClass(OobleckSingleProcessTestCase):
@@ -209,11 +488,11 @@ class TestOobleckEngineClass(OobleckElasticTestCase):
             "oobleck.execution.engine.PipelineTemplateGenerator.create_pipeline_templates",
             return_value=[
                 cls.factory.get_dummy_pipeline_template(
-                    num_stages=num_gpus + 1,
-                    num_gpus_per_node=num_gpus + 1,
-                    num_nodes=1,
+                    num_stages=num_gpus,
+                    num_gpus_per_node=1,
+                    num_nodes=num_gpus,
                 )
-                for num_gpus in range(4)
+                for num_gpus in [1, 2, 3, 4]
             ],
         )
         class_mocker.patch("socket.gethostname", return_value="127.0.0.1")
@@ -522,32 +801,6 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
                 key in optimizer.state[p] for key in ["step", "exp_avg", "exp_avg_sq"]
             )
 
-    def test_distributed_engine_train(
-        self, num_stages: int, sample_args: OobleckArguments
-    ):
-        num_gpus_per_node = 1
-        ctx = multiprocessing.get_context("spawn")
-        agent_ips: list[str] = ["127.0.0.1", "127.0.0.2", "127.0.0.3", "127.0.0.4"]
-        pipes = [ctx.Pipe(duplex=True) for _ in range(len(agent_ips))]
-        for pipe, _ in pipes:
-            # DistributionInfo
-            pipe.send(DistributionInfo(agent_ips, len(agent_ips)))
-
-        thread = threading.Thread(target=self.broadcast_rank0_port, args=(pipes,))
-        thread.start()
-
-        self.run_in_parallel(
-            len(agent_ips),
-            self._run_data_parallel_allreduce,
-            num_stages,
-            len(agent_ips),
-            num_gpus_per_node,
-            [p[1] for p in pipes],
-            agent_ips,
-            sample_args,
-        )
-        thread.join()
-
     @staticmethod
     def _run_fsdp_allreduce(
         factory: OobleckStaticClassFactory,
@@ -558,7 +811,7 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
         my_ip: str,
         arguments: OobleckArguments,
     ):
-        # Assume all GPUs are in one GPUs
+        # Assume all GPUs are in one node
         num_gpus_per_node = 4
         num_nodes_per_pipeline = 1
         pipe = pipe[rank]
@@ -620,7 +873,6 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
         thread = threading.Thread(target=self.broadcast_rank0_port, args=(pipes,))
         thread.start()
 
-        num_gpus_per_node = 4 // num_stages
         self.run_in_parallel(
             4,
             self._run_fsdp_allreduce,
@@ -732,14 +984,17 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
                     for layer_index, ranks in pipeline.rank_grid.items():
                         # This test didn't use FSDP
                         assert len(ranks) == 1
-                        assert ranks[0] == 2
+                        assert ranks[0] in [0, 2]
                 else:
                     for layer_index, ranks in pipeline.rank_grid.items():
                         # This test didn't use FSDP
                         assert len(ranks) == 1
-                        assert ranks[0] == (
-                            0 if layer_index < len(model.layers) // 2 else 1
+                        assert (
+                            ranks[0] in [0, 2]
+                            if layer_index < len(model.layers) // 2
+                            else [1, 3]
                         )
+
             rank = dist.get_rank()
             for layer_id, ranks_per_layer in engine._pipeline.rank_grid.items():
                 if rank in ranks_per_layer:
