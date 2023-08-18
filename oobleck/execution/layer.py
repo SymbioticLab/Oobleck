@@ -47,6 +47,8 @@ class Layer(torch.nn.Module):
         assert torch.distributed.get_rank(process_group) >= 0
 
         layer = cls.__new__(cls)
+        super(Layer, cls).__init__(layer)
+
         layer.layer_id = existing_layer.layer_id
         layer._rank_index = torch.distributed.get_rank(process_group)
         layer._group_size = torch.distributed.get_world_size(process_group)

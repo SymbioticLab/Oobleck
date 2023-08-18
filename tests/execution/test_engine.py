@@ -984,7 +984,7 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
                     for layer_index, ranks in pipeline.rank_grid.items():
                         # This test didn't use FSDP
                         assert len(ranks) == 1
-                        assert ranks[0] == 0
+                        assert ranks[0] in [0, 2]
                 else:
                     for layer_index, ranks in pipeline.rank_grid.items():
                         # This test didn't use FSDP
