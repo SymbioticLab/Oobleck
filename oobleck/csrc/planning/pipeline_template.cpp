@@ -33,7 +33,11 @@ std::shared_ptr<LayerExecutionResults> get_profile_results(
   auto get_cache = [](const std::string& cache_path) -> nlohmann::json {
     std::ifstream ifs(cache_path);
     assert(ifs.is_open());
-    return nlohmann::json::parse(ifs);
+    try {
+      return nlohmann::json::parse(ifs);
+    } catch (std::exception& e) {
+      throw pybind11::value_error("Error parsing json file: " + cache_path);
+    }
   };
 
   std::string profile_path =

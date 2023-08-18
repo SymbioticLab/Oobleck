@@ -4,10 +4,12 @@ import asyncio
 import copy
 import functools
 import multiprocessing
+import re
 import socket
 import threading
 import traceback
 from collections import defaultdict
+from dataclasses import dataclass
 from multiprocessing import connection
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -24,7 +26,11 @@ from torch.distributed.fsdp.flat_param import (
     HandleShardingStrategy,
 )
 
-from oobleck.csrc.planning.pipeline_template import PipelineTemplate
+from oobleck.csrc.planning.pipeline_template import (
+    LayerExecutionResult,
+    LayerExecutionResults,
+    PipelineTemplate,
+)
 from oobleck.elastic.message_util import DistributionInfo
 from oobleck.elastic.training_util import OobleckArguments
 from oobleck.execution.dataloader import OobleckSampler
@@ -297,6 +303,137 @@ class TestOobleckDataParallelEngineClass(OobleckSingleProcessTestCase):
                 assert key in allreduce_called
                 # all ranks in the dp should call allreduces for the same size of tensors in the same order
                 assert allreduce_called[dp_rank_sets[0]] == allreduce_called[key]
+
+
+class TestOobleckNumNodeComputationClass(OobleckSingleProcessTestCase):
+    """
+    Number of nodes calculation test
+    Calculating minimum required number of nodes is based on
+    profile results and device memory capacity.
+    """
+
+    factory: OobleckStaticClassFactory
+
+    def get_fake_profile_results(self, num_layers: int) -> LayerExecutionResults:
+        results: list[LayerExecutionResult] = []
+        for index in range(num_layers):
+            results.append(
+                LayerExecutionResult(
+                    layer_index=index,
+                    forward=0.1,
+                    backward=0.1,
+                    allreduce_in_node={i + 1: 0.1 for i in range(8)},
+                    allreduce_across_nodes={i + 1: 0.1 for i in range(64)},
+                    mem_required=(1024, 0),
+                )
+            )
+        return LayerExecutionResults(results)
+
+    @pytest.fixture(scope="class")
+    def pipe(self) -> tuple[connection.Connection, connection.Connection]:
+        p1: connection.Connection
+        p2: connection.Connection
+        p1, p2 = multiprocessing.Pipe()
+        yield p1, p2
+        p1.close()
+        p2.close()
+
+    @dataclass
+    class FakeDeviceProperties:
+        total_memory: int
+
+    @pytest.fixture(scope="class", autouse=True)
+    def setup_class(
+        cls,
+        class_mocker: MockerFixture,
+        model_name_fixture: str,
+        tmp_path_factory: pytest.TempPathFactory,
+        request: pytest.FixtureRequest,
+    ) -> None:
+        directory = tmp_path_factory.getbasetemp()
+        request.cls.factory = OobleckStaticClassFactory(model_name_fixture, directory)
+
+        class_mocker.patch(
+            "oobleck.execution.engine.OobleckDataset",
+            return_value=cls.factory.get_dataset(),
+        )
+        class_mocker.patch(
+            "oobleck.execution.engine.OobleckModel",
+            return_value=cls.factory.get_model(),
+        )
+
+        class_mocker.patch("torch.cuda.device_count", return_value=1)
+
+        # This class does not mock get_pipeline_templates
+
+    @pytest.fixture(autouse=True)
+    def setup(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+
+    @pytest.mark.parametrize(
+        [
+            "num_nodes",
+            "num_gpus_per_node",
+            "gpu_mem",
+            "num_layers",
+            "expected_min_num_nodes",
+            "expect_fail",
+        ],
+        [
+            (1, 1, 1024 * 32 * 6, 32, 1, False),
+            (1, 1, 1024 * 32 * 6, 64, 2, True),
+            (1, 1, 1024 * 128 * 6, 64, 1, False),
+            (4, 1, 1024 * 32 * 6, 64, 2, False),
+            (4, 1, 1024 * 16 * 6, 64, 4, False),
+            (4, 1, 1024 * 16 * 6, 128, 8, True),
+            (1, 4, 1024 * 16 * 6, 128, 2, True),
+            (1, 4, 1024 * 32 * 6, 128, 1, False),
+            (4, 4, 1024 * 16 * 6, 128, 2, False),
+            (4, 4, 1024 * 1 * 6, 32, 8, True),
+        ],
+    )
+    def test_multi_nodes_template_configuration(
+        self,
+        pipe: tuple[connection.Connection, connection.Connection],
+        sample_args: OobleckArguments,
+        num_nodes: int,
+        num_gpus_per_node: int,
+        gpu_mem: int,
+        num_layers: int,
+        expected_min_num_nodes: int,
+        expect_fail: bool,
+        mocker: MockerFixture,
+    ):
+        fake_profile = self.get_fake_profile_results(num_layers)
+
+        # Fake device memory capacity so that number of nodes match with our simulated ones
+        mocker.patch(
+            "torch.cuda.get_device_properties",
+            return_value=TestOobleckNumNodeComputationClass.FakeDeviceProperties(
+                gpu_mem
+            ),
+        )
+        mocker.patch(
+            "oobleck.execution.engine.get_profile_results",
+            return_value=fake_profile,
+        )
+        pt_create_mock = mocker.patch(
+            "oobleck.csrc.planning.pipeline_template.PipelineTemplateGenerator.create_pipeline_templates",
+            return_value=None,
+        )
+
+        if expect_fail:
+            with pytest.raises(AssertionError) as e:
+                OobleckEngine(0, num_nodes, num_gpus_per_node, pipe[1], sample_args)
+
+            assert e.value.args[0].startswith("Minimum required number of nodes")
+            match = re.search(r"minimum required: (\d+),", e.value.args[0])
+            assert int(match[1]) == expected_min_num_nodes
+        else:
+            OobleckEngine(0, num_nodes, num_gpus_per_node, pipe[1], sample_args)
+            pt_create_mock.assert_called_once_with(
+                fake_profile, (expected_min_num_nodes, num_nodes), num_gpus_per_node
+            )
 
 
 class TestOobleckEngineClass(OobleckElasticTestCase):
