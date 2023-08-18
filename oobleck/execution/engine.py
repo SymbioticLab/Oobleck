@@ -213,7 +213,6 @@ class ReconfigurationEngine:
         (
             new_pipeline,
             pipelines,
-            process_groups_dp,
         ) = execution_plan.instantiate(
             model=self.engine._model,
             dataloader=new_dataloader,
@@ -228,7 +227,7 @@ class ReconfigurationEngine:
             pipeline.initialize_distributed_pipeline()
         new_pipeline.initialize_execution(self.engine._model, self.engine._pipeline)
 
-        self.engine._dp_engine = DataParallelEngine(self.engine, process_groups_dp)
+        self.engine._dp_engine = DataParallelEngine(self.engine, pipelines)
         self._pipelines = pipelines
 
         return new_pipeline

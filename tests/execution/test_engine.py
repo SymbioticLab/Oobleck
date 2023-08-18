@@ -282,21 +282,28 @@ class TestOobleckDataParallelEngineClass(OobleckSingleProcessTestCase):
                 rank_used += rank_for_pipeline
 
         def fake_get_rank(
-            process_group: TestOobleckDataParallelEngineClass.FakeProcessGroup,
+            my_rank: int,
+            process_group: TestOobleckDataParallelEngineClass.FakeProcessGroup = None,
         ):
-            my_rank = torch.distributed.get_rank()
-            return (
-                process_group.ranks.index(my_rank)
-                if my_rank in process_group.ranks
-                else -1
-            )
+            if process_group is None:
+                return my_rank
+            else:
+                return (
+                    process_group.ranks.index(my_rank)
+                    if my_rank in process_group.ranks
+                    else -1
+                )
 
         for rank in range(rank_used):
             my_pipeline = next(p for p in pipelines if rank in p._ranks)
             engine_mock._pipeline = my_pipeline
 
-            mocker.patch("deepspeed.comm.get_rank", return_value=rank)
-            mocker.patch("torch.distributed.get_rank", new=fake_get_rank)
+            mocker.patch(
+                "deepspeed.comm.get_rank", new=functools.partial(fake_get_rank, rank)
+            )
+            mocker.patch(
+                "torch.distributed.get_rank", new=functools.partial(fake_get_rank, rank)
+            )
             dp_engine = DataParallelEngine(engine_mock, pipelines)
             dp_engine.do_allreduce()
 

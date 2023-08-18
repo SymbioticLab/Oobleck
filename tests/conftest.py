@@ -6,6 +6,7 @@ import math
 import multiprocessing as mp
 import random
 import traceback
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -162,25 +163,26 @@ class OobleckStaticClassFactory:
             return slicing_points
 
         def split_gpus(num_nodes: int, num_gpus: int, num_stages: int) -> list[int]:
-            if (num_nodes * num_gpus) % num_stages == 0:
-                return [int((num_nodes * num_gpus) // num_stages)] * num_stages
+            # num_gpus_per_stage -> num_stages with the num_gpus_per_stage
+            num_gpus_per_stage: dict[int, int] = defaultdict(int)
+            num_gpus_per_stage[1] = num_nodes * num_gpus
+
+            while sum(num_gpus_per_stage.values()) > num_stages:
+                min_num_gpus_per_stage = min(
+                    [n for n in num_gpus_per_stage.keys() if num_gpus_per_stage[n] >= 2]
+                )
+                num_gpus_per_stage[min_num_gpus_per_stage] -= 2
+                num_gpus_per_stage[min_num_gpus_per_stage * 2] += 1
+
+            assert (
+                sum([k * v for k, v in num_gpus_per_stage.items()])
+                == num_nodes * num_gpus
+            )
 
             subnumbers: list[int] = []
-            num_nodes_remain = num_nodes
-            num_stages_remain = num_stages
+            for num_gpus in sorted(num_gpus_per_stage.keys()):
+                subnumbers.extend([num_gpus] * num_gpus_per_stage[num_gpus])
 
-            num_gpus_per_stage = 1
-
-            while num_stages_remain > 0:
-                num_stages_in_this_node = num_gpus // num_gpus_per_stage
-                if num_stages_remain > num_stages_in_this_node:
-                    subnumbers.extend([num_gpus_per_stage] * num_stages_in_this_node)
-                    num_stages_remain -= num_stages_in_this_node
-                    num_nodes_remain -= 1
-
-                num_gpus_per_stage *= 2
-
-            assert num_stages_remain == 0 and num_nodes_remain == 0
             return subnumbers
 
         assert num_stages >= num_nodes, "num_stages must be greater than num_nodes."
