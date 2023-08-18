@@ -162,18 +162,25 @@ class OobleckStaticClassFactory:
             return slicing_points
 
         def split_gpus(num_nodes: int, num_gpus: int, num_stages: int) -> list[int]:
+            if (num_nodes * num_gpus) % num_stages == 0:
+                return [int((num_nodes * num_gpus) // num_stages)] * num_stages
+
+            subnumbers: list[int] = []
             num_nodes_remain = num_nodes
             num_stages_remain = num_stages
-            subnumbers: list[int] = []
-            while num_nodes_remain < num_stages_remain:
-                subnumbers.append(num_gpus // 2)
-                subnumbers.append(num_gpus // 2)
-                num_nodes_remain -= 1
-                num_stages_remain -= 2
 
-            for _ in range(num_stages_remain):
-                subnumbers.append(num_gpus)
+            num_gpus_per_stage = 1
 
+            while num_stages_remain > 0:
+                num_stages_in_this_node = num_gpus // num_gpus_per_stage
+                if num_stages_remain > num_stages_in_this_node:
+                    subnumbers.extend([num_gpus_per_stage] * num_stages_in_this_node)
+                    num_stages_remain -= num_stages_in_this_node
+                    num_nodes_remain -= 1
+
+                num_gpus_per_stage *= 2
+
+            assert num_stages_remain == 0 and num_nodes_remain == 0
             return subnumbers
 
         assert num_stages >= num_nodes, "num_stages must be greater than num_nodes."

@@ -258,7 +258,7 @@ class Layer(torch.nn.Module):
             torch.autograd.backward(output, gradients)
 
     def _shard_param(self, tensor: torch.Tensor, number: int) -> list[torch.Tensor]:
-        chunks = torch.flatten(tensor).chunk(number)
+        chunks = list(torch.flatten(tensor).chunk(number))
         if len(chunks) < number:
             chunks = chunks + [torch.zeros_like(chunks[0])] * (number - len(chunks))
 

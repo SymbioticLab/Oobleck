@@ -404,7 +404,7 @@ class DataParallelEngine:
             process_groups = {
                 fsdp_index: pg
                 for fsdp_index, pg in self._dp_process_groups[layer.layer_id].items()
-                if pg.rank() >= 0
+                if torch.distributed.get_rank(pg) >= 0
             }
             if process_groups:
                 layer.reduce_gradients(process_groups)

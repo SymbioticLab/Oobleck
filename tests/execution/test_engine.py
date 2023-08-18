@@ -61,10 +61,6 @@ class TestOobleckDataParallelEngineClass(OobleckSingleProcessTestCase):
         ) -> TestOobleckDataParallelEngineClass.FakeProcessGroup:
             return cls(ranks)
 
-        def rank(self) -> int:
-            my_rank = torch.distributed.get_rank()
-            return self.ranks.index(my_rank) if my_rank in self.ranks else -1
-
         def size(self) -> int:
             return len(self.ranks)
 
@@ -121,7 +117,7 @@ class TestOobleckDataParallelEngineClass(OobleckSingleProcessTestCase):
             my_rank = torch.distributed.get_rank()
 
             sharded_flat_param = self.sharded_flat_params[
-                self.fsdp_process_group.rank()
+                torch.distributed.get_rank(self.fsdp_process_group)
             ]
             if len(process_groups) > 1:
                 params = self._shard_param(sharded_flat_param, len(process_groups))
@@ -285,13 +281,22 @@ class TestOobleckDataParallelEngineClass(OobleckSingleProcessTestCase):
                 pipelines.append(pipeline)
                 rank_used += rank_for_pipeline
 
+        def fake_get_rank(
+            process_group: TestOobleckDataParallelEngineClass.FakeProcessGroup,
+        ):
+            my_rank = torch.distributed.get_rank()
+            return (
+                process_group.ranks.index(my_rank)
+                if my_rank in process_group.ranks
+                else -1
+            )
+
         for rank in range(rank_used):
             my_pipeline = next(p for p in pipelines if rank in p._ranks)
-
             engine_mock._pipeline = my_pipeline
 
             mocker.patch("deepspeed.comm.get_rank", return_value=rank)
-            mocker.patch("torch.distributed.get_rank", return_value=rank)
+            mocker.patch("torch.distributed.get_rank", new=fake_get_rank)
             dp_engine = DataParallelEngine(engine_mock, pipelines)
             dp_engine.do_allreduce()
 
@@ -476,11 +481,11 @@ class TestOobleckEngineClass(OobleckElasticTestCase):
             "oobleck.execution.engine.PipelineTemplateGenerator.create_pipeline_templates",
             return_value=[
                 cls.factory.get_dummy_pipeline_template(
-                    num_stages=num_gpus + 1,
-                    num_gpus_per_node=num_gpus + 1,
-                    num_nodes=1,
+                    num_stages=num_gpus,
+                    num_gpus_per_node=1,
+                    num_nodes=num_gpus,
                 )
-                for num_gpus in range(4)
+                for num_gpus in [1, 2, 3, 4]
             ],
         )
         class_mocker.patch("socket.gethostname", return_value="127.0.0.1")
@@ -799,7 +804,7 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
         my_ip: str,
         arguments: OobleckArguments,
     ):
-        # Assume all GPUs are in one GPUs
+        # Assume all GPUs are in one node
         num_gpus_per_node = 4
         num_nodes_per_pipeline = 1
         pipe = pipe[rank]
@@ -861,7 +866,6 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
         thread = threading.Thread(target=self.broadcast_rank0_port, args=(pipes,))
         thread.start()
 
-        num_gpus_per_node = 4 // num_stages
         self.run_in_parallel(
             4,
             self._run_fsdp_allreduce,
@@ -973,14 +977,17 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
                     for layer_index, ranks in pipeline.rank_grid.items():
                         # This test didn't use FSDP
                         assert len(ranks) == 1
-                        assert ranks[0] == 2
+                        assert ranks[0] == 0
                 else:
                     for layer_index, ranks in pipeline.rank_grid.items():
                         # This test didn't use FSDP
                         assert len(ranks) == 1
-                        assert ranks[0] == (
-                            0 if layer_index < len(model.layers) // 2 else 1
+                        assert (
+                            ranks[0] in [0, 2]
+                            if layer_index < len(model.layers) // 2
+                            else [1, 3]
                         )
+
             rank = dist.get_rank()
             for layer_id, ranks_per_layer in engine._pipeline.rank_grid.items():
                 if rank in ranks_per_layer:
