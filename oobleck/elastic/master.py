@@ -166,11 +166,10 @@ class OobleckMasterDaemon:
     async def register_agent_handler(
         self, r: asyncio.StreamReader, w: asyncio.StreamWriter
     ):
-        # TODO: find another unique identifier than IP address.
-        client_ip = w.get_extra_info("peername")[0]
+        client_ip_port: tuple[str, int] = w.get_extra_info("peername")
 
-        if self._job is None or client_ip not in self._job.node_ips:
-            logger.warning(f"Agent {client_ip} is not registered")
+        if self._job is None or client_ip_port[0] not in self._job.node_ips:
+            logger.warning(f"Agent {client_ip_port} is not registered")
             return await message_util.send_response(
                 w,
                 message_util.RequestType.REGISTER_AGENT,
@@ -178,8 +177,8 @@ class OobleckMasterDaemon:
                 close=True,
             )
 
-        if client_ip in self._agent_connections:
-            logger.warning(f"Agent {client_ip} already registered")
+        if client_ip_port in self._agent_connections:
+            logger.warning(f"Agent {client_ip_port} already registered")
             return await message_util.send_response(
                 w,
                 message_util.RequestType.REGISTER_AGENT,
@@ -187,10 +186,10 @@ class OobleckMasterDaemon:
                 close=True,
             )
 
-        logger.info(f"Registering agent stream: {client_ip}")
-        self._agent_connections[client_ip] = (r, w)
+        logger.info(f"Registering agent stream: {client_ip_port}")
+        self._agent_connections[client_ip_port] = (r, w)
 
-        self._server.get_loop().create_task(self.agent_handler(client_ip))
+        self._server.get_loop().create_task(self.agent_handler(client_ip_port))
 
         # self._server.get_loop().create_task(self.on_agent_callback(agent))
         await message_util.send_response(
@@ -200,8 +199,8 @@ class OobleckMasterDaemon:
             close=False,
         )
 
-    async def close_agent(self, agent_ip: str):
-        self._agent_connections.pop(agent_ip)
+    async def close_agent(self, agent_info: tuple[str, int]):
+        self._agent_connections.pop(agent_info)
 
         # Broadcast reconfiguration event
         for _, w in self._agent_connections.values():
@@ -211,7 +210,7 @@ class OobleckMasterDaemon:
                 message_util.Response.RECONFIGURATION,
                 close=False,
             )
-            await message_util.send(w, agent_ip, need_pickle=True, close=False)
+            await message_util.send(w, agent_info[0], need_pickle=True, close=False)
 
     async def pong(self, w: asyncio.StreamWriter):
         logger.info("Sending pong")
@@ -222,9 +221,9 @@ class OobleckMasterDaemon:
             close=False,
         )
 
-    async def agent_handler(self, agent_ip: str):
+    async def agent_handler(self, agent_info: tuple[str, int]):
         loop = self._server.get_loop()
-        r, w = self._agent_connections[agent_ip]
+        r, w = self._agent_connections[agent_info]
         try:
             while True:
                 request_type = await message_util.recv_request_type(r)
@@ -238,8 +237,8 @@ class OobleckMasterDaemon:
                     logger.warning(f"Unknown request type: {request_type}")
                     continue
         except (asyncio.IncompleteReadError, ConnectionResetError):
-            logger.warning(f"Agent {agent_ip} disconnected")
-            await self.close_agent(agent_ip)
+            logger.warning(f"Agent {agent_info} disconnected")
+            await self.close_agent(agent_info)
             if not self._agent_connections:
                 logger.warning("No agent alive. Cancel job.")
                 self._job = None

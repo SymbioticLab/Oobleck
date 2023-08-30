@@ -25,7 +25,9 @@ class TestOobleckAgentClass(OobleckElasticTestCase):
     ):
         await agent._register_agent()
         await asyncio.sleep(1)
-        assert self.sample_ip in daemon._agent_connections
+        assert self.sample_ip in [
+            connection[0] for connection in daemon._agent_connections
+        ]
 
     @pytest.mark.asyncio
     async def test_fail_register_agent(

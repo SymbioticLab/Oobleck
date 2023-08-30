@@ -98,7 +98,7 @@ class TestOobleckMasterDaemonClass(OobleckElasticTestCase):
         await agents[1]._conn[1].wait_closed()
 
         await asyncio.sleep(1)
-        close_agent_handler_spy.assert_called_once_with("127.0.0.2")
+        close_agent_handler_spy.assert_called_once_with(("127.0.0.2", 0))
 
         # check first agent receives reconfiguration broadcast
         result, req = await message_util.recv_response(agents[0]._conn[0])
