@@ -82,7 +82,7 @@ class OobleckMasterDaemon:
                 num_workers=1,
             )
             cmd += " ".join(
-                [f"--{k}={v}" for k, v in flatten_configurations(agent_args).items()]
+                [f"--{k} {v}" for k, v in flatten_configurations(agent_args).items()]
             )
             cmd += '"'
             logger.info(f"Launching an agent on {node_ip}: {cmd}")
@@ -278,9 +278,11 @@ async def main(ip: str | None, port: int):
 
 if __name__ == "__main__":
     parser = simple_parsing.ArgumentParser()
-    parser.add_argument("--ip", type=Optional[str], default=None)
+    parser.add_argument("--ip", type=str, default="")
     parser.add_argument("--port", type=int, default=0)
 
     args = parser.parse_args()
+    if not args.ip:
+        args.ip = "127.0.0.1"
 
     asyncio.run(main(args.ip, args.port))

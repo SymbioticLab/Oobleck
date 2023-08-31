@@ -547,7 +547,9 @@ class OobleckEngine:
         dist_info = self._dist_info
 
         my_ip: str = socket.gethostbyname(socket.gethostname())
-        assert my_ip in dist_info.agent_ips, "My IP is not in dist info."
+        assert (
+            my_ip in dist_info.agent_ips
+        ), f"My IP {my_ip} is not in dist info {dist_info.agent_ips}."
 
         self._num_nodes = len(dist_info.agent_ips)
         self._world_size = dist_info.world_size
@@ -644,5 +646,9 @@ class OobleckEngine:
         assert self._hf_training_args.max_steps > 0
 
         for step in range(self._hf_training_args.max_steps):
-            logger.info(f"Step {step}")
-            self._train_step()
+            try:
+                logger.info(f"Step {step}")
+                self._train_step()
+            except StopIteration:
+                logger.info("Epoch is done.")
+                self._pipeline.reset_iterator()

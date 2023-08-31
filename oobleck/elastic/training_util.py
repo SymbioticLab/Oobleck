@@ -59,7 +59,7 @@ def flatten_configurations(
             v = {k: v for k, v in v.items() if v is not None}
             result.update(v)
         elif isinstance(v, list):
-            result[k] = ",".join(v)
+            result[k] = " ".join(v)
         else:
             result[k] = v
     return result
