@@ -8,6 +8,7 @@ timer = SynchronizedWallClockTimer()
 def measure_time(timer_name: str):
     def inner(func: callable):
         def wrapper(s, *args, **kwargs):
+            global timer
             timer: SynchronizedWallClockTimer.Timer = timer.timer(timer_name)
             timer.start()
             # TODO: restore timer later.
