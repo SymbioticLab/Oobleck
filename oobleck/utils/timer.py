@@ -9,7 +9,7 @@ def measure_time(timer_name: str):
     def inner(func: callable):
         def wrapper(s, *args, **kwargs):
             global sync_timer
-            timer: SynchronizedWallClockTimer.Timer = sync_timer.timer(timer_name)
+            timer: SynchronizedWallClockTimer.Timer = sync_timer(timer_name)
             timer.start()
             # TODO: restore timer later.
             result = func(s, *args, **kwargs)

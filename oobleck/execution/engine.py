@@ -30,7 +30,7 @@ from oobleck.planning.instantiator import (
     HeterogeneousPipelinesExecutionPlan,
     PipelineInstantiator,
 )
-from oobleck.utils.timer import measure_time, timer
+from oobleck.utils.timer import measure_time, sync_timer
 
 logger = LoggerFactory.create_logger("oobleck_engine")
 
@@ -652,7 +652,7 @@ class OobleckEngine:
             try:
                 self._train_step()
 
-                step_timer: SynchronizedWallClockTimer.Timer = timer.timer("step")
+                step_timer: SynchronizedWallClockTimer.Timer = sync_timer("step")
                 logger.info(f"Step {step} time: {step_timer.elapsed()} ms")
             except StopIteration:
                 logger.info("Epoch is done.")
