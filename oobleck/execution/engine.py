@@ -11,6 +11,7 @@ from multiprocessing import connection
 import deepspeed.comm as dist
 import torch.distributed
 from deepspeed.utils.logging import LoggerFactory
+from deepspeed.utils.timer import SynchronizedWallClockTimer
 from transformers.training_args import TrainingArguments as HFTrainingArguments
 
 from oobleck.csrc.planning.pipeline_template import (
@@ -29,6 +30,7 @@ from oobleck.planning.instantiator import (
     HeterogeneousPipelinesExecutionPlan,
     PipelineInstantiator,
 )
+from oobleck.utils.timer import measure_time, timer
 
 logger = LoggerFactory.create_logger("oobleck_engine")
 
@@ -637,6 +639,7 @@ class OobleckEngine:
         self._dp_engine = DataParallelEngine(self, pipelines)
         self._reconfiguration = ReconfigurationEngine(self, pipelines)
 
+    @measure_time("step")
     def _train_step(self):
         self._pipeline.train()
         self._dp_engine.do_allreduce()
@@ -647,8 +650,10 @@ class OobleckEngine:
 
         for step in range(self._hf_training_args.max_steps):
             try:
-                logger.info(f"Step {step}")
                 self._train_step()
+
+                step_timer: SynchronizedWallClockTimer.Timer = timer.timer("step")
+                logger.info(f"Step {step} time: {step_timer.elapsed()} ms")
             except StopIteration:
                 logger.info("Epoch is done.")
                 self._pipeline.reset_iterator()
