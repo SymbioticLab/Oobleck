@@ -121,8 +121,8 @@ class OobleckAgent:
                 target=worker_main,
                 args=(
                     index,
-                    len(self._args.node_ips) * num_workers,
-                    1,
+                    len(self._args.node_ips),
+                    num_workers,
                     child_pipe,
                     args,
                 ),

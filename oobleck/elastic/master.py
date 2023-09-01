@@ -79,7 +79,7 @@ class OobleckMasterDaemon:
                 master_port=self._port,
                 node_ips=job_config.node_ips,
                 job_args=job_config.job_args,
-                num_workers=1,
+                num_workers=4,
             )
             cmd += " ".join(
                 [f"--{k} {v}" for k, v in flatten_configurations(agent_args).items()]
