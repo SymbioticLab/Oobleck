@@ -10,7 +10,7 @@ from multiprocessing import connection
 
 import deepspeed.comm as dist
 import torch.distributed
-from deepspeed.utils.logging import LoggerFactory
+from deepspeed.utils.logging import LoggerFactory, log_dist
 from deepspeed.utils.timer import SynchronizedWallClockTimer
 from transformers.training_args import TrainingArguments as HFTrainingArguments
 
@@ -647,13 +647,19 @@ class OobleckEngine:
 
     def train(self):
         assert self._hf_training_args.max_steps > 0
-        step_timer: SynchronizedWallClockTimer.Timer = sync_timer("step")
 
         for step in range(self._hf_training_args.max_steps):
             try:
                 self._train_step()
-                logger.info(f"Step {step} time: {step_timer.elapsed()} ms")
+                sync_timer.log(["step"])
+                if step % 10 == 0:
+                    log_dist(SynchronizedWallClockTimer.memory_usage(), ranks=[0])
             except StopIteration:
-                logger.info("Epoch is done.")
+                step_timer: SynchronizedWallClockTimer.Timer = sync_timer("step")
                 step_timer.reset()
                 self._pipeline.reset_iterator()
+
+        logger.info("Training is done. Waiting for synchronization...")
+        dist.barrier()
+        torch.cuda.synchronize()
+        logger.info("Training done.")
