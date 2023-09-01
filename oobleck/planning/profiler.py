@@ -186,7 +186,9 @@ class Profiler:
             for result in results.tolist()
         ]
 
-    def profile_allreduce_in_node(self) -> list[dict[int, float]]:
+    def profile_allreduce_in_node(
+        self, num_gpus_per_node: int
+    ) -> list[dict[int, float]]:
         """Profile allreduce latency between GPUs in node,
         \# nodes = 1, 2, 4, ....
         Actual measurement is done only on global rank 0,
@@ -200,8 +202,6 @@ class Profiler:
         assert dist.is_initialized()
         logger.info(f"Profile allreduce within a node latency")
 
-        num_gpus_per_node = torch.cuda.device_count()
-        # 1, 2, 4, 8, ...
         num_gpus_list = [2**i for i in range(int(math.log2(num_gpus_per_node)) + 1)]
         ranks = list(range(num_gpus_per_node))
 
@@ -319,7 +319,7 @@ def profile(
         logger.info("Skip profiling in-node allreduce latency.")
     else:
         logger.info("Profiling in-node allreduce latency.")
-        allreduce_in_node = profiler.profile_allreduce_in_node()
+        allreduce_in_node = profiler.profile_allreduce_in_node(num_workers_per_node)
         if "0" in os.environ["CUDA_VISIBLE_DEVICES"]:
             with path.open(mode="w") as f:
                 json.dump(allreduce_in_node, f)
