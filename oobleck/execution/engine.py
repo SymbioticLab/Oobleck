@@ -647,13 +647,13 @@ class OobleckEngine:
 
     def train(self):
         assert self._hf_training_args.max_steps > 0
+        step_timer: SynchronizedWallClockTimer.Timer = sync_timer("step")
 
         for step in range(self._hf_training_args.max_steps):
             try:
                 self._train_step()
-
-                step_timer: SynchronizedWallClockTimer.Timer = sync_timer("step")
                 logger.info(f"Step {step} time: {step_timer.elapsed()} ms")
             except StopIteration:
                 logger.info("Epoch is done.")
+                step_timer.reset()
                 self._pipeline.reset_iterator()
