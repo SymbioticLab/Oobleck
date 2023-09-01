@@ -298,7 +298,7 @@ def profile(
             arguments.microbatch_size
         )
         # In each node, the first process writes a file.
-        if "0" in os.environ["CUDA_VISIBLE_DEVICES"]:
+        if dist.get_rank() % num_workers_per_node == 0:
             with path.open(mode="w") as f:
                 json.dump(layer_execution_result, f)
                 f.flush()
@@ -309,7 +309,7 @@ def profile(
     else:
         logger.info("Profiling cross-node allreduce latency.")
         allreduce_across_nodes = profiler.profile_allreduce_across_nodes()
-        if "0" in os.environ["CUDA_VISIBLE_DEVICES"]:
+        if dist.get_rank() % num_workers_per_node == 0:
             with path.open(mode="w") as f:
                 json.dump(allreduce_across_nodes, f)
                 f.flush()
@@ -320,7 +320,7 @@ def profile(
     else:
         logger.info("Profiling in-node allreduce latency.")
         allreduce_in_node = profiler.profile_allreduce_in_node(num_workers_per_node)
-        if "0" in os.environ["CUDA_VISIBLE_DEVICES"]:
+        if dist.get_rank() % num_workers_per_node == 0:
             with path.open(mode="w") as f:
                 json.dump(allreduce_in_node, f)
                 f.flush()
