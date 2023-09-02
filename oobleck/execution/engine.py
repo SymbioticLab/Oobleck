@@ -185,8 +185,8 @@ class ReconfigurationEngine:
         new_ranks_list: list[list[int]],
     ) -> OobleckPipeline:
         global_num_microbatch = (
-            self.engine._args.global_microbatch_size
-            // self.engine._args.microbatch_size
+            self.engine._args.job.global_microbatch_size
+            // self.engine._args.job.microbatch_size
         )
         instantiator = PipelineInstantiator()
         execution_plan: HeterogeneousPipelinesExecutionPlan = (
