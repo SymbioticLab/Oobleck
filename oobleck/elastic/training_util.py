@@ -1,4 +1,5 @@
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 from simple_parsing import Serializable
 
@@ -43,7 +44,7 @@ class ModelArguments(Serializable):
     model_tag: str
     dataset_path: str
     dataset_name: str | None = None
-    # Other arbitrary model configuration can be here..
+    model_args: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

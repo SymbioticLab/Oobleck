@@ -476,7 +476,7 @@ class OobleckEngine:
             dataset.sample,
             self._hf_training_args,
             self._args.model.model_tag,
-            asdict(self._args.model),
+            self._args.model.model_args,
         )
 
         profile_results: LayerExecutionResults = get_profile_results(

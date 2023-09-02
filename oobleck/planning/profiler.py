@@ -268,7 +268,7 @@ def profile(
         dataset.sample,
         None,
         args.model.model_tag,
-        asdict(args.model),
+        args.model.model_args,
     )
     device = torch.device("cuda")
     for layer in model.layers:
