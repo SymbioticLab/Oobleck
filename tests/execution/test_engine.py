@@ -583,7 +583,7 @@ class TestOobleckEngineClass(OobleckElasticTestCase):
         )
 
         global_num_microbatch = (
-            sample_args.global_microbatch_size // sample_args.microbatch_size
+            sample_args.job.global_microbatch_size // sample_args.job.microbatch_size
         )
         engine.instantiate_pipelines(global_num_microbatch)
 
@@ -692,7 +692,7 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
         assert dist.get_rank() < dist.get_world_size()
         assert dist.get_world_size() == 4, "This test must run with 4 GPUs"
         global_num_microbatch = (
-            arguments.global_microbatch_size // arguments.microbatch_size
+            arguments.job.global_microbatch_size // arguments.job.microbatch_size
         )
         engine.instantiate_pipelines(global_num_microbatch)
 
@@ -756,7 +756,7 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
         num_nodes_per_pipeline = num_stages
         pipe = pipe[rank]
         global_num_microbatch = (
-            arguments.global_microbatch_size // arguments.microbatch_size
+            arguments.job.global_microbatch_size // arguments.job.microbatch_size
         )
 
         my_ip = agent_ips[rank]
@@ -816,7 +816,7 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
         num_nodes_per_pipeline = 1
         pipe = pipe[rank]
         global_num_microbatch = (
-            arguments.global_microbatch_size // arguments.microbatch_size
+            arguments.job.global_microbatch_size // arguments.job.microbatch_size
         )
 
         socket_patcher = patch("socket.gethostbyname", return_value=my_ip)
@@ -897,7 +897,7 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
     ):
         pipe = pipes[rank]
         global_num_microbatch = (
-            arguments.global_microbatch_size // arguments.microbatch_size
+            arguments.job.global_microbatch_size // arguments.job.microbatch_size
         )
 
         my_ip = agent_ips[rank]
@@ -1027,7 +1027,7 @@ class TestOobleckDistributedEngineClass(OobleckMultiProcessTestCase):
         # adjust global microbatch size so that batch distribution
         # works after losing 1 node.
         sample_args = copy.deepcopy(sample_args)
-        sample_args.global_microbatch_size = 24 * TRAIN_BATCH_SIZE
+        sample_args.job.global_microbatch_size = 24 * TRAIN_BATCH_SIZE
 
         num_gpus_per_node = 1
         ctx = multiprocessing.get_context("spawn")
