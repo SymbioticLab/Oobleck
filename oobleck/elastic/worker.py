@@ -24,10 +24,10 @@ def worker_main(
     logger.info("Initializing torch.distributed...")
     engine.initialize_distributed()
 
-    if args.global_microbatch_size % args.microbatch_size != 0:
+    if args.job.global_microbatch_size % args.job.microbatch_size != 0:
         raise ValueError("global_microbatch_size must be divisible by microbatch_size")
 
-    global_num_microbatch = args.global_microbatch_size // args.microbatch_size
+    global_num_microbatch = args.job.global_microbatch_size // args.job.microbatch_size
     logger.info("Instantiating pipelines...")
     engine.instantiate_pipelines(global_num_microbatch)
     logger.info("Begin training...")

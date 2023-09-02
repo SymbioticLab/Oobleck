@@ -7,7 +7,9 @@ job:
   steps: 30
 
 model:
-  model_name: gpt2
-  model_tag: medium
+  model_name: gpt2 # Must use model name gpt2
+  model_tag: 2.7b
   dataset_path: wikitext
   dataset_name: wikitext-2-raw-v1
+  num_hidden_layers: 24
+  hidden_size: 2048

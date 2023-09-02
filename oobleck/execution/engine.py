@@ -6,6 +6,7 @@ import socket
 import threading
 import weakref
 from collections import defaultdict
+from dataclasses import asdict
 from multiprocessing import connection
 
 import deepspeed.comm as dist
@@ -427,12 +428,12 @@ class OobleckEngine:
         self._agent_pipe: connection.Connection = pipe
         self._args: OobleckArguments = args
         training_args = {
-            "output_dir": f"/tmp/oobleck/output/{args.model_name}-{args.model_tag}",
-            "per_device_train_batch_size": args.microbatch_size,
+            "output_dir": f"/tmp/oobleck/output/{args.model.model_name}-{args.model.model_tag}",
+            "per_device_train_batch_size": args.job.microbatch_size,
             "no_cuda": True,  # don't use cuda in HFTrainingArguments
             "log_level": "error",  # omit warning messages from HFTrainingArguments
             # do not set gradient_accumulation_steps in HFTrainingArguments
-            "max_steps": args.steps,
+            "max_steps": args.job.steps,
         }
         self._hf_training_args: HFTrainingArguments = HFTrainingArguments(
             **training_args
@@ -462,25 +463,25 @@ class OobleckEngine:
         list[PipelineTemplate],
     ]:
         dataset = OobleckDataset(
-            self._args.model_name,
-            self._args.dataset_path,
-            self._args.dataset_name,
-            self._args.model_args["n_positions"]
-            if self._args.model_args and "n_positions" in self._args.model_args
+            self._args.model.model_name,
+            self._args.model.dataset_path,
+            self._args.model.dataset_name,
+            self._args.model.n_positions
+            if hasattr(self._args.model, "n_positions")
             else None,
         )
 
         model = OobleckModel(
-            self._args.model_name,
+            self._args.model.model_name,
             dataset.sample,
             self._hf_training_args,
-            self._args.model_tag,
-            self._args.model_args,
+            self._args.model.model_tag,
+            asdict(self._args.model),
         )
 
         profile_results: LayerExecutionResults = get_profile_results(
-            self._args.model_name,
-            self._args.model_tag,
+            self._args.model.model_name,
+            self._args.model.model_tag,
             self._hf_training_args.per_device_train_batch_size,
         )
 

@@ -1,9 +1,8 @@
 import gc
 import json
-import logging
 import math
-import os
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -241,7 +240,7 @@ def get_profile_path(model_name: str, model_tag: str) -> Path:
 
 
 def profile(
-    arguments: OobleckArguments,
+    args: OobleckArguments,
     master_addr: str,
     master_port: int,
     num_workers_per_node: int,
@@ -256,20 +255,20 @@ def profile(
     Result is stored in cache for future use.
     Path: /tmp/oobleck/profiles/{model_name}-{tag}/{layers|allreduce_in_node|allreduce_across_nodes}
     """
-    directory = get_profile_path(arguments.model_name, arguments.model_tag)
+    directory = get_profile_path(args.model.model_name, args.model.model_tag)
     directory.mkdir(parents=True, exist_ok=True)
 
-    logger.info("Profiling model %s", arguments.model_name)
+    logger.info("Profiling model %s", args.model.model_name)
 
     dataset = OobleckDataset(
-        arguments.model_name, arguments.dataset_path, arguments.dataset_name
+        args.model.model_name, args.model.dataset_path, args.model.dataset_name
     )
     model = OobleckModel(
-        arguments.model_name,
+        args.model.model_name,
         dataset.sample,
         None,
-        arguments.model_tag,
-        arguments.model_args,
+        args.model.model_tag,
+        asdict(args.model),
     )
     device = torch.device("cuda")
     for layer in model.layers:
@@ -289,13 +288,13 @@ def profile(
         backend="nccl", store=store, rank=rank, world_size=world_size
     )
 
-    path = directory.joinpath(f"mb{arguments.microbatch_size}.json")
+    path = directory.joinpath(f"mb{args.job.microbatch_size}.json")
     if path.exists():
         logger.info("Skip profiling execution latency.")
     else:
         logger.info("Profiling model execution latency.")
         layer_execution_result = profiler.profile_execution_layers(
-            arguments.microbatch_size
+            args.job.microbatch_size
         )
         # In each node, the first process writes a file.
         if dist.get_rank() % num_workers_per_node == 0:

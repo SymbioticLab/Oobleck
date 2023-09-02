@@ -9,7 +9,7 @@ class DistributedArguments(Serializable):
     master_port: int
     node_ips: list[str]
     node_port: int = 22
-    num_workers: int = 0
+    num_workers: int = 1
     num_agents_per_node: int = 1
     username: str | None = None
 

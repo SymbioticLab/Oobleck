@@ -6,12 +6,17 @@ import sys
 from dataclasses import dataclass
 from multiprocessing import connection
 
-import simple_parsing
+import simple_parsing as sp
 from deepspeed.utils.logging import LoggerFactory
 
 import oobleck.elastic.message_util as message_util
 from oobleck.csrc.planning.pipeline_template import get_profile_results
-from oobleck.elastic.training_util import OobleckAgentArguments, OobleckArguments
+from oobleck.elastic.training_util import (
+    DistributedArguments,
+    JobArguments,
+    ModelArguments,
+    OobleckArguments,
+)
 from oobleck.elastic.worker import worker_main
 from oobleck.planning.profiler import profile
 
@@ -39,18 +44,23 @@ class OobleckAgent:
        the agent queries a new distribution information from the master and forward it to workers.
     """
 
-    def __init__(self, args: OobleckAgentArguments):
-        self._args = args
+    def __init__(self, master_ip: str, master_port: int, job_id: int):
+        self._master_ip = master_ip
+        self._master_port = master_port
+        self._job_id = job_id
+
+        self._args: OobleckArguments | None = None
         self._conn: tuple[asyncio.StreamReader, asyncio.StreamWriter] | None = None
         self._workers: list[Worker] = []
         self._response_callbacks: dict[message_util.RequestType, callable] = {}
         self._job_done: bool = False
 
     async def run(self):
-        await self._connect_to_master(self._args.master_ip, self._args.master_port)
-        await self._register_agent()
-        await self._launch_workers(self._args.num_workers, self._args.job_args)
+        await self._connect_to_master(self._master_ip, self._master_port)
+        args = await self._register_agent(self._job_id)
+        await self._launch_workers(args)
 
+        self._args = args
         while not self._job_done:
             await self.on_receive_response()
 
@@ -61,10 +71,11 @@ class OobleckAgent:
             timeout=message_util.TIMEOUT,
         )
 
-    async def _register_agent(self):
+    async def _register_agent(self, job_id: int) -> OobleckArguments:
         await message_util.send_request_type(
             self._conn[1], message_util.RequestType.REGISTER_AGENT
         )
+        await message_util.send(self._conn[1], job_id)
         result, req = await message_util.recv_response(self._conn[0])
         if (
             result is not message_util.Response.SUCCESS
@@ -72,20 +83,29 @@ class OobleckAgent:
         ):
             raise ConnectionError("Failed to register agent")
 
-    def _run_profiler(self, num_workers: int, args: OobleckArguments):
+        return await message_util.recv(self._conn[0])
+
+    def _run_profiler(self, args: OobleckArguments):
         ctx = multiprocessing.get_context("spawn")
         profiler_processes: list[multiprocessing.Process] = []
 
-        for index in range(num_workers):
+        for index in range(args.dist.num_workers):
             os.environ["CUDA_VISIBLE_DEVICES"] = str(index)
             my_ip = socket.gethostbyname(socket.gethostname())
-            master_ip = self._args.node_ips[0]
+            master_ip = args.dist.node_ips[0]
             master_port = 23456
-            world_size = len(self._args.node_ips) * num_workers
-            rank = self._args.node_ips.index(my_ip) * num_workers + index
+            world_size = len(args.dist.node_ips) * args.dist.num_workers
+            rank = args.dist.node_ips.index(my_ip) * args.dist.num_workers + index
             process = ctx.Process(
                 target=profile,
-                args=(args, master_ip, master_port, num_workers, world_size, rank),
+                args=(
+                    args,
+                    master_ip,
+                    master_port,
+                    args.dist.num_workers,
+                    world_size,
+                    rank,
+                ),
             )
             process.start()
             profiler_processes.append(process)
@@ -93,24 +113,30 @@ class OobleckAgent:
         for process in profiler_processes:
             process.join()
 
-    async def _launch_workers(self, num_workers: int, args: OobleckArguments):
+    async def _launch_workers(self, args: OobleckArguments):
+        logger.info(f"Job arguments: {args}")
+
         # Test if profile data exists
         try:
-            get_profile_results(args.model_name, args.model_tag, args.microbatch_size)
+            get_profile_results(
+                args.model.model_name,
+                args.model.model_tag,
+                args.job.microbatch_size,
+            )
         except Exception:
             # Run profiler
             logger.warning(
-                f"Profile data for model {args.model_name} not found. Launching profiler..."
+                f"Profile data for model {args.model.model_name} not found. Launching profiler..."
             )
-            self._run_profiler(num_workers, args)
+            self._run_profiler(args)
 
         dist_info = message_util.DistributionInfo(
-            agent_ips=self._args.node_ips,
-            world_size=len(self._args.node_ips) * self._args.num_workers,
+            agent_ips=args.dist.node_ips,
+            world_size=len(args.dist.node_ips) * args.dist.num_workers,
         )
 
         ctx = multiprocessing.get_context("spawn")
-        for index in range(num_workers):
+        for index in range(args.dist.num_workers):
             logger.info(f"Launching worker {index}...")
             # TODO: add all arguments. Arguments should be passed from the master
             # via command line arguments.
@@ -121,8 +147,8 @@ class OobleckAgent:
                 target=worker_main,
                 args=(
                     index,
-                    len(self._args.node_ips),
-                    num_workers,
+                    len(args.dist.node_ips),
+                    args.dist.num_workers,
                     child_pipe,
                     args,
                 ),
@@ -140,7 +166,7 @@ class OobleckAgent:
 
         # If a worker has rank 0, it should forward its port to the master
         my_ip: str = socket.gethostbyname(socket.gethostname())
-        if my_ip == self._args.node_ips[0]:
+        if my_ip == args.dist.node_ips[0]:
             await self.forward_worker_port(self._workers[0].pipe)
 
     async def forward_worker_port(self, pipe: connection.Connection):
@@ -191,7 +217,7 @@ class OobleckAgent:
             sys.exit(1)
 
         else:
-            self._args.node_ips.remove(lost_node_ip)
+            self._args.dist.node_ips.remove(lost_node_ip)
             # Send notification to workers
             for worker in self._workers:
                 worker.pipe.send(lost_node_ip)
@@ -254,9 +280,11 @@ class OobleckAgent:
 
 
 if __name__ == "__main__":
-    args: OobleckAgentArguments = simple_parsing.parse(OobleckAgentArguments)
-    agent = OobleckAgent(args)
+    parser = sp.ArgumentParser()
+    parser.add_argument("--master_ip", type=str)
+    parser.add_argument("--master_port", type=int)
+    parser.add_argument("--job_id", type=int)
 
-    logger.info(f"Arguments: {args.to_dict()}")
-
+    args = parser.parse_args()
+    agent = OobleckAgent(args.master_ip, args.master_port, args.job_id)
     asyncio.run(agent.run())
