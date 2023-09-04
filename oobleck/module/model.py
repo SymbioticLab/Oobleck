@@ -1,5 +1,5 @@
 import random
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Optional, Type
 
 import torch
 from accelerate import init_empty_weights
@@ -47,10 +47,10 @@ class OobleckModel:
     def __init__(
         self,
         model_name: str,
-        sample_inputs: Dict[str, Any],
+        sample_inputs: dict[str, Any],
         training_args: Optional[TrainingArguments] = None,
         model_tag: Optional[str] = None,
-        config_args: Optional[Dict[str, Any]] = None,
+        config_args: Optional[dict[str, Any]] = None,
     ):
         # Initialize CPU seed
         random.seed(RANDOM_SEED)
