@@ -2,7 +2,6 @@ import gc
 import json
 import math
 import time
-from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -324,6 +323,24 @@ def profile(
                 json.dump(allreduce_in_node, f)
                 f.flush()
 
+    # export configuration
+    path = directory.joinpath("model_args.json")
+    if dist.get_rank() % num_workers_per_node == 0:
+        with open(path, "w") as f:
+            json.dump(args.model.model_args, f)
+
     dist.barrier()
     dist.destroy_process_group()
     assert not dist.is_initialized()
+
+
+def validate_model_args(args: OobleckArguments) -> bool:
+    directory = get_profile_path(args.model.model_name, args.model.model_tag)
+    path = directory.joinpath("model_args.json")
+
+    if not directory.exists() or not path.exists():
+        return False
+
+    with path.open() as f:
+        args_from_file = json.load(f)
+        return args_from_file == args.model.model_args
