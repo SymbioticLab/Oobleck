@@ -466,10 +466,12 @@ class OobleckEngine:
             self._args.model.model_name,
             self._args.model.dataset_path,
             self._args.model.dataset_name,
-            self._args.model.n_positions
-            if hasattr(self._args.model, "n_positions")
+            self._args.model.model_args["n_positions"]
+            if "n_positions" in self._args.model.model_args
             else None,
         )
+
+        logger.info(f"model arguments: {self._args.model.model_args}")
 
         model = OobleckModel(
             self._args.model.model_name,
