@@ -29,6 +29,7 @@ class OobleckElasticTestCase:
                 master_port=daemon.port,
                 node_ips=["127.0.0.1", "127.0.0.2"],
                 username="test",
+                num_workers=4,
             ),
             job=JobArguments(),
             model=ModelArguments(

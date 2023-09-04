@@ -29,6 +29,6 @@ def sample_args(model_name_fixture: str) -> OobleckArguments:
             model_tag="test",
             dataset_path=dataset[0],
             dataset_name=dataset[1],
-            **model_args[model_name_fixture],
+            model_args=model_args[model_name_fixture],
         ),
     )

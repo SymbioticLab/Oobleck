@@ -25,21 +25,6 @@ class JobArguments(Serializable):
 
 @dataclass
 class ModelArguments(Serializable):
-    def __init__(
-        self,
-        model_name: str,
-        model_tag: str,
-        dataset_path: str,
-        dataset_name: str | None = None,
-        **kwargs,
-    ):
-        self.model_name = model_name
-        self.model_tag = model_tag
-        self.dataset_path = dataset_path
-        self.dataset_name = dataset_name
-        for key, value in kwargs.items():
-            setattr(self, key, value)
-
     model_name: str
     model_tag: str
     dataset_path: str
