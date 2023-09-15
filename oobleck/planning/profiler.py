@@ -287,44 +287,33 @@ def profile(
         backend="nccl", store=store, rank=rank, world_size=world_size
     )
 
-    path = directory.joinpath(f"mb{args.job.microbatch_size}.json")
-    if path.exists():
-        logger.info("Skip profiling execution latency.")
-    else:
-        logger.info("Profiling model execution latency.")
-        layer_execution_result = profiler.profile_execution_layers(
-            args.job.microbatch_size
-        )
-        # In each node, the first process writes a file.
-        if dist.get_rank() % num_workers_per_node == 0:
-            with path.open(mode="w") as f:
-                json.dump(layer_execution_result, f)
-                f.flush()
+    path = directory / f"mb{args.job.microbatch_size}.json"
+    logger.info("Profiling model execution latency.")
+    layer_execution_result = profiler.profile_execution_layers(args.job.microbatch_size)
+    # In each node, the first process writes a file.
+    if dist.get_rank() % num_workers_per_node == 0:
+        with path.open(mode="w") as f:
+            json.dump(layer_execution_result, f)
+            f.flush()
 
-    path = directory.joinpath("allreduce_across_nodes.json")
-    if path.exists():
-        logger.info("Skip profiling cross-node allreduce latency.")
-    else:
-        logger.info("Profiling cross-node allreduce latency.")
-        allreduce_across_nodes = profiler.profile_allreduce_across_nodes()
-        if dist.get_rank() % num_workers_per_node == 0:
-            with path.open(mode="w") as f:
-                json.dump(allreduce_across_nodes, f)
-                f.flush()
+    path = directory / "allreduce_across_nodes.json"
+    logger.info("Profiling cross-node allreduce latency.")
+    allreduce_across_nodes = profiler.profile_allreduce_across_nodes()
+    if dist.get_rank() % num_workers_per_node == 0:
+        with path.open(mode="w") as f:
+            json.dump(allreduce_across_nodes, f)
+            f.flush()
 
-    path = directory.joinpath("allreduce_in_node.json")
-    if path.exists():
-        logger.info("Skip profiling in-node allreduce latency.")
-    else:
-        logger.info("Profiling in-node allreduce latency.")
-        allreduce_in_node = profiler.profile_allreduce_in_node(num_workers_per_node)
-        if dist.get_rank() % num_workers_per_node == 0:
-            with path.open(mode="w") as f:
-                json.dump(allreduce_in_node, f)
-                f.flush()
+    path = directory / "allreduce_in_node.json"
+    logger.info("Profiling in-node allreduce latency.")
+    allreduce_in_node = profiler.profile_allreduce_in_node(num_workers_per_node)
+    if dist.get_rank() % num_workers_per_node == 0:
+        with path.open(mode="w") as f:
+            json.dump(allreduce_in_node, f)
+            f.flush()
 
     # export configuration
-    path = directory.joinpath("model_args.json")
+    path = directory / "model_args.json"
     if dist.get_rank() % num_workers_per_node == 0:
         with open(path, "w") as f:
             json.dump(args.model.model_args, f)
@@ -336,11 +325,16 @@ def profile(
 
 def validate_model_args(args: OobleckArguments) -> bool:
     directory = get_profile_path(args.model.model_name, args.model.model_tag)
-    path = directory.joinpath("model_args.json")
+    path = directory / "model_args.json"
 
     if not directory.exists() or not path.exists():
         return False
 
+    args_same: bool = True
     with path.open() as f:
         args_from_file = json.load(f)
-        return args_from_file == args.model.model_args
+        for k, v in args.model.model_args.items():
+            if k not in args_from_file or args_from_file[k] != v:
+                args_same = False
+                break
+    return args_same

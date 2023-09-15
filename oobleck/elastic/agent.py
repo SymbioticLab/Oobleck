@@ -117,10 +117,13 @@ class OobleckAgent:
                 args.job.microbatch_size,
             )
 
-            assert validate_model_args(args), (
-                "Model arguments are inconsistent: "
-                f"{args.model.model_args} != model_args.json."
-            )
+            if not validate_model_args(args):
+                logger.warning(
+                    "Model arguments are inconsistent: "
+                    f"{args.model.model_args} != model_args.json."
+                )
+                raise RuntimeError("Model arguments are inconsistent")
+
             logger.info(f"Job arguments: {args}")
         except Exception:
             # Run profiler
