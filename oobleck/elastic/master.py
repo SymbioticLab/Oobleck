@@ -57,14 +57,15 @@ class OobleckMasterDaemon:
 
         return daemon
 
-    async def run_node_agent(
+    async def run_node_agents(
         self,
         args: OobleckArguments,
-        index: int,
+        node_index: int,
+        agent_index: int,
         job_id: int,
         log_path: Path,
     ):
-        node_ip = args.dist.node_ips[index]
+        node_ip = args.dist.node_ips[node_index]
 
         async with asyncssh.connect(
             node_ip, args.dist.node_port, username=args.dist.username
@@ -72,7 +73,7 @@ class OobleckMasterDaemon:
             cmd = '/bin/bash -ic "conda run --no-capture-output -n oobleck '
             cmd += "python -m oobleck.elastic.agent "
             cmd += f"--master_ip {args.dist.master_ip} --master_port {args.dist.master_port} "
-            cmd += f'--job_id {job_id}"'
+            cmd += f'--job_id {job_id} --agent_index {agent_index}"'
             logger.info(f"Launching an agent on {node_ip}: {cmd}")
 
             log_file_path = log_path / f"{node_ip}.out"
@@ -111,15 +112,17 @@ class OobleckMasterDaemon:
             self._job_arguments[self._next_job_id] = args
 
             loop = self._server.get_loop()
-            for index in range(len(args.dist.node_ips)):
-                loop.create_task(
-                    self.run_node_agent(
-                        args,
-                        index,
-                        self._next_job_id,
-                        log_path,
+            for node_index in range(len(args.dist.node_ips)):
+                for agent_index in range(args.dist.num_agents_per_node):
+                    loop.create_task(
+                        self.run_node_agents(
+                            args,
+                            node_index,
+                            agent_index,
+                            self._next_job_id,
+                            log_path,
+                        )
                     )
-                )
 
             result = message_util.Response.SUCCESS
         except Exception as e:

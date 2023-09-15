@@ -39,10 +39,11 @@ class OobleckAgent:
        the agent queries a new distribution information from the master and forward it to workers.
     """
 
-    def __init__(self, master_ip: str, master_port: int, job_id: int):
+    def __init__(self, master_ip: str, master_port: int, job_id: int, agent_index: int):
         self._master_ip = master_ip
         self._master_port = master_port
         self._job_id = job_id
+        self._agent_index = agent_index
 
         self._args: OobleckArguments | None = None
         self._conn: tuple[asyncio.StreamReader, asyncio.StreamWriter] | None = None
@@ -138,17 +139,23 @@ class OobleckAgent:
         )
 
         ctx = multiprocessing.get_context("spawn")
-        for index in range(args.dist.num_workers):
-            logger.info(f"Launching worker {index}...")
+
+        gpu_indices = range(
+            self._agent_index * args.dist.num_workers,
+            (self._agent_index + 1) * args.dist.num_workers,
+        )
+
+        for gpu_index in gpu_indices:
+            logger.info(f"Launching worker {gpu_index}...")
             # TODO: add all arguments. Arguments should be passed from the master
             # via command line arguments.
             pipe, child_pipe = ctx.Pipe()
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(index)
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
 
             process = ctx.Process(
                 target=worker_main,
                 args=(
-                    index,
+                    gpu_index,
                     len(args.dist.node_ips),
                     args.dist.num_workers,
                     child_pipe,
@@ -286,7 +293,10 @@ if __name__ == "__main__":
     parser.add_argument("--master_ip", type=str)
     parser.add_argument("--master_port", type=int)
     parser.add_argument("--job_id", type=int)
+    parser.add_argument("--agent_index", type=int)
 
     args = parser.parse_args()
-    agent = OobleckAgent(args.master_ip, args.master_port, args.job_id)
+    agent = OobleckAgent(
+        args.master_ip, args.master_port, args.job_id, args.agent_index
+    )
     asyncio.run(agent.run())

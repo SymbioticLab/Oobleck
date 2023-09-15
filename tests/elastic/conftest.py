@@ -29,6 +29,7 @@ class OobleckElasticTestCase:
                 master_port=daemon.port,
                 node_ips=["127.0.0.1", "127.0.0.2"],
                 username="test",
+                num_agents_per_node=1,
                 num_workers=4,
             ),
             job=JobArguments(),
@@ -53,7 +54,7 @@ class OobleckElasticTestCase:
     async def agent(
         self, daemon: OobleckMasterDaemon, mocker: MockerFixture
     ) -> OobleckAgent:
-        agent = OobleckAgent("127.0.0.1", daemon.port, 0)
+        agent = OobleckAgent("127.0.0.1", daemon.port, 0, 0)
 
         future = asyncio.Future()
         future.set_result(None)

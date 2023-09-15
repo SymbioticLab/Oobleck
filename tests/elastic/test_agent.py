@@ -44,14 +44,6 @@ class TestOobleckAgentClass(OobleckElasticTestCase):
         for worker in agent._workers:
             worker.process.join()
 
-    @staticmethod
-    async def agent_process_fn(args: OobleckArguments):
-        agent = OobleckAgent(args)
-        await agent._connect_to_master(args.dist.master_ip, args.dist.master_port)
-        await agent._register_agent()
-        await asyncio.sleep(1)
-        agent._conn[1].close()
-
     @pytest.mark.asyncio
     async def test_receive_reconfiguration(
         self, daemon: OobleckMasterDaemon, agent: OobleckAgent, mocker: MockerFixture
@@ -72,7 +64,7 @@ class TestOobleckAgentClass(OobleckElasticTestCase):
 
         # Create a new agent, register it, and terminate it
         new_agent = OobleckAgent(
-            agent._args.dist.master_ip, agent._args.dist.master_port, job_id
+            agent._args.dist.master_ip, agent._args.dist.master_port, job_id, 1
         )
         await new_agent._connect_to_master(
             agent._args.dist.master_ip, agent._args.dist.master_port
