@@ -6,8 +6,9 @@ from pytest_mock import MockerFixture
 from oobleck.elastic.agent import OobleckAgent
 from oobleck.elastic.master import OobleckMasterDaemon
 from oobleck.elastic.training_util import (
-    DistributedJobConfiguration,
-    OobleckAgentArguments,
+    DistributedArguments,
+    JobArguments,
+    ModelArguments,
     OobleckArguments,
 )
 
@@ -22,18 +23,24 @@ class OobleckElasticTestCase:
         event_loop: asyncio.AbstractEventLoop,
     ) -> OobleckMasterDaemon:
         daemon = await OobleckMasterDaemon.create("127.0.0.1", 0)
-        daemon._job = DistributedJobConfiguration(
-            master_ip="127.0.0.1",
-            master_port=daemon.port,
-            node_ips=["127.0.0.1", "127.0.0.2"],
-            job_args=OobleckArguments(
+        daemon._job_arguments[0] = OobleckArguments(
+            dist=DistributedArguments(
+                master_ip="127.0.0.1",
+                master_port=daemon.port,
+                node_ips=["127.0.0.1", "127.0.0.2"],
+                username="test",
+                num_agents_per_node=1,
+                num_workers=4,
+            ),
+            job=JobArguments(),
+            model=ModelArguments(
                 model_name="gpt2",
                 model_tag="test",
                 dataset_path="test",
                 dataset_name=None,
             ),
-            username="test",
         )
+
         event_loop.create_task(daemon._server.serve_forever())
 
         yield daemon
@@ -47,20 +54,12 @@ class OobleckElasticTestCase:
     async def agent(
         self, daemon: OobleckMasterDaemon, mocker: MockerFixture
     ) -> OobleckAgent:
-        args = OobleckAgentArguments(
-            master_ip=daemon._job.master_ip,
-            master_port=daemon.port,
-            node_ips=daemon._job.node_ips,
-            job_args=daemon._job.job_args,
-            num_workers=self.sample_num_workers,
-        )
-
-        agent = OobleckAgent(args)
+        agent = OobleckAgent("127.0.0.1", daemon.port, 0, 0)
 
         future = asyncio.Future()
         future.set_result(None)
         mocker.patch.object(agent, "_run_profiler", return_value=future)
-        await agent._connect_to_master(args.master_ip, args.master_port)
+        await agent._connect_to_master("127.0.0.1", daemon.port)
         yield agent
         if not agent._conn[1].is_closing():
             agent._conn[1].close()

@@ -77,6 +77,17 @@ class TestOobleckPipelineTemplate(OobleckSingleProcessTestCase):
             for template in pipeline_templates
         ) == 4
 
+    def test_create_pipeline_templates_multiple_gpus_in_node_range(
+        self, profile: LayerExecutionResults
+    ):
+        generator = PipelineTemplateGenerator()
+        pipeline_templates = generator.create_pipeline_templates(profile, (1, 6), 4)
+        assert len(pipeline_templates) >= 1
+        for index, template in enumerate(pipeline_templates):
+            num_nodes = index + 1
+            assert template._num_gpus_per_node == 4
+            assert num_nodes == template._num_nodes
+
     @pytest.mark.skip(reason="Not implemented yet")
     def test_create_pipeline_templates_fsdp(self, profile: LayerExecutionResults):
         pass

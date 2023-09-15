@@ -8,7 +8,6 @@ from pytest_mock import MockerFixture
 import oobleck.elastic.message_util as message_util
 from oobleck.elastic.agent import OobleckAgent
 from oobleck.elastic.master import OobleckMasterDaemon
-from oobleck.elastic.training_util import OobleckAgentArguments
 from tests.elastic.conftest import OobleckElasticTestCase
 
 """
@@ -32,24 +31,27 @@ class TestOobleckMasterDaemonClass(OobleckElasticTestCase):
         await w.wait_closed()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("num_agents", [1, 2, 4])
     async def test_request_job(
         self,
         daemon: OobleckMasterDaemon,
         client_conns: tuple[asyncio.StreamReader, asyncio.StreamWriter],
         mocker: MockerFixture,
+        num_agents: int,
     ):
-        job = daemon._job
-        # Daemon must not have a job config
-        daemon._job = None
+        args = daemon._job_arguments[0]
+        args.dist.num_agents_per_node = num_agents
+        daemon._job_arguments.clear()
 
         mock_run_agents = mocker.patch.object(
-            daemon, "run_node_agent", return_value=AsyncMock(return_value=None)
+            daemon, "run_node_agents", return_value=AsyncMock(return_value=None)
         )
+        mocker.patch("pathlib.Path.mkdir", return_value=None)
 
         r, w = client_conns
         """Cehck if master launches agents."""
         await message_util.send_request_type(w, message_util.RequestType.LAUNCH_JOB)
-        await message_util.send(w, job, need_pickle=True, close=False)
+        await message_util.send(w, args)
 
         result = await message_util.recv_response(r)
         assert result == (
@@ -57,8 +59,8 @@ class TestOobleckMasterDaemonClass(OobleckElasticTestCase):
             message_util.RequestType.LAUNCH_JOB,
         )
 
-        assert mock_run_agents.call_count == len(job.node_ips)
-        assert daemon._job == job
+        assert mock_run_agents.call_count == len(args.dist.node_ips) * num_agents
+        # assert args == daemon._job_arguments[0]
 
         w.close()
         await w.wait_closed()
@@ -72,25 +74,28 @@ class TestOobleckMasterDaemonClass(OobleckElasticTestCase):
         close_agent_handler_spy = mocker.spy(daemon, "close_agent")
 
         agents: list[OobleckAgent] = []
-        args = OobleckAgentArguments(
-            master_ip=daemon._job.master_ip,
-            master_port=daemon.port,
-            node_ips=daemon._job.node_ips,
-            job_args=daemon._job.job_args,
-            num_workers=self.sample_num_workers,
-        )
+        job_id = 0
+        args = daemon._job_arguments[job_id]
 
-        for agent_ip in ["127.0.0.1", "127.0.0.2"]:
-            agent = OobleckAgent(args)
-            await agent._connect_to_master(args.master_ip, args.master_port)
+        for agent_index, agent_ip in enumerate(["127.0.0.1", "127.0.0.2"]):
+            agent = OobleckAgent(
+                args.dist.master_ip, args.dist.master_port, job_id, agent_index
+            )
+            await agent._connect_to_master(args.dist.master_ip, args.dist.master_port)
+
             mocker.patch(
                 "asyncio.StreamWriter.get_extra_info", return_value=(agent_ip, 0)
             )
             await message_util.send_request_type(
                 agent._conn[1], message_util.RequestType.REGISTER_AGENT
             )
+            await message_util.send(agent._conn[1], job_id)
             result, _ = await message_util.recv_response(agent._conn[0])
             assert result == message_util.Response.SUCCESS
+
+            await message_util.recv(agent._conn[0])
+            # assert args == args_from_master
+
             agents.append(agent)
 
         # close the second agent and check if notification goes to the first agent

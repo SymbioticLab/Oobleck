@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import itertools
 import weakref
 from collections.abc import Mapping
 from typing import Any
@@ -486,6 +485,9 @@ class OobleckPipeline:
             self.pipe_buffers[name] = [None] * len(pipe_buffers)
 
         self._global_step += 1
+
+    def reset_iterator(self):
+        self.execution._data_iterator = iter(self.execution._dataloader)
 
     def initialize_execution(
         self,

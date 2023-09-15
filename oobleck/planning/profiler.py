@@ -1,8 +1,6 @@
 import gc
 import json
-import logging
 import math
-import os
 import time
 from pathlib import Path
 
@@ -186,7 +184,9 @@ class Profiler:
             for result in results.tolist()
         ]
 
-    def profile_allreduce_in_node(self) -> list[dict[int, float]]:
+    def profile_allreduce_in_node(
+        self, num_gpus_per_node: int
+    ) -> list[dict[int, float]]:
         """Profile allreduce latency between GPUs in node,
         \# nodes = 1, 2, 4, ....
         Actual measurement is done only on global rank 0,
@@ -200,8 +200,6 @@ class Profiler:
         assert dist.is_initialized()
         logger.info(f"Profile allreduce within a node latency")
 
-        num_gpus_per_node = torch.cuda.device_count()
-        # 1, 2, 4, 8, ...
         num_gpus_list = [2**i for i in range(int(math.log2(num_gpus_per_node)) + 1)]
         ranks = list(range(num_gpus_per_node))
 
@@ -241,7 +239,7 @@ def get_profile_path(model_name: str, model_tag: str) -> Path:
 
 
 def profile(
-    arguments: OobleckArguments,
+    args: OobleckArguments,
     master_addr: str,
     master_port: int,
     num_workers_per_node: int,
@@ -256,20 +254,20 @@ def profile(
     Result is stored in cache for future use.
     Path: /tmp/oobleck/profiles/{model_name}-{tag}/{layers|allreduce_in_node|allreduce_across_nodes}
     """
-    directory = get_profile_path(arguments.model_name, arguments.model_tag)
+    directory = get_profile_path(args.model.model_name, args.model.model_tag)
     directory.mkdir(parents=True, exist_ok=True)
 
-    logger.info("Profiling model %s", arguments.model_name)
+    logger.info("Profiling model %s", args.model.model_name)
 
     dataset = OobleckDataset(
-        arguments.model_name, arguments.dataset_path, arguments.dataset_name
+        args.model.model_name, args.model.dataset_path, args.model.dataset_name
     )
     model = OobleckModel(
-        arguments.model_name,
+        args.model.model_name,
         dataset.sample,
         None,
-        arguments.model_tag,
-        arguments.model_args,
+        args.model.model_tag,
+        args.model.model_args,
     )
     device = torch.device("cuda")
     for layer in model.layers:
@@ -289,42 +287,54 @@ def profile(
         backend="nccl", store=store, rank=rank, world_size=world_size
     )
 
-    path = directory.joinpath(f"mb{arguments.microbatch_size}.json")
-    if path.exists():
-        logger.info("Skip profiling execution latency.")
-    else:
-        logger.info("Profiling model execution latency.")
-        layer_execution_result = profiler.profile_execution_layers(
-            arguments.microbatch_size
-        )
-        # In each node, the first process writes a file.
-        if "0" in os.environ["CUDA_VISIBLE_DEVICES"]:
-            with path.open(mode="w") as f:
-                json.dump(layer_execution_result, f)
-                f.flush()
+    path = directory / f"mb{args.job.microbatch_size}.json"
+    logger.info("Profiling model execution latency.")
+    layer_execution_result = profiler.profile_execution_layers(args.job.microbatch_size)
+    # In each node, the first process writes a file.
+    if dist.get_rank() % num_workers_per_node == 0:
+        with path.open(mode="w") as f:
+            json.dump(layer_execution_result, f)
+            f.flush()
 
-    path = directory.joinpath("allreduce_across_nodes.json")
-    if path.exists():
-        logger.info("Skip profiling cross-node allreduce latency.")
-    else:
-        logger.info("Profiling cross-node allreduce latency.")
-        allreduce_across_nodes = profiler.profile_allreduce_across_nodes()
-        if "0" in os.environ["CUDA_VISIBLE_DEVICES"]:
-            with path.open(mode="w") as f:
-                json.dump(allreduce_across_nodes, f)
-                f.flush()
+    path = directory / "allreduce_across_nodes.json"
+    logger.info("Profiling cross-node allreduce latency.")
+    allreduce_across_nodes = profiler.profile_allreduce_across_nodes()
+    if dist.get_rank() % num_workers_per_node == 0:
+        with path.open(mode="w") as f:
+            json.dump(allreduce_across_nodes, f)
+            f.flush()
 
-    path = directory.joinpath("allreduce_in_node.json")
-    if path.exists():
-        logger.info("Skip profiling in-node allreduce latency.")
-    else:
-        logger.info("Profiling in-node allreduce latency.")
-        allreduce_in_node = profiler.profile_allreduce_in_node()
-        if "0" in os.environ["CUDA_VISIBLE_DEVICES"]:
-            with path.open(mode="w") as f:
-                json.dump(allreduce_in_node, f)
-                f.flush()
+    path = directory / "allreduce_in_node.json"
+    logger.info("Profiling in-node allreduce latency.")
+    allreduce_in_node = profiler.profile_allreduce_in_node(num_workers_per_node)
+    if dist.get_rank() % num_workers_per_node == 0:
+        with path.open(mode="w") as f:
+            json.dump(allreduce_in_node, f)
+            f.flush()
+
+    # export configuration
+    path = directory / "model_args.json"
+    if dist.get_rank() % num_workers_per_node == 0:
+        with open(path, "w") as f:
+            json.dump(args.model.model_args, f)
 
     dist.barrier()
     dist.destroy_process_group()
     assert not dist.is_initialized()
+
+
+def validate_model_args(args: OobleckArguments) -> bool:
+    directory = get_profile_path(args.model.model_name, args.model.model_tag)
+    path = directory / "model_args.json"
+
+    if not directory.exists() or not path.exists():
+        return False
+
+    args_same: bool = True
+    with path.open() as f:
+        args_from_file = json.load(f)
+        for k, v in args.model.model_args.items():
+            if k not in args_from_file or args_from_file[k] != v:
+                args_same = False
+                break
+    return args_same

@@ -313,7 +313,7 @@ class PipelineInstantiator:
         # model.constraint2 = pyomo.Constraint(range(len(model.I)), rule=c2)
 
         pyomo.SolverFactory("mindtpy").solve(
-            model, mip_solver="glpk", nlp_solver="ipopt", tee=True
+            model, mip_solver="glpk", nlp_solver="ipopt", tee=False
         )
 
         # check for all i model.nb[i].value is integer, otherwise return None
