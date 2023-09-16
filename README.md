@@ -32,6 +32,12 @@ Successfully installed oobleck-0.1.0
 
     `--node_port` specifies the ssh port of worker nodes. The master daemon will launch agent processes on nodes through ssh. All of them must use the same port number and specified here, and the node where the master daemon is running should be able to passwordless ssh to nodes.
 
+    - Taget model and dataset
+
+        Oobleck follows HuggingFace `transformer` format. Therefore, `job_args.model_name` should be one among the models in [HuggingFace model hub](https://huggingface.co/models), and `dataset_path` and `dataset_name` in `job_args` should be from [HuggingFace datasets hub](https://huggingface.co/datasets).
+
+        Currently GPT models are tested.
+
     - An example of `node_ips` in command line:
         ```bash
         --config_path examples/gpt2.yml --node_ips 192.168.0.1 192.168.0.2 192.168.0.3 192.168.0.4 --master_ip ...
@@ -94,3 +100,4 @@ Oobleck is an ongoing research prototype and currently lacks some features, incl
 - Richer documentation
 - Modualization: We are working on improving Oobleck compatibility to HuggingFace `
 Transformer` and `Accelerate`.
+- Checkpoint: saving and loading checkpoints it not supported yet.
