@@ -1,8 +1,46 @@
-[build-system]
-requires = ["setuptools", "pybind11"]
-build-backend = "setuptools.build_meta"
+[project]
+name = "oobleck"
+description = "A framework for efficient fault tolerance in large scale distributed training with pipeline template."
+readme = "README.md"
+license = {file = "LICENSE.txt"}
+requires-python = ">=3.10"
+version = "0.0.1"
+authors = [
+    {name = "Insu Jang", email = "insujang@umich.edu"}
+]
+maintainers = [
+    {name = "Insu Jang", email = "insujang@umich.edu"}
+]
+dependencies = [
+    "torch",
+    "transformers>=4.36.0",
+    "oobleck-colossalai",
+]
 
-[tool.pytest.ini_options]
-minversion = "6.0"
-addopts = "-ra -q"
-testpaths = ["tests"]
+[project.optional-dependencies]
+dev = [
+    "torch>=2.1.0",
+    "ruff",
+    "black>=23.0",
+    "isort>=5.12",
+    "pytest",
+    "pytest-mock",
+]
+
+[tool.ruff]
+# Never enforce `E501` (line length violations).
+ignore = ["E501"]
+
+[tool.setuptools.packages.find]
+# Pure Python packages/modules
+where = ["."]
+include = ["oobleck"]
+
+[[tool.setuptools-rust.ext-modules]]
+target = "oobleck._planner"
+path = "Cargo.toml"
+binding = "PyO3"
+
+[build-system]
+requires = ["setuptools>=63.0.0", "setuptools-rust"]
+build-backend = "setuptools.build_meta"

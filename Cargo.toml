@@ -1,0 +1,15 @@
+[package]
+name = "oobleck"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+pyo3 = { version = "0.20.0", features = ["extension-module"] }
+
+[lib]
+name = "_planner"
+crate-type = ["cdylib"]
+path = "oobleck/rust/planner.rs"
+
+[build-dependencies]
+pyo3-build-config = "0.20.0"
