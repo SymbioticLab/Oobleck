@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from multiprocessing.connection import Connection
 import socket
+from multiprocessing.connection import Connection
+
 from oobleck.arg_utils import DistArgs
 
 
