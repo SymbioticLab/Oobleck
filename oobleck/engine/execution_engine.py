@@ -2,7 +2,7 @@ import socket
 from colossalai.booster import Booster
 from oobleck_colossalai import HeterogeneousParallelPlugin
 from oobleck.planning.pipeline_template import PipelineTemplate
-from oobleck.engine.arg_utils import DistArgs, TrainingArgs
+from oobleck.arg_utils import DistArgs, TrainingArgs
 from oobleck.engine.pipeline_instantiator import PipelineInstantiator
 from oobleck.engine.configuration_engine import ConfigurationEngine
 
