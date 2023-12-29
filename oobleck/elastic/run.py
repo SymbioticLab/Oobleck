@@ -1,21 +1,21 @@
 from __future__ import annotations
-import multiprocessing
 
+import multiprocessing
 import pickle
 import socket
 import sys
 from concurrent import futures
 from dataclasses import dataclass
 from multiprocessing.synchronize import Condition
-
 from pathlib import Path
 
 import fabric
 import grpc
-from oobleck.elastic import master_service_pb2, master_service_pb2_grpc
 import simple_parsing
 from loguru import logger
 from paramiko import SSHException
+
+from oobleck.elastic import master_service_pb2, master_service_pb2_grpc
 
 """
 Oobleck master process code.

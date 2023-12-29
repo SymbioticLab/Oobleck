@@ -1,29 +1,18 @@
 import multiprocessing
 import os
-import socket
+import pickle
 from dataclasses import dataclass
 from multiprocessing.connection import Connection
 from multiprocessing.context import SpawnContext, SpawnProcess
-from types import CodeType
 
-import rpyc
+import grpc
 import simple_parsing
+from google.protobuf.empty_pb2 import Empty
 from loguru import logger
-from rpyc.core import brine
 
-from oobleck.arg_utils import DistArgs
+from oobleck.elastic.master_service_pb2_grpc import OobleckMasterStub
+from oobleck.elastic.run import HostInfo
 from oobleck.engine.configuration_engine import ConfigurationEngine
-
-
-@rpyc.service
-class AgentService(rpyc.Service):
-    @rpyc.exposed
-    def reconfigure(self, dist_info):
-        pass
-
-    @rpyc.exposed
-    def receive_rank0_port(self, port: int):
-        pass
 
 
 @dataclass
@@ -62,47 +51,43 @@ class Worker:
 
 
 class Agent:
-    def __init__(
-        self,
-        master_conn: rpyc.Connection,
-        agent_args: OobleckAgentArguments,
-        dist_args: DistArgs,
-        code: str,
-    ):
-        self.master_conn = master_conn
-        self.agent_args = agent_args
-        self.dist_args = dist_args
-        self.code = code
-        self._workers: list[Worker] = []
+    def __init__(self, agent_index: int, stub: OobleckMasterStub):
+        self.agent_index = agent_index
+        self.stub = stub
+
+        # Get distributed information and code from the master
+        dist_info = stub.GetDistInfo(Empty())
+        self.dist_info = list(
+            HostInfo(host.ip, host.slots, host.port) for host in dist_info.hosts
+        )
+        self.code = pickle.loads(stub.GetCode(Empty()).code)
+        self.workers: list[Worker] = []
+
+    def notify_reconfiguration_to_workers(self, dist_info: list[HostInfo]):
+        for worker in self.workers:
+            worker.pipe.send(dist_info)
+
+    def watch_reconfiguration_notification(self):
+        for dist_info in stub.WatchReconfigurationNotification(Empty()):
+            self.notify_reconfiguration_to_workers(dist_info)
+
+    def run_profiler(self):
+        raise NotImplementedError()
 
     def launch_workers(self):
         """Launch worker processes.
 
-        Before launching workers, test if profile data exists
+        Before launching workers, check if profile data exists
         in this node. If not, call run_profiler() to collect
         profile data.
+        TODO (insujang): implement run_profiler()
         """
         ctx: SpawnContext = multiprocessing.get_context("spawn")
 
-        assert (
-            len(self.dist_args.agent_ips) * self.dist_args.tensor_parallel_size
-            == self.dist_args.world_size
-        ), (
-            f"Number of agents ({len(self.dist_args.agent_ips)}) "
-            f"times tensor parallel size ({self.dist_args.tensor_parallel_size}) "
-            f"must be equal to world size ({self.dist_args.world_size})."
-        )
-
-        assert (
-            len(self.agent_args.gpu_indices) == self.dist_args.tensor_parallel_size
-        ), (
-            f"Number of GPUs ({len(self.agent_args.gpu_indices)}) "
-            f"must be equal to tensor parallel size ({self.dist_args.tensor_parallel_size})."
-        )
-
+        tensor_parallel_size = self.dist_info[0].slots
         ranks = range(
-            self.agent_args.agent_index * self.dist_args.tensor_parallel_size,
-            (self.agent_args.agent_index + 1) * self.dist_args.tensor_parallel_size,
+            self.agent_index * tensor_parallel_size,
+            (self.agent_index + 1) * tensor_parallel_size,
         )
 
         for gpu_index, rank in enumerate(ranks):
@@ -120,22 +105,27 @@ class Agent:
                 daemon=True,
             )
             process.start()
-            self._workers.append(Worker(pipe, process))
-            pipe.send(dist_args)
+            self.workers.append(Worker(pipe, process))
+            pipe.send(self.dist_info)
 
         os.environ.pop("CUDA_VISIBLE_DEVICES")
 
-        # If an agent has rank 0, it should forward its port to the master
-        my_ip = socket.gethostbyname(socket.gethostname())
-        if my_ip == dist_args.agent_ips[0]:
-            self.forward_worker_port(self._workers[0].pipe)
+        # If this is the first agent, it should forward the master rank port
+        if self.agent_index == 0:
+            port: int = pipe.recv()
+            self.stub.SetMasterRankPort(master_port=port)
 
-    def forward_worker_port(self, pipe: Connection):
-        port: int = pipe.recv()
-        self.master.root.forward_rank0_port(port)
+        # Forward master port to all workers.
+        self.forward_master_port()
 
-    def run_profiler(self):
-        pass
+    def forward_master_port(self):
+        """
+        Forward master port after receiving it from the master
+        to all worker processes.
+        """
+        port: int = self.stub.GetMasterRankPort(Empty()).port
+        for worker in self.workers:
+            worker.pipe.send(port)
 
 
 if __name__ == "__main__":
@@ -143,10 +133,9 @@ if __name__ == "__main__":
         OobleckAgentArguments, dest="agent"
     )
 
-    args: OobleckAgentArguments = args.agent
-    conn = rpyc.connect(args.agent.master_ip, args.agent.master_port)
-    dist_args: DistArgs = conn.root.get_dist_info()
-    code: str = conn.root.get_code()
+    # Connect to the master
+    channel = grpc.insecure_channel(f"{args.agent.master_ip}:{args.agent.master_port}")
+    stub = OobleckMasterStub(channel)
 
-    agent = Agent(conn, args, dist_args, code)
+    agent = Agent(args.agent_index, stub)
     agent.launch_workers()
