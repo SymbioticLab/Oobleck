@@ -1,15 +1,14 @@
-import threading
 import multiprocessing
+import pickle
+import threading
 from concurrent import futures
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 
 import grpc
-from google.protobuf.empty_pb2 import Empty
 import pytest
-import pickle
-from contextlib import redirect_stdout
-from io import StringIO
-
+from google.protobuf.empty_pb2 import Empty
 from oobleck.elastic import master_service_pb2, master_service_pb2_grpc
 from oobleck.elastic.run import (
     HostInfo,
