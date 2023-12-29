@@ -4,9 +4,9 @@ import "google/protobuf/empty.proto";
 service OobleckMaster {
     rpc GetDistInfo(google.protobuf.Empty) returns (DistInfo) {}
     rpc GetCode(google.protobuf.Empty) returns (CodeInfo) {}
-    rpc SendMasterRankPort(PortInfo) returns (google.protobuf.Empty) {}
-    rpc ReceiveMasterRankPort(google.protobuf.Empty) returns (PortInfo) {}
-    rpc ReceiveReconfigurationNotification(google.protobuf.Empty) returns (stream DistInfo) {}
+    rpc SetMasterRankPort(PortInfo) returns (google.protobuf.Empty) {}
+    rpc GetMasterRankPort(google.protobuf.Empty) returns (PortInfo) {}
+    rpc WatchReconfigurationNotification(google.protobuf.Empty) returns (stream DistInfo) {}
 }
 
 message HostInfo {

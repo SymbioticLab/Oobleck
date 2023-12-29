@@ -1,11 +1,13 @@
 from __future__ import annotations
+import multiprocessing
 
 import pickle
 import socket
 import sys
 from concurrent import futures
 from dataclasses import dataclass
-from multiprocessing.context import SpawnContext
+from multiprocessing.synchronize import Condition
+
 from pathlib import Path
 
 import fabric
@@ -86,7 +88,7 @@ class MultiNodeAgentRunner:
 
     def __init__(
         self,
-        disconnect_condition: SpawnContext.Condition,
+        disconnect_condition: Condition,
         hosts: list[HostInfo],
         master_service_port: int,
         output_dir: Path | None = None,
@@ -99,7 +101,7 @@ class MultiNodeAgentRunner:
     @staticmethod
     def run_on_host(
         agent_index: int,
-        disconnect_condition: SpawnContext.Condition,
+        disconnect_condition: Condition,
         host: HostInfo,
         master_service_port: int,
         output: Path | None = None,
@@ -134,7 +136,9 @@ class MultiNodeAgentRunner:
         Spawn multiple processes to run agents on multiple hosts.
         Each process accesses a host via SSH and runs the agent.
         """
-        with futures.ProcessPoolExecutor(mp_context=SpawnContext()) as pool:
+        with futures.ProcessPoolExecutor(
+            mp_context=multiprocessing.get_context("spawn")
+        ) as pool:
             for agent_index, host in enumerate(self.hosts):
                 output = (
                     self.outpur_dir / f"agent-{agent_index}.log"
@@ -168,14 +172,16 @@ class MasterService(master_service_pb2_grpc.OobleckMasterServicer):
         self,
         code_path: Path,
         hostinfo: list[HostInfo],
-        disconnect_condition: SpawnContext.Condition,
+        disconnect_condition: Condition,
     ):
         self.code = pickle.dumps(code_path.read_bytes())
         self.hostinfo = hostinfo
         self.disconnect_condition = disconnect_condition
         self.clients = []
 
-    def GetDistInfo(self, request, context) -> master_service_pb2.DistInfo:
+    def GetDistInfo(
+        self, request, context: grpc.RpcContext
+    ) -> master_service_pb2.DistInfo:
         return master_service_pb2.DistInfo(
             hosts=[
                 master_service_pb2.HostInfo(
@@ -185,22 +191,23 @@ class MasterService(master_service_pb2_grpc.OobleckMasterServicer):
             ]
         )
 
-    def GetCode(self, request, context) -> master_service_pb2.CodeInfo:
+    def GetCode(self, request, context: grpc.RpcContext) -> master_service_pb2.CodeInfo:
         return master_service_pb2.CodeInfo(code=self.code)
 
-    def ReceiveReconfigurationNotification(self, request, context):
-        with self.condition:
+    def WatchReconfigurationNotification(self, request, context: grpc.RpcContext):
+        with self.disconnect_condition:
             self.clients.append(context)
             self.disconnect_condition.wait()
 
-        yield master_service_pb2.DistInfo(
-            hosts=[
-                master_service_pb2.HostInfo(
-                    ip=host.ip, slots=host.slots, port=host.port
-                )
-                for host in self.hostinfo
-            ]
-        )
+        if context.is_active():
+            yield master_service_pb2.DistInfo(
+                hosts=[
+                    master_service_pb2.HostInfo(
+                        ip=host.ip, slots=host.slots, port=host.port
+                    )
+                    for host in self.hostinfo
+                ]
+            )
 
 
 @dataclass
@@ -221,7 +228,7 @@ def serve():
 
     disconnect_condition = SpawnContext().Condition()
 
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=None))
     service = MasterService(args.code_path, hostinfo, disconnect_condition)
     master_service_pb2_grpc.add_OobleckMasterServicer_to_server(service, server)
     port = server.add_insecure_port(f"0.0.0.0:{args.master_service_port}")

@@ -15,7 +15,7 @@ _sym_db = _symbol_database.Default()
 from google.protobuf import empty_pb2 as google_dot_protobuf_dot_empty__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x14master_service.proto\x1a\x1bgoogle/protobuf/empty.proto\"3\n\x08HostInfo\x12\n\n\x02ip\x18\x01 \x01(\t\x12\r\n\x05slots\x18\x02 \x01(\r\x12\x0c\n\x04port\x18\x03 \x01(\r\"$\n\x08\x44istInfo\x12\x18\n\x05hosts\x18\x01 \x03(\x0b\x32\t.HostInfo\"\x18\n\x08\x43odeInfo\x12\x0c\n\x04\x63ode\x18\x01 \x01(\x0c\"\x18\n\x08PortInfo\x12\x0c\n\x04port\x18\x01 \x01(\r2\xb9\x02\n\rOobleckMaster\x12\x32\n\x0bGetDistInfo\x12\x16.google.protobuf.Empty\x1a\t.DistInfo\"\x00\x12.\n\x07GetCode\x12\x16.google.protobuf.Empty\x1a\t.CodeInfo\"\x00\x12\x39\n\x12SendMasterRankPort\x12\t.PortInfo\x1a\x16.google.protobuf.Empty\"\x00\x12<\n\x15ReceiveMasterRankPort\x12\x16.google.protobuf.Empty\x1a\t.PortInfo\"\x00\x12K\n\"ReceiveReconfigurationNotification\x12\x16.google.protobuf.Empty\x1a\t.DistInfo\"\x00\x30\x01\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x14master_service.proto\x1a\x1bgoogle/protobuf/empty.proto\"3\n\x08HostInfo\x12\n\n\x02ip\x18\x01 \x01(\t\x12\r\n\x05slots\x18\x02 \x01(\r\x12\x0c\n\x04port\x18\x03 \x01(\r\"$\n\x08\x44istInfo\x12\x18\n\x05hosts\x18\x01 \x03(\x0b\x32\t.HostInfo\"\x18\n\x08\x43odeInfo\x12\x0c\n\x04\x63ode\x18\x01 \x01(\x0c\"\x18\n\x08PortInfo\x12\x0c\n\x04port\x18\x01 \x01(\r2\xb2\x02\n\rOobleckMaster\x12\x32\n\x0bGetDistInfo\x12\x16.google.protobuf.Empty\x1a\t.DistInfo\"\x00\x12.\n\x07GetCode\x12\x16.google.protobuf.Empty\x1a\t.CodeInfo\"\x00\x12\x38\n\x11SetMasterRankPort\x12\t.PortInfo\x1a\x16.google.protobuf.Empty\"\x00\x12\x38\n\x11GetMasterRankPort\x12\x16.google.protobuf.Empty\x1a\t.PortInfo\"\x00\x12I\n WatchReconfigurationNotification\x12\x16.google.protobuf.Empty\x1a\t.DistInfo\"\x00\x30\x01\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -31,5 +31,5 @@ if _descriptor._USE_C_DESCRIPTORS == False:
   _globals['_PORTINFO']._serialized_start=170
   _globals['_PORTINFO']._serialized_end=194
   _globals['_OOBLECKMASTER']._serialized_start=197
-  _globals['_OOBLECKMASTER']._serialized_end=510
+  _globals['_OOBLECKMASTER']._serialized_end=503
 # @@protoc_insertion_point(module_scope)

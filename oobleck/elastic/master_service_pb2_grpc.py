@@ -25,18 +25,18 @@ class OobleckMasterStub(object):
             request_serializer=google_dot_protobuf_dot_empty__pb2.Empty.SerializeToString,
             response_deserializer=master__service__pb2.CodeInfo.FromString,
         )
-        self.SendMasterRankPort = channel.unary_unary(
-            "/OobleckMaster/SendMasterRankPort",
+        self.SetMasterRankPort = channel.unary_unary(
+            "/OobleckMaster/SetMasterRankPort",
             request_serializer=master__service__pb2.PortInfo.SerializeToString,
             response_deserializer=google_dot_protobuf_dot_empty__pb2.Empty.FromString,
         )
-        self.ReceiveMasterRankPort = channel.unary_unary(
-            "/OobleckMaster/ReceiveMasterRankPort",
+        self.GetMasterRankPort = channel.unary_unary(
+            "/OobleckMaster/GetMasterRankPort",
             request_serializer=google_dot_protobuf_dot_empty__pb2.Empty.SerializeToString,
             response_deserializer=master__service__pb2.PortInfo.FromString,
         )
-        self.ReceiveReconfigurationNotification = channel.unary_stream(
-            "/OobleckMaster/ReceiveReconfigurationNotification",
+        self.WatchReconfigurationNotification = channel.unary_stream(
+            "/OobleckMaster/WatchReconfigurationNotification",
             request_serializer=google_dot_protobuf_dot_empty__pb2.Empty.SerializeToString,
             response_deserializer=master__service__pb2.DistInfo.FromString,
         )
@@ -57,19 +57,19 @@ class OobleckMasterServicer(object):
         context.set_details("Method not implemented!")
         raise NotImplementedError("Method not implemented!")
 
-    def SendMasterRankPort(self, request, context):
+    def SetMasterRankPort(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details("Method not implemented!")
         raise NotImplementedError("Method not implemented!")
 
-    def ReceiveMasterRankPort(self, request, context):
+    def GetMasterRankPort(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details("Method not implemented!")
         raise NotImplementedError("Method not implemented!")
 
-    def ReceiveReconfigurationNotification(self, request, context):
+    def WatchReconfigurationNotification(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details("Method not implemented!")
@@ -88,18 +88,18 @@ def add_OobleckMasterServicer_to_server(servicer, server):
             request_deserializer=google_dot_protobuf_dot_empty__pb2.Empty.FromString,
             response_serializer=master__service__pb2.CodeInfo.SerializeToString,
         ),
-        "SendMasterRankPort": grpc.unary_unary_rpc_method_handler(
-            servicer.SendMasterRankPort,
+        "SetMasterRankPort": grpc.unary_unary_rpc_method_handler(
+            servicer.SetMasterRankPort,
             request_deserializer=master__service__pb2.PortInfo.FromString,
             response_serializer=google_dot_protobuf_dot_empty__pb2.Empty.SerializeToString,
         ),
-        "ReceiveMasterRankPort": grpc.unary_unary_rpc_method_handler(
-            servicer.ReceiveMasterRankPort,
+        "GetMasterRankPort": grpc.unary_unary_rpc_method_handler(
+            servicer.GetMasterRankPort,
             request_deserializer=google_dot_protobuf_dot_empty__pb2.Empty.FromString,
             response_serializer=master__service__pb2.PortInfo.SerializeToString,
         ),
-        "ReceiveReconfigurationNotification": grpc.unary_stream_rpc_method_handler(
-            servicer.ReceiveReconfigurationNotification,
+        "WatchReconfigurationNotification": grpc.unary_stream_rpc_method_handler(
+            servicer.WatchReconfigurationNotification,
             request_deserializer=google_dot_protobuf_dot_empty__pb2.Empty.FromString,
             response_serializer=master__service__pb2.DistInfo.SerializeToString,
         ),
@@ -173,7 +173,7 @@ class OobleckMaster(object):
         )
 
     @staticmethod
-    def SendMasterRankPort(
+    def SetMasterRankPort(
         request,
         target,
         options=(),
@@ -188,7 +188,7 @@ class OobleckMaster(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            "/OobleckMaster/SendMasterRankPort",
+            "/OobleckMaster/SetMasterRankPort",
             master__service__pb2.PortInfo.SerializeToString,
             google_dot_protobuf_dot_empty__pb2.Empty.FromString,
             options,
@@ -202,7 +202,7 @@ class OobleckMaster(object):
         )
 
     @staticmethod
-    def ReceiveMasterRankPort(
+    def GetMasterRankPort(
         request,
         target,
         options=(),
@@ -217,7 +217,7 @@ class OobleckMaster(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            "/OobleckMaster/ReceiveMasterRankPort",
+            "/OobleckMaster/GetMasterRankPort",
             google_dot_protobuf_dot_empty__pb2.Empty.SerializeToString,
             master__service__pb2.PortInfo.FromString,
             options,
@@ -231,7 +231,7 @@ class OobleckMaster(object):
         )
 
     @staticmethod
-    def ReceiveReconfigurationNotification(
+    def WatchReconfigurationNotification(
         request,
         target,
         options=(),
@@ -246,7 +246,7 @@ class OobleckMaster(object):
         return grpc.experimental.unary_stream(
             request,
             target,
-            "/OobleckMaster/ReceiveReconfigurationNotification",
+            "/OobleckMaster/WatchReconfigurationNotification",
             google_dot_protobuf_dot_empty__pb2.Empty.SerializeToString,
             master__service__pb2.DistInfo.FromString,
             options,
