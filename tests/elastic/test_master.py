@@ -5,6 +5,7 @@ from concurrent import futures
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
+from pytest_mock import MockerFixture
 
 import grpc
 import pytest
@@ -120,3 +121,39 @@ def test_receive_reconfiguration_notification(
         assert host.ip == fake_host.ip
         assert host.slots == fake_host.slots
         assert host.port == fake_host.port
+
+
+def test_run_agents(
+    server: tuple[MasterArgs, MasterService, int],
+    mocker: MockerFixture,
+):
+    args, _, port = server
+    hosts = HostInfo.fetch_hostfile(args.hostfile)
+    disconnect_condition = None
+    runner = MultiNodeAgentRunner(
+        disconnect_condition=disconnect_condition,
+        hosts=hosts,
+        master_service_port=port,
+        output_dir=args.output_dir,
+    )
+
+    submit_mock = mocker.patch(
+        "concurrent.futures.ProcessPoolExecutor.submit",
+        return_value=None,
+    )
+    runner.run()
+
+    assert submit_mock.call_count == len(hosts)
+    for agent_index, (call_args, host) in enumerate(
+        zip(submit_mock.call_args_list, hosts)
+    ):
+        call_args = call_args[0]
+        agent_output_dir = args.output_dir / f"agent-{agent_index}.log"
+        assert call_args == (
+            runner.run_on_host,
+            agent_index,
+            disconnect_condition,
+            host,
+            port,
+            agent_output_dir,
+        )

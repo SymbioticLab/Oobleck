@@ -141,8 +141,8 @@ class MultiNodeAgentRunner:
         ) as pool:
             for agent_index, host in enumerate(self.hosts):
                 output = (
-                    self.outpur_dir / f"agent-{agent_index}.log"
-                    if self.outpur_dir is not None
+                    self.output_dir / f"agent-{agent_index}.log"
+                    if self.output_dir is not None
                     else None
                 )
                 pool.submit(
