@@ -21,13 +21,16 @@ class AgentService(rpyc.Service):
     def reconfigure(self, dist_info):
         pass
 
+    @rpyc.exposed
+    def receive_rank0_port(self, port: int):
+        pass
+
 
 @dataclass
 class OobleckAgentArguments:
     master_ip: str
     master_port: int
     agent_index: int
-    gpu_indices: list[int]
 
 
 @dataclass
@@ -102,7 +105,7 @@ class Agent:
             (self.agent_args.agent_index + 1) * self.dist_args.tensor_parallel_size,
         )
 
-        for gpu_index, rank in zip(self.agent_args.gpu_indices, ranks):
+        for gpu_index, rank in enumerate(ranks):
             logger.info(f"Launching worker {rank} (GPU: {gpu_index})...")
 
             pipe, child_pipe = ctx.Pipe()

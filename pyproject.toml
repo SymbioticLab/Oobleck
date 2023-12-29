@@ -14,13 +14,11 @@ maintainers = [
 dependencies = [
     "torch",
     "transformers>=4.36.0",
-    "rpyc",
     "simple_parsing",
     "loguru",
-    "asyncio",
-    "asyncssh",
-    "aiofiles",
+    "fabric",
     "oobleck-colossalai",
+    "grpcio",
 ]
 
 [project.optional-dependencies]
@@ -31,7 +29,8 @@ dev = [
     "isort>=5.12",
     "pytest",
     "pytest-mock",
-    "pytest-asyncio",
+    "pytest-grpc",
+    "grpcio-tools",
 ]
 
 [tool.ruff]
