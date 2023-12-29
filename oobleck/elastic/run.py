@@ -226,7 +226,7 @@ def serve():
     args: MasterArgs = simple_parsing.parse(MasterArgs, dest="args")
     hostinfo = HostInfo.fetch_hostfile(args.hostfile)
 
-    disconnect_condition = SpawnContext().Condition()
+    disconnect_condition = multiprocessing.get_context("spawn").Condition()
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=None))
     service = MasterService(args.code_path, hostinfo, disconnect_condition)
