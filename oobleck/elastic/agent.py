@@ -11,7 +11,7 @@ import simple_parsing
 from google.protobuf.empty_pb2 import Empty
 from loguru import logger
 
-from oobleck.elastic.master_service_pb2 import PortInfo, DistInfo
+from oobleck.elastic.master_service_pb2 import DistInfo, PortInfo
 from oobleck.elastic.master_service_pb2_grpc import OobleckMasterStub
 from oobleck.elastic.run import HostInfo
 from oobleck.engine.configuration_engine import ConfigurationEngine

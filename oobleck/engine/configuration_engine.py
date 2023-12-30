@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from multiprocessing.connection import Connection
+
 from oobleck.elastic.run import HostInfo
 
 
@@ -8,6 +9,12 @@ class ConfigurationEngine:
     _instance: ConfigurationEngine = None
 
     def __init__(self):
+        self.pipe: Connection = None
+        self.agent_index: int = None
+        self.local_rank: int = None
+        self.dist_info: list[HostInfo] = None
+        self.rank_map: dict[str, list[int]] = None
+        self.rank: int = None
         raise NotImplementedError(
             "Use get_instance() instead to get an instance of ConfigurationEngine."
         )
@@ -47,6 +54,10 @@ class ConfigurationEngine:
             ConfigurationEngine._instance is not None
         ), "ConfigurationEngine is not initialized."
         return ConfigurationEngine._instance
+
+    @property
+    def configuration_world_size(self) -> int:
+        return sum(host.slots for host in self.dist_info)
 
     @property
     def is_master(self) -> bool:
