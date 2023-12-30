@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import socket
 from multiprocessing.connection import Connection
-
-from oobleck.arg_utils import DistArgs
+from oobleck.elastic.run import HostInfo
 
 
 class ConfigurationEngine:
@@ -17,6 +15,7 @@ class ConfigurationEngine:
     @staticmethod
     def create(
         pipe: Connection,
+        agent_index: int,
         local_rank: int,
     ) -> ConfigurationEngine:
         """Create a new instance of ConfigurationEngine."""
@@ -27,20 +26,16 @@ class ConfigurationEngine:
 
         # TODO: set initial attributes.
         instance.pipe: Connection = pipe
+        instance.agent_index = agent_index
         instance.local_rank: int = local_rank
-        instance.dist_args: DistArgs = pipe.recv()
+        dist_info: list[HostInfo] = pipe.recv()
+        instance.dist_info = dist_info
 
         instance.rank_map: dict[str, list[int]] = {
-            ip: list(
-                range(
-                    i * instance.dist_args.tensor_parallel_size,
-                    (i + 1) * instance.dist_args.tensor_parallel_size,
-                )
-            )
-            for i, ip in enumerate(instance.dist_args.agent_ips)
+            f"{host.ip}:{host.port}": list(range(i * host.slots, (i + 1) * host.slots))
+            for i, host in enumerate(dist_info)
         }
-        my_ip = socket.gethostbyname(socket.gethostname())
-        instance.rank = instance.rank_map[my_ip][instance.local_rank]
+        instance.rank = instance.rank_map[agent_index][instance.local_rank]
 
         ConfigurationEngine._instance = instance
         return ConfigurationEngine._instance
@@ -54,11 +49,10 @@ class ConfigurationEngine:
 
     @property
     def is_master(self) -> bool:
-        return self.rank in next(iter(self.rank_map))[0]
+        return self.agent_index == 0 and self.local_rank == 0
 
     def send_distributed_port(self, port: int):
         self.pipe.send(port)
 
     def receive_distributed_port(self) -> int:
-        port: int = self.pipe.recv()
-        return port
+        return self.pipe.recv()

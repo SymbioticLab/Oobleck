@@ -1,14 +1,9 @@
-import multiprocessing
 import pickle
 import threading
-from concurrent import futures
 from contextlib import redirect_stdout
 from io import StringIO
-from pathlib import Path
-from pytest_mock import MockerFixture
 
 import grpc
-import pytest
 from google.protobuf.empty_pb2 import Empty
 from oobleck.elastic import master_service_pb2, master_service_pb2_grpc
 from oobleck.elastic.run import (
@@ -17,50 +12,12 @@ from oobleck.elastic.run import (
     MasterService,
     MultiNodeAgentRunner,
 )
+from pytest_mock import MockerFixture
 
 
 def get_stub(port: int) -> master_service_pb2_grpc.OobleckMasterStub:
     channel = grpc.insecure_channel(f"localhost:{port}")
     return master_service_pb2_grpc.OobleckMasterStub(channel)
-
-
-@pytest.fixture()
-def server(tmp_path: Path):
-    fake_master_args = MasterArgs(
-        hostfile=Path(tmp_path / "hostfile"),
-        code_path=Path(tmp_path / "testcode.py"),
-        output_dir=tmp_path,
-    )
-
-    fake_host_info = [
-        HostInfo("127.0.0.1", 2, 1234),
-        HostInfo("127.0.0.2", 2, 1234),
-        HostInfo("127.0.0.3", 2, 1234),
-    ]
-
-    fake_master_args.hostfile.write_text(
-        "\n".join(
-            list(
-                f"{host.ip} slots={host.slots} port={host.port}"
-                for host in fake_host_info
-            )
-        )
-    )
-
-    fake_master_args.code_path.write_text("print('Hello, world!')")
-
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
-    service = MasterService(
-        fake_master_args.code_path,
-        fake_host_info,
-        multiprocessing.get_context("spawn").Condition(),
-    )
-    master_service_pb2_grpc.add_OobleckMasterServicer_to_server(service, server)
-    port = server.add_insecure_port(f"0.0.0.0:0")
-    server.start()
-
-    yield fake_master_args, service, port
-    server.stop(grace=None)
 
 
 def test_get_dist_info(server: tuple[MasterArgs, MasterService, int]):

@@ -12,6 +12,7 @@ from pathlib import Path
 import fabric
 import grpc
 import simple_parsing
+from google.protobuf import empty_pb2
 from loguru import logger
 from paramiko import SSHException
 
@@ -178,9 +179,12 @@ class MasterService(master_service_pb2_grpc.OobleckMasterServicer):
         self.hostinfo = hostinfo
         self.disconnect_condition = disconnect_condition
         self.clients = []
+        self.master_port = 0
 
     def GetDistInfo(
-        self, request, context: grpc.RpcContext
+        self,
+        request: master_service_pb2.DistInfo,
+        context: grpc.RpcContext,
     ) -> master_service_pb2.DistInfo:
         return master_service_pb2.DistInfo(
             hosts=[
@@ -191,10 +195,33 @@ class MasterService(master_service_pb2_grpc.OobleckMasterServicer):
             ]
         )
 
-    def GetCode(self, request, context: grpc.RpcContext) -> master_service_pb2.CodeInfo:
+    def GetCode(
+        self,
+        request: master_service_pb2.CodeInfo,
+        context: grpc.RpcContext,
+    ) -> master_service_pb2.CodeInfo:
         return master_service_pb2.CodeInfo(code=self.code)
 
-    def WatchReconfigurationNotification(self, request, context: grpc.RpcContext):
+    def SetMasterRankPort(
+        self,
+        request: master_service_pb2.PortInfo,
+        context: grpc.RpcContext,
+    ) -> empty_pb2.Empty:
+        self.master_port = request.port
+        return empty_pb2.Empty()
+
+    def GetMasterRankPort(
+        self,
+        request: empty_pb2.Empty,
+        context: grpc.RpcContext,
+    ) -> master_service_pb2.PortInfo:
+        return master_service_pb2.PortInfo(port=self.master_port)
+
+    def WatchReconfigurationNotification(
+        self,
+        request: empty_pb2.Empty,
+        context: grpc.RpcContext,
+    ):
         with self.disconnect_condition:
             self.clients.append(context)
             self.disconnect_condition.wait()

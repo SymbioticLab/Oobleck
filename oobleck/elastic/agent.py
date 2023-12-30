@@ -1,6 +1,7 @@
 import multiprocessing
 import os
 import pickle
+import time
 from dataclasses import dataclass
 from multiprocessing.connection import Connection
 from multiprocessing.context import SpawnContext, SpawnProcess
@@ -10,6 +11,7 @@ import simple_parsing
 from google.protobuf.empty_pb2 import Empty
 from loguru import logger
 
+from oobleck.elastic.master_service_pb2 import PortInfo
 from oobleck.elastic.master_service_pb2_grpc import OobleckMasterStub
 from oobleck.elastic.run import HostInfo
 from oobleck.engine.configuration_engine import ConfigurationEngine
@@ -39,6 +41,8 @@ class Worker:
         It creates ConfigurationEngine that will internally be used in
         ExecutionEngine, and execute the given code.
         """
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
+
         assert ConfigurationEngine._instance is None, (
             "ConfigurationEngine must not be initialized before "
             "worker_main() is called."
@@ -51,6 +55,12 @@ class Worker:
 
 
 class Agent:
+    """Oobleck Agent class.
+
+    For each node, there is one agent process that manages
+    worker processes in the node.
+    """
+
     def __init__(self, agent_index: int, stub: OobleckMasterStub):
         self.agent_index = agent_index
         self.stub = stub
@@ -94,12 +104,12 @@ class Agent:
             logger.info(f"Launching worker {rank} (GPU: {gpu_index})...")
 
             pipe, child_pipe = ctx.Pipe()
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
 
             process: SpawnProcess = ctx.Process(
                 target=Worker.worker_main,
                 args=(
                     child_pipe,
+                    self.agent_index,
                     gpu_index,
                 ),
                 daemon=True,
@@ -108,12 +118,10 @@ class Agent:
             self.workers.append(Worker(pipe, process))
             pipe.send(self.dist_info)
 
-        os.environ.pop("CUDA_VISIBLE_DEVICES")
-
         # If this is the first agent, it should forward the master rank port
         if self.agent_index == 0:
             port: int = pipe.recv()
-            self.stub.SetMasterRankPort(master_port=port)
+            self.stub.SetMasterRankPort(PortInfo(port=port))
 
         # Forward master port to all workers.
         self.forward_master_port()
@@ -123,7 +131,14 @@ class Agent:
         Forward master port after receiving it from the master
         to all worker processes.
         """
-        port: int = self.stub.GetMasterRankPort(Empty()).port
+        # Get master rank port from the master.
+        # port will be 0 until master port is set.
+        #
+        port: int = 0
+        while port == 0:
+            time.sleep(0.1)
+            port = self.stub.GetMasterRankPort(Empty()).port
+
         for worker in self.workers:
             worker.pipe.send(port)
 
