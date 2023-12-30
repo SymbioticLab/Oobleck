@@ -1,12 +1,20 @@
+import pytest
 import functools
-import os
+import multiprocessing
 from multiprocessing.connection import Connection
 from unittest.mock import patch
 
 import grpc
-from oobleck.elastic.agent import Agent
+from oobleck.elastic.agent import Agent, Worker
 from oobleck.elastic.master_service_pb2_grpc import OobleckMasterStub
 from oobleck.elastic.run import HostInfo, MasterArgs, MasterService
+from oobleck.engine.configuration_engine import ConfigurationEngine
+
+
+@pytest.fixture(autouse=True)
+def reset_configuration_engine():
+    del ConfigurationEngine._instance
+    ConfigurationEngine._instance = None
 
 
 def worker_main_forward_master_port(
@@ -46,3 +54,36 @@ def test_agent_forward_master_port(server: tuple[MasterArgs, MasterService, int]
         for worker in agent.workers:
             worker.process.join()
             assert worker.pipe.recv() == 4321
+
+
+@pytest.mark.parametrize("gpu_index", [0, 1, 2, 6])
+def test_worker_main_init_configuration_engine(
+    server: tuple[MasterArgs, MasterService, int],
+    gpu_index: int,
+):
+    master_args, _, __ = server
+
+    pipe, child_pipe = multiprocessing.Pipe()
+    hosts = HostInfo.fetch_hostfile(master_args.hostfile)
+    pipe.send(hosts)
+
+    # This creates ConfigurationEngine instance.
+    # Because Fake hostinfo has 2 losts per host,
+    # it must raise IndexError when GPU index >= 2.
+    if gpu_index >= 2:
+        with pytest.raises(IndexError):
+            Worker.worker_main(child_pipe, 0, gpu_index, b"")
+        return
+
+    Worker.worker_main(child_pipe, 0, 1, b"")
+
+    assert ConfigurationEngine._instance is not None
+    instance = ConfigurationEngine.get_instance()
+    assert instance.agent_index == 0
+    assert instance.local_rank == 1
+    assert instance.dist_info == hosts
+    assert instance.rank_map == {
+        "127.0.0.1:1234": [0, 1],
+        "127.0.0.2:1234": [2, 3],
+        "127.0.0.3:1234": [4, 5],
+    }

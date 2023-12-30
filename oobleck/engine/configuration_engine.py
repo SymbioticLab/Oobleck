@@ -35,7 +35,8 @@ class ConfigurationEngine:
             f"{host.ip}:{host.port}": list(range(i * host.slots, (i + 1) * host.slots))
             for i, host in enumerate(dist_info)
         }
-        instance.rank = instance.rank_map[agent_index][instance.local_rank]
+        my_ip = f"{dist_info[agent_index].ip}:{dist_info[agent_index].port}"
+        instance.rank = instance.rank_map[my_ip][instance.local_rank]
 
         ConfigurationEngine._instance = instance
         return ConfigurationEngine._instance

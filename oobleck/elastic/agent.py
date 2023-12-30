@@ -11,7 +11,7 @@ import simple_parsing
 from google.protobuf.empty_pb2 import Empty
 from loguru import logger
 
-from oobleck.elastic.master_service_pb2 import PortInfo
+from oobleck.elastic.master_service_pb2 import PortInfo, DistInfo
 from oobleck.elastic.master_service_pb2_grpc import OobleckMasterStub
 from oobleck.elastic.run import HostInfo
 from oobleck.engine.configuration_engine import ConfigurationEngine
@@ -32,8 +32,9 @@ class Worker:
     @staticmethod
     def worker_main(
         pipe: Connection,
+        agent_index: int,
         gpu_index: int,
-        code: str,
+        code: bytes,
     ):
         """
         Worker process main function.
@@ -48,7 +49,7 @@ class Worker:
             "worker_main() is called."
         )
 
-        ConfigurationEngine.create(pipe, gpu_index)
+        ConfigurationEngine.create(pipe, agent_index, gpu_index)
 
         ccode = compile(code, "<string>", "exec")
         exec(ccode)
@@ -66,11 +67,11 @@ class Agent:
         self.stub = stub
 
         # Get distributed information and code from the master
-        dist_info = stub.GetDistInfo(Empty())
+        dist_info: DistInfo = stub.GetDistInfo(Empty())
         self.dist_info = list(
             HostInfo(host.ip, host.slots, host.port) for host in dist_info.hosts
         )
-        self.code = pickle.loads(stub.GetCode(Empty()).code)
+        self.code: bytes = pickle.loads(stub.GetCode(Empty()).code)
         self.workers: list[Worker] = []
 
     def notify_reconfiguration_to_workers(self, dist_info: list[HostInfo]):
@@ -111,6 +112,7 @@ class Agent:
                     child_pipe,
                     self.agent_index,
                     gpu_index,
+                    self.code,
                 ),
                 daemon=True,
             )
