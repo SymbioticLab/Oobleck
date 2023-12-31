@@ -1,4 +1,4 @@
-from typing import Callable, Iterator
+from typing import Any, Callable, Iterator
 
 import torch.distributed as dist
 import torch.nn as nn
@@ -99,8 +99,8 @@ class ExecutionEngine:
         optimizer: Optimizer,
         return_loss: bool = True,
         return_outputs: bool = False,
-    ):
-        self.booster.execute_pipeline(
+    ) -> dict[str, Any]:
+        return self.booster.execute_pipeline(
             dataloader_iterator,
             model,
             criterion,

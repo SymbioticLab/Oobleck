@@ -3,8 +3,16 @@ from unittest.mock import patch
 
 import pytest
 import torch.distributed as dist
+from colossalai.booster.plugin.hybrid_parallel_plugin import (
+    HybridParallelAMPOptimizer,
+    HybridParallelNaiveOptimizer,
+)
 from conftest import GLUEDataBuilder, heterogeneous_templates, homogeneous_templates
-from oobleck_colossalai import HeterogeneousParallelPlugin, PipelineTemplate
+from oobleck_colossalai import (
+    HeterogeneousParallelModule,
+    HeterogeneousParallelPlugin,
+    PipelineTemplate,
+)
 from torch.optim import Adam
 from torch.testing._internal.common_distributed import MultiProcessTestCase
 from torch.testing._internal.common_utils import (
@@ -36,15 +44,11 @@ class TestExecutionEngineClass(MultiProcessTestCase):
         self.pipe = pipe
 
         ConfigurationEngine.create(child_pipe, self.rank // 2, self.rank % 2)
-        # mock1 = patch.object(
-        #     ConfigurationEngine._instance, "send_distributed_port", return_value=None
-        # )
-        # mock2 = patch.object(
-        #     ConfigurationEngine._instance, "receive_distributed_port", return_value=1234
-        # )
 
     def get_plugin(self) -> HeterogeneousParallelPlugin:
-        plugin = HeterogeneousParallelPlugin(tp_size=2, microbatch_size=1)
+        plugin = HeterogeneousParallelPlugin(
+            tp_size=2, microbatch_size=1, precision="fp32"
+        )
         return plugin
 
     @property
@@ -54,6 +58,19 @@ class TestExecutionEngineClass(MultiProcessTestCase):
     def setUp(self):
         super().setUp()
         self._spawn_processes()
+
+    def tearDown(self):
+        super().tearDown()
+        ConfigurationEngine._instance = None
+
+    def fake_init_distributed(self):
+        print(f"dist init r={self.rank}, world={self.world_size}")
+        return dist.init_process_group(
+            init_method=f"{FILE_SCHEMA}{self.file_name}",
+            backend="gloo",
+            world_size=self.world_size,
+            rank=self.rank,
+        )
 
     @parametrize(
         "pipeline_templates",
@@ -76,14 +93,44 @@ class TestExecutionEngineClass(MultiProcessTestCase):
 
         assert not dist.is_initialized()
 
-        def fake_init_distributed():
-            print(f"dist init r={self.rank}, world={self.world_size}")
-            return dist.init_process_group(
-                init_method=f"{FILE_SCHEMA}{self.file_name}",
-                backend="gloo",
-                world_size=self.world_size,
-                rank=self.rank,
+        with patch(
+            "oobleck.engine.execution_engine.PipelineInstantiator.instantiate",
+            return_value=(
+                pipeline_templates,
+                {template: 1 for template in pipeline_templates},
+            ),
+        ), patch(
+            "oobleck.engine.execution_engine.PipelineTemplate.generate_pipeline_templates",
+            return_value=pipeline_templates.keys(),
+        ), patch.object(
+            engine, "_init_distributed", new=self.fake_init_distributed
+        ):
+            model, _, optimizer, lr_scheduler, _ = engine.prepare(
+                model=model,
+                optimizer=optimizer,
+                scheduler=lr_scheduler,
             )
+
+        assert dist.is_initialized()
+
+    @parametrize(
+        "pipeline_templates",
+        [homogeneous_templates, heterogeneous_templates],
+        name_fn=lambda pipeline_templates: "homogeneous"
+        if len(pipeline_templates) == 1
+        else "heterogeneous",
+    )
+    def test_engine_execute(self, pipeline_templates: dict[PipelineTemplate, int]):
+        self.init_configuration_engine()
+
+        plugin = self.get_plugin()
+        engine = ExecutionEngine(plugin)
+
+        global config
+        model = GPT2ForSequenceClassification(config)
+
+        optimizer = Adam(model.parameters())
+        lr_scheduler = get_linear_schedule_with_warmup(optimizer, 0, 100)
 
         with patch(
             "oobleck.engine.execution_engine.PipelineInstantiator.instantiate",
@@ -95,18 +142,34 @@ class TestExecutionEngineClass(MultiProcessTestCase):
             "oobleck.engine.execution_engine.PipelineTemplate.generate_pipeline_templates",
             return_value=pipeline_templates.keys(),
         ), patch.object(
-            engine, "_init_distributed", new=fake_init_distributed
+            engine, "_init_distributed", new=self.fake_init_distributed
         ):
-            model, optimizer, _, lr_scheduler, _ = engine.prepare(
+            model, optimizer, criterion, lr_scheduler, _ = engine.prepare(
                 model=model,
                 criterion=lambda outputs, inputs: outputs.loss,
                 optimizer=optimizer,
                 scheduler=lr_scheduler,
             )
 
-        # dataloader = GLUEDataBuilder("gpt2", plugin).dataloader()
+        assert isinstance(model, HeterogeneousParallelModule)
+        assert isinstance(
+            optimizer, (HybridParallelAMPOptimizer, HybridParallelNaiveOptimizer)
+        )
 
-        assert dist.is_initialized()
+        dataloader = GLUEDataBuilder("gpt2", plugin).dataloader()
+        iterator = iter(dataloader)
+
+        with patch.object(
+            model, "sync_dp_grads", wraps=model.sync_dp_grads
+        ) as sync_mock:
+            result = engine.execute(iterator, model, criterion, optimizer)
+
+        sync_mock.assert_called_once()
+        assert (
+            result["loss"] is not None
+            if plugin.stage_manager.is_last_stage()
+            else result["loss"] is None
+        )
 
 
 instantiate_parametrized_tests(TestExecutionEngineClass)
