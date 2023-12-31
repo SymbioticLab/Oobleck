@@ -1,13 +1,9 @@
-import pytest
-
-from transformers import (
-    AutoTokenizer,
-    PreTrainedTokenizer,
-)
-from oobleck_colossalai.pipeline_template import PipelineTemplate
-from oobleck_colossalai import HeterogeneousParallelPlugin
 import datasets
+import pytest
+from oobleck_colossalai import HeterogeneousParallelPlugin
+from oobleck_colossalai.pipeline_template import PipelineTemplate
 from torch.utils.data import DataLoader
+from transformers import AutoTokenizer, PreTrainedTokenizer
 
 homogeneous_templates = {
     PipelineTemplate(

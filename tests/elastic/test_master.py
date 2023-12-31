@@ -5,6 +5,8 @@ from io import StringIO
 
 import grpc
 from google.protobuf.empty_pb2 import Empty
+from pytest_mock import MockerFixture
+
 from oobleck.elastic import master_service_pb2, master_service_pb2_grpc
 from oobleck.elastic.run import (
     HostInfo,
@@ -12,7 +14,6 @@ from oobleck.elastic.run import (
     MasterService,
     MultiNodeAgentRunner,
 )
-from pytest_mock import MockerFixture
 
 
 def get_stub(port: int) -> master_service_pb2_grpc.OobleckMasterStub:

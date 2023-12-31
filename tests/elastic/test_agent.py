@@ -1,9 +1,10 @@
-import pytest
 import multiprocessing
 from multiprocessing.connection import Connection
 from unittest.mock import patch
 
 import grpc
+import pytest
+
 from oobleck.elastic.agent import Agent, Worker
 from oobleck.elastic.master_service_pb2_grpc import OobleckMasterStub
 from oobleck.elastic.run import HostInfo, MasterArgs, MasterService

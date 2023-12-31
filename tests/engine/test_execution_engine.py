@@ -1,26 +1,26 @@
-import pytest
-
 import multiprocessing
 from unittest.mock import patch
+
+import pytest
 import torch.distributed as dist
-from torch.optim import Adam
-from oobleck.engine.execution_engine import ExecutionEngine
-from torch.testing._internal.common_distributed import MultiProcessTestCase
-from conftest import GLUEDataBuilder, homogeneous_templates, heterogeneous_templates
+from conftest import GLUEDataBuilder, heterogeneous_templates, homogeneous_templates
 from oobleck_colossalai import HeterogeneousParallelPlugin, PipelineTemplate
+from torch.optim import Adam
+from torch.testing._internal.common_distributed import MultiProcessTestCase
 from torch.testing._internal.common_utils import (
     FILE_SCHEMA,
     instantiate_parametrized_tests,
     parametrize,
 )
-from oobleck.engine.configuration_engine import ConfigurationEngine
-from oobleck.elastic.run import HostInfo
-
 from transformers import (
     AutoConfig,
     GPT2ForSequenceClassification,
     get_linear_schedule_with_warmup,
 )
+
+from oobleck.elastic.run import HostInfo
+from oobleck.engine.configuration_engine import ConfigurationEngine
+from oobleck.engine.execution_engine import ExecutionEngine
 
 config = AutoConfig.from_pretrained("gpt2")
 config.num_hidden_layers = 4

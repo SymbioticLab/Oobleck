@@ -4,6 +4,7 @@ from pathlib import Path
 
 import grpc
 import pytest
+
 from oobleck.elastic import master_service_pb2_grpc
 from oobleck.elastic.run import HostInfo, MasterArgs, MasterService
 
