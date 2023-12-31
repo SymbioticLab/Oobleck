@@ -1,5 +1,4 @@
 import pytest
-import functools
 import multiprocessing
 from multiprocessing.connection import Connection
 from unittest.mock import patch
@@ -18,7 +17,7 @@ def reset_configuration_engine():
 
 
 def worker_main_forward_master_port(
-    agent_index: int, pipe: Connection, gpu_index: int, code: bytes
+    pipe: Connection, agent_index: int, gpu_index: int, code: bytes
 ):
     if agent_index == 0:
         pipe.send(4321)
@@ -41,12 +40,12 @@ def test_agent_forward_master_port(server: tuple[MasterArgs, MasterService, int]
 
     with patch(
         "oobleck.elastic.agent.Worker.worker_main",
-        new=functools.partial(worker_main_forward_master_port, 0),
+        new=worker_main_forward_master_port,
     ):
         agent0.launch_workers()
     with patch(
         "oobleck.elastic.agent.Worker.worker_main",
-        new=functools.partial(worker_main_forward_master_port, 1),
+        new=worker_main_forward_master_port,
     ):
         agent1.launch_workers()
 
