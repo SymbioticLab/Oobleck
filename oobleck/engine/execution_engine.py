@@ -33,7 +33,7 @@ class ExecutionEngine:
         dataloader: DataLoader | None = None,
         optimizer: Optimizer | None = None,
         scheduler: LRScheduler | None = None,
-    ) -> list[nn.Module | Optimizer | LRScheduler | DataLoader]:
+    ) -> tuple[nn.Module, Optimizer, Callable, LRScheduler, DataLoader]:
         """Initialize pipeline templates and distributed configuration."""
 
         if self.pipeline_templates is None:
