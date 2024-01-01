@@ -26,13 +26,20 @@ class ExecutionEngine:
 
         self.pipeline_templates: list[PipelineTemplate] | None = None
 
+    @property
+    def is_master(self) -> bool:
+        configuration_engine = ConfigurationEngine.get_instance()
+        if configuration_engine is None:
+            raise RuntimeError("ConfigurationEngine must be initialized.")
+        return configuration_engine.is_master
+
     def prepare(
         self,
         model: nn.Module,
         criterion: Callable | None = None,
         dataloader: DataLoader | None = None,
         optimizer: Optimizer | None = None,
-        scheduler: LRScheduler | None = None,
+        lr_scheduler: LRScheduler | None = None,
     ) -> tuple[nn.Module, Optimizer, Callable, LRScheduler, DataLoader]:
         """Initialize pipeline templates and distributed configuration."""
 
@@ -48,7 +55,7 @@ class ExecutionEngine:
             dist.get_world_size()
         )
         self.plugin.set_pipeline_templates(num_instances, num_microbatches)
-        return self.booster.boost(model, optimizer, criterion, dataloader, scheduler)
+        return self.booster.boost(model, optimizer, criterion, dataloader, lr_scheduler)
 
     def _init_distributed(self):
         if dist.is_initialized():
