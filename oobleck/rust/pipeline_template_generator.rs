@@ -3,16 +3,7 @@ use dashmap::DashMap;
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::result::Result;
-
-fn get_profile_results(
-    model_name: &str,
-    model_config: HashMap<String, String>,
-) -> Vec<LayerExecutionResult> {
-    // Use csv to read the profile results
-    return vec![];
-}
 
 #[pyclass]
 pub struct PipelineTemplateGenerator {
@@ -23,13 +14,9 @@ pub struct PipelineTemplateGenerator {
 }
 
 impl PipelineTemplateGenerator {
-    pub fn new(
-        model_name: &str,
-        model_config: HashMap<String, String>,
-        microbatch_size: u32,
-    ) -> Self {
+    pub fn new(model_name: &str, tag: &str, microbatch_size: u32) -> Self {
         PipelineTemplateGenerator {
-            layer_execution_results: get_profile_results(model_name, model_config),
+            layer_execution_results: get_profile_results(model_name, tag),
             stage_execution_results: Vec::new(),
             execution_result_cache: DashMap::new(),
         }
@@ -63,17 +50,18 @@ impl PipelineTemplateGenerator {
             rayon::scope(|s| {
                 for i in 0..num_layers {
                     for j in i..num_layers {
+                        let key = (num_stages, i, j);
+
                         // If number of layers is less than number of stages, skip it
                         // Cannot create specified number of stages with the given number of layers
                         if j - i + 1 < num_stages as usize {
+                            self.execution_result_cache
+                                .insert(key, Err("Infeasible case".to_string()));
                             continue;
                         }
 
                         // Spawn a task to compute the result for this subproblem.
-                        // Each task has a unique key.
                         s.spawn(move |_| {
-                            let key = (num_stages, i, j);
-
                             // Iterate number of stages and layers to subproblems to find the best result
                             let best_result = (i..j)
                                 .into_par_iter()
@@ -141,4 +129,8 @@ impl PipelineTemplateGenerator {
     }
 
     pub fn create_pipeline_template(&mut self, num_nodes: u32) {}
+}
+
+mod test {
+    use super::*;
 }
