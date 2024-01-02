@@ -64,13 +64,17 @@ impl PipelineTemplateGenerator {
                 for i in 0..num_layers {
                     for j in i..num_layers {
                         // If number of layers is less than number of stages, skip it
+                        // Cannot create specified number of stages with the given number of layers
                         if j - i + 1 < num_stages as usize {
                             continue;
                         }
 
+                        // Spawn a task to compute the result for this subproblem.
+                        // Each task has a unique key.
                         s.spawn(move |_| {
-                            // Within this scope, key is unique.
                             let key = (num_stages, i, j);
+
+                            // Iterate number of stages and layers to subproblems to find the best result
                             let best_result = (i..j)
                                 .into_par_iter()
                                 .map(|num_layers_left| {
@@ -78,17 +82,17 @@ impl PipelineTemplateGenerator {
                                         Err("Error in subproblem".to_string());
 
                                     for num_stages_left in 1..num_stages {
+                                        let num_stages_right = num_stages - num_stages_left;
+
+                                        // As we gradually increase the number of stages from 1,
+                                        // we must have already computed the results for the subproblems
                                         let left = self
                                             .execution_result_cache
                                             .get(&(num_stages_left, i, num_layers_left))
                                             .unwrap();
                                         let right = self
                                             .execution_result_cache
-                                            .get(&(
-                                                num_stages - num_stages_left,
-                                                num_layers_left + 1,
-                                                j,
-                                            ))
+                                            .get(&(num_stages_right, num_layers_left + 1, j))
                                             .unwrap();
 
                                         if left.is_err() || right.is_err() {
