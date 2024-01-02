@@ -5,11 +5,13 @@ edition = "2021"
 
 [dependencies]
 pyo3 = { version = "0.20.0", features = ["extension-module"] }
+dashmap = { version = "5.5", features = ["rayon"] }
+rayon = "1.8" 
 
 [lib]
-name = "_planner"
+name = "planner"
 crate-type = ["cdylib"]
-path = "oobleck/rust/planner.rs"
+path = "oobleck/rust/lib.rs"
 
 [build-dependencies]
 pyo3-build-config = "0.20.0"
