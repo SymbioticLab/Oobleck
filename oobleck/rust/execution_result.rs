@@ -143,9 +143,6 @@ impl PipelineExecutionResult {
     pub fn latency(&self) -> f64 {
         self.t1 + self.t2 + self.t3
     }
-    pub fn num_stages(&self) -> usize {
-        self.stages.len()
-    }
     pub fn mem_required(&self) -> u64 {
         self.stages.iter().fold(0, |acc, x| acc + x.mem_required)
     }
