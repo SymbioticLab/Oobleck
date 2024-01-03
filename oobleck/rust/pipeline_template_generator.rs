@@ -1,4 +1,5 @@
 use crate::execution_result::*;
+use crate::PlannerError;
 use dashmap::DashMap;
 use env_logger;
 use log;
@@ -26,7 +27,7 @@ impl PipelineTemplateGenerator {
         }
     }
 
-    pub fn divide_and_conquer(&mut self, max_num_nodes: u32) -> Result<(), String> {
+    pub fn divide_and_conquer(&mut self, max_num_nodes: u32) -> Result<(), PlannerError> {
         if !self.stage_execution_results.is_empty() {
             return Ok(());
         }
@@ -34,7 +35,7 @@ impl PipelineTemplateGenerator {
         let num_layers = self.layer_execution_results.len();
 
         if max_num_nodes as usize > num_layers {
-            return Err("Invalid number of nodes".to_string());
+            return Err(PlannerError::new("Invalid number of nodes"));
         }
 
         // Put all base cases in the cache
@@ -110,29 +111,6 @@ impl PipelineTemplateGenerator {
                                     .get(&(num_stages_right, num_layers_left, j))
                                     .unwrap();
 
-                                log::debug!(
-                                    "({}, {}, {}) Getting subproblems: ({}, {}, {}) -> {} + ({}, {}, {}) -> {}",
-                                    num_stages,
-                                    i,
-                                    j,
-                                    num_stages_left,
-                                    i,
-                                    num_layers_left,
-                                    if left.is_ok() {
-                                        left.as_ref().unwrap().latency()
-                                    } else {
-                                        0.0
-                                    },
-                                    num_stages_right,
-                                    num_layers_left,
-                                    j,
-                                    if right.is_ok() {
-                                        right.as_ref().unwrap().latency()
-                                    } else {
-                                        0.0
-                                    }
-                                );
-
                                 if left.is_err() || right.is_err() {
                                     continue;
                                 }
@@ -156,11 +134,9 @@ impl PipelineTemplateGenerator {
                             |acc, result| {
                                 if result.is_err() {
                                     return acc;
-                                }
-                                else if acc.is_err() {
+                                } else if acc.is_err() {
                                     return result;
-                                }
-                                else if result.as_ref().unwrap() < acc.as_ref().unwrap() {
+                                } else if result.as_ref().unwrap() < acc.as_ref().unwrap() {
                                     return result;
                                 } else {
                                     return acc;
@@ -186,19 +162,21 @@ impl PipelineTemplateGenerator {
         Ok(())
     }
 
-    pub fn get_pipeline_template(&self, num_nodes: u32) -> Vec<Vec<String>> {
+    pub fn get_pipeline_template(&self, num_nodes: u32) -> Result<Vec<Vec<String>>, PlannerError> {
         log::debug!(
             "get_pipeline_template({}, {}, {})",
             num_nodes,
             0,
             self.layer_execution_results.len()
         );
-        self.execution_result_cache
+
+        Ok(self
+            .execution_result_cache
             .get(&(num_nodes, 0, self.layer_execution_results.len()))
             .unwrap()
             .as_ref()
-            .unwrap()
-            .get_modules_per_stage(&self.layer_execution_results)
+            .expect(format!("No template found for num_nodes {}", num_nodes).as_str())
+            .get_modules_per_stage(&self.layer_execution_results))
     }
 }
 
@@ -207,19 +185,20 @@ pub fn create_pipeline_templates(
     model_name: &str,
     tag: &str,
     mut nodes: Vec<u32>,
-) -> HashMap<u32, Vec<Vec<String>>> {
+) -> Result<HashMap<u32, Vec<Vec<String>>>, PlannerError> {
     let _ = env_logger::try_init();
     nodes.sort();
 
     let mut generator = PipelineTemplateGenerator::new(model_name, tag);
-    let _ = generator.divide_and_conquer(nodes[nodes.len() - 1]);
+    generator.divide_and_conquer(nodes[nodes.len() - 1])?;
 
     let mut results: HashMap<u32, Vec<Vec<String>>> = HashMap::new();
     for num_node in nodes {
-        results.insert(num_node, generator.get_pipeline_template(num_node));
+        let template = generator.get_pipeline_template(num_node)?;
+        results.insert(num_node, template);
     }
 
-    results
+    Ok(results)
 }
 
 #[cfg(test)]
@@ -228,31 +207,71 @@ mod test {
     use std::fs;
     use std::path::PathBuf;
 
-    fn prepare_profile_file() {
+    fn prepare_profile_file(num_layers: u32, same_latency: bool) {
         let model_name = "gpt2";
         let tag = "test";
         let path =
             PathBuf::from("/tmp/oobleck/profiles/".to_string() + model_name + "__" + tag + ".csv");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // let _ = fs::remove_file(&path);
 
         let mut writer = csv::Writer::from_path(path).unwrap();
-        for i in 0..6 {
+        for i in 0..num_layers {
             writer
                 .serialize(LayerExecutionResult::new(
                     i,
                     format!("layer{}", i),
-                    (i + 1) as f64 * 2.0,
-                    (i + 1) as f64 * 2.0,
-                    (i + 1) as u64,
+                    if same_latency {
+                        1 as f64
+                    } else {
+                        (i + 1) as f64
+                    },
+                    if same_latency {
+                        1 as f64
+                    } else {
+                        (i + 1) as f64
+                    },
+                    if same_latency {
+                        1 as u64
+                    } else {
+                        (i + 1) as u64
+                    },
                 ))
                 .unwrap();
+        }
+        writer.flush().unwrap();
+    }
+
+    #[test]
+    fn test_return_no_template_for_too_large_num_nodes() {
+        prepare_profile_file(6, true);
+
+        let templates = create_pipeline_templates("gpt2", "test", vec![7]);
+        assert!(templates.is_err());
+    }
+
+    #[test]
+    fn test_all_layers_covered() {
+        prepare_profile_file(6, false);
+        let templates = create_pipeline_templates("gpt2", "test", vec![1, 2, 3, 4, 5, 6]).unwrap();
+
+        let expected_layers: Vec<String> = (0..6).map(|i| format!("layer{}", i)).collect();
+
+        for (_, template) in templates.iter() {
+            let mut covered_layers: Vec<String> = Vec::new();
+            for stage in template.iter() {
+                for layer in stage.iter() {
+                    covered_layers.push(layer.clone());
+                }
+            }
+            assert_eq!(covered_layers, expected_layers);
         }
     }
 
     #[test]
     fn test_divide_and_conquer_base_only() {
-        prepare_profile_file();
-        let template = create_pipeline_templates("gpt2", "test", vec![1]);
+        prepare_profile_file(6, false);
+        let template = create_pipeline_templates("gpt2", "test", vec![1]).unwrap();
         assert_eq!(template.len(), 1);
         assert_eq!(template[&1].len(), 1);
         assert_eq!(
@@ -263,8 +282,8 @@ mod test {
 
     #[test]
     fn test_divide_and_conquer_divide() {
-        prepare_profile_file();
-        let templates = create_pipeline_templates("gpt2", "test", vec![1, 2]);
+        prepare_profile_file(6, false);
+        let templates = create_pipeline_templates("gpt2", "test", vec![1, 2]).unwrap();
         assert_eq!(templates.len(), 2);
         assert_eq!(
             templates[&1][0],
@@ -279,8 +298,8 @@ mod test {
 
     #[test]
     fn test_divide_and_conquer_divide2() {
-        prepare_profile_file();
-        let templates = create_pipeline_templates("gpt2", "test", vec![2, 3, 4]);
+        prepare_profile_file(6, false);
+        let templates = create_pipeline_templates("gpt2", "test", vec![2, 3, 4]).unwrap();
         assert_eq!(templates.len(), 3);
         assert_eq!(
             templates[&2][0],
