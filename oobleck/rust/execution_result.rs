@@ -1,11 +1,12 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::clone::Clone;
 use std::cmp::{Ordering, PartialEq};
 use std::sync::Arc;
 
 use csv;
 use std::path::PathBuf;
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct LayerExecutionResult {
     layer_index: u32,
     layer_name: String,
@@ -14,22 +15,40 @@ pub struct LayerExecutionResult {
     mem_required: u64,
 }
 
-pub fn get_profile_results(model_name: &str, tag: &str) -> Vec<LayerExecutionResult> {
-    let path =
-        PathBuf::from("/tmp/oobleck/profiles/".to_string() + model_name + "__" + tag + ".csv");
-    let mut reader = csv::Reader::from_path(path).unwrap();
-
-    let mut data: Vec<LayerExecutionResult> = Vec::new();
-    for result in reader.deserialize() {
-        let record: LayerExecutionResult = result.unwrap();
-        data.push(record);
+impl LayerExecutionResult {
+    pub fn new(
+        layer_index: u32,
+        layer_name: String,
+        forward: f64,
+        backward: f64,
+        mem_required: u64,
+    ) -> Self {
+        LayerExecutionResult {
+            layer_index: layer_index,
+            layer_name: layer_name,
+            forward: forward,
+            backward: backward,
+            mem_required: mem_required,
+        }
     }
 
-    data
+    pub fn get_profile_results(model_name: &str, tag: &str) -> Vec<LayerExecutionResult> {
+        let path =
+            PathBuf::from("/tmp/oobleck/profiles/".to_string() + model_name + "__" + tag + ".csv");
+        let mut reader = csv::Reader::from_path(path).unwrap();
+
+        let mut data: Vec<LayerExecutionResult> = Vec::new();
+        for result in reader.deserialize() {
+            let record: LayerExecutionResult = result.unwrap();
+            data.push(record);
+        }
+
+        data
+    }
 }
 
 pub struct StageExecutionResult {
-    layers: (u32, u32),
+    pub layers: (u32, u32),
     forward: f64,
     backward: f64,
     mem_required: u64,
@@ -48,7 +67,10 @@ impl StageExecutionResult {
         }
 
         StageExecutionResult {
-            layers: (layers[0].layer_index, layers[layers.len() - 1].layer_index),
+            layers: (
+                layers[0].layer_index,
+                layers[layers.len() - 1].layer_index + 1,
+            ),
             forward: forward,
             backward: backward,
             mem_required: mem_required,
@@ -60,12 +82,13 @@ impl StageExecutionResult {
     }
 }
 
+#[derive(Clone)]
 pub struct PipelineExecutionResult {
-    stages: Vec<Arc<StageExecutionResult>>,
-    t1: f64,
-    t2: f64,
-    t3: f64,
-    kstar: usize,
+    pub stages: Vec<Arc<StageExecutionResult>>,
+    pub t1: f64,
+    pub t2: f64,
+    pub t3: f64,
+    pub kstar: usize,
 }
 
 impl PipelineExecutionResult {
@@ -75,7 +98,7 @@ impl PipelineExecutionResult {
 
         let t1 = left.t1 + right.t1;
 
-        let kstar = if left.stages[left.kstar].latency() < right.stages[right.kstar].latency() {
+        let kstar = if left.stages[left.kstar].latency() > right.stages[right.kstar].latency() {
             left.kstar
         } else {
             left.stages.len() + right.kstar
@@ -127,7 +150,7 @@ impl PipelineExecutionResult {
         let mut modules_per_stage: Vec<Vec<String>> = Vec::new();
         for stage in &self.stages {
             let mut modules: Vec<String> = Vec::new();
-            for layer in &layers[stage.layers.0 as usize - 1..stage.layers.1 as usize] {
+            for layer in &layers[stage.layers.0 as usize..stage.layers.1 as usize] {
                 modules.push(layer.layer_name.clone());
             }
             modules_per_stage.push(modules);
