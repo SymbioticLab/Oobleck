@@ -1,10 +1,10 @@
 [package]
-name = "oobleck"
+name = "oobleck-rust"
 version = "0.0.1"
 edition = "2021"
 
 [dependencies]
-pyo3 = { version = "0.20.0", features = ["extension-module"] }
+pyo3 = { version = "0.20", features = ["extension-module"] }
 dashmap = { version = "5.5", features = ["rayon"] }
 rayon = "1.8" 
 csv = "1.3"
