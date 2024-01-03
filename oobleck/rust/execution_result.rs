@@ -146,12 +146,6 @@ impl PipelineExecutionResult {
     pub fn mem_required(&self) -> u64 {
         self.stages.iter().fold(0, |acc, x| acc + x.mem_required)
     }
-    pub fn layers(&self) -> (u32, u32) {
-        (
-            self.stages[0].layers.0,
-            self.stages[self.stages.len() - 1].layers.1,
-        )
-    }
     pub fn get_modules_per_stage(&self, layers: &Vec<LayerExecutionResult>) -> Vec<Vec<String>> {
         let mut modules_per_stage: Vec<Vec<String>> = Vec::new();
         for stage in &self.stages {
