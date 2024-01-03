@@ -1,10 +1,19 @@
-use csv;
-use pyo3::prelude::*;
 use serde::Deserialize;
 use std::cmp::{Ordering, PartialEq};
+use std::sync::Arc;
+
+use csv;
 use std::path::PathBuf;
 
-#[pyfunction]
+#[derive(Deserialize)]
+pub struct LayerExecutionResult {
+    layer_index: u32,
+    layer_name: String,
+    forward: f64,
+    backward: f64,
+    mem_required: u64,
+}
+
 pub fn get_profile_results(model_name: &str, tag: &str) -> Vec<LayerExecutionResult> {
     let path =
         PathBuf::from("/tmp/oobleck/profiles/".to_string() + model_name + "__" + tag + ".csv");
@@ -19,16 +28,6 @@ pub fn get_profile_results(model_name: &str, tag: &str) -> Vec<LayerExecutionRes
     data
 }
 
-#[pyclass]
-#[derive(Deserialize)]
-pub struct LayerExecutionResult {
-    layer_index: u32,
-    layer_name: String,
-    forward: f64,
-    backward: f64,
-    mem_required: u64,
-}
-
 pub struct StageExecutionResult {
     layers: (u32, u32),
     forward: f64,
@@ -37,7 +36,7 @@ pub struct StageExecutionResult {
 }
 
 impl StageExecutionResult {
-    pub fn new(layers: &[LayerExecutionResult], num_nodes: u32) -> Self {
+    pub fn new(layers: &[LayerExecutionResult]) -> Self {
         let mut forward = 0.0;
         let mut backward = 0.0;
         let mut mem_required = 0;
@@ -61,9 +60,8 @@ impl StageExecutionResult {
     }
 }
 
-#[derive(PartialEq, Eq)]
 pub struct PipelineExecutionResult {
-    stages: Vec<StageExecutionResult>,
+    stages: Vec<Arc<StageExecutionResult>>,
     t1: f64,
     t2: f64,
     t3: f64,
@@ -71,44 +69,42 @@ pub struct PipelineExecutionResult {
 }
 
 impl PipelineExecutionResult {
-    pub fn new(
-        left: PipelineExecutionResult,
-        right: PipelineExecutionResult,
-        num_nodes: u32,
-    ) -> Self {
+    pub fn new(left: &PipelineExecutionResult, right: &PipelineExecutionResult) -> Self {
+        let mut stages = left.stages.clone();
+        stages.extend(right.stages.clone());
+
         let t1 = left.t1 + right.t1;
 
         let kstar = if left.stages[left.kstar].latency() < right.stages[right.kstar].latency() {
-            (left.kstar, left)
+            left.kstar
         } else {
-            (left.stages.len() + right.kstar, right)
+            left.stages.len() + right.kstar
         };
 
-        let num_stages = left.stages.len() + right.stages.len();
-        let num_microbatches = 4 * num_stages;
-        let t2 = (num_microbatches - num_stages + kstar.0 - 1) as f64
-            * kstar.1.stages[kstar.0].latency();
+        let num_microbatches = 4 * stages.len();
+        let t2 = (num_microbatches - stages.len() + kstar - 1) as f64 * stages[kstar].latency();
 
-        let t3 = if kstar.0 == left.kstar {
+        let t3 = if kstar == left.kstar {
             left.t3 + right.t1
         } else {
             right.t3
         };
 
         PipelineExecutionResult {
-            stages: left.stages.concat(right.stages),
+            stages: stages,
             t1: t1,
             t2: t2,
             t3: t3,
-            kstar: kstar.0,
+            kstar: kstar,
         }
     }
-    pub fn make_base_result(stage: StageExecutionResult) -> Self {
+    pub fn make_base_result(stage: Arc<StageExecutionResult>) -> Self {
+        let latency = stage.latency();
         PipelineExecutionResult {
             stages: vec![stage],
-            t1: stage.latency(),
-            t2: 2.0 * (stage.latency()),
-            t3: stage.latency(),
+            t1: latency,
+            t2: 2.0 * (latency),
+            t3: latency,
             kstar: 0,
         }
     }
@@ -127,21 +123,42 @@ impl PipelineExecutionResult {
             self.stages[self.stages.len() - 1].layers.1,
         )
     }
+    pub fn get_modules_per_stage(&self, layers: &Vec<LayerExecutionResult>) -> Vec<Vec<String>> {
+        let mut modules_per_stage: Vec<Vec<String>> = Vec::new();
+        for stage in &self.stages {
+            let mut modules: Vec<String> = Vec::new();
+            for layer in &layers[stage.layers.0 as usize - 1..stage.layers.1 as usize] {
+                modules.push(layer.layer_name.clone());
+            }
+            modules_per_stage.push(modules);
+        }
+        modules_per_stage
+    }
 }
+
+impl PartialEq for PipelineExecutionResult {
+    fn eq(&self, other: &Self) -> bool {
+        self.latency() == other.latency() && self.mem_required() == other.mem_required()
+    }
+}
+
+impl Eq for PipelineExecutionResult {}
 
 impl Ord for PipelineExecutionResult {
     fn cmp(&self, other: &Self) -> Ordering {
-        if self.latency() < other.latency() {
-            Ordering::Less
-        } else if self.latency() > other.latency() {
-            Ordering::Greater
+        if self == other {
+            Ordering::Equal
         } else {
-            if self.mem_required() < other.mem_required() {
+            if self.latency() < other.latency() {
                 Ordering::Less
-            } else if self.mem_required() > other.mem_required() {
+            } else if self.latency() > other.latency() {
                 Ordering::Greater
             } else {
-                Ordering::Equal
+                if self.mem_required() < other.mem_required() {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
             }
         }
     }
