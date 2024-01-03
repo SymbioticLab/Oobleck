@@ -208,7 +208,7 @@ pub fn create_pipeline_templates(
     tag: &str,
     mut nodes: Vec<u32>,
 ) -> HashMap<u32, Vec<Vec<String>>> {
-    env_logger::init();
+    let _ = env_logger::try_init();
     nodes.sort();
 
     let mut generator = PipelineTemplateGenerator::new(model_name, tag);
@@ -236,7 +236,7 @@ mod test {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
 
         let mut writer = csv::Writer::from_path(path).unwrap();
-        for i in 0..4 {
+        for i in 0..6 {
             writer
                 .serialize(LayerExecutionResult::new(
                     i,
@@ -257,7 +257,7 @@ mod test {
         assert_eq!(template[&1].len(), 1);
         assert_eq!(
             template[&1][0],
-            vec!["layer0", "layer1", "layer2", "layer3"]
+            vec!["layer0", "layer1", "layer2", "layer3", "layer4", "layer5"]
         );
     }
 
@@ -268,9 +268,33 @@ mod test {
         assert_eq!(templates.len(), 2);
         assert_eq!(
             templates[&1][0],
+            vec!["layer0", "layer1", "layer2", "layer3", "layer4", "layer5"]
+        );
+        assert_eq!(
+            templates[&2][0],
             vec!["layer0", "layer1", "layer2", "layer3"]
         );
-        assert_eq!(templates[&2][0], vec!["layer0", "layer1", "layer2"]);
-        assert_eq!(templates[&2][1], vec!["layer3"]);
+        assert_eq!(templates[&2][1], vec!["layer4", "layer5"]);
+    }
+
+    #[test]
+    fn test_divide_and_conquer_divide2() {
+        prepare_profile_file();
+        let templates = create_pipeline_templates("gpt2", "test", vec![2, 3, 4]);
+        assert_eq!(templates.len(), 3);
+        assert_eq!(
+            templates[&2][0],
+            vec!["layer0", "layer1", "layer2", "layer3"]
+        );
+        assert_eq!(templates[&2][1], vec!["layer4", "layer5"]);
+
+        assert_eq!(templates[&3][0], vec!["layer0", "layer1", "layer2"]);
+        assert_eq!(templates[&3][1], vec!["layer3", "layer4"]);
+        assert_eq!(templates[&3][2], vec!["layer5"]);
+
+        assert_eq!(templates[&4][0], vec!["layer0", "layer1", "layer2"]);
+        assert_eq!(templates[&4][1], vec!["layer3"]);
+        assert_eq!(templates[&4][2], vec!["layer4"]);
+        assert_eq!(templates[&4][3], vec!["layer5"]);
     }
 }
