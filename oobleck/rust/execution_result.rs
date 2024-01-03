@@ -24,11 +24,11 @@ impl LayerExecutionResult {
         mem_required: u64,
     ) -> Self {
         LayerExecutionResult {
-            layer_index: layer_index,
-            layer_name: layer_name,
-            forward: forward,
-            backward: backward,
-            mem_required: mem_required,
+            layer_index,
+            layer_name,
+            forward,
+            backward,
+            mem_required,
         }
     }
 
@@ -71,9 +71,9 @@ impl StageExecutionResult {
                 layers[0].layer_index,
                 layers[layers.len() - 1].layer_index + 1,
             ),
-            forward: forward,
-            backward: backward,
-            mem_required: mem_required,
+            forward,
+            backward,
+            mem_required,
         }
     }
 
@@ -114,11 +114,11 @@ impl PipelineExecutionResult {
         };
 
         PipelineExecutionResult {
-            stages: stages,
-            t1: t1,
-            t2: t2,
-            t3: t3,
-            kstar: kstar,
+            stages,
+            t1,
+            t2,
+            t3,
+            kstar,
         }
     }
     pub fn make_base_result(stage: Arc<StageExecutionResult>) -> Self {
