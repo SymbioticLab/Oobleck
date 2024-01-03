@@ -32,18 +32,27 @@ impl LayerExecutionResult {
         }
     }
 
-    pub fn get_profile_results(model_name: &str, tag: &str) -> Vec<LayerExecutionResult> {
-        let path =
-            PathBuf::from("/tmp/oobleck/profiles/".to_string() + model_name + "__" + tag + ".csv");
-        let mut reader = csv::Reader::from_path(path).unwrap();
+    pub fn get_profile_results(
+        model_name: &str,
+        tag: &str,
+        oobleck_base_dir: Option<PathBuf>,
+    ) -> Result<Vec<LayerExecutionResult>, std::io::Error> {
+        let path = match oobleck_base_dir {
+            Some(base_dir) => base_dir.join("profiles"),
+            None => PathBuf::from("/tmp/oobleck/profiles/".to_string()),
+        }
+        .join(model_name.to_string() + "__" + tag + ".csv");
+
+        let mut reader = csv::Reader::from_path(path)?;
 
         let mut data: Vec<LayerExecutionResult> = Vec::new();
         for result in reader.deserialize() {
-            let record: LayerExecutionResult = result.unwrap();
+            let record: LayerExecutionResult = result?;
             data.push(record);
         }
+        drop(reader);
 
-        data
+        Ok(data)
     }
 }
 

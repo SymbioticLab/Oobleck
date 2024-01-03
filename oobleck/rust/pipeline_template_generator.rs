@@ -7,6 +7,7 @@ use pyo3::prelude::*;
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::result::Result;
 use std::sync::Arc;
 
@@ -19,9 +20,14 @@ pub struct PipelineTemplateGenerator {
 }
 
 impl PipelineTemplateGenerator {
-    pub fn new(model_name: &str, tag: &str) -> Self {
+    pub fn new(model_name: &str, tag: &str, oobleck_base_dir: Option<PathBuf>) -> Self {
         PipelineTemplateGenerator {
-            layer_execution_results: LayerExecutionResult::get_profile_results(model_name, tag),
+            layer_execution_results: LayerExecutionResult::get_profile_results(
+                model_name,
+                tag,
+                oobleck_base_dir,
+            )
+            .unwrap(),
             stage_execution_results: DashMap::new(),
             execution_result_cache: DashMap::new(),
         }
@@ -184,16 +190,17 @@ impl PipelineTemplateGenerator {
 pub fn create_pipeline_templates(
     model_name: &str,
     tag: &str,
-    mut nodes: Vec<u32>,
+    mut num_nodes: Vec<u32>,
+    oobleck_base_dir: Option<PathBuf>,
 ) -> Result<HashMap<u32, Vec<Vec<String>>>, PlannerError> {
     let _ = env_logger::try_init();
-    nodes.sort();
+    num_nodes.sort();
 
-    let mut generator = PipelineTemplateGenerator::new(model_name, tag);
-    generator.divide_and_conquer(nodes[nodes.len() - 1])?;
+    let mut generator = PipelineTemplateGenerator::new(model_name, tag, oobleck_base_dir);
+    generator.divide_and_conquer(num_nodes[num_nodes.len() - 1])?;
 
     let mut results: HashMap<u32, Vec<Vec<String>>> = HashMap::new();
-    for num_node in nodes {
+    for num_node in num_nodes {
         let template = generator.get_pipeline_template(num_node)?;
         results.insert(num_node, template);
     }
@@ -206,14 +213,17 @@ mod test {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
+    use tempfile::TempDir;
 
-    fn prepare_profile_file(num_layers: u32, same_latency: bool) {
+    fn prepare_profile_file(num_layers: u32, same_latency: bool) -> PathBuf {
         let model_name = "gpt2";
         let tag = "test";
-        let path =
-            PathBuf::from("/tmp/oobleck/profiles/".to_string() + model_name + "__" + tag + ".csv");
+        let base_dir = TempDir::new().unwrap().path().to_path_buf();
+        let path = base_dir
+            .join("profiles")
+            .join(model_name.to_string() + "__" + tag + ".csv");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        // let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&path);
 
         let mut writer = csv::Writer::from_path(path).unwrap();
         for i in 0..num_layers {
@@ -240,20 +250,24 @@ mod test {
                 .unwrap();
         }
         writer.flush().unwrap();
+        drop(writer);
+
+        base_dir
     }
 
     #[test]
     fn test_return_no_template_for_too_large_num_nodes() {
-        prepare_profile_file(6, true);
+        let dir = prepare_profile_file(6, true);
 
-        let templates = create_pipeline_templates("gpt2", "test", vec![7]);
+        let templates = create_pipeline_templates("gpt2", "test", vec![7], Some(dir));
         assert!(templates.is_err());
     }
 
     #[test]
     fn test_all_layers_covered() {
-        prepare_profile_file(6, false);
-        let templates = create_pipeline_templates("gpt2", "test", vec![1, 2, 3, 4, 5, 6]).unwrap();
+        let dir = prepare_profile_file(6, false);
+        let templates =
+            create_pipeline_templates("gpt2", "test", vec![1, 2, 3, 4, 5, 6], Some(dir)).unwrap();
 
         let expected_layers: Vec<String> = (0..6).map(|i| format!("layer{}", i)).collect();
 
@@ -270,8 +284,8 @@ mod test {
 
     #[test]
     fn test_divide_and_conquer_base_only() {
-        prepare_profile_file(6, false);
-        let template = create_pipeline_templates("gpt2", "test", vec![1]).unwrap();
+        let dir = prepare_profile_file(6, false);
+        let template = create_pipeline_templates("gpt2", "test", vec![1], Some(dir)).unwrap();
         assert_eq!(template.len(), 1);
         assert_eq!(template[&1].len(), 1);
         assert_eq!(
@@ -282,8 +296,8 @@ mod test {
 
     #[test]
     fn test_divide_and_conquer_divide() {
-        prepare_profile_file(6, false);
-        let templates = create_pipeline_templates("gpt2", "test", vec![1, 2]).unwrap();
+        let dir = prepare_profile_file(6, false);
+        let templates = create_pipeline_templates("gpt2", "test", vec![1, 2], Some(dir)).unwrap();
         assert_eq!(templates.len(), 2);
         assert_eq!(
             templates[&1][0],
@@ -298,8 +312,9 @@ mod test {
 
     #[test]
     fn test_divide_and_conquer_divide2() {
-        prepare_profile_file(6, false);
-        let templates = create_pipeline_templates("gpt2", "test", vec![2, 3, 4]).unwrap();
+        let dir = prepare_profile_file(6, false);
+        let templates =
+            create_pipeline_templates("gpt2", "test", vec![2, 3, 4], Some(dir)).unwrap();
         assert_eq!(templates.len(), 3);
         assert_eq!(
             templates[&2][0],
@@ -315,5 +330,12 @@ mod test {
         assert_eq!(templates[&4][1], vec!["layer3"]);
         assert_eq!(templates[&4][2], vec!["layer4"]);
         assert_eq!(templates[&4][3], vec!["layer5"]);
+    }
+
+    #[test]
+    fn test_measure_time_of_large_model() {
+        let dir = prepare_profile_file(96, false);
+        let templates = create_pipeline_templates("gpt2", "test", vec![64], Some(dir)).unwrap();
+        assert_eq!(templates.len(), 1);
     }
 }
