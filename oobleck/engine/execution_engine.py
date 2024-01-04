@@ -11,17 +11,26 @@ from torch.utils.data import DataLoader
 
 from oobleck.engine.configuration_engine import ConfigurationEngine
 from oobleck.engine.pipeline_instantiator import PipelineInstantiator
+from oobleck.planner import create_pipeline_templates
 
 
 class ExecutionEngine:
     """A main execution engine using an execution Backend."""
 
-    def __init__(self, plugin: HeterogeneousParallelPlugin, **booster_kwargs):
+    def __init__(
+        self,
+        plugin: HeterogeneousParallelPlugin,
+        tag: str,
+        output_dir: str,
+        **booster_kwargs,
+    ):
         assert (
             not dist.is_initialized()
         ), "Distributed environment must not be initialized."
 
         self.plugin = plugin
+        self.tag = tag
+        self.output_dir = output_dir
         self.booster = Booster(plugin=plugin, **booster_kwargs)
 
         self.pipeline_templates: list[PipelineTemplate] | None = None
@@ -44,8 +53,8 @@ class ExecutionEngine:
         """Initialize pipeline templates and distributed configuration."""
 
         if self.pipeline_templates is None:
-            self.pipeline_templates = PipelineTemplate.generate_pipeline_templates(
-                model
+            self.pipeline_templates = create_pipeline_templates(
+                self.tag, [X], self.output_dir
             )
 
         self._init_distributed()

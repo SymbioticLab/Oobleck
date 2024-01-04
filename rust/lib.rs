@@ -36,14 +36,13 @@ impl From<PlannerError> for PyErr {
 
 #[pyfunction]
 fn create_pipeline_templates(
-    model_name: &str,
     tag: &str,
     mut num_nodes: Vec<u32>,
     oobleck_base_dir: Option<PathBuf>,
 ) -> PyResult<PyObject> {
     num_nodes.sort();
 
-    let mut generator = PipelineTemplateGenerator::new(model_name, tag, oobleck_base_dir);
+    let mut generator = PipelineTemplateGenerator::new(tag, oobleck_base_dir);
     generator.divide_and_conquer(num_nodes[num_nodes.len() - 1])?;
 
     Python::with_gil(|py| {

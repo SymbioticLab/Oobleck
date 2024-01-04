@@ -33,7 +33,6 @@ impl LayerExecutionResult {
     }
 
     pub fn get_profile_results(
-        model_name: &str,
         tag: &str,
         oobleck_base_dir: Option<PathBuf>,
     ) -> Result<Vec<LayerExecutionResult>, std::io::Error> {
@@ -41,7 +40,7 @@ impl LayerExecutionResult {
             Some(base_dir) => base_dir.join("profiles"),
             None => PathBuf::from("/tmp/oobleck/profiles/".to_string()),
         }
-        .join(model_name.to_string() + "__" + tag + ".csv");
+        .join(tag.to_string() + ".csv");
 
         let mut reader = csv::Reader::from_path(path)?;
 

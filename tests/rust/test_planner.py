@@ -4,13 +4,12 @@ from oobleck import planner
 from pathlib import Path
 import csv
 
-model_name = "gpt2"
-tag = "test"
+tag = "gpt2-test"
 
 
 @pytest.fixture()
 def base_dir(tmp_path: Path) -> Path:
-    path = tmp_path / "profiles" / f"{model_name}__{tag}.csv"
+    path = tmp_path / "profiles" / f"{tag}.csv"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as f:
         fieldnames = [
@@ -40,13 +39,13 @@ def base_dir(tmp_path: Path) -> Path:
 def test_error_for_too_large_num_nodes(base_dir: Path):
     with pytest.raises(RuntimeError):
         planner.create_pipeline_templates(
-            model_name="gpt2", tag="test", num_nodes=[8], oobleck_base_dir=base_dir
+            tag="gpt2-test", num_nodes=[8], oobleck_base_dir=base_dir
         )
 
 
 def test_create_pipeline_templates(base_dir: Path):
     templates: dict[int, PipelineTemplate] = planner.create_pipeline_templates(
-        model_name="gpt2", tag="test", num_nodes=[1, 2, 3, 4], oobleck_base_dir=base_dir
+        tag="gpt2-test", num_nodes=[1, 2, 3, 4], oobleck_base_dir=base_dir
     )
 
     expected_layers = [f"layer_{i}" for i in range(6)]

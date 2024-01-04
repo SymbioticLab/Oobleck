@@ -17,10 +17,9 @@ pub struct PipelineTemplateGenerator {
 }
 
 impl PipelineTemplateGenerator {
-    pub fn new(model_name: &str, tag: &str, oobleck_base_dir: Option<PathBuf>) -> Self {
+    pub fn new(tag: &str, oobleck_base_dir: Option<PathBuf>) -> Self {
         PipelineTemplateGenerator {
             layer_execution_results: LayerExecutionResult::get_profile_results(
-                model_name,
                 tag,
                 oobleck_base_dir,
             )
@@ -200,12 +199,9 @@ mod test {
         same_latency: bool,
         mut num_nodes: Vec<u32>,
     ) -> Result<PipelineTemplateGenerator, PlannerError> {
-        let model_name = "gpt2";
-        let tag = "test";
+        let tag = "gpt2-test";
         let base_dir = TempDir::new().unwrap().path().to_path_buf();
-        let path = base_dir
-            .join("profiles")
-            .join(model_name.to_string() + "__" + tag + ".csv");
+        let path = base_dir.join("profiles").join(tag.to_string() + ".csv");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let _ = fs::remove_file(&path);
 
@@ -238,7 +234,7 @@ mod test {
 
         num_nodes.sort();
 
-        let mut generator = PipelineTemplateGenerator::new(model_name, tag, Some(base_dir));
+        let mut generator = PipelineTemplateGenerator::new(tag, Some(base_dir));
         generator.divide_and_conquer(num_nodes[num_nodes.len() - 1])?;
         Ok(generator)
     }
