@@ -6,9 +6,8 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
 homogeneous_templates = {
+    # 3 nodes
     PipelineTemplate(
-        num_nodes=3,
-        gpus_per_node=2,
         modules_per_stage=[
             [
                 "transformer.wte",
@@ -22,9 +21,8 @@ homogeneous_templates = {
     ): 3
 }
 heterogeneous_templates = {
+    # 3 nodes
     PipelineTemplate(
-        num_nodes=3,
-        gpus_per_node=2,
         modules_per_stage=[
             [
                 "transformer.wte",
@@ -36,9 +34,8 @@ heterogeneous_templates = {
             ["transformer.ln_f", "score"],
         ],
     ): 1,
+    # 2 nodes
     PipelineTemplate(
-        num_nodes=2,
-        gpus_per_node=2,
         modules_per_stage=[
             ["transformer.wte", "transformer.wpe", "transformer.drop"],
             [f"transformer.h.{i}" for i in range(0, 4)]
