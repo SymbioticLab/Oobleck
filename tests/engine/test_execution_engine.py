@@ -47,7 +47,7 @@ class TestExecutionEngineClass(MultiProcessTestCase):
 
     def get_plugin(self) -> HeterogeneousParallelPlugin:
         plugin = HeterogeneousParallelPlugin(
-            tp_size=2, microbatch_size=1, precision="fp32"
+            tp_size=2, global_batch_size=12, microbatch_size=1, precision="fp32"
         )
         return plugin
 
@@ -88,6 +88,8 @@ class TestExecutionEngineClass(MultiProcessTestCase):
         global config
         model = GPT2ForSequenceClassification(config)
 
+        dataloader = GLUEDataBuilder("gpt2", plugin).dataloader()
+
         optimizer = Adam(model.parameters())
         lr_scheduler = get_linear_schedule_with_warmup(optimizer, 0, 100)
 
@@ -97,7 +99,10 @@ class TestExecutionEngineClass(MultiProcessTestCase):
             "oobleck.engine.execution_engine.PipelineInstantiator.instantiate",
             return_value=(
                 pipeline_templates,
-                {template: 1 for template in pipeline_templates},
+                {
+                    template: 12 // sum(pipeline_templates.values())
+                    for template in pipeline_templates
+                },
             ),
         ), patch(
             "oobleck.engine.execution_engine.PipelineTemplate.generate_pipeline_templates",
@@ -105,13 +110,17 @@ class TestExecutionEngineClass(MultiProcessTestCase):
         ), patch.object(
             engine, "_init_distributed", new=self.fake_init_distributed
         ):
-            model, _, optimizer, lr_scheduler, _ = engine.prepare(
+            model, optimizer, _, dataloader, lr_scheduler = engine.prepare(
                 model=model,
                 optimizer=optimizer,
-                scheduler=lr_scheduler,
+                dataloader=dataloader,
+                lr_scheduler=lr_scheduler,
             )
 
         assert dist.is_initialized()
+        assert (
+            dataloader.batch_sampler
+        ), "HeterogeneousDataLoader.configure() is not called."
 
     @parametrize(
         "pipeline_templates",
@@ -129,6 +138,8 @@ class TestExecutionEngineClass(MultiProcessTestCase):
         global config
         model = GPT2ForSequenceClassification(config)
 
+        dataloader = GLUEDataBuilder("gpt2", plugin).dataloader()
+
         optimizer = Adam(model.parameters())
         lr_scheduler = get_linear_schedule_with_warmup(optimizer, 0, 100)
 
@@ -136,7 +147,10 @@ class TestExecutionEngineClass(MultiProcessTestCase):
             "oobleck.engine.execution_engine.PipelineInstantiator.instantiate",
             return_value=(
                 pipeline_templates,
-                {template: 1 for template in pipeline_templates},
+                {
+                    template: 12 // sum(pipeline_templates.values())
+                    for template in pipeline_templates
+                },
             ),
         ), patch(
             "oobleck.engine.execution_engine.PipelineTemplate.generate_pipeline_templates",
@@ -144,11 +158,12 @@ class TestExecutionEngineClass(MultiProcessTestCase):
         ), patch.object(
             engine, "_init_distributed", new=self.fake_init_distributed
         ):
-            model, optimizer, criterion, lr_scheduler, _ = engine.prepare(
+            model, optimizer, criterion, dataloader, lr_scheduler = engine.prepare(
                 model=model,
                 criterion=lambda outputs, inputs: outputs.loss,
+                dataloader=dataloader,
                 optimizer=optimizer,
-                scheduler=lr_scheduler,
+                lr_scheduler=lr_scheduler,
             )
 
         assert isinstance(model, HeterogeneousParallelModule)
@@ -156,7 +171,6 @@ class TestExecutionEngineClass(MultiProcessTestCase):
             optimizer, (HybridParallelAMPOptimizer, HybridParallelNaiveOptimizer)
         )
 
-        dataloader = GLUEDataBuilder("gpt2", plugin).dataloader()
         iterator = iter(dataloader)
 
         with patch.object(

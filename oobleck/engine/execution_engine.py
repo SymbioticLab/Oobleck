@@ -3,7 +3,7 @@ from typing import Any, Callable, Iterator
 import torch.distributed as dist
 import torch.nn as nn
 from colossalai.booster import Booster
-from oobleck_colossalai import HeterogeneousParallelPlugin
+from oobleck_colossalai import HeterogeneousParallelPlugin, HeterogeneousDataLoader
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler as LRScheduler
 from torch.utils.data import DataLoader
@@ -36,11 +36,11 @@ class ExecutionEngine:
     def prepare(
         self,
         model: nn.Module,
-        criterion: Callable | None = None,
-        dataloader: DataLoader | None = None,
         optimizer: Optimizer | None = None,
+        criterion: Callable | None = None,
+        dataloader: HeterogeneousDataLoader | None = None,
         lr_scheduler: LRScheduler | None = None,
-    ) -> tuple[nn.Module, Optimizer, Callable, LRScheduler, DataLoader]:
+    ) -> tuple[nn.Module, Optimizer, Callable, DataLoader, LRScheduler]:
         """Initialize pipeline templates and distributed configuration."""
 
         if self.pipeline_templates is None:

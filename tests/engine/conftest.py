@@ -7,9 +7,9 @@ from transformers import AutoTokenizer, PreTrainedTokenizer
 
 homogeneous_templates = {
     PipelineTemplate(
-        3,
-        2,
-        [
+        num_nodes=3,
+        gpus_per_node=2,
+        modules_per_stage=[
             [
                 "transformer.wte",
                 "transformer.wpe",
@@ -23,9 +23,9 @@ homogeneous_templates = {
 }
 heterogeneous_templates = {
     PipelineTemplate(
-        3,
-        2,
-        [
+        num_nodes=3,
+        gpus_per_node=2,
+        modules_per_stage=[
             [
                 "transformer.wte",
                 "transformer.wpe",
@@ -37,9 +37,9 @@ heterogeneous_templates = {
         ],
     ): 1,
     PipelineTemplate(
-        2,
-        2,
-        [
+        num_nodes=2,
+        gpus_per_node=2,
+        modules_per_stage=[
             ["transformer.wte", "transformer.wpe", "transformer.drop"],
             [f"transformer.h.{i}" for i in range(0, 4)]
             + [f"transformer.ln_f", "score"],
