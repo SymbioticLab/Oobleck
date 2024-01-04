@@ -175,15 +175,25 @@ class TestExecutionEngineClass(MultiProcessTestCase):
 
         with patch.object(
             model, "sync_dp_grads", wraps=model.sync_dp_grads
-        ) as sync_mock:
+        ) as sync_mock, patch.object(
+            plugin.schedule, "forward_step", wraps=plugin.schedule.forward_step
+        ) as forward_mock, patch.object(
+            plugin.schedule, "backward_step", wraps=plugin.schedule.backward_step
+        ) as backward_mock:
             result = engine.execute(iterator, model, criterion, optimizer)
 
-        sync_mock.assert_called_once()
+        assert sync_mock.call_count == 1
         assert (
             result["loss"] is not None
             if plugin.stage_manager.is_last_stage()
             else result["loss"] is None
         )
+
+        num_microbatches = plugin.num_microbatches[
+            plugin._pipeline_index_to_pipeline[plugin._pipeline_index]
+        ]
+        assert forward_mock.call_count == num_microbatches
+        assert backward_mock.call_count == num_microbatches
 
 
 instantiate_parametrized_tests(TestExecutionEngineClass)
