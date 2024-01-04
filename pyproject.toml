@@ -2,7 +2,7 @@
 name = "oobleck"
 description = "A framework for efficient fault tolerance in large scale distributed training with pipeline template."
 readme = "README.md"
-license = {file = "LICENSE.txt"}
+license = {file = "LICENSE"}
 requires-python = ">=3.10"
 version = "0.0.1"
 authors = [
@@ -17,11 +17,15 @@ dependencies = [
     "simple_parsing",
     "loguru",
     "fabric",
-    "oobleck-colossalai",
+    # "oobleck-colossalai",
     "grpcio",
 ]
 
 [project.optional-dependencies]
+colossalai-backend = [
+    "colossalai",
+    "xformers",
+]
 dev = [
     "torch>=2.1.0",
     "ruff",
@@ -40,7 +44,8 @@ ignore = ["E501"]
 [tool.setuptools.packages.find]
 # Pure Python packages/modules
 where = ["."]
-include = ["oobleck"]
+include = ["oobleck*"]
+exclude = ["examples", "tests"]
 
 [[tool.setuptools-rust.ext-modules]]
 target = "oobleck.planner"
@@ -48,5 +53,5 @@ path = "Cargo.toml"
 binding = "PyO3"
 
 [build-system]
-requires = ["setuptools>=63.0.0", "setuptools-rust"]
+requires = ["setuptools>=63.0.0", "wheel", "setuptools-rust"]
 build-backend = "setuptools.build_meta"

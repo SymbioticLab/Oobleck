@@ -1,7 +1,0 @@
-[submodule "oobleck/legacy/csrc/modules/json"]
-	path = oobleck/legacy/csrc/modules/json
-	url = https://github.com/nlohmann/json
-[submodule "oobleck/legacy/csrc/modules/cppcoro"]
-	path = oobleck/legacy/csrc/modules/cppcoro
-	url = https://github.com/insujang/cppcoro
-	branch = cmakeify

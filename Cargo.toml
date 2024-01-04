@@ -16,7 +16,7 @@ env_logger = "0.10"
 [lib]
 name = "planner"
 crate-type = ["cdylib"]
-path = "oobleck/rust/lib.rs"
+path = "rust/lib.rs"
 
 [build-dependencies]
 pyo3-build-config = "0.20.0"
