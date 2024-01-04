@@ -17,4 +17,4 @@ class PipelineInstantiator:
         If there are already instantiated pipelines, this method will reconfigure
         pipelines for a new distributed configuration.
         """
-        pass
+        raise NotImplementedError

@@ -32,4 +32,4 @@ class PipelineTemplate:
 
     @staticmethod
     def generate_pipeline_templates() -> list[PipelineTemplate]:
-        pass
+        raise NotImplementedError
