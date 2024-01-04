@@ -44,7 +44,9 @@ def test_error_for_too_large_num_nodes(base_dir: Path):
 
 
 def test_create_pipeline_templates(base_dir: Path):
-    template_layers: dict[int, list[list[str]]] = planner.create_pipeline_templates(
+    template_layers: dict[
+        int, planner.PipelineTemplate
+    ] = planner.create_pipeline_templates(
         model_name="gpt2", tag="test", num_nodes=[1, 2, 3, 4], oobleck_base_dir=base_dir
     )
 
@@ -53,7 +55,7 @@ def test_create_pipeline_templates(base_dir: Path):
     assert sorted(list(template_layers.keys())) == [1, 2, 3, 4]
     for _, template in template_layers.items():
         covered_layers = []
-        for stage in template:
+        for stage in template.modules_per_stage:
             for layer in stage:
                 covered_layers.append(layer)
 

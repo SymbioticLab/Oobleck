@@ -1,12 +1,9 @@
 use crate::execution_result::*;
-use crate::PlannerError;
+use crate::{PipelineTemplate, PlannerError};
 use dashmap::DashMap;
-use env_logger;
 use log;
-use pyo3::prelude::*;
 use rayon::prelude::*;
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::result::Result;
 use std::sync::Arc;
@@ -168,7 +165,7 @@ impl PipelineTemplateGenerator {
         Ok(())
     }
 
-    pub fn get_pipeline_template(&self, num_nodes: u32) -> Result<Vec<Vec<String>>, PlannerError> {
+    pub fn get_pipeline_template(&self, num_nodes: u32) -> Result<PipelineTemplate, PlannerError> {
         log::debug!(
             "get_pipeline_template({}, {}, {})",
             num_nodes,
@@ -176,41 +173,26 @@ impl PipelineTemplateGenerator {
             self.layer_execution_results.len()
         );
 
-        Ok(self
+        let result = self
             .execution_result_cache
             .get(&(num_nodes, 0, self.layer_execution_results.len()))
-            .unwrap()
+            .unwrap();
+        let result = result
             .as_ref()
-            .expect(format!("No template found for num_nodes {}", num_nodes).as_str())
-            .get_modules_per_stage(&self.layer_execution_results))
+            .expect(format!("No pipeline template for {} nodes", num_nodes).as_str());
+
+        Ok(PipelineTemplate {
+            latency: result.latency(),
+            mem_required: result.mem_required(),
+            modules_per_stage: result.get_modules_per_stage(&self.layer_execution_results),
+        })
     }
-}
-
-#[pyfunction]
-pub fn create_pipeline_templates(
-    model_name: &str,
-    tag: &str,
-    mut num_nodes: Vec<u32>,
-    oobleck_base_dir: Option<PathBuf>,
-) -> Result<HashMap<u32, Vec<Vec<String>>>, PlannerError> {
-    let _ = env_logger::try_init();
-    num_nodes.sort();
-
-    let mut generator = PipelineTemplateGenerator::new(model_name, tag, oobleck_base_dir);
-    generator.divide_and_conquer(num_nodes[num_nodes.len() - 1])?;
-
-    let mut results: HashMap<u32, Vec<Vec<String>>> = HashMap::new();
-    for num_node in num_nodes {
-        let template = generator.get_pipeline_template(num_node)?;
-        results.insert(num_node, template);
-    }
-
-    Ok(results)
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::create_pipeline_templates;
     use std::fs;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -273,7 +255,7 @@ mod test {
 
         for (_, template) in templates.iter() {
             let mut covered_layers: Vec<String> = Vec::new();
-            for stage in template.iter() {
+            for stage in template.modules_per_stage.iter() {
                 for layer in stage.iter() {
                     covered_layers.push(layer.clone());
                 }
@@ -287,9 +269,9 @@ mod test {
         let dir = prepare_profile_file(6, false);
         let template = create_pipeline_templates("gpt2", "test", vec![1], Some(dir)).unwrap();
         assert_eq!(template.len(), 1);
-        assert_eq!(template[&1].len(), 1);
+        assert_eq!(template[&1].modules_per_stage.len(), 1);
         assert_eq!(
-            template[&1][0],
+            template[&1].modules_per_stage[0],
             vec!["layer0", "layer1", "layer2", "layer3", "layer4", "layer5"]
         );
     }
@@ -300,14 +282,14 @@ mod test {
         let templates = create_pipeline_templates("gpt2", "test", vec![1, 2], Some(dir)).unwrap();
         assert_eq!(templates.len(), 2);
         assert_eq!(
-            templates[&1][0],
+            templates[&1].modules_per_stage[0],
             vec!["layer0", "layer1", "layer2", "layer3", "layer4", "layer5"]
         );
         assert_eq!(
-            templates[&2][0],
+            templates[&2].modules_per_stage[0],
             vec!["layer0", "layer1", "layer2", "layer3"]
         );
-        assert_eq!(templates[&2][1], vec!["layer4", "layer5"]);
+        assert_eq!(templates[&2].modules_per_stage[1], vec!["layer4", "layer5"]);
     }
 
     #[test]
@@ -317,19 +299,25 @@ mod test {
             create_pipeline_templates("gpt2", "test", vec![2, 3, 4], Some(dir)).unwrap();
         assert_eq!(templates.len(), 3);
         assert_eq!(
-            templates[&2][0],
+            templates[&2].modules_per_stage[0],
             vec!["layer0", "layer1", "layer2", "layer3"]
         );
-        assert_eq!(templates[&2][1], vec!["layer4", "layer5"]);
+        assert_eq!(templates[&2].modules_per_stage[1], vec!["layer4", "layer5"]);
 
-        assert_eq!(templates[&3][0], vec!["layer0", "layer1", "layer2"]);
-        assert_eq!(templates[&3][1], vec!["layer3", "layer4"]);
-        assert_eq!(templates[&3][2], vec!["layer5"]);
+        assert_eq!(
+            templates[&3].modules_per_stage[0],
+            vec!["layer0", "layer1", "layer2"]
+        );
+        assert_eq!(templates[&3].modules_per_stage[1], vec!["layer3", "layer4"]);
+        assert_eq!(templates[&3].modules_per_stage[2], vec!["layer5"]);
 
-        assert_eq!(templates[&4][0], vec!["layer0", "layer1", "layer2"]);
-        assert_eq!(templates[&4][1], vec!["layer3"]);
-        assert_eq!(templates[&4][2], vec!["layer4"]);
-        assert_eq!(templates[&4][3], vec!["layer5"]);
+        assert_eq!(
+            templates[&4].modules_per_stage[0],
+            vec!["layer0", "layer1", "layer2"]
+        );
+        assert_eq!(templates[&4].modules_per_stage[1], vec!["layer3"]);
+        assert_eq!(templates[&4].modules_per_stage[2], vec!["layer4"]);
+        assert_eq!(templates[&4].modules_per_stage[3], vec!["layer5"]);
     }
 
     #[test]
