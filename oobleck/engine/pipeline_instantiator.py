@@ -35,20 +35,29 @@ class PipelineInstantiator:
         instantiations_options = self._enumerate_instantiation_options(num_nodes)
 
         # Call self._distribute_batch for each element in instantiations_options
-        batch_distributions = {
-            option: self._distribute_batch(self.global_batch_size, option)
+        batch_distributions = [
+            self._distribute_batch(self.global_batch_size, option)
             for option in instantiations_options
-        }
+        ]
 
         # Find the second dictionary where its corresponding float is the minimum
-        optimal_distribution = min(
-            batch_distributions.keys(), key=lambda x: batch_distributions[x][0]
-        )
-        logger.debug(
-            f"Optimal batch distribution: {batch_distributions[optimal_distribution]}"
-        )
+        try:
+            optimal_distribution = min(
+                [dist for dist in batch_distributions if dist[0] is not None],
+                key=lambda x: x[0],
+            )
+        except ValueError as e:
+            raise RuntimeError(
+                f"Failed to find optimal batch distribution for {num_nodes} nodes."
+            ) from e
 
-        return (optimal_distribution, batch_distributions[optimal_distribution][1])
+        index = batch_distributions.index(optimal_distribution)
+        logger.debug(f"Optimal batch distribution: {optimal_distribution[1]}")
+
+        return (
+            instantiations_options[index],
+            optimal_distribution[1],
+        )
 
     def _enumerate_instantiation_options(
         self, num_nodes: int
@@ -78,9 +87,9 @@ class PipelineInstantiator:
             for j in range(1, num_nodes + 1):
                 # (1) in Figure: copy all dicts
                 dp[i][j] = [combo.copy() for combo in dp[i - 1][j]]
-                if self.pipeline_templates[i - 1]._num_nodes <= j:
+                if self.pipeline_templates[i - 1].num_stages <= j:
                     # (2) in Figure: copy all dicts with one pipeline_templates[i - 1] added
-                    for combo in dp[i][j - self.pipeline_templates[i - 1]._num_nodes]:
+                    for combo in dp[i][j - self.pipeline_templates[i - 1].num_stages]:
                         new_combo = combo.copy()
                         new_combo[self.pipeline_templates[i - 1]] += 1
 
@@ -88,6 +97,10 @@ class PipelineInstantiator:
                         dp[i][j].append(new_combo)
 
         logger.debug(f"Dynamic programming result: {dp[-1][-1]}")
+        if not dp[-1][-1]:
+            raise RuntimeError(
+                f"Failed to find feasible sets of pipeline templates for {num_nodes} nodes."
+            )
         return dp[-1][-1]
 
     def _distribute_batch(
@@ -134,8 +147,8 @@ class PipelineInstantiator:
         )
         for template in num_microbatches.keys():
             model += (
-                global_iteration_time
-                >= num_microbatches[template] / template.num_stages
+                global_iteration_time * template.num_stages
+                >= template.latency * num_microbatches[template]
             )
 
         # define objective function
@@ -143,9 +156,8 @@ class PipelineInstantiator:
         model.solve()
 
         if pulp.LpStatus[model.status] != "Optimal":
-            raise RuntimeError(
-                f"Failed to find optimal solution: {pulp.LpStatus[model.status]}"
-            )
+            logger.debug(f"Failed to find optimal solution for {num_templates}")
+            return (None, None)
 
         logger.debug(
             f"Optiomal batch distribution for {num_templates}: {num_microbatches}"
