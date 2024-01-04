@@ -1,1 +1,2 @@
 from oobleck.engine.execution_engine import ExecutionEngine
+from oobleck_colossalai.pipeline_template import PipelineTemplate

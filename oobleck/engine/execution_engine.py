@@ -4,13 +4,13 @@ import torch.distributed as dist
 import torch.nn as nn
 from colossalai.booster import Booster
 from oobleck_colossalai import HeterogeneousParallelPlugin, HeterogeneousDataLoader
+from oobleck_colossalai.pipeline_template import PipelineTemplate
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler as LRScheduler
 from torch.utils.data import DataLoader
 
 from oobleck.engine.configuration_engine import ConfigurationEngine
 from oobleck.engine.pipeline_instantiator import PipelineInstantiator
-from oobleck.planning.pipeline_template import PipelineTemplate
 
 
 class ExecutionEngine:
