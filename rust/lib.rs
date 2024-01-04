@@ -55,9 +55,9 @@ fn create_pipeline_templates(
         for num_node in num_nodes {
             let template = generator.get_pipeline_template(num_node).unwrap();
             let py_template = class.call1((
+                template.get_modules_per_stage(&generator.layer_execution_results),
                 template.latency(),
                 template.mem_required(),
-                template.get_modules_per_stage(&generator.layer_execution_results),
             ))?;
             results.set_item(num_node, py_template.to_object(py))?;
         }
