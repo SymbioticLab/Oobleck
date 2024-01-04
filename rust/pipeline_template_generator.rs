@@ -1,5 +1,5 @@
 use crate::execution_result::*;
-use crate::{PipelineTemplate, PlannerError};
+use crate::PlannerError;
 use dashmap::DashMap;
 use log;
 use rayon::prelude::*;
@@ -9,7 +9,7 @@ use std::result::Result;
 use std::sync::Arc;
 
 pub struct PipelineTemplateGenerator {
-    layer_execution_results: Vec<LayerExecutionResult>,
+    pub layer_execution_results: Vec<LayerExecutionResult>,
     // Key: (layer_start_index, layer_end_index)
     stage_execution_results: DashMap<(usize, usize), Arc<StageExecutionResult>>,
     // Key: (num_stages, layer_start_index, layer_end_index)
@@ -165,7 +165,10 @@ impl PipelineTemplateGenerator {
         Ok(())
     }
 
-    pub fn get_pipeline_template(&self, num_nodes: u32) -> Result<PipelineTemplate, PlannerError> {
+    pub fn get_pipeline_template(
+        &self,
+        num_nodes: u32,
+    ) -> Result<PipelineExecutionResult, PlannerError> {
         log::debug!(
             "get_pipeline_template({}, {}, {})",
             num_nodes,
@@ -173,31 +176,30 @@ impl PipelineTemplateGenerator {
             self.layer_execution_results.len()
         );
 
-        let result = self
-            .execution_result_cache
-            .get(&(num_nodes, 0, self.layer_execution_results.len()))
-            .unwrap();
-        let result = result
-            .as_ref()
-            .expect(format!("No pipeline template for {} nodes", num_nodes).as_str());
+        let result =
+            self.execution_result_cache
+                .get(&(num_nodes, 0, self.layer_execution_results.len()));
 
-        Ok(PipelineTemplate {
-            latency: result.latency(),
-            mem_required: result.mem_required(),
-            modules_per_stage: result.get_modules_per_stage(&self.layer_execution_results),
-        })
+        match result {
+            Some(result) => Ok(result.value().clone().unwrap()),
+            None => Err(PlannerError::new(
+                format!("No pipeline template for {} nodes", num_nodes).as_str(),
+            ))?,
+        }
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::create_pipeline_templates;
     use std::fs;
-    use std::path::PathBuf;
     use tempfile::TempDir;
 
-    fn prepare_profile_file(num_layers: u32, same_latency: bool) -> PathBuf {
+    fn prepare(
+        num_layers: u32,
+        same_latency: bool,
+        mut num_nodes: Vec<u32>,
+    ) -> Result<PipelineTemplateGenerator, PlannerError> {
         let model_name = "gpt2";
         let tag = "test";
         let base_dir = TempDir::new().unwrap().path().to_path_buf();
@@ -234,30 +236,34 @@ mod test {
         writer.flush().unwrap();
         drop(writer);
 
-        base_dir
+        num_nodes.sort();
+
+        let mut generator = PipelineTemplateGenerator::new(model_name, tag, Some(base_dir));
+        generator.divide_and_conquer(num_nodes[num_nodes.len() - 1])?;
+        Ok(generator)
     }
 
     #[test]
     fn test_return_no_template_for_too_large_num_nodes() {
-        let dir = prepare_profile_file(6, true);
+        let generator = prepare(6, true, vec![7]);
+        assert!(generator.is_err());
 
-        let templates = create_pipeline_templates("gpt2", "test", vec![7], Some(dir));
-        assert!(templates.is_err());
+        let generator = prepare(6, true, vec![6]);
+        assert!(generator.is_ok());
+        assert!(generator.unwrap().get_pipeline_template(7).is_err());
     }
 
     #[test]
     fn test_all_layers_covered() {
-        let dir = prepare_profile_file(6, false);
-        let templates =
-            create_pipeline_templates("gpt2", "test", vec![1, 2, 3, 4, 5, 6], Some(dir)).unwrap();
+        let generator = prepare(6, false, vec![1, 2, 3, 4, 5, 6]).unwrap();
+        let expected_layers: Vec<u32> = (0..6).map(|i| i).collect();
 
-        let expected_layers: Vec<String> = (0..6).map(|i| format!("layer{}", i)).collect();
-
-        for (_, template) in templates.iter() {
-            let mut covered_layers: Vec<String> = Vec::new();
-            for stage in template.modules_per_stage.iter() {
-                for layer in stage.iter() {
-                    covered_layers.push(layer.clone());
+        for i in 1..=6 {
+            let template = generator.get_pipeline_template(i).unwrap();
+            let mut covered_layers: Vec<u32> = Vec::new();
+            for stage in template.stages.iter() {
+                for layer in stage.layers.0..stage.layers.1 {
+                    covered_layers.push(layer);
                 }
             }
             assert_eq!(covered_layers, expected_layers);
@@ -266,64 +272,64 @@ mod test {
 
     #[test]
     fn test_divide_and_conquer_base_only() {
-        let dir = prepare_profile_file(6, false);
-        let template = create_pipeline_templates("gpt2", "test", vec![1], Some(dir)).unwrap();
-        assert_eq!(template.len(), 1);
-        assert_eq!(template[&1].modules_per_stage.len(), 1);
-        assert_eq!(
-            template[&1].modules_per_stage[0],
-            vec!["layer0", "layer1", "layer2", "layer3", "layer4", "layer5"]
-        );
+        let generator = prepare(6, false, vec![1]).unwrap();
+        let template = generator.get_pipeline_template(1).unwrap();
+
+        assert_eq!(template.stages.len(), 1);
+        assert_eq!(template.stages[0].layers, (0, 6));
     }
 
     #[test]
     fn test_divide_and_conquer_divide() {
-        let dir = prepare_profile_file(6, false);
-        let templates = create_pipeline_templates("gpt2", "test", vec![1, 2], Some(dir)).unwrap();
-        assert_eq!(templates.len(), 2);
-        assert_eq!(
-            templates[&1].modules_per_stage[0],
-            vec!["layer0", "layer1", "layer2", "layer3", "layer4", "layer5"]
-        );
-        assert_eq!(
-            templates[&2].modules_per_stage[0],
-            vec!["layer0", "layer1", "layer2", "layer3"]
-        );
-        assert_eq!(templates[&2].modules_per_stage[1], vec!["layer4", "layer5"]);
+        // Uneven distribution test
+        let generator = prepare(6, false, vec![1, 2]).unwrap();
+
+        // Template for 1 node
+        let template = generator.get_pipeline_template(1).unwrap();
+        assert_eq!(template.stages.len(), 1);
+        assert_eq!(template.stages[0].layers, (0, 6));
+
+        let template = generator.get_pipeline_template(2).unwrap();
+        assert_eq!(template.stages.len(), 2);
+        assert_eq!(template.stages[0].layers, (0, 4));
+        assert_eq!(template.stages[1].layers, (4, 6));
+
+        let generator = prepare(6, true, vec![1, 2]).unwrap();
+        let template = generator.get_pipeline_template(2).unwrap();
+        assert_eq!(template.stages.len(), 2);
+        assert_eq!(template.stages[0].layers, (0, 3));
+        assert_eq!(template.stages[1].layers, (3, 6));
     }
 
     #[test]
     fn test_divide_and_conquer_divide2() {
-        let dir = prepare_profile_file(6, false);
-        let templates =
-            create_pipeline_templates("gpt2", "test", vec![2, 3, 4], Some(dir)).unwrap();
-        assert_eq!(templates.len(), 3);
-        assert_eq!(
-            templates[&2].modules_per_stage[0],
-            vec!["layer0", "layer1", "layer2", "layer3"]
-        );
-        assert_eq!(templates[&2].modules_per_stage[1], vec!["layer4", "layer5"]);
+        let generator = prepare(6, false, vec![2, 3, 4]).unwrap();
+        let template = generator.get_pipeline_template(2).unwrap();
+        assert_eq!(template.stages.len(), 2);
+        assert_eq!(template.stages[0].layers, (0, 4));
+        assert_eq!(template.stages[1].layers, (4, 6));
 
-        assert_eq!(
-            templates[&3].modules_per_stage[0],
-            vec!["layer0", "layer1", "layer2"]
-        );
-        assert_eq!(templates[&3].modules_per_stage[1], vec!["layer3", "layer4"]);
-        assert_eq!(templates[&3].modules_per_stage[2], vec!["layer5"]);
+        let template = generator.get_pipeline_template(3).unwrap();
+        assert_eq!(template.stages.len(), 3);
+        assert_eq!(template.stages[0].layers, (0, 3));
+        assert_eq!(template.stages[1].layers, (3, 5));
+        assert_eq!(template.stages[2].layers, (5, 6));
 
-        assert_eq!(
-            templates[&4].modules_per_stage[0],
-            vec!["layer0", "layer1", "layer2"]
-        );
-        assert_eq!(templates[&4].modules_per_stage[1], vec!["layer3"]);
-        assert_eq!(templates[&4].modules_per_stage[2], vec!["layer4"]);
-        assert_eq!(templates[&4].modules_per_stage[3], vec!["layer5"]);
+        let template = generator.get_pipeline_template(4).unwrap();
+        assert_eq!(template.stages.len(), 4);
+        assert_eq!(template.stages[0].layers, (0, 3));
+        assert_eq!(template.stages[1].layers, (3, 4));
+        assert_eq!(template.stages[2].layers, (4, 5));
+        assert_eq!(template.stages[3].layers, (5, 6));
     }
 
     #[test]
     fn test_measure_time_of_large_model() {
-        let dir = prepare_profile_file(96, false);
-        let templates = create_pipeline_templates("gpt2", "test", vec![64], Some(dir)).unwrap();
-        assert_eq!(templates.len(), 1);
+        let generator = prepare(96, false, vec![64]).unwrap();
+        for i in 1..=64 {
+            let template_result = generator.get_pipeline_template(i);
+            assert!(template_result.is_ok());
+            assert_eq!(template_result.unwrap().stages.len(), i as usize);
+        }
     }
 }
