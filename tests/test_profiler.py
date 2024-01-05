@@ -1,9 +1,10 @@
-import pytest
-from oobleck.profiler import ModelProfiler
-from pathlib import Path
 import csv
+from pathlib import Path
 
+import pytest
 from transformers import AutoConfig, AutoModelForPreTraining, PreTrainedModel
+
+from oobleck.profiler import ModelProfiler
 
 
 @pytest.fixture

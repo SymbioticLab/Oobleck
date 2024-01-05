@@ -1,8 +1,10 @@
+import csv
+from pathlib import Path
+
 import pytest
 from oobleck_colossalai.pipeline_template import PipelineTemplate
+
 from oobleck import planner
-from pathlib import Path
-import csv
 
 tag = "gpt2-test"
 

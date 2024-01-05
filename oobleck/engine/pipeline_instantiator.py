@@ -1,7 +1,8 @@
-from oobleck_colossalai.pipeline_template import PipelineTemplate
-import pulp
 from collections import defaultdict
+
+import pulp
 from loguru import logger
+from oobleck_colossalai.pipeline_template import PipelineTemplate
 
 
 class PipelineInstantiator:

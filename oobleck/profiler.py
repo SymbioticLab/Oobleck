@@ -1,10 +1,10 @@
-from functools import reduce
-from pathlib import Path
 import copy
 import csv
-from dataclasses import dataclass, asdict
-from collections import defaultdict
 import functools
+from collections import defaultdict
+from dataclasses import asdict, dataclass
+from functools import reduce
+from pathlib import Path
 
 import torch
 import torch.nn as nn

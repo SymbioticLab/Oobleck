@@ -1,9 +1,7 @@
 import pytest
+from conftest import heterogeneous_templates
 
 from oobleck.engine.pipeline_instantiator import PipelineInstantiator
-from oobleck_colossalai.pipeline_template import PipelineTemplate
-
-from conftest import homogeneous_templates, heterogeneous_templates
 
 
 @pytest.mark.parametrize("num_nodes", list(range(4, 17)))
