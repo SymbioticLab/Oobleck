@@ -1,15 +1,19 @@
 from typing import Any, Callable, Iterator
 
+import math
+import torch
 import torch.distributed as dist
 import torch.nn as nn
 from colossalai.booster import Booster
 from oobleck_colossalai import HeterogeneousDataLoader, HeterogeneousParallelPlugin
 from oobleck_colossalai.pipeline_template import PipelineTemplate
+from oobleck_colossalai.module_info.auto_module import get_module_names
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler as LRScheduler
 from torch.utils.data import DataLoader
 
 from oobleck.engine.configuration_engine import ConfigurationEngine
+from oobleck.profiler import ModelProfiler
 from oobleck.engine.pipeline_instantiator import PipelineInstantiator
 from oobleck.planner import create_pipeline_templates
 
@@ -53,8 +57,30 @@ class ExecutionEngine:
         """Initialize pipeline templates and distributed configuration."""
 
         if self.pipeline_templates is None:
+            profiler = ModelProfiler(
+                self.tag, model, get_module_names(model), self.output_dir
+            )
+
+            # Check profile data exists
+            if not profiler.profile_exists():
+                inputs = torch.stack(
+                    [dataloader.dataset[i] for i in range(self.plugin.microbatch_size)]
+                )
+                profiler.profile(inputs)
+
+            # Calculate the minimum number of nodes required
+            memory = torch.cuda.get_device_properties(0).total_memory
+            min_num_nodes = max(
+                1,
+                math.ceil(profiler.mem_consumption / memory),
+            )
+            max_num_nodes = (
+                ConfigurationEngine.get_instance().configuration_world_size
+                // self.plugin.shard_config["tp_size"]
+            )
+
             self.pipeline_templates = create_pipeline_templates(
-                self.tag, [X], self.output_dir
+                self.tag, list(range(min_num_nodes, max_num_nodes)), self.output_dir
             )
 
         self._init_distributed()

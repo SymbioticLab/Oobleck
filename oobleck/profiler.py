@@ -44,10 +44,40 @@ class ModelProfiler:
         self.layers = layers
         self.profile_path = base_dir / "profiles" / f"{tag}.csv"
         self.profile_path.parent.mkdir(parents=True, exist_ok=True)
+        self.profile = self.load_profile()
+
+    def load_profile(self) -> list[LayerExecutionResult] | None:
+        """Load the profile."""
+        if not self.profile_path.exists():
+            return None
+
+        try:
+            with self.profile_path.open("r") as f:
+                reader = csv.DictReader(f)
+                return [
+                    LayerExecutionResult(
+                        layer_index=int(row["layer_index"]),
+                        layer_name=row["layer_name"],
+                        forward=float(row["forward"]),
+                        backward=float(row["backward"]),
+                        mem_required=int(row["mem_required"]),
+                    )
+                    for row in reader
+                ]
+        except (csv.Error, KeyError):
+            return None
+
+    @property
+    def mem_consumption(self) -> int:
+        """Get the overall memory consumption."""
+        if not self.profile_exists():
+            raise ValueError("Profile does not exist.")
+
+        return sum(result.mem_required for result in self.profile)
 
     def profile_exists(self) -> bool:
         """Check if the profile exists."""
-        return self.profile_path.exists()
+        return self.profile
 
     @staticmethod
     def get_module_by_name(model: nn.Module, name: str) -> nn.Module:
@@ -62,6 +92,9 @@ class ModelProfiler:
         repeat: int = 5,
     ):
         """Profile the model.
+
+        FIXME: better to spawn a process. Can we use torch.multiprocessing
+        and copy model's class name to instantiate it?
 
         Returns:
             dict[str, dict[str, float | int]]: A dictionary of layer names and their
