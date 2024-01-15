@@ -6,7 +6,7 @@ import grpc
 import pytest
 
 from oobleck.elastic import master_service_pb2_grpc
-from oobleck.elastic.run import HostInfo, MasterArgs, MasterService
+from oobleck.elastic.run import HostInfo, LaunchArgs, ScriptArgs, MasterService
 
 fake_host_info = [
     HostInfo("127.0.0.1", 2, 1234),
@@ -16,14 +16,13 @@ fake_host_info = [
 
 
 @pytest.fixture()
-def server(tmp_path: Path):
-    fake_master_args = MasterArgs(
+def server(tmp_path: Path) -> tuple[LaunchArgs, ScriptArgs, MasterService, int]:
+    fake_launch_args = LaunchArgs(
         hostfile=Path(tmp_path / "hostfile"),
-        code_path=Path(tmp_path / "testcode.py"),
         output_dir=tmp_path,
     )
 
-    fake_master_args.hostfile.write_text(
+    fake_launch_args.hostfile.write_text(
         "\n".join(
             list(
                 f"{host.ip} slots={host.slots} port={host.port}"
@@ -32,11 +31,23 @@ def server(tmp_path: Path):
         )
     )
 
-    fake_master_args.code_path.write_text("print('Hello, world!')")
+    fake_script_args = ScriptArgs(
+        training_script=Path(tmp_path / "testscript.py"),
+        training_script_args=["--foo", "bar", "--baz", "qux"],
+    )
+
+    fake_script_args.training_script.write_text(
+        "import argparse\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--foo')\n"
+        "parser.add_argument('--baz')\n"
+        "args = parser.parse_args()\n"
+        "print(f'Hello, {args.foo}, {args.baz}')\n"
+    )
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
     service = MasterService(
-        fake_master_args.code_path,
+        fake_script_args,
         fake_host_info,
         multiprocessing.get_context("spawn").Condition(),
     )
@@ -44,5 +55,5 @@ def server(tmp_path: Path):
     port = server.add_insecure_port(f"0.0.0.0:0")
     server.start()
 
-    yield fake_master_args, service, port
+    yield fake_launch_args, fake_script_args, service, port
     server.stop(grace=None)

@@ -10,7 +10,8 @@ from pytest_mock import MockerFixture
 from oobleck.elastic import master_service_pb2, master_service_pb2_grpc
 from oobleck.elastic.run import (
     HostInfo,
-    MasterArgs,
+    LaunchArgs,
+    ScriptArgs,
     MasterService,
     MultiNodeAgentRunner,
 )
@@ -21,8 +22,8 @@ def get_stub(port: int) -> master_service_pb2_grpc.OobleckMasterStub:
     return master_service_pb2_grpc.OobleckMasterStub(channel)
 
 
-def test_get_dist_info(server: tuple[MasterArgs, MasterService, int]):
-    fake_master_args, _, port = server
+def test_get_dist_info(server: tuple[LaunchArgs, ScriptArgs, MasterService, int]):
+    fake_master_args, _, _, port = server
     stub = get_stub(port)
     dist_info = stub.GetDistInfo(Empty())
 
@@ -34,22 +35,32 @@ def test_get_dist_info(server: tuple[MasterArgs, MasterService, int]):
         assert host.port == fake_host.port
 
 
-def test_get_code(server: tuple[MasterArgs, MasterService, int]):
-    fake_master_args, _, port = server
+def test_get_code(
+    server: tuple[LaunchArgs, ScriptArgs, MasterService, int], mocker: MockerFixture
+):
+    _, fake_script_args, _, port = server
     stub = get_stub(port)
-    code = pickle.loads(stub.GetCode(Empty()).code)
-    assert code == fake_master_args.code_path.read_bytes()
+    result = stub.GetCode(Empty())
+    code = pickle.loads(result.code)
+    assert code == fake_script_args.training_script.read_bytes()
+    assert result.args == fake_script_args.training_script_args
+
+    mocker.patch("sys.argv", ["fake_script.py"] + fake_script_args.training_script_args)
 
     f = StringIO()
     with redirect_stdout(f):
-        exec(code)
-    assert f.getvalue() == "Hello, world!\n"
+        ccode = compile(code, "<string>", "exec")
+        exec(ccode)
+    assert (
+        f.getvalue()
+        == f"Hello, {fake_script_args.training_script_args[1]}, {fake_script_args.training_script_args[3]}\n"
+    )
 
 
 def test_receive_reconfiguration_notification(
-    server: tuple[MasterArgs, MasterService, int]
+    server: tuple[LaunchArgs, ScriptArgs, MasterService, int]
 ):
-    _, service, port = server
+    _, _, service, port = server
 
     from queue import Queue
 
@@ -82,10 +93,10 @@ def test_receive_reconfiguration_notification(
 
 
 def test_run_agents(
-    server: tuple[MasterArgs, MasterService, int],
+    server: tuple[LaunchArgs, ScriptArgs, MasterService, int],
     mocker: MockerFixture,
 ):
-    args, _, port = server
+    args, _, _, port = server
     hosts = HostInfo.fetch_hostfile(args.hostfile)
     disconnect_condition = None
     runner = MultiNodeAgentRunner(

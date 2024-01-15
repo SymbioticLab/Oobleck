@@ -1,6 +1,7 @@
 import multiprocessing
 import os
 import pickle
+import sys
 import time
 from dataclasses import dataclass
 from multiprocessing.connection import Connection
@@ -10,8 +11,7 @@ import grpc
 import simple_parsing
 from google.protobuf.empty_pb2 import Empty
 from loguru import logger
-
-from oobleck.elastic.master_service_pb2 import DistInfo, PortInfo
+from oobleck.elastic.master_service_pb2 import CodeInfo, DistInfo, PortInfo
 from oobleck.elastic.master_service_pb2_grpc import OobleckMasterStub
 from oobleck.elastic.run import HostInfo
 from oobleck.engine.configuration_engine import ConfigurationEngine
@@ -35,6 +35,7 @@ class Worker:
         agent_index: int,
         gpu_index: int,
         code: bytes,
+        args: list[str],
     ):
         """
         Worker process main function.
@@ -51,8 +52,15 @@ class Worker:
 
         ConfigurationEngine.create(pipe, agent_index, gpu_index)
 
+        # Back up sys.argv and replace it with the given args
+        original_argv = sys.argv
+        sys.argv = ["worker.py"] + args
+
         ccode = compile(code, "<string>", "exec")
         exec(ccode)
+
+        # Restore sys.argv
+        sys.argc = original_argv
 
 
 class Agent:
@@ -71,7 +79,9 @@ class Agent:
         self.dist_info = list(
             HostInfo(host.ip, host.slots, host.port) for host in dist_info.hosts
         )
-        self.code: bytes = pickle.loads(stub.GetCode(Empty()).code)
+        training_args: CodeInfo = stub.GetCode(Empty())
+        self.code: bytes = pickle.loads(training_args.code)
+        self.script_args: list[str] = [arg for arg in training_args.args]
         self.workers: list[Worker] = []
 
     def notify_reconfiguration_to_workers(self, dist_info: list[HostInfo]):
@@ -113,6 +123,7 @@ class Agent:
                     self.agent_index,
                     gpu_index,
                     self.code,
+                    self.script_args,
                 ),
                 daemon=True,
             )

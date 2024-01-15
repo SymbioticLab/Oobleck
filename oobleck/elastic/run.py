@@ -4,19 +4,21 @@ import multiprocessing
 import pickle
 import socket
 import sys
+from argparse import REMAINDER
 from concurrent import futures
 from dataclasses import dataclass
 from multiprocessing.synchronize import Condition
 from pathlib import Path
+from typing import Any
 
 import fabric
 import grpc
-import simple_parsing
 from google.protobuf import empty_pb2
 from loguru import logger
-from paramiko import SSHException
-
 from oobleck.elastic import master_service_pb2, master_service_pb2_grpc
+from paramiko import SSHException
+from simple_parsing import ArgumentParser
+from simple_parsing.helpers import field
 
 """
 Oobleck master process code.
@@ -28,6 +30,22 @@ watches disconnection evernts from agents.
 Once an agent is disconnected, the master process will
 broadcast `reconfigure` message to all live agents.
 """
+
+
+@dataclass
+class LaunchArgs:
+    # Path to the hostfile
+    hostfile: Path
+    # Port for master gRPC service
+    master_service_port: int = 0
+    # Directory to store agent logs
+    output_dir: Path = Path("/tmp/oobleck")
+
+
+@dataclass
+class ScriptArgs:
+    training_script: Path = field(positional=True)
+    training_script_args: list[str] = field(positional=True, nargs=REMAINDER)
 
 
 @dataclass
@@ -171,11 +189,12 @@ class MasterService(master_service_pb2_grpc.OobleckMasterServicer):
 
     def __init__(
         self,
-        code_path: Path,
+        script_args: ScriptArgs,
         hostinfo: list[HostInfo],
         disconnect_condition: Condition,
     ):
-        self.code = pickle.dumps(code_path.read_bytes())
+        self.script_args = script_args
+        self.code = pickle.dumps(script_args.training_script.read_bytes())
         self.hostinfo = hostinfo
         self.disconnect_condition = disconnect_condition
         self.clients = []
@@ -200,7 +219,9 @@ class MasterService(master_service_pb2_grpc.OobleckMasterServicer):
         request: master_service_pb2.CodeInfo,
         context: grpc.RpcContext,
     ) -> master_service_pb2.CodeInfo:
-        return master_service_pb2.CodeInfo(code=self.code)
+        return master_service_pb2.CodeInfo(
+            code=self.code, args=self.script_args.training_script_args
+        )
 
     def SetMasterRankPort(
         self,
@@ -237,31 +258,34 @@ class MasterService(master_service_pb2_grpc.OobleckMasterServicer):
             )
 
 
-@dataclass
-class MasterArgs:
-    # Path to the hostfile
-    hostfile: Path
-    # Path to user training code
-    code_path: Path
-    # Port for master gRPC service
-    master_service_port: int = 0
-    # Directory to store agent logs
-    output_dir: Path = Path("/tmp/oobleck")
-
-
 def serve():
-    args: MasterArgs = simple_parsing.parse(MasterArgs, dest="args")
-    hostinfo = HostInfo.fetch_hostfile(args.hostfile)
+    parser = ArgumentParser()
+    parser.add_arguments(LaunchArgs, dest="launch")
 
-    disconnect_condition = multiprocessing.get_context("spawn").Condition()
+    # positional arguments
+    parser.add_argument(
+        "training_script",
+        type=Path,
+        help="Full path to the training script to be launched in parallel, "
+        "followed by all the arguments for the training script.",
+    )
+    parser.add_argument("training_script_args", nargs=REMAINDER)
+
+    args = parser.parse_args()
+    launch_args: LaunchArgs = args.launch
+    script_args = ScriptArgs(args.training_script, args.training_script_args)
+    hostinfo = HostInfo.fetch_hostfile(launch_args.hostfile)
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=None))
-    service = MasterService(args.code_path, hostinfo, disconnect_condition)
+    disconnect_condition = multiprocessing.get_context("spawn").Condition()
+    service = MasterService(script_args, hostinfo, disconnect_condition)
     master_service_pb2_grpc.add_OobleckMasterServicer_to_server(service, server)
-    port = server.add_insecure_port(f"0.0.0.0:{args.master_service_port}")
+    port = server.add_insecure_port(f"0.0.0.0:{launch_args.master_service_port}")
     server.start()
 
-    runner = MultiNodeAgentRunner(disconnect_condition, hostinfo, port, args.output_dir)
+    runner = MultiNodeAgentRunner(
+        disconnect_condition, hostinfo, port, launch_args.output_dir
+    )
     runner.run()
     server.wait_for_termination()
 

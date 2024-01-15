@@ -21,6 +21,7 @@ message DistInfo {
 
 message CodeInfo {
     bytes code = 1;
+    repeated string args = 2;
 }
 
 message PortInfo {

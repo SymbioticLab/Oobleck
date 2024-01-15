@@ -1,9 +1,5 @@
 from oobleck import ExecutionEngine
-from oobleck_colossalai import (
-    HeterogeneousParallelModule,
-    HeterogeneousParallelPlugin,
-    PipelineTemplate,
-)
+from oobleck_colossalai import HeterogeneousParallelPlugin
 
 from tqdm import tqdm
 
