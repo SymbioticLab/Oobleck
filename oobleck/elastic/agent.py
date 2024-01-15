@@ -57,10 +57,14 @@ class Worker:
         original_argv = sys.argv.copy()
         sys.argv = [script_path.name] + script_args
 
+        script_directory = str(script_path.parent)
+        sys.path.insert(0, script_directory)
+
         runpy.run_path(script_path, run_name="__main__")
 
         # Restore sys.argv
         sys.argv = original_argv
+        sys.path.remove(script_directory)
 
 
 class Agent:
