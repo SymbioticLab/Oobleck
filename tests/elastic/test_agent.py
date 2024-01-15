@@ -4,10 +4,9 @@ from unittest.mock import patch
 
 import grpc
 import pytest
-
 from oobleck.elastic.agent import Agent, Worker
 from oobleck.elastic.master_service_pb2_grpc import OobleckMasterStub
-from oobleck.elastic.run import HostInfo, LaunchArgs, ScriptArgs, MasterService
+from oobleck.elastic.run import HostInfo, LaunchArgs, MasterService, ScriptArgs
 from oobleck.engine.configuration_engine import ConfigurationEngine
 
 
@@ -63,7 +62,7 @@ def test_worker_main_init_configuration_engine(
     server: tuple[LaunchArgs, ScriptArgs, MasterService, int],
     gpu_index: int,
 ):
-    master_args, _, _, _ = server
+    master_args, script_args, _, _ = server
 
     pipe, child_pipe = multiprocessing.Pipe()
     hosts = HostInfo.fetch_hostfile(master_args.hostfile)
@@ -74,10 +73,18 @@ def test_worker_main_init_configuration_engine(
     # it must raise IndexError when GPU index >= 2.
     if gpu_index >= 2:
         with pytest.raises(IndexError):
-            Worker.worker_main(child_pipe, 0, gpu_index, b"", [])
+            Worker.worker_main(
+                child_pipe,
+                0,
+                gpu_index,
+                script_args.training_script,
+                script_args.training_script_args,
+            )
         return
 
-    Worker.worker_main(child_pipe, 0, 1, b"", [])
+    Worker.worker_main(
+        child_pipe, 0, 1, script_args.training_script, script_args.training_script_args
+    )
 
     assert ConfigurationEngine._instance is not None
     instance = ConfigurationEngine.get_instance()

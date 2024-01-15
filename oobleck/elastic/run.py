@@ -1,16 +1,13 @@
 from __future__ import annotations
 
 import multiprocessing
-import pickle
 import socket
 import sys
 from argparse import REMAINDER
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from multiprocessing.synchronize import Condition
 from pathlib import Path
-from typing import Any
-
 
 import fabric
 import grpc
@@ -40,7 +37,7 @@ class LaunchArgs:
     # Port for master gRPC service
     master_service_port: int = 0
     # Directory to store agent logs
-    output_dir: Path = Path("/tmp/oobleck")
+    output_dir: Path | None = None
 
 
 @dataclass
@@ -141,74 +138,44 @@ class MultiNodeAgentRunner:
 
         try:
             with fabric.Connection(host.ip, port=host.port, connect_timeout=30) as conn:
-                logger.debug(f"Connected to {host.ip}:{host.port}")
-
-                cmd = "python -m oobleck.elastic.agent "
+                cmd = f"{sys.executable} -m oobleck.elastic.agent "
                 cmd += f"--master_ip {my_ip} --master_port {master_service_port} "
                 cmd += f"--agent_index {agent_index}"
 
-                with output.open(
-                    "w"
-                ) if output is not None else sys.stdout as out_stream:
-                    conn.run(
-                        cmd, hide=True, out_stream=out_stream, err_stream=out_stream
-                    )
+                logger.debug(f"Connected to {host.ip}:{host.port}. Executing: {cmd}")
+
+                out_stream = output.open("w") if output is not None else sys.stdout
+                conn.run(cmd, hide=True, out_stream=out_stream, err_stream=out_stream)
+
+                if output is not None:
+                    out_stream.close()
         except SSHException as e:
             # Notify conditional variable to notify agent disconnection
             # to all agents.
             logger.warning(f"SSH disconnected: {e}")
             disconnect_condition.notify_all()
 
+            print("Asdadas")
+
     def run(self):
         """
         Spawn multiple processes to run agents on multiple hosts.
         Each process accesses a host via SSH and runs the agent.
         """
-        processes = []
         context = multiprocessing.get_context("spawn")
         for agent_index, host in enumerate(self.hosts):
-            logger.debug(f"Spawning agent {agent_index} process...")
-            output = (
-                self.output_dir / f"agent-{agent_index}.log"
-                if self.output_dir is not None
-                else None
-            )
-            process = context.Process(
+            context.Process(
                 target=self.run_on_nodes,
                 args=(
                     agent_index,
                     self.disconnect_condition,
                     host,
                     self.master_service_port,
-                    output,
+                    self.output_dir / f"agent-{agent_index}.log"
+                    if self.output_dir is not None
+                    else None,
                 ),
-                daemon=True,
-            )
-            process.start()
-            processes.append(process)
-
-        # with ProcessPoolExecutor(
-        #     mp_context=multiprocessing.get_context("spawn")
-        # ) as pool:
-        #     for agent_index, host in enumerate(self.hosts):
-        #         logger.debug(f"Spawning agent {agent_index} process...")
-        #         output = (
-        #             self.output_dir / f"agent-{agent_index}.log"
-        #             if self.output_dir is not None
-        #             else None
-        #         )
-        #         futures.append(
-        #             pool.submit(
-        #                 self.run_on_nodes,
-        #                 agent_index,
-        #                 self.disconnect_condition,
-        #                 host,
-        #                 self.master_service_port,
-        #                 output,
-        #             )
-        #         )
-
-        #     pool.shutdown(wait=True)
+            ).start()
 
 
 class MasterService(master_service_pb2_grpc.OobleckMasterServicer):
@@ -229,7 +196,6 @@ class MasterService(master_service_pb2_grpc.OobleckMasterServicer):
         disconnect_condition: Condition,
     ):
         self.script_args = script_args
-        self.code = pickle.dumps(script_args.training_script.read_bytes())
         self.hostinfo = hostinfo
         self.disconnect_condition = disconnect_condition
         self.clients = []
@@ -255,7 +221,8 @@ class MasterService(master_service_pb2_grpc.OobleckMasterServicer):
         context: grpc.RpcContext,
     ) -> master_service_pb2.CodeInfo:
         return master_service_pb2.CodeInfo(
-            code=self.code, args=self.script_args.training_script_args
+            path=self.script_args.training_script.absolute().as_posix(),
+            args=self.script_args.training_script_args,
         )
 
     def SetMasterRankPort(

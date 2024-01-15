@@ -19,30 +19,21 @@ class HostInfo(_message.Message):
     ip: str
     slots: int
     port: int
-    def __init__(
-        self,
-        ip: _Optional[str] = ...,
-        slots: _Optional[int] = ...,
-        port: _Optional[int] = ...,
-    ) -> None: ...
+    def __init__(self, ip: _Optional[str] = ..., slots: _Optional[int] = ..., port: _Optional[int] = ...) -> None: ...
 
 class DistInfo(_message.Message):
     __slots__ = ("hosts",)
     HOSTS_FIELD_NUMBER: _ClassVar[int]
     hosts: _containers.RepeatedCompositeFieldContainer[HostInfo]
-    def __init__(
-        self, hosts: _Optional[_Iterable[_Union[HostInfo, _Mapping]]] = ...
-    ) -> None: ...
+    def __init__(self, hosts: _Optional[_Iterable[_Union[HostInfo, _Mapping]]] = ...) -> None: ...
 
 class CodeInfo(_message.Message):
-    __slots__ = ("code", "args")
-    CODE_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ("path", "args")
+    PATH_FIELD_NUMBER: _ClassVar[int]
     ARGS_FIELD_NUMBER: _ClassVar[int]
-    code: bytes
+    path: str
     args: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(
-        self, code: _Optional[bytes] = ..., args: _Optional[_Iterable[str]] = ...
-    ) -> None: ...
+    def __init__(self, path: _Optional[str] = ..., args: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class PortInfo(_message.Message):
     __slots__ = ("port",)

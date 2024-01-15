@@ -1,11 +1,12 @@
 import multiprocessing
 import os
-import pickle
+import runpy
 import sys
 import time
 from dataclasses import dataclass
 from multiprocessing.connection import Connection
 from multiprocessing.context import SpawnContext, SpawnProcess
+from pathlib import Path
 
 import grpc
 import simple_parsing
@@ -34,8 +35,8 @@ class Worker:
         pipe: Connection,
         agent_index: int,
         gpu_index: int,
-        code: bytes,
-        args: list[str],
+        script_path: Path,
+        script_args: list[str],
     ):
         """
         Worker process main function.
@@ -53,14 +54,13 @@ class Worker:
         ConfigurationEngine.create(pipe, agent_index, gpu_index)
 
         # Back up sys.argv and replace it with the given args
-        original_argv = sys.argv
-        sys.argv = ["worker.py"] + args
+        original_argv = sys.argv.copy()
+        sys.argv = [script_path.name] + script_args
 
-        ccode = compile(code, "<string>", "exec")
-        exec(ccode)
+        runpy.run_path(script_path, run_name="__main__")
 
         # Restore sys.argv
-        sys.argc = original_argv
+        sys.argv = original_argv
 
 
 class Agent:
@@ -80,7 +80,7 @@ class Agent:
             HostInfo(host.ip, host.slots, host.port) for host in dist_info.hosts
         )
         training_args: CodeInfo = stub.GetCode(Empty())
-        self.code: bytes = pickle.loads(training_args.code)
+        self.script: Path = Path(training_args.path)
         self.script_args: list[str] = [arg for arg in training_args.args]
         self.workers: list[Worker] = []
 
@@ -122,7 +122,7 @@ class Agent:
                     child_pipe,
                     self.agent_index,
                     gpu_index,
-                    self.code,
+                    self.script,
                     self.script_args,
                 ),
                 daemon=True,
@@ -162,7 +162,7 @@ if __name__ == "__main__":
     )
 
     # Connect to the master
-    channel = grpc.insecure_channel(f"{args.agent.master_ip}:{args.agent.master_port}")
+    channel = grpc.insecure_channel(f"{args.master_ip}:{args.master_port}")
     stub = OobleckMasterStub(channel)
 
     agent = Agent(args.agent_index, stub)

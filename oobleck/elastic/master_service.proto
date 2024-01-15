@@ -20,7 +20,7 @@ message DistInfo {
 }
 
 message CodeInfo {
-    bytes code = 1;
+    string path = 1;
     repeated string args = 2;
 }
 

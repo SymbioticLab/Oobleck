@@ -1,20 +1,20 @@
-import pickle
+import runpy
 import threading
 from contextlib import redirect_stdout
 from io import StringIO
+from pathlib import Path
 
 import grpc
 from google.protobuf.empty_pb2 import Empty
-from pytest_mock import MockerFixture
-
 from oobleck.elastic import master_service_pb2, master_service_pb2_grpc
 from oobleck.elastic.run import (
     HostInfo,
     LaunchArgs,
-    ScriptArgs,
     MasterService,
     MultiNodeAgentRunner,
+    ScriptArgs,
 )
+from pytest_mock import MockerFixture
 
 
 def get_stub(port: int) -> master_service_pb2_grpc.OobleckMasterStub:
@@ -41,16 +41,14 @@ def test_get_code(
     _, fake_script_args, _, port = server
     stub = get_stub(port)
     result = stub.GetCode(Empty())
-    code = pickle.loads(result.code)
-    assert code == fake_script_args.training_script.read_bytes()
+    assert Path(result.path) == fake_script_args.training_script
     assert result.args == fake_script_args.training_script_args
 
     mocker.patch("sys.argv", ["fake_script.py"] + fake_script_args.training_script_args)
 
     f = StringIO()
     with redirect_stdout(f):
-        ccode = compile(code, "<string>", "exec")
-        exec(ccode)
+        runpy.run_path(result.path, run_name="__main__")
     assert (
         f.getvalue()
         == f"Hello, {fake_script_args.training_script_args[1]}, {fake_script_args.training_script_args[3]}\n"
@@ -99,27 +97,28 @@ def test_run_agents(
     args, _, _, port = server
     hosts = HostInfo.fetch_hostfile(args.hostfile)
     disconnect_condition = None
+
+    mock_context = mocker.Mock()
+    mock_process = mocker.Mock()
+    mock_context.Process.return_value = mock_process
+    mocker.patch("multiprocessing.get_context", return_value=mock_context)
+
     runner = MultiNodeAgentRunner(
         disconnect_condition=disconnect_condition,
         hosts=hosts,
         master_service_port=port,
         output_dir=args.output_dir,
     )
-
-    submit_mock = mocker.patch(
-        "concurrent.futures.ProcessPoolExecutor.submit",
-        return_value=None,
-    )
     runner.run()
 
-    assert submit_mock.call_count == len(hosts)
+    assert mock_process.start.call_count == len(hosts)
     for agent_index, (call_args, host) in enumerate(
-        zip(submit_mock.call_args_list, hosts)
+        zip(mock_process.call_args_list, hosts)
     ):
         call_args = call_args[0]
         agent_output_dir = args.output_dir / f"agent-{agent_index}.log"
         assert call_args == (
-            runner.run_on_host,
+            runner.run_on_nodes,
             agent_index,
             disconnect_condition,
             host,
