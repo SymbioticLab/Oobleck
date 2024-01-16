@@ -10,8 +10,10 @@ from pathlib import Path
 
 import grpc
 import simple_parsing
+import torch
 from google.protobuf.empty_pb2 import Empty
 from loguru import logger
+
 from oobleck.elastic.master_service_pb2 import CodeInfo, DistInfo, PortInfo
 from oobleck.elastic.master_service_pb2_grpc import OobleckMasterStub
 from oobleck.elastic.run import HostInfo
@@ -23,6 +25,8 @@ class OobleckAgentArguments:
     master_ip: str
     master_port: int
     agent_index: int
+    tag: str
+    base_dir: Path
 
 
 @dataclass
@@ -35,6 +39,8 @@ class Worker:
         pipe: Connection,
         agent_index: int,
         gpu_index: int,
+        tag: str,
+        base_dir: Path,
         script_path: Path,
         script_args: list[str],
     ):
@@ -44,14 +50,16 @@ class Worker:
         It creates ConfigurationEngine that will internally be used in
         ExecutionEngine, and execute the given code.
         """
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
+        assert (
+            torch.cuda.device_count() == 1
+        ), "CUDA_VISIBLE_DEVICES must be set to a single GPU."
 
         assert ConfigurationEngine._instance is None, (
             "ConfigurationEngine must not be initialized before "
             "worker_main() is called."
         )
 
-        ConfigurationEngine.create(pipe, agent_index, gpu_index)
+        ConfigurationEngine.create(pipe, agent_index, gpu_index, tag, base_dir)
 
         # Back up sys.argv and replace it with the given args
         original_argv = sys.argv.copy()
@@ -74,8 +82,16 @@ class Agent:
     worker processes in the node.
     """
 
-    def __init__(self, agent_index: int, stub: OobleckMasterStub):
+    def __init__(
+        self,
+        agent_index: int,
+        job_tag: str,
+        base_dir: Path,
+        stub: OobleckMasterStub,
+    ):
         self.agent_index = agent_index
+        self.tag = job_tag
+        self.base_dir = base_dir
         self.stub = stub
 
         # Get distributed information and code from the master
@@ -115,17 +131,22 @@ class Agent:
             (self.agent_index + 1) * tensor_parallel_size,
         )
 
+        env_backup = os.environ.copy()
+
         for gpu_index, rank in enumerate(ranks):
             logger.info(f"Launching worker {rank} (GPU: {gpu_index})...")
 
             pipe, child_pipe = ctx.Pipe()
 
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
             process: SpawnProcess = ctx.Process(
                 target=Worker.worker_main,
                 args=(
                     child_pipe,
                     self.agent_index,
                     gpu_index,
+                    self.tag,
+                    self.base_dir,
                     self.script,
                     self.script_args,
                 ),
@@ -135,9 +156,13 @@ class Agent:
             self.workers.append(Worker(pipe, process))
             pipe.send(self.dist_info)
 
+        os.environ = env_backup
+
         # If this is the first agent, it should forward the master rank port
         if self.agent_index == 0:
-            port: int = pipe.recv()
+            logger.debug("Waiting for rank 0 port...")
+            port: int = self.workers[0].pipe.recv()
+            logger.debug(f"Received rank 0 port: {port}. Sending it to master.")
             self.stub.SetMasterRankPort(PortInfo(port=port))
 
         # Forward master port to all workers.
@@ -159,6 +184,12 @@ class Agent:
         for worker in self.workers:
             worker.pipe.send(port)
 
+    def watch_worker_exit(self):
+        """Watch worker exit and restart it.
+        TODO: It must detect ANY worker exit, not just the first one."""
+        for worker in self.workers:
+            worker.process.join()
+
 
 if __name__ == "__main__":
     args: OobleckAgentArguments = simple_parsing.parse(
@@ -169,5 +200,6 @@ if __name__ == "__main__":
     channel = grpc.insecure_channel(f"{args.master_ip}:{args.master_port}")
     stub = OobleckMasterStub(channel)
 
-    agent = Agent(args.agent_index, stub)
+    agent = Agent(args.agent_index, args.tag, args.base_dir, stub)
     agent.launch_workers()
+    agent.watch_worker_exit()

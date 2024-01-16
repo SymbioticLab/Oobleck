@@ -1,9 +1,11 @@
 import multiprocessing
 from multiprocessing.connection import Connection
+from pathlib import Path
 from unittest.mock import patch
 
 import grpc
 import pytest
+
 from oobleck.elastic.agent import Agent, Worker
 from oobleck.elastic.master_service_pb2_grpc import OobleckMasterStub
 from oobleck.elastic.run import HostInfo, LaunchArgs, MasterService, ScriptArgs
@@ -17,7 +19,13 @@ def reset_configuration_engine():
 
 
 def worker_main_forward_master_port(
-    pipe: Connection, agent_index: int, gpu_index: int, code: bytes, args: list[str]
+    pipe: Connection,
+    agent_index: int,
+    gpu_index: int,
+    tag: str,
+    base_dir: Path,
+    code: bytes,
+    args: list[str],
 ):
     if agent_index == 0:
         pipe.send(4321)
@@ -35,10 +43,10 @@ def worker_main_forward_master_port(
 def test_agent_forward_master_port(
     server: tuple[LaunchArgs, ScriptArgs, MasterService, int]
 ):
-    _, _, _, port = server
+    args, _, _, port = server
     channel = grpc.insecure_channel(f"localhost:{port}")
-    agent0 = Agent(0, OobleckMasterStub(channel))
-    agent1 = Agent(1, OobleckMasterStub(channel))
+    agent0 = Agent(0, args.tag, args.base_dir, OobleckMasterStub(channel))
+    agent1 = Agent(1, args.tag, args.base_dir, OobleckMasterStub(channel))
 
     with patch(
         "oobleck.elastic.agent.Worker.worker_main",
@@ -77,13 +85,21 @@ def test_worker_main_init_configuration_engine(
                 child_pipe,
                 0,
                 gpu_index,
+                master_args.tag,
+                master_args.base_dir,
                 script_args.training_script,
                 script_args.training_script_args,
             )
         return
 
     Worker.worker_main(
-        child_pipe, 0, 1, script_args.training_script, script_args.training_script_args
+        child_pipe,
+        0,
+        1,
+        master_args.tag,
+        master_args.base_dir,
+        script_args.training_script,
+        script_args.training_script_args,
     )
 
     assert ConfigurationEngine._instance is not None

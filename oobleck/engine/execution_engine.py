@@ -1,21 +1,21 @@
+import math
 from typing import Any, Callable, Iterator
 
-import math
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from colossalai.booster import Booster
+from loguru import logger
 from oobleck_colossalai import HeterogeneousDataLoader, HeterogeneousParallelPlugin
 from oobleck_colossalai.pipeline_template import PipelineTemplate
-from oobleck_colossalai.module_info.auto_module import get_module_names
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler as LRScheduler
 from torch.utils.data import DataLoader
 
 from oobleck.engine.configuration_engine import ConfigurationEngine
-from oobleck.profiler import ModelProfiler
 from oobleck.engine.pipeline_instantiator import PipelineInstantiator
 from oobleck.planner import create_pipeline_templates
+from oobleck.profiler import ModelProfiler
 
 
 class ExecutionEngine:
@@ -24,8 +24,6 @@ class ExecutionEngine:
     def __init__(
         self,
         plugin: HeterogeneousParallelPlugin,
-        tag: str,
-        output_dir: str,
         **booster_kwargs,
     ):
         assert (
@@ -33,8 +31,10 @@ class ExecutionEngine:
         ), "Distributed environment must not be initialized."
 
         self.plugin = plugin
-        self.tag = tag
-        self.output_dir = output_dir
+
+        configuration_engine = ConfigurationEngine.get_instance()
+        self.tag = configuration_engine.tag
+        self.base_dir = configuration_engine.base_dir
         self.booster = Booster(plugin=plugin, **booster_kwargs)
 
         self.pipeline_templates: list[PipelineTemplate] | None = None
@@ -56,17 +56,30 @@ class ExecutionEngine:
     ) -> tuple[nn.Module, Optimizer, Callable, DataLoader, LRScheduler]:
         """Initialize pipeline templates and distributed configuration."""
 
+        configuration_engine = ConfigurationEngine.get_instance()
+
         if self.pipeline_templates is None:
+            logger.debug("Creating pipeline templates...")
             profiler = ModelProfiler(
-                self.tag, model, get_module_names(model), self.output_dir
+                self.tag,
+                model.__class__.__name__,
+                model.config,
+                self.plugin.microbatch_size,
+                self.base_dir,
             )
 
             # Check profile data exists
             if not profiler.profile_exists():
-                inputs = torch.stack(
-                    [dataloader.dataset[i] for i in range(self.plugin.microbatch_size)]
+                logger.debug("Profile does not exist. Start profiling.")
+                profile_dataloder = DataLoader(
+                    dataloader.dataset, batch_size=self.plugin.microbatch_size
                 )
-                profiler.profile(inputs)
+                inputs = next(iter(profile_dataloder))
+                profiler.profile(
+                    configuration_engine.local_rank,
+                    self.plugin.shard_config["tp_size"],
+                    inputs,
+                )
 
             # Calculate the minimum number of nodes required
             memory = torch.cuda.get_device_properties(0).total_memory
@@ -75,20 +88,32 @@ class ExecutionEngine:
                 math.ceil(profiler.mem_consumption / memory),
             )
             max_num_nodes = (
-                ConfigurationEngine.get_instance().configuration_world_size
+                configuration_engine.configuration_world_size
                 // self.plugin.shard_config["tp_size"]
             )
 
             self.pipeline_templates = create_pipeline_templates(
-                self.tag, list(range(min_num_nodes, max_num_nodes)), self.output_dir
+                self.plugin.microbatch_size,
+                list(range(min_num_nodes, max_num_nodes)) + [max_num_nodes],
+                self.base_dir / self.tag / "profile",
             )
+
+            logger.debug(f"Pipelines: {self.pipeline_templates}")
 
         self._init_distributed()
 
-        pipeline_instantiator = PipelineInstantiator(self.pipeline_templates)
-        num_instances, num_microbatches = pipeline_instantiator.instantiate(
-            dist.get_world_size()
+        pipeline_instantiator = PipelineInstantiator(
+            [
+                self.pipeline_templates[num_nodes]
+                for num_nodes in sorted(self.pipeline_templates.keys())
+            ],
+            self.plugin.global_batch_size,
         )
+        num_instances, num_microbatches = pipeline_instantiator.instantiate(
+            len(configuration_engine.dist_info)
+        )
+        logger.debug(f"Pipeline instances: {num_instances}")
+        logger.debug(f"Microbatches: {num_microbatches}")
         self.plugin.set_pipeline_templates(num_instances, num_microbatches)
         return self.booster.boost(model, optimizer, criterion, dataloader, lr_scheduler)
 
@@ -112,12 +137,14 @@ class ExecutionEngine:
                 is_master=True,
                 wait_for_workers=False,
             )
+            logger.debug(f"torch rank 0 port: {store.port}")
             configuration_engine.send_distributed_port(store.port)
             # this distributed port is broadcasted.
             # For master it is useless, so just discard it.
             configuration_engine.receive_distributed_port()
         else:
             port = configuration_engine.receive_distributed_port()
+            logger.debug(f"Received torch rank 0 port: {port}")
             store = dist.TCPStore(
                 host_name=configuration_engine.dist_info[0].ip,
                 port=port,
@@ -125,11 +152,19 @@ class ExecutionEngine:
                 is_master=False,
                 wait_for_workers=False,
             )
+        logger.debug(
+            "Initializing torch.distributed. "
+            f"rank: {configuration_engine.rank}, world size: {configuration_engine.configuration_world_size}"
+        )
+
         dist.init_process_group(
+            backend="nccl",
             store=store,
             rank=configuration_engine.rank,
             world_size=configuration_engine.configuration_world_size,
         )
+
+        logger.debug("Distributed environment initialized.")
 
         assert dist.is_initialized(), "Distributed environment is not initialized."
 

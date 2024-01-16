@@ -17,10 +17,13 @@ pub struct PipelineTemplateGenerator {
 }
 
 impl PipelineTemplateGenerator {
-    pub fn new(tag: &str, job_dir: Option<PathBuf>) -> Self {
+    pub fn new(microbatch_size: u32, job_profile_dir: PathBuf) -> Self {
         PipelineTemplateGenerator {
-            layer_execution_results: LayerExecutionResult::get_profile_results(tag, job_dir)
-                .unwrap(),
+            layer_execution_results: LayerExecutionResult::get_profile_results(
+                microbatch_size,
+                job_profile_dir,
+            )
+            .unwrap(),
             stage_execution_results: DashMap::new(),
             execution_result_cache: DashMap::new(),
         }
@@ -198,11 +201,11 @@ mod test {
     ) -> Result<PipelineTemplateGenerator, PlannerError> {
         let tag = "gpt2-test";
         let base_dir = TempDir::new().unwrap().path().to_path_buf();
-        let path = base_dir.join("profiles").join(tag.to_string() + ".csv");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let _ = fs::remove_file(&path);
+        let path = base_dir.join(tag).join("profile");
+        let _ = fs::remove_dir_all(path.clone());
+        fs::create_dir_all(path.clone()).unwrap();
 
-        let mut writer = csv::Writer::from_path(path).unwrap();
+        let mut writer = csv::Writer::from_path(path.join("mb_1.csv")).unwrap();
         for i in 0..num_layers {
             writer
                 .serialize(LayerExecutionResult::new(
@@ -231,7 +234,7 @@ mod test {
 
         num_nodes.sort();
 
-        let mut generator = PipelineTemplateGenerator::new(tag, Some(base_dir));
+        let mut generator = PipelineTemplateGenerator::new(1, path);
         generator.divide_and_conquer(num_nodes[num_nodes.len() - 1])?;
         Ok(generator)
     }

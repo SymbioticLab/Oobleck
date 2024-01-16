@@ -4,6 +4,7 @@ from pathlib import Path
 
 import grpc
 import pytest
+
 from oobleck.elastic import master_service_pb2_grpc
 from oobleck.elastic.run import HostInfo, LaunchArgs, MasterService, ScriptArgs
 
@@ -18,7 +19,8 @@ fake_host_info = [
 def server(tmp_path: Path) -> tuple[LaunchArgs, ScriptArgs, MasterService, int]:
     fake_launch_args = LaunchArgs(
         hostfile=Path(tmp_path / "hostfile"),
-        output_dir=tmp_path,
+        tag="test-gpt2",
+        base_dir=tmp_path,
     )
 
     fake_launch_args.hostfile.write_text(

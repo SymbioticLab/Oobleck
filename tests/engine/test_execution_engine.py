@@ -1,13 +1,20 @@
 import multiprocessing
+import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-import pytest
 import torch.distributed as dist
 from colossalai.booster.plugin.hybrid_parallel_plugin import (
     HybridParallelAMPOptimizer,
     HybridParallelNaiveOptimizer,
 )
-from conftest import GLUEDataBuilder, heterogeneous_templates, homogeneous_templates
+from conftest import (
+    GLUEDataBuilder,
+    heterogeneous_templates,
+    homogeneous_templates,
+    init_profile_data,
+)
 from oobleck_colossalai import (
     HeterogeneousParallelModule,
     HeterogeneousParallelPlugin,
@@ -35,7 +42,10 @@ config.num_hidden_layers = 4
 
 
 class TestExecutionEngineClass(MultiProcessTestCase):
-    def init_configuration_engine(self):
+    tag: str = "test-gpt2"
+    microbatch_size: int = 1
+
+    def init_configuration_engine(self, temp_dir: Path):
         pipe, child_pipe = multiprocessing.Pipe()
         # dist info
         pipe.send([HostInfo("127.0.0.1", 2, 1234 + i) for i in range(9)])
@@ -43,11 +53,16 @@ class TestExecutionEngineClass(MultiProcessTestCase):
         pipe.send(1234)
         self.pipe = pipe
 
-        ConfigurationEngine.create(child_pipe, self.rank // 2, self.rank % 2)
+        ConfigurationEngine.create(
+            child_pipe, self.rank // 2, self.rank % 2, self.tag, temp_dir
+        )
 
     def get_plugin(self) -> HeterogeneousParallelPlugin:
         plugin = HeterogeneousParallelPlugin(
-            tp_size=2, global_batch_size=12, microbatch_size=1, precision="fp32"
+            tp_size=2,
+            global_batch_size=12,
+            microbatch_size=self.microbatch_size,
+            precision="fp32",
         )
         return plugin
 
@@ -80,7 +95,14 @@ class TestExecutionEngineClass(MultiProcessTestCase):
         else "heterogeneous",
     )
     def test_engine_prepare(self, pipeline_templates: dict[PipelineTemplate, int]):
-        self.init_configuration_engine()
+        temp_dir = TemporaryDirectory()
+        self.init_configuration_engine(Path(temp_dir.name))
+        init_profile_data(
+            Path(temp_dir.name)
+            / self.tag
+            / "profile"
+            / f"mb_{self.microbatch_size}.csv"
+        )
 
         plugin = self.get_plugin()
         engine = ExecutionEngine(plugin)
@@ -105,7 +127,7 @@ class TestExecutionEngineClass(MultiProcessTestCase):
                 },
             ),
         ), patch(
-            "oobleck.engine.execution_engine.PipelineTemplate.generate_pipeline_templates",
+            "oobleck.planner.create_pipeline_templates",
             return_value=pipeline_templates.keys(),
         ), patch.object(
             engine, "_init_distributed", new=self.fake_init_distributed
@@ -129,8 +151,16 @@ class TestExecutionEngineClass(MultiProcessTestCase):
         if len(pipeline_templates) == 1
         else "heterogeneous",
     )
+    @unittest.skip("Gloo does not support pipeline send/recv")
     def test_engine_execute(self, pipeline_templates: dict[PipelineTemplate, int]):
-        self.init_configuration_engine()
+        temp_dir = TemporaryDirectory()
+        self.init_configuration_engine(Path(temp_dir.name))
+        init_profile_data(
+            Path(temp_dir.name)
+            / self.tag
+            / "profile"
+            / f"mb_{self.microbatch_size}.csv"
+        )
 
         plugin = self.get_plugin()
         engine = ExecutionEngine(plugin)
@@ -153,7 +183,7 @@ class TestExecutionEngineClass(MultiProcessTestCase):
                 },
             ),
         ), patch(
-            "oobleck.engine.execution_engine.PipelineTemplate.generate_pipeline_templates",
+            "oobleck.planner.create_pipeline_templates",
             return_value=pipeline_templates.keys(),
         ), patch.object(
             engine, "_init_distributed", new=self.fake_init_distributed

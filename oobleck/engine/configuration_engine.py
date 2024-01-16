@@ -1,20 +1,31 @@
 from __future__ import annotations
 
 from multiprocessing.connection import Connection
+from pathlib import Path
+
+from loguru import logger
 
 from oobleck.elastic.run import HostInfo
 
 
 class ConfigurationEngine:
+    """
+    An engine that manages internal configurations and distributed of Oobleck.
+    Users should not touch this class manually.
+    """
+
     _instance: ConfigurationEngine = None
 
+    pipe: Connection
+    agent_index: int
+    tag: str
+    base_dir: Path
+    local_rank: int
+    dist_info: list[HostInfo]
+    rank_map: dict[str, list[int]]
+    rank: int
+
     def __init__(self):
-        self.pipe: Connection = None
-        self.agent_index: int = None
-        self.local_rank: int = None
-        self.dist_info: list[HostInfo] = None
-        self.rank_map: dict[str, list[int]] = None
-        self.rank: int = None
         raise NotImplementedError(
             "Use get_instance() instead to get an instance of ConfigurationEngine."
         )
@@ -24,6 +35,8 @@ class ConfigurationEngine:
         pipe: Connection,
         agent_index: int,
         local_rank: int,
+        tag: str,
+        base_dir: Path,
     ) -> ConfigurationEngine:
         """Create a new instance of ConfigurationEngine."""
         if ConfigurationEngine._instance is not None:
@@ -34,9 +47,14 @@ class ConfigurationEngine:
         # TODO: set initial attributes.
         instance.pipe: Connection = pipe
         instance.agent_index = agent_index
+        instance.tag = tag
+        instance.base_dir = base_dir
+
         instance.local_rank: int = local_rank
         dist_info: list[HostInfo] = pipe.recv()
         instance.dist_info = dist_info
+
+        logger.debug(f"dist_info: {dist_info}")
 
         instance.rank_map: dict[str, list[int]] = {
             f"{host.ip}:{host.port}": list(range(i * host.slots, (i + 1) * host.slots))
@@ -44,6 +62,8 @@ class ConfigurationEngine:
         }
         my_ip = f"{dist_info[agent_index].ip}:{dist_info[agent_index].port}"
         instance.rank = instance.rank_map[my_ip][instance.local_rank]
+
+        logger.debug(f"rank_map: {instance.rank_map}")
 
         ConfigurationEngine._instance = instance
         return ConfigurationEngine._instance

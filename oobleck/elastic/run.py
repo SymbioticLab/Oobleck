@@ -13,10 +13,11 @@ import fabric
 import grpc
 from google.protobuf import empty_pb2
 from loguru import logger
-from oobleck.elastic import master_service_pb2, master_service_pb2_grpc
 from paramiko import SSHException
 from simple_parsing import ArgumentParser
 from simple_parsing.helpers import field
+
+from oobleck.elastic import master_service_pb2, master_service_pb2_grpc
 
 """
 Oobleck master process code.
@@ -34,10 +35,14 @@ broadcast `reconfigure` message to all live agents.
 class LaunchArgs:
     # Path to the hostfile
     hostfile: Path
+    # A tag to identify this run
+    tag: str
     # Port for master gRPC service
     master_service_port: int = 0
-    # Directory to store agent logs
-    output_dir: Path | None = None
+    # Oobleck root directory to store logs and profiles.
+    base_dir: Path = Path("/tmp/oobleck")
+    # Print agent's ssh outputs to stdout, instead of files
+    debug: bool = field(default=False, action="store_true")
 
 
 @dataclass
@@ -110,12 +115,14 @@ class MultiNodeAgentRunner:
         disconnect_condition: Condition,
         hosts: list[HostInfo],
         master_service_port: int,
-        output_dir: Path | None = None,
+        tag: str,
+        base_dir: Path | None = None,
     ):
         self.disconnect_condition = disconnect_condition
         self.hosts = hosts
         self.master_service_port = master_service_port
-        self.output_dir = output_dir
+        self.tag = tag
+        self.base_dir = base_dir
 
     @staticmethod
     def run_on_nodes(
@@ -123,7 +130,9 @@ class MultiNodeAgentRunner:
         disconnect_condition: Condition,
         host: HostInfo,
         master_service_port: int,
-        output: Path | None = None,
+        tag: str,
+        base_dir: Path,
+        debug: bool,
     ):
         """
         Use fabric to run the agent on the given host.
@@ -140,24 +149,29 @@ class MultiNodeAgentRunner:
             with fabric.Connection(host.ip, port=host.port, connect_timeout=30) as conn:
                 cmd = f"{sys.executable} -m oobleck.elastic.agent "
                 cmd += f"--master_ip {my_ip} --master_port {master_service_port} "
-                cmd += f"--agent_index {agent_index}"
+                cmd += f"--agent_index {agent_index} "
+                cmd += f"--tag {tag} --base_dir {str(base_dir)}"
 
                 logger.debug(f"Connected to {host.ip}:{host.port}. Executing: {cmd}")
 
-                out_stream = output.open("w") if output is not None else sys.stdout
-                conn.run(cmd, hide=True, out_stream=out_stream, err_stream=out_stream)
-
-                if output is not None:
-                    out_stream.close()
+                with (
+                    sys.stdout
+                    if debug
+                    else (base_dir / tag / f"agent{agent_index}.log").open("w")
+                ) as out_stream:
+                    conn.run(
+                        cmd,
+                        hide=True,
+                        out_stream=out_stream,
+                        err_stream=out_stream,
+                    )
         except SSHException as e:
             # Notify conditional variable to notify agent disconnection
             # to all agents.
             logger.warning(f"SSH disconnected: {e}")
             disconnect_condition.notify_all()
 
-            print("Asdadas")
-
-    def run(self):
+    def run(self, debug: bool = False):
         """
         Spawn multiple processes to run agents on multiple hosts.
         Each process accesses a host via SSH and runs the agent.
@@ -171,9 +185,9 @@ class MultiNodeAgentRunner:
                     self.disconnect_condition,
                     host,
                     self.master_service_port,
-                    self.output_dir / f"agent-{agent_index}.log"
-                    if self.output_dir is not None
-                    else None,
+                    self.tag,
+                    self.base_dir,
+                    debug,
                 ),
             ).start()
 
@@ -280,6 +294,10 @@ def serve():
     logger.info(f"Dist arguments: {launch_args}")
     logger.info(f"Script arguments: {script_args}")
 
+    job_directory = launch_args.base_dir / launch_args.tag
+    job_directory.mkdir(parents=True, exist_ok=True)
+    assert job_directory.is_dir(), f"{str(job_directory)} is not a directory."
+
     hostinfo = HostInfo.fetch_hostfile(launch_args.hostfile)
 
     server = grpc.server(ThreadPoolExecutor(max_workers=None))
@@ -290,10 +308,10 @@ def serve():
     server.start()
     logger.info(f"Running master service on port {port}")
 
-    runner = MultiNodeAgentRunner(
-        disconnect_condition, hostinfo, port, launch_args.output_dir
-    )
-    runner.run()
+    # runner = MultiNodeAgentRunner(
+    #     disconnect_condition, hostinfo, port, launch_args.tag, launch_args.base_dir
+    # )
+    # runner.run(launch_args.debug)
     server.wait_for_termination()
 
 

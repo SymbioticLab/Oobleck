@@ -6,6 +6,8 @@ from pathlib import Path
 
 import grpc
 from google.protobuf.empty_pb2 import Empty
+from pytest_mock import MockerFixture
+
 from oobleck.elastic import master_service_pb2, master_service_pb2_grpc
 from oobleck.elastic.run import (
     HostInfo,
@@ -14,7 +16,6 @@ from oobleck.elastic.run import (
     MultiNodeAgentRunner,
     ScriptArgs,
 )
-from pytest_mock import MockerFixture
 
 
 def get_stub(port: int) -> master_service_pb2_grpc.OobleckMasterStub:
@@ -107,7 +108,8 @@ def test_run_agents(
         disconnect_condition=disconnect_condition,
         hosts=hosts,
         master_service_port=port,
-        output_dir=args.output_dir,
+        tag=args.tag,
+        base_dir=args.base_dir,
     )
     runner.run()
 
@@ -116,7 +118,7 @@ def test_run_agents(
         zip(mock_process.call_args_list, hosts)
     ):
         call_args = call_args[0]
-        agent_output_dir = args.output_dir / f"agent-{agent_index}.log"
+        agent_output_dir = args.base_dir / f"agent{agent_index}.log"
         assert call_args == (
             runner.run_on_nodes,
             agent_index,

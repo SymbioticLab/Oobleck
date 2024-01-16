@@ -154,11 +154,10 @@ class PipelineInstantiator:
 
         # define objective function
         model += global_iteration_time
-        model.solve()
+        model.solve(pulp.PULP_CBC_CMD(msg=False))
 
         if pulp.LpStatus[model.status] != "Optimal":
-            logger.debug(f"Failed to find optimal solution for {num_templates}")
-            return (None, None)
+            raise RuntimeError(f"Failed to find optimal solution for {num_templates}.")
 
         logger.debug(
             f"Optiomal batch distribution for {num_templates}: {num_microbatches}"

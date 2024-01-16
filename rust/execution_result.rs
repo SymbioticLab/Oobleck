@@ -33,15 +33,11 @@ impl LayerExecutionResult {
     }
 
     pub fn get_profile_results(
-        tag: &str,
-        job_dir: Option<PathBuf>,
+        microbatch_size: u32,
+        job_profile_dir: PathBuf,
     ) -> Result<Vec<LayerExecutionResult>, std::io::Error> {
-        let path = match job_dir {
-            Some(base_dir) => base_dir.join("profiles"),
-            None => PathBuf::from("/tmp/oobleck/profiles/".to_string()),
-        }
-        .join(tag.to_string() + ".csv");
-
+        let path =
+            job_profile_dir.join("mb_".to_string() + microbatch_size.to_string().as_str() + ".csv");
         let mut reader = csv::Reader::from_path(path)?;
 
         let mut data: Vec<LayerExecutionResult> = Vec::new();
