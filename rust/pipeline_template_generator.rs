@@ -17,13 +17,10 @@ pub struct PipelineTemplateGenerator {
 }
 
 impl PipelineTemplateGenerator {
-    pub fn new(tag: &str, oobleck_base_dir: Option<PathBuf>) -> Self {
+    pub fn new(tag: &str, job_dir: Option<PathBuf>) -> Self {
         PipelineTemplateGenerator {
-            layer_execution_results: LayerExecutionResult::get_profile_results(
-                tag,
-                oobleck_base_dir,
-            )
-            .unwrap(),
+            layer_execution_results: LayerExecutionResult::get_profile_results(tag, job_dir)
+                .unwrap(),
             stage_execution_results: DashMap::new(),
             execution_result_cache: DashMap::new(),
         }

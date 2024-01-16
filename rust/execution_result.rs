@@ -34,9 +34,9 @@ impl LayerExecutionResult {
 
     pub fn get_profile_results(
         tag: &str,
-        oobleck_base_dir: Option<PathBuf>,
+        job_dir: Option<PathBuf>,
     ) -> Result<Vec<LayerExecutionResult>, std::io::Error> {
-        let path = match oobleck_base_dir {
+        let path = match job_dir {
             Some(base_dir) => base_dir.join("profiles"),
             None => PathBuf::from("/tmp/oobleck/profiles/".to_string()),
         }
