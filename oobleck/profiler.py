@@ -1,13 +1,20 @@
-import copy
 import csv
 import functools
-from collections import defaultdict
+import importlib
+import multiprocessing
 from dataclasses import asdict, dataclass
 from functools import reduce
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+import yaml
+from colossalai.shardformer import ShardConfig, ShardFormer
+from loguru import logger
+from oobleck_colossalai.module_info.auto_module import get_module_names
+from torch.distributed import FileStore
+from transformers import PretrainedConfig, PreTrainedModel
 
 
 @dataclass
@@ -35,16 +42,27 @@ class ModelProfiler:
     def __init__(
         self,
         tag: str,
-        model: nn.Module,
-        layers: list[str],
+        model_class_name: str,
+        config: PretrainedConfig,
+        microbatch_size: int,
         base_dir: Path = Path("/tmp/oobleck"),
     ):
-        assert all(self.get_module_by_name(model, name) for name in layers)
-        self.model = model
-        self.layers = layers
-        self.profile_path = base_dir / "profiles" / f"{tag}.csv"
+        self.model_class_name = model_class_name
+        self.model_config = config
+        self.microbatch_size = microbatch_size
+        self.profile_path = base_dir / tag / "profile" / f"mb_{microbatch_size}.csv"
         self.profile_path.parent.mkdir(parents=True, exist_ok=True)
-        self.profile = self.load_profile()
+
+        # config_path = self.profile_path.parent / "config.yaml"
+        # if config_path.exists():
+        #     assert set(config.to_dict().items()) == set(
+        #         yaml.safe_load(config_path.read_text()).items()
+        #     ), (
+        #         "Model config mismatch. "
+        #         "Please delete the profile directory and re-run the script or use another tag."
+        #     )
+
+        self.profile_result = self.load_profile()
 
     def load_profile(self) -> list[LayerExecutionResult] | None:
         """Load the profile."""
@@ -73,11 +91,11 @@ class ModelProfiler:
         if not self.profile_exists():
             raise ValueError("Profile does not exist.")
 
-        return sum(result.mem_required for result in self.profile)
+        return sum(result.mem_required for result in self.profile_result)
 
     def profile_exists(self) -> bool:
         """Check if the profile exists."""
-        return self.profile
+        return self.profile_result is not None
 
     @staticmethod
     def get_module_by_name(model: nn.Module, name: str) -> nn.Module:
@@ -87,63 +105,109 @@ class ModelProfiler:
 
     def profile(
         self,
+        local_rank: int,
+        tensor_parallel_size: int,
+        inputs: dict[str, torch.Tensor],
+    ):
+        """Profile the model."""
+        context = multiprocessing.get_context("spawn")
+        process = context.Process(
+            target=ModelProfiler._profile_model,
+            args=(
+                self.model_class_name,
+                self.model_config,
+                self.profile_path,
+                local_rank,
+                tensor_parallel_size,
+                inputs,
+            ),
+            daemon=True,
+        )
+        process.start()
+        process.join()
+
+    @staticmethod
+    def _profile_model(
+        model_class_name: str,
+        model_config: PretrainedConfig,
+        profile_path: Path,
+        local_rank: int,
+        tensor_parallel_size: int,
         inputs: dict[str, torch.Tensor],
         warmup: int = 3,
         repeat: int = 5,
     ):
-        """Profile the model.
+        """Use filestore to profile the model within a node."""
 
-        FIXME: better to spawn a process. Can we use torch.multiprocessing
-        and copy model's class name to instantiate it?
+        module = importlib.import_module("transformers")
+        module = getattr(module, model_class_name)
+        model: PreTrainedModel = module(model_config)
+        layers = get_module_names(model)
 
-        Returns:
-            dict[str, dict[str, float | int]]: A dictionary of layer names and their
-                forward and backward latency and memory consumption.
-        """
+        store_path = profile_path.parent / "store"
+        logger.debug(f"Profiler initiating torch.distributed: {store_path}")
+
+        store = FileStore(str(store_path), tensor_parallel_size)
+        dist.init_process_group(
+            backend="nccl",
+            world_size=tensor_parallel_size,
+            rank=local_rank,
+            store=store,
+        )
+
+        logger.debug(
+            f"Sharding model with {dist.get_process_group_ranks(dist.group.WORLD)} ranks"
+        )
+
+        if tensor_parallel_size > 1:
+            shard_config = ShardConfig(
+                tensor_parallel_process_group=dist.group.WORLD,
+                pipeline_stage_manager=None,
+                enable_tensor_parallelism=True,
+                enable_flash_attention=False,
+            )
+
+            shardformer = ShardFormer(shard_config)
+            model, _ = shardformer.optimize(model)
+
+        # Move inputs to cuda
+        for name in inputs.keys():
+            inputs[name] = inputs[name].to("cuda")
+            inputs[name].requires_grad = inputs[name].is_floating_point()
 
         events: dict[nn.Module, list[torch.cuda.Event]] = {}
         memory: dict[nn.Module, list[int]] = {}
-        for name in inputs.keys():
-            inputs[name] = inputs[name].cuda()
-            inputs[name].requires_grad = inputs[name].is_floating_point()
 
-        torch.cuda.synchronize()
-        model = copy.deepcopy(self.model)
-        model.train()
+        logger.debug("Profiler started...")
 
         init_memory = torch.cuda.memory_allocated()
-
-        for layer_name in self.layers:
-            module = self.get_module_by_name(model, layer_name)
+        for layer_name in layers:
+            module = ModelProfiler.get_module_by_name(model, layer_name)
 
             # forward start, forward end, backward start, backward end
             events[module] = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
             memory[module] = [0 for _ in range(4)]
 
             def forward_pre_hook(module_name, module, inputs):
-                print(f"forward_pre_hook for {module_name}")
-                module.cuda()
+                module.to("cuda")
                 memory[module][0] = torch.cuda.memory_allocated() - init_memory
                 events[module][0].record()
 
             def forward_hook(module_name, module, inputs, outputs):
-                print(f"forward_hook for {module_name}")
                 memory[module][1] = torch.cuda.memory_allocated() - init_memory
                 events[module][1].record()
                 if not (
                     model.config.tie_word_embeddings
                     and module == model.get_input_embeddings()
                 ):
-                    module.cpu()
+                    module.to("cpu")
 
             def backward_pre_hook(module_name, module, grad_output):
-                print(f"backward_pre_hook for {module_name}")
-                module.cuda()
+                module.to("cuda")
                 memory[module][2] = torch.cuda.memory_allocated() - init_memory
                 events[module][2].record()
 
             def backward_hook(module_name, module, grad_input, grad_output):
-                print(f"backward_hook for {module_name}")
                 memory[module][3] = torch.cuda.memory_allocated() - init_memory
                 events[module][3].record()
 
@@ -151,7 +215,7 @@ class ModelProfiler:
                     model.config.tie_word_embeddings
                     and module == model.get_input_embeddings()
                 ):
-                    module.cpu()
+                    module.to("cpu")
 
             module.register_forward_pre_hook(
                 functools.partial(forward_pre_hook, layer_name)
@@ -168,7 +232,7 @@ class ModelProfiler:
             for _ in range(warmup):
                 model(**inputs)
 
-        for i in range(repeat):
+        for _ in range(repeat):
             outputs = model(**inputs)
             loss = outputs["loss"]
             loss.backward()
@@ -176,23 +240,36 @@ class ModelProfiler:
 
         torch.cuda.synchronize()
 
-        with self.profile_path.open("w") as f:
-            writer = csv.DictWriter(
-                f, fieldnames=LayerExecutionResult.__annotations__.keys()
-            )
-            writer.writeheader()
+        logger.debug("Profiler finished.")
 
-            for index, layer_name in enumerate(self.layers):
-                module = self.get_module_by_name(model, layer_name)
-                forward = events[module][0].elapsed_time(events[module][1])
-                backward = events[module][2].elapsed_time(events[module][3])
-                mem_required = memory[module][3]
-
-                result = LayerExecutionResult(
-                    layer_index=index,
-                    layer_name=layer_name,
-                    forward=forward,
-                    backward=backward,
-                    mem_required=mem_required,
+        if dist.get_rank() == 0:
+            logger.debug(f"Writing results to {profile_path}")
+            with profile_path.open("w") as f:
+                writer = csv.DictWriter(
+                    f, fieldnames=LayerExecutionResult.__annotations__.keys()
                 )
-                writer.writerow(asdict(result))
+                writer.writeheader()
+
+                for index, layer_name in enumerate(layers):
+                    module = ModelProfiler.get_module_by_name(model, layer_name)
+                    forward = events[module][0].elapsed_time(events[module][1])
+                    backward = events[module][2].elapsed_time(events[module][3])
+                    mem_required = memory[module][3]
+
+                    result = LayerExecutionResult(
+                        layer_index=index,
+                        layer_name=layer_name,
+                        forward=forward,
+                        backward=backward,
+                        mem_required=mem_required,
+                    )
+                    writer.writerow(asdict(result))
+
+            store_path.unlink()
+
+            config_path = profile_path.parent / "config.yaml"
+            with config_path.open("w") as f:
+                yaml.safe_dump(model_config.to_dict(), f)
+
+        dist.barrier()
+        dist.destroy_process_group()
