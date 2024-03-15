@@ -32,6 +32,12 @@ class PipelineInstantiator:
             A tuple of two dict[PipelineTemplate, int] objects, where
             1. dict[PipelineTemplate, int]: the number of pipelines to be instantiated
             2. dict[PipelineTemplate, int]: the number of microbatches per pipeline
+
+        Raises:
+            RuntimeError:
+                1. If no optimal batch distribution found for the given number of nodes
+                   and the global batch size.
+                2. If failed to find a set of pipeline templates for the given number of nodes.
         """
         instantiations_options = self._enumerate_instantiation_options(num_nodes)
 
