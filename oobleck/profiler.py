@@ -12,7 +12,7 @@ import torch.nn as nn
 import yaml
 from colossalai.shardformer import ShardConfig, ShardFormer
 from loguru import logger
-from oobleck_colossalai.module_info.auto_module import get_module_names
+from oobleck_colossalai.pipeline_template import PipelineTemplate
 from torch.distributed import FileStore
 from transformers import PretrainedConfig, PreTrainedModel
 
@@ -142,7 +142,7 @@ class ModelProfiler:
         module = importlib.import_module("transformers")
         module = getattr(module, model_class_name)
         model: PreTrainedModel = module(model_config)
-        layers = get_module_names(model)
+        layers = PipelineTemplate.get_modules(model)
 
         store_path = profile_path.parent / "store"
         logger.debug(f"Profiler initiating torch.distributed: {store_path}")

@@ -45,18 +45,18 @@ class ConfigurationEngine:
         instance = ConfigurationEngine.__new__(ConfigurationEngine)
 
         # TODO: set initial attributes.
-        instance.pipe: Connection = pipe
+        instance.pipe = pipe
         instance.agent_index = agent_index
         instance.tag = tag
         instance.base_dir = base_dir
 
-        instance.local_rank: int = local_rank
+        instance.local_rank = local_rank
         dist_info: list[HostInfo] = pipe.recv()
         instance.dist_info = dist_info
 
         logger.debug(f"dist_info: {dist_info}")
 
-        instance.rank_map: dict[str, list[int]] = {
+        instance.rank_map = {
             f"{host.ip}:{host.port}": list(range(i * host.slots, (i + 1) * host.slots))
             for i, host in enumerate(dist_info)
         }
