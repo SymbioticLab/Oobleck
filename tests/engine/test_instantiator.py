@@ -1,12 +1,16 @@
 import pytest
-from conftest import singlenode_template, homogeneous_templates, heterogeneous_templates
+from conftest import template_1stage, template_2stages, template_3stages
 
 from oobleck.engine.pipeline_instantiator import PipelineInstantiator
 
 
-@pytest.mark.parametrize("num_nodes", list(range(4, 17)))
+@pytest.mark.parametrize(
+    "num_nodes",
+    list(range(4, 17)),
+    ids=lambda num_nodes: f"{num_nodes} nodes",
+)
 def test_instantiate(num_nodes: int):
-    instantiator = PipelineInstantiator(list(heterogeneous_templates.keys()), 512)
+    instantiator = PipelineInstantiator([template_2stages, template_3stages], 512)
     result = instantiator.instantiate(num_nodes)
 
     assert isinstance(result, tuple)
@@ -25,7 +29,7 @@ def test_instantiate(num_nodes: int):
 
 
 def test_instantiate_onenode():
-    instantiator = PipelineInstantiator(list(singlenode_template.keys()), 32)
+    instantiator = PipelineInstantiator([template_1stage], 32)
     result = instantiator.instantiate(1)
 
     assert isinstance(result, tuple)

@@ -41,18 +41,18 @@ class PipelineInstantiator:
             for option in instantiations_options
         ]
 
-        # Find the second dictionary where its corresponding float is the minimum
-        try:
-            optimal_distribution = min(
-                [dist for dist in batch_distributions if dist[0] is not None],
-                key=lambda x: x[0],
-            )
-        except ValueError as e:
+        if all(dist is None for dist in batch_distributions):
             raise RuntimeError(
                 f"Failed to find optimal batch distribution for {num_nodes} nodes."
-            ) from e
+            )
 
+        # Find the second dictionary where its corresponding float is the minimum
+        optimal_distribution = min(
+            (dist for dist in batch_distributions if dist is not None),
+            key=lambda x: x[0],
+        )
         index = batch_distributions.index(optimal_distribution)
+
         logger.debug(f"Optimal batch distribution: {optimal_distribution[1]}")
 
         return (
@@ -106,7 +106,7 @@ class PipelineInstantiator:
 
     def _distribute_batch(
         self, global_num_microbatch: int, num_templates: dict[PipelineTemplate, int]
-    ) -> tuple[float, dict[PipelineTemplate, int]]:
+    ) -> tuple[float, dict[PipelineTemplate, int]] | None:
         """Find the optimal distribution of microbatches that minimizes iteration time.
         Implementation of Section 4.2.2.
 
@@ -125,6 +125,8 @@ class PipelineInstantiator:
                 2. A dict[PipelineTemplate, int] object, where each key represents
                    a pipeline template and each value represents the number of microbatches
                    for that pipeline template.
+
+            Or None if the optimal solution is not found.
         """
 
         model = pulp.LpProblem("Microbatch Distribution", pulp.LpMinimize)
@@ -157,7 +159,12 @@ class PipelineInstantiator:
         model.solve(pulp.PULP_CBC_CMD(msg=False))
 
         if pulp.LpStatus[model.status] != "Optimal":
-            raise RuntimeError(f"Failed to find optimal solution for {num_templates}.")
+            logger.warning(f"Failed to find optimal solution for {num_templates}.")
+            return None
+
+        assert (
+            float(global_iteration_time.value()) is not None
+        ), "Status is optimal but global_iteration_time is None."
 
         logger.debug(
             f"Optiomal batch distribution for {num_templates}: {num_microbatches}"

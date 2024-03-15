@@ -8,6 +8,8 @@ from oobleck_colossalai.pipeline_template import PipelineTemplate
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
+model_name: str = "transformers.models.gpt2.modeling_gpt2.GPT2ForSequenceClassification"
+
 
 def init_profile_data(file_path: Path):
     file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -26,7 +28,7 @@ def init_profile_data(file_path: Path):
         for index, layer_name in enumerate(
             ["transformer.wte", "transformer.wpe", "transformer.drop"]
             + [f"transformer.h.{i}" for i in range(0, 4)]
-            + [f"transformer.ln_f", "score"]
+            + ["transformer.ln_f", "score"]
         ):
             writer.writerow(
                 {
@@ -39,54 +41,41 @@ def init_profile_data(file_path: Path):
             )
 
 
-singlenode_template = {
-    PipelineTemplate(
-        modules_per_stage=[
-            ["transformer.wte", "transformer.wpe", "transformer.drop"]
-            + [f"transformer.h.{i}" for i in range(0, 4)]
-            + [f"transformer.ln_f", "score"],
-        ],
-    ): 1
-}
+template_1stage = PipelineTemplate(
+    model_name,
+    [
+        [
+            "transformer.wte",
+            "transformer.wpe",
+            "transformer.drop",
+            *[f"transformer.h.{i}" for i in range(0, 4)],
+            "transformer.ln_f",
+            "score",
+        ]
+    ],
+)
 
-homogeneous_templates = {
-    # 3 nodes
-    PipelineTemplate(
-        modules_per_stage=[
-            [
-                "transformer.wte",
-                "transformer.wpe",
-                "transformer.drop",
-                "transformer.h.0",
-            ],
-            [f"transformer.h.{i}" for i in range(1, 4)],
-            ["transformer.ln_f", "score"],
+template_2stages = PipelineTemplate(
+    model_name,
+    [
+        ["transformer.wte", "transformer.wpe", "transformer.drop"],
+        [*[f"transformer.h.{i}" for i in range(0, 4)], "transformer.ln_f", "score"],
+    ],
+)
+
+template_3stages = PipelineTemplate(
+    model_name,
+    [
+        [
+            "transformer.wte",
+            "transformer.wpe",
+            "transformer.drop",
+            "transformer.h.0",
         ],
-    ): 3
-}
-heterogeneous_templates = {
-    # 3 nodes
-    PipelineTemplate(
-        modules_per_stage=[
-            [
-                "transformer.wte",
-                "transformer.wpe",
-                "transformer.drop",
-                "transformer.h.0",
-            ],
-            [f"transformer.h.{i}" for i in range(1, 4)],
-            ["transformer.ln_f", "score"],
-        ],
-    ): 1,
-    # 2 nodes
-    PipelineTemplate(
-        modules_per_stage=[
-            ["transformer.wte", "transformer.wpe", "transformer.drop"],
-            [f"transformer.h.{i}" for i in range(0, 4)]
-            + [f"transformer.ln_f", "score"],
-        ],
-    ): 3,
-}
+        [f"transformer.h.{i}" for i in range(1, 4)],
+        ["transformer.ln_f", "score"],
+    ],
+)
 
 
 class GLUEDataBuilder:
@@ -168,7 +157,10 @@ class GLUEDataBuilder:
         )
 
 
-@pytest.fixture(scope="class", params=[homogeneous_templates, heterogeneous_templates])
+@pytest.fixture(
+    scope="class",
+    params=[{template_3stages: 3}, {template_3stages: 1, template_2stages: 3}],
+)
 def plugin(request: pytest.FixtureRequest):
     plugin = HeterogeneousParallelPlugin(tp_size=2, microbatch_size=1)
     plugin.set_pipeline_templates(request.param)

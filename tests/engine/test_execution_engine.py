@@ -11,9 +11,9 @@ from colossalai.booster.plugin.hybrid_parallel_plugin import (
 )
 from conftest import (
     GLUEDataBuilder,
-    heterogeneous_templates,
-    homogeneous_templates,
     init_profile_data,
+    template_2stages,
+    template_3stages,
 )
 from oobleck_colossalai import (
     HeterogeneousParallelModule,
@@ -89,7 +89,7 @@ class TestExecutionEngineClass(MultiProcessTestCase):
 
     @parametrize(
         "pipeline_templates",
-        [homogeneous_templates, heterogeneous_templates],
+        [{template_3stages: 3}, {template_3stages: 1, template_2stages: 3}],
         name_fn=lambda pipeline_templates: "homogeneous"
         if len(pipeline_templates) == 1
         else "heterogeneous",
@@ -117,20 +117,22 @@ class TestExecutionEngineClass(MultiProcessTestCase):
 
         assert not dist.is_initialized()
 
-        with patch(
-            "oobleck.engine.execution_engine.PipelineInstantiator.instantiate",
-            return_value=(
-                pipeline_templates,
-                {
-                    template: 12 // sum(pipeline_templates.values())
-                    for template in pipeline_templates
-                },
+        with (
+            patch(
+                "oobleck.engine.execution_engine.PipelineInstantiator.instantiate",
+                return_value=(
+                    pipeline_templates,
+                    {
+                        template: 12 // sum(pipeline_templates.values())
+                        for template in pipeline_templates
+                    },
+                ),
             ),
-        ), patch(
-            "oobleck.planner.create_pipeline_templates",
-            return_value=pipeline_templates.keys(),
-        ), patch.object(
-            engine, "_init_distributed", new=self.fake_init_distributed
+            patch(
+                "oobleck.planner.create_pipeline_templates",
+                return_value=pipeline_templates.keys(),
+            ),
+            patch.object(engine, "_init_distributed", new=self.fake_init_distributed),
         ):
             model, optimizer, _, dataloader, lr_scheduler = engine.prepare(
                 model=model,
@@ -146,7 +148,7 @@ class TestExecutionEngineClass(MultiProcessTestCase):
 
     @parametrize(
         "pipeline_templates",
-        [homogeneous_templates, heterogeneous_templates],
+        [{template_3stages: 3}, {template_3stages: 1, template_2stages: 3}],
         name_fn=lambda pipeline_templates: "homogeneous"
         if len(pipeline_templates) == 1
         else "heterogeneous",
@@ -173,20 +175,22 @@ class TestExecutionEngineClass(MultiProcessTestCase):
         optimizer = Adam(model.parameters())
         lr_scheduler = get_linear_schedule_with_warmup(optimizer, 0, 100)
 
-        with patch(
-            "oobleck.engine.execution_engine.PipelineInstantiator.instantiate",
-            return_value=(
-                pipeline_templates,
-                {
-                    template: 12 // sum(pipeline_templates.values())
-                    for template in pipeline_templates
-                },
+        with (
+            patch(
+                "oobleck.engine.execution_engine.PipelineInstantiator.instantiate",
+                return_value=(
+                    pipeline_templates,
+                    {
+                        template: 12 // sum(pipeline_templates.values())
+                        for template in pipeline_templates
+                    },
+                ),
             ),
-        ), patch(
-            "oobleck.planner.create_pipeline_templates",
-            return_value=pipeline_templates.keys(),
-        ), patch.object(
-            engine, "_init_distributed", new=self.fake_init_distributed
+            patch(
+                "oobleck.planner.create_pipeline_templates",
+                return_value=pipeline_templates.keys(),
+            ),
+            patch.object(engine, "_init_distributed", new=self.fake_init_distributed),
         ):
             model, optimizer, criterion, dataloader, lr_scheduler = engine.prepare(
                 model=model,
@@ -203,13 +207,17 @@ class TestExecutionEngineClass(MultiProcessTestCase):
 
         iterator = iter(dataloader)
 
-        with patch.object(
-            model, "sync_dp_grads", wraps=model.sync_dp_grads
-        ) as sync_mock, patch.object(
-            plugin.schedule, "forward_step", wraps=plugin.schedule.forward_step
-        ) as forward_mock, patch.object(
-            plugin.schedule, "backward_step", wraps=plugin.schedule.backward_step
-        ) as backward_mock:
+        with (
+            patch.object(
+                model, "sync_dp_grads", wraps=model.sync_dp_grads
+            ) as sync_mock,
+            patch.object(
+                plugin.schedule, "forward_step", wraps=plugin.schedule.forward_step
+            ) as forward_mock,
+            patch.object(
+                plugin.schedule, "backward_step", wraps=plugin.schedule.backward_step
+            ) as backward_mock,
+        ):
             result = engine.execute(iterator, model, criterion, optimizer)
 
         assert sync_mock.call_count == 1
