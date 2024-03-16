@@ -92,8 +92,7 @@ class ExecutionEngine:
                 math.ceil(profiler.mem_consumption / memory),
             )
             max_num_nodes = (
-                configuration_engine.configuration_world_size
-                // self.plugin.shard_config["tp_size"]
+                configuration_engine.world_size // self.plugin.shard_config["tp_size"]
             )
 
             self.pipeline_templates = create_pipeline_templates(
