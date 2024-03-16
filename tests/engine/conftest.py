@@ -163,5 +163,5 @@ class GLUEDataBuilder:
 )
 def plugin(request: pytest.FixtureRequest):
     plugin = HeterogeneousParallelPlugin(tp_size=2, microbatch_size=1)
-    plugin.set_pipeline_templates(request.param)
+    plugin.set_pipelines(request.param)
     request.cls.plugin = plugin

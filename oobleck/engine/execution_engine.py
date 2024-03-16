@@ -19,7 +19,11 @@ from oobleck.profiler import ModelProfiler
 
 
 class ExecutionEngine:
-    """A main execution engine using an execution Backend."""
+    """A main execution engine using an execution Backend.
+
+    ExecutionEngine does not have a global view of distributed training.
+
+    """
 
     def __init__(
         self,
@@ -100,7 +104,7 @@ class ExecutionEngine:
 
             logger.debug(f"Pipelines: {self.pipeline_templates}")
 
-        self._init_distributed()
+        configuration_engine.init_distributed()
 
         pipeline_instantiator = PipelineInstantiator(
             [
@@ -114,59 +118,12 @@ class ExecutionEngine:
         )
         logger.debug(f"Pipeline instances: {num_instances}")
         logger.debug(f"Microbatches: {num_microbatches}")
-        self.plugin.set_pipeline_templates(num_instances, num_microbatches)
+        self.plugin.set_pipelines(num_instances, num_microbatches)
         return self.booster.boost(model, optimizer, criterion, dataloader, lr_scheduler)
 
-    def _init_distributed(self):
-        if dist.is_initialized():
-            # Destroy all process group
-            # TODO: if we try to destroy a process group where some operation is stuck,
-            # destroying it might be stuck as well.
-            # If this is witnessed, change it to destryoing all process groups
-            # manually gathered in ThreadPoolExecutor.
-            dist.destroy_process_group(dist.group.WORLD)
-
-        # ConfigurationEngine must be initialized by worker_main().
-        configuration_engine = ConfigurationEngine.get_instance()
-
-        if configuration_engine.is_master:
-            store = dist.TCPStore(
-                host_name=configuration_engine.dist_info[0].ip,
-                port=0,
-                world_size=configuration_engine.configuration_world_size,
-                is_master=True,
-                wait_for_workers=False,
-            )
-            logger.debug(f"torch rank 0 port: {store.port}")
-            configuration_engine.send_distributed_port(store.port)
-            # this distributed port is broadcasted.
-            # For master it is useless, so just discard it.
-            configuration_engine.receive_distributed_port()
-        else:
-            port = configuration_engine.receive_distributed_port()
-            logger.debug(f"Received torch rank 0 port: {port}")
-            store = dist.TCPStore(
-                host_name=configuration_engine.dist_info[0].ip,
-                port=port,
-                world_size=configuration_engine.configuration_world_size,
-                is_master=False,
-                wait_for_workers=False,
-            )
-        logger.debug(
-            "Initializing torch.distributed. "
-            f"rank: {configuration_engine.rank}, world size: {configuration_engine.configuration_world_size}"
-        )
-
-        dist.init_process_group(
-            backend="nccl",
-            store=store,
-            rank=configuration_engine.rank,
-            world_size=configuration_engine.configuration_world_size,
-        )
-
-        logger.debug("Distributed environment initialized.")
-
-        assert dist.is_initialized(), "Distributed environment is not initialized."
+    def _estimate_max_num_nodes_required(self):
+        # TODO: implement it
+        pass
 
     def execute(
         self,
