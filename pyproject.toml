@@ -36,6 +36,7 @@ dev = [
     "pytest-mock",
     "pytest-grpc",
     "grpcio-tools",
+    "datasets",
 ]
 
 [tool.ruff]
