@@ -1,3 +1,4 @@
+import itertools
 import math
 from typing import Any, Callable, Iterator
 
@@ -110,14 +111,22 @@ class ExecutionEngine:
                 self.pipeline_templates[num_nodes]
                 for num_nodes in sorted(self.pipeline_templates.keys())
             ],
-            self.plugin.global_batch_size,
+            self.plugin.global_batch_size // self.plugin.microbatch_size,
         )
         num_instances, num_microbatches = pipeline_instantiator.instantiate(
             len(configuration_engine.dist_info)
         )
         logger.debug(f"Pipeline instances: {num_instances}")
         logger.debug(f"Microbatches: {num_microbatches}")
-        self.plugin.set_pipelines(num_instances, num_microbatches)
+        self.plugin.set_pipelines(
+            list(
+                itertools.chain.from_iterable(
+                    itertools.repeat(template, num_templates)
+                    for template, num_templates in num_instances.items()
+                )
+            ),
+            num_microbatches,
+        )
         return self.booster.boost(model, optimizer, criterion, dataloader, lr_scheduler)
 
     def _estimate_max_num_nodes_required(self):

@@ -89,12 +89,15 @@ class TestExecutionEngineClass(MultiProcessTestCase):
 
     @parametrize(
         "pipeline_templates",
-        [{template_3stages: 3}, {template_3stages: 1, template_2stages: 3}],
+        [
+            [template_3stages, template_3stages, template_3stages],
+            [template_3stages, template_2stages, template_2stages, template_2stages],
+        ],
         name_fn=lambda pipeline_templates: "homogeneous"
-        if len(pipeline_templates) == 1
+        if len(pipeline_templates) == 3
         else "heterogeneous",
     )
-    def test_engine_prepare(self, pipeline_templates: dict[PipelineTemplate, int]):
+    def test_engine_prepare(self, pipeline_templates: list[PipelineTemplate]):
         temp_dir = TemporaryDirectory()
         self.init_configuration_engine(Path(temp_dir.name))
         init_profile_data(
@@ -123,16 +126,22 @@ class TestExecutionEngineClass(MultiProcessTestCase):
                 return_value=(
                     pipeline_templates,
                     {
-                        template: 12 // sum(pipeline_templates.values())
+                        template: 12 // len(pipeline_templates)
                         for template in pipeline_templates
                     },
                 ),
             ),
             patch(
                 "oobleck.planner.create_pipeline_templates",
-                return_value=pipeline_templates.keys(),
+                return_value={
+                    template.num_stages: template for template in pipeline_templates
+                },
             ),
-            patch.object(engine, "_init_distributed", new=self.fake_init_distributed),
+            patch.object(
+                ConfigurationEngine._instance,
+                "init_distributed",
+                new=self.fake_init_distributed,
+            ),
         ):
             model, optimizer, _, dataloader, lr_scheduler = engine.prepare(
                 model=model,
@@ -148,13 +157,16 @@ class TestExecutionEngineClass(MultiProcessTestCase):
 
     @parametrize(
         "pipeline_templates",
-        [{template_3stages: 3}, {template_3stages: 1, template_2stages: 3}],
+        [
+            [template_3stages, template_3stages, template_3stages],
+            [template_3stages, template_2stages, template_2stages, template_2stages],
+        ],
         name_fn=lambda pipeline_templates: "homogeneous"
-        if len(pipeline_templates) == 1
+        if len(pipeline_templates) == 3
         else "heterogeneous",
     )
     @unittest.skip("Gloo does not support pipeline send/recv")
-    def test_engine_execute(self, pipeline_templates: dict[PipelineTemplate, int]):
+    def test_engine_execute(self, pipeline_templates: list[PipelineTemplate]):
         temp_dir = TemporaryDirectory()
         self.init_configuration_engine(Path(temp_dir.name))
         init_profile_data(
@@ -181,16 +193,22 @@ class TestExecutionEngineClass(MultiProcessTestCase):
                 return_value=(
                     pipeline_templates,
                     {
-                        template: 12 // sum(pipeline_templates.values())
+                        template: 12 // len(pipeline_templates)
                         for template in pipeline_templates
                     },
                 ),
             ),
             patch(
                 "oobleck.planner.create_pipeline_templates",
-                return_value=pipeline_templates.keys(),
+                return_value={
+                    template.num_stages: template for template in pipeline_templates
+                },
             ),
-            patch.object(engine, "_init_distributed", new=self.fake_init_distributed),
+            patch.object(
+                ConfigurationEngine._instance,
+                "init_distributed",
+                new=self.fake_init_distributed,
+            ),
         ):
             model, optimizer, criterion, dataloader, lr_scheduler = engine.prepare(
                 model=model,
