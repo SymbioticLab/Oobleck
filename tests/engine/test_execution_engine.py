@@ -2,6 +2,7 @@ import multiprocessing
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Counter
 from unittest.mock import patch
 
 import torch.distributed as dist
@@ -124,7 +125,7 @@ class TestExecutionEngineClass(MultiProcessTestCase):
             patch(
                 "oobleck.engine.execution_engine.PipelineInstantiator.instantiate",
                 return_value=(
-                    pipeline_templates,
+                    dict(Counter(pipeline_templates)),
                     {
                         template: 12 // len(pipeline_templates)
                         for template in pipeline_templates
@@ -191,7 +192,7 @@ class TestExecutionEngineClass(MultiProcessTestCase):
             patch(
                 "oobleck.engine.execution_engine.PipelineInstantiator.instantiate",
                 return_value=(
-                    pipeline_templates,
+                    dict(Counter(pipeline_templates)),
                     {
                         template: 12 // len(pipeline_templates)
                         for template in pipeline_templates
