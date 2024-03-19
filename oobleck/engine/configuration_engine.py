@@ -80,7 +80,13 @@ class ConfigurationEngine:
         ), "ConfigurationEngine is not initialized."
         return ConfigurationEngine._instance
 
-    def get_host_update(self):
+    def get_host_update(self) -> tuple[list[HostInfo], list[HostInfo]]:
+        """
+        Get host update from the agent process.
+
+        Returns:
+            tuple[list[HostInfo], list[HostInfo]]: new dist_info and removed dist_info.
+        """
         new_dist_info: list[HostInfo] = self.pipe.recv()
 
         added_hosts = [host for host in new_dist_info if host not in self.dist_info]
@@ -90,6 +96,8 @@ class ConfigurationEngine:
         removed_hosts = [host for host in self.dist_info if host not in new_dist_info]
         for host in removed_hosts:
             self.remove_host(host)
+
+        return added_hosts, removed_hosts
 
     def add_host(self, host: HostInfo):
         """TODO(insujang): implement it. Currently not support adding hosts.
