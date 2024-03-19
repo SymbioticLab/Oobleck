@@ -18,7 +18,6 @@ from conftest import (
 )
 from oobleck_colossalai import (
     HeterogeneousParallelModule,
-    HeterogeneousParallelPlugin,
     PipelineTemplate,
 )
 from torch.optim import Adam
@@ -37,6 +36,7 @@ from transformers import (
 from oobleck.elastic.run import HostInfo
 from oobleck.engine.configuration_engine import ConfigurationEngine
 from oobleck.engine.execution_engine import ExecutionEngine
+from oobleck.engine.plugin import OobleckPlugin
 
 config = AutoConfig.from_pretrained("gpt2")
 config.num_hidden_layers = 4
@@ -58,8 +58,8 @@ class TestExecutionEngineClass(MultiProcessTestCase):
             child_pipe, self.rank // 2, self.rank % 2, self.tag, temp_dir
         )
 
-    def get_plugin(self) -> HeterogeneousParallelPlugin:
-        plugin = HeterogeneousParallelPlugin(
+    def get_plugin(self) -> OobleckPlugin:
+        plugin = OobleckPlugin(
             tp_size=2,
             global_batch_size=12,
             microbatch_size=self.microbatch_size,

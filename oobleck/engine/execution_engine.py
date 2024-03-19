@@ -7,14 +7,15 @@ import torch.distributed as dist
 import torch.nn as nn
 from colossalai.booster import Booster
 from loguru import logger
-from oobleck_colossalai import HeterogeneousDataLoader, HeterogeneousParallelPlugin
 from oobleck_colossalai.pipeline_template import PipelineTemplate
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler as LRScheduler
 from torch.utils.data import DataLoader
 
 from oobleck.engine.configuration_engine import ConfigurationEngine
+from oobleck.engine.dataloader import OobleckDataLoader
 from oobleck.engine.pipeline_instantiator import PipelineInstantiator
+from oobleck.engine.plugin import OobleckPlugin
 from oobleck.planner import create_pipeline_templates
 from oobleck.profiler import ModelProfiler
 
@@ -28,12 +29,15 @@ class ExecutionEngine:
 
     def __init__(
         self,
-        plugin: HeterogeneousParallelPlugin,
+        plugin: OobleckPlugin,
         **booster_kwargs,
     ):
         assert (
             not dist.is_initialized()
         ), "Distributed environment must not be initialized."
+        assert isinstance(
+            plugin, OobleckPlugin
+        ), "Plugin must be an instance of OobleckPlugin."
 
         self.plugin = plugin
 
@@ -56,7 +60,7 @@ class ExecutionEngine:
         model: nn.Module,
         optimizer: Optimizer | None = None,
         criterion: Callable | None = None,
-        dataloader: HeterogeneousDataLoader | None = None,
+        dataloader: OobleckDataLoader | None = None,
         lr_scheduler: LRScheduler | None = None,
     ) -> tuple[nn.Module, Optimizer, Callable, DataLoader, LRScheduler]:
         """Initialize pipeline templates and distributed configuration."""
