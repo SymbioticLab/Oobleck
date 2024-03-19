@@ -159,7 +159,10 @@ class GLUEDataBuilder:
 
 @pytest.fixture(
     scope="class",
-    params=[{template_3stages: 3}, {template_3stages: 1, template_2stages: 3}],
+    params=[
+        [template_3stages, template_3stages, template_3stages],
+        [template_3stages, template_2stages, template_2stages],
+    ],
 )
 def plugin(request: pytest.FixtureRequest):
     plugin = HeterogeneousParallelPlugin(tp_size=2, microbatch_size=1)
