@@ -97,6 +97,7 @@ class ExecutionEngine:
             )
 
             self.pipeline_templates = create_pipeline_templates(
+                model.name_or_path,
                 self.plugin.microbatch_size,
                 list(range(min_num_nodes, max_num_nodes)) + [max_num_nodes],
                 self.base_dir / self.tag / "profile",
