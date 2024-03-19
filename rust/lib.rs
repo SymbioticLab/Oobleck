@@ -36,6 +36,7 @@ impl From<PlannerError> for PyErr {
 
 #[pyfunction]
 fn create_pipeline_templates(
+    model_name: String,
     microbatch_size: u32,
     mut num_nodes: Vec<u32>,
     job_profile_dir: PathBuf,
@@ -54,6 +55,7 @@ fn create_pipeline_templates(
         for num_node in num_nodes {
             let template = generator.get_pipeline_template(num_node).unwrap();
             let py_template = class.call1((
+                model_name.as_str(),
                 template.get_modules_per_stage(&generator.layer_execution_results),
                 template.latency(),
                 template.mem_required(),
