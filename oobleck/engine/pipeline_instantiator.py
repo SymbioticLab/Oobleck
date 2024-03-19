@@ -13,10 +13,10 @@ class PipelineInstantiator:
     def __init__(
         self,
         pipeline_templates: list[PipelineTemplate],
-        global_batch_size: int,
+        global_num_microbatches: int,
     ):
         self.pipeline_templates = pipeline_templates
-        self.global_batch_size = global_batch_size
+        self.global_num_microbatches = global_num_microbatches
 
     def instantiate(
         self, num_nodes: int
@@ -43,8 +43,7 @@ class PipelineInstantiator:
 
         # Call self._distribute_batch for each element in instantiations_options
         batch_distributions = [
-            self._distribute_batch(self.global_batch_size, option)
-            for option in instantiations_options
+            self.distribute_batch(option) for option in instantiations_options
         ]
 
         if all(dist is None for dist in batch_distributions):
@@ -110,8 +109,8 @@ class PipelineInstantiator:
             )
         return dp[-1][-1]
 
-    def _distribute_batch(
-        self, global_num_microbatch: int, num_templates: dict[PipelineTemplate, int]
+    def distribute_batch(
+        self, num_templates: dict[PipelineTemplate, int]
     ) -> tuple[float, dict[PipelineTemplate, int]] | None:
         """Find the optimal distribution of microbatches that minimizes iteration time.
         Implementation of Section 4.2.2.
@@ -152,7 +151,7 @@ class PipelineInstantiator:
                 num_microbatches[template] * num_templates[template]
                 for template in num_microbatches
             )
-            == global_num_microbatch
+            == self.global_num_microbatches
         )
         for template in num_microbatches.keys():
             model += (
