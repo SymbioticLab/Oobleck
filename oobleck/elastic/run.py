@@ -57,6 +57,12 @@ class HostInfo:
     slots: int
     port: int
 
+    def __eq__(self, other: HostInfo) -> bool:
+        return self.ip == other.ip and self.port == other.port
+
+    def __hash__(self) -> int:
+        return hash((self.ip, self.port))
+
     @staticmethod
     def fetch_hostfile(hostfile_path: Path) -> list[HostInfo]:
         """
