@@ -10,7 +10,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
 from torch.distributed.fsdp._common_utils import HandleTrainingState
-from torch.distributed.fsdp.flat_param import FlatParamHandle, HandleShardingStrategy
+from torch.distributed.fsdp._flat_param import FlatParamHandle, HandleShardingStrategy
 
 
 def is_checkpointable(layer: torch.fx.GraphModule) -> bool:

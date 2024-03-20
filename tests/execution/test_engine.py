@@ -20,7 +20,7 @@ import torch._C._distributed_c10d as c10d
 import torch.distributed
 import torch.fx
 from pytest_mock import MockerFixture
-from torch.distributed.fsdp.flat_param import (
+from torch.distributed.fsdp._flat_param import (
     FlatParameter,
     FlatParamHandle,
     HandleShardingStrategy,
@@ -76,7 +76,7 @@ class TestOobleckDataParallelEngineClass(OobleckSingleProcessTestCase):
             self.fsdp_process_group = fsdp_process_group
 
             # Fake layers follow FSDP flat param generation and sharding
-            # from torch.distributed.fsdp.flat_param.py
+            # from torch.distributed.fsdp._flat_param.py
             assert all([p.is_meta for p in layer.parameters()])
 
             # Create FlatParameter

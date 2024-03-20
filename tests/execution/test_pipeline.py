@@ -6,7 +6,7 @@ import pytest
 import torch
 import torch.distributed
 from deepspeed.runtime.lr_schedules import WarmupLR
-from torch.distributed.fsdp.flat_param import HandleShardingStrategy
+from torch.distributed.fsdp._flat_param import HandleShardingStrategy
 from torch.optim import AdamW
 
 from tests.conftest import (

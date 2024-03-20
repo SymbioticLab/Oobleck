@@ -1,15 +1,40 @@
-FROM nvidia/cuda:11.7.1-devel-ubuntu20.04
+FROM pytorch/pytorch:2.2.0-cuda11.8-cudnn8-runtime
 
-COPY ./environment.yml /
-
-WORKDIR /
+WORKDIR /workspace
+ENV PYTHONPATH=/workspace
 
 RUN apt update -y && apt install wget git -y && apt clean
-RUN wget -q https://repo.anaconda.com/archive/Anaconda3-2023.03-1-Linux-x86_64.sh -O ./anaconda.sh && \
-    /bin/bash ./anaconda.sh -b -p /opt/conda && \
-    rm ./anaconda.sh && \
-    /opt/conda/bin/conda init bash && \
-    /opt/conda/bin/conda env create -f environment.yml && \
-    /opt/conda/bin/conda clean -afy && \
-    echo "conda activate oobleck" >> ~/.bashrc && \
-    rm ./environment.yml
+
+RUN conda update -n base --override-channels -c defaults conda
+RUN conda install -y \
+    numpy \ 
+    scikit-learn \
+    pytest \
+    pytest-mock \
+    pytest-asyncio \
+    tensorboard \
+    glpk \
+    setuptools \
+    pybind11 \
+    ninja \
+    cmake \
+    tbb-devel \
+    conda-forge::cyipopt \
+    conda-forge::python-devtools \
+    conda-forge::pyomo \
+    conda-forge::cxx-compiler \
+    "conda-forge::transformers>=4.29.0" \ 
+    "conda-forge::deepspeed>=0.8.1" \
+    conda-forge::accelerate \
+    conda-forge::datasets \
+    conda-forge::evaluate
+  
+RUN pip install psutil simple-parsing asyncssh aiofiles
+
+RUN sh -c "$(wget -O- https://github.com/deluan/zsh-in-docker/releases/download/v1.1.5/zsh-in-docker.sh)" -- \
+    -t https://github.com/denysdovhan/spaceship-prompt \
+    -p git \
+    -p https://github.com/zsh-users/zsh-autosuggestions
+RUN conda init zsh
+RUN chsh -s /bin/zsh root
+CMD [ "/bin/zsh" ]
