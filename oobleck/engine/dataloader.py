@@ -51,7 +51,7 @@ class OobleckBatchSampler(HeterogeneousBatchSampler):
         the number of iteration (len(self.num_samples)) should also not be changed,
         but just the pipeline index and num_microbatches per pipeline.
         """
-        while self.sample_index < len(self.num_samples):
+        while self.sample_index < self.num_samples:
             index = indices[self.sample_index] * self.global_batch_size
             # increment the sample index for the next iteration.
             # If training fails in the current iteration, will be decreased by 1 by step_back()
