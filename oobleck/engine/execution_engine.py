@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from colossalai.booster import Booster
+from colossalai.shardformer.policies.auto_policy import _fullname
 from loguru import logger
 from oobleck_colossalai.pipeline_template import PipelineTemplate
 from torch.optim import Optimizer
@@ -101,7 +102,7 @@ class ExecutionEngine:
             )
 
             self.pipeline_templates = create_pipeline_templates(
-                model.name_or_path,
+                _fullname(model),
                 self.plugin.microbatch_size,
                 list(range(min_num_nodes, max_num_nodes)) + [max_num_nodes],
                 self.base_dir / self.tag / "profile",

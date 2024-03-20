@@ -89,16 +89,16 @@ class TestExecutionEngineClass(MultiProcessTestCase):
         )
 
     @parametrize(
-        "pipeline_templates",
+        "pipelines",
         [
             [template_3stages, template_3stages, template_3stages],
             [template_3stages, template_2stages, template_2stages, template_2stages],
         ],
-        name_fn=lambda pipeline_templates: "homogeneous"
-        if len(pipeline_templates) == 3
+        name_fn=lambda pipelines: "homogeneous"
+        if len(pipelines) == 3
         else "heterogeneous",
     )
-    def test_engine_prepare(self, pipeline_templates: list[PipelineTemplate]):
+    def test_engine_prepare(self, pipelines: list[PipelineTemplate]):
         temp_dir = TemporaryDirectory()
         self.init_configuration_engine(Path(temp_dir.name))
         init_profile_data(
@@ -125,18 +125,13 @@ class TestExecutionEngineClass(MultiProcessTestCase):
             patch(
                 "oobleck.engine.execution_engine.PipelineInstantiator.instantiate",
                 return_value=(
-                    dict(Counter(pipeline_templates)),
-                    {
-                        template: 12 // len(pipeline_templates)
-                        for template in pipeline_templates
-                    },
+                    dict(Counter(pipelines)),
+                    {template: 12 // len(pipelines) for template in pipelines},
                 ),
             ),
             patch(
                 "oobleck.planner.create_pipeline_templates",
-                return_value={
-                    template.num_stages: template for template in pipeline_templates
-                },
+                return_value={template.num_stages: template for template in pipelines},
             ),
             patch.object(
                 ConfigurationEngine._instance,
@@ -155,6 +150,16 @@ class TestExecutionEngineClass(MultiProcessTestCase):
         assert (
             dataloader.batch_sampler
         ), "HeterogeneousDataLoader.configure() is not called."
+
+        assert engine.pipeline_templates == {
+            template.num_stages: template for template in pipelines
+        }
+        assert engine.plugin.pipelines == pipelines
+        assert (
+            sum(engine.plugin.num_microbatches[pipeline] for pipeline in pipelines)
+            == 12
+        )
+        assert engine.plugin.dp_size == len(pipelines)
 
     @parametrize(
         "pipeline_templates",
