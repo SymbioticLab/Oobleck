@@ -167,7 +167,7 @@ class ConfigurationEngine:
         )
 
         dist.init_process_group(
-            backend="nccl",
+            backend=None,  # both gloo and nccl is initialized
             store=store,
             rank=self.rank,
             world_size=self.world_size,
