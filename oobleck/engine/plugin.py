@@ -1,3 +1,5 @@
+import copy
+import gc
 from collections import Counter
 
 from colossalai.booster.plugin.hybrid_parallel_plugin import (
@@ -6,6 +8,7 @@ from colossalai.booster.plugin.hybrid_parallel_plugin import (
     get_param_info,
 )
 from colossalai.interface import ModelWrapper, OptimizerWrapper
+from colossalai.shardformer import ShardConfig
 from loguru import logger
 from oobleck_colossalai.pipeline_template import PipelineTemplate
 from oobleck_colossalai.plugin.heterogeneous_parallel_plugin import (
@@ -104,23 +107,31 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
         configuration_engine = ConfigurationEngine.get_instance()
 
         # Get old attributes
-        old_pg_mesh = self.pg_mesh
-        old_rank_map = configuration_engine.rank_map
-        old_pipelines = self.pipelines
+        old_pg_mesh = copy.deepcopy(self.pg_mesh.mesh)
+        old_rank_map = copy.deepcopy(configuration_engine.rank_map)
+        old_pipelines = copy.deepcopy(self.pipelines)
 
         # Reset process group
-        _, removed_hosts = configuration_engine.get_host_update()
+        configuration_engine.get_host_update()
+        del self.pg_mesh
+        self.pg_mesh = None
+        gc.collect()
         configuration_engine.init_distributed()
 
         num_hosts_per_pipeline = [pipeline.num_stages for pipeline in old_pipelines]
-        removed_ranks_list = [old_rank_map[host] for host in removed_hosts]
+        removed_ranks_list = [
+            old_rank_map[host]
+            for host in old_rank_map
+            if host not in configuration_engine.rank_map
+        ]
         all_ranks = [rank for ranks in old_rank_map.values() for rank in ranks]
         for removed_ranks in removed_ranks_list:
-            for pipeline_index, ranks_in_mesh in enumerate(old_pg_mesh.mesh):
+            for pipeline_index, ranks_in_mesh in enumerate(old_pg_mesh):
                 if removed_ranks in ranks_in_mesh:
                     num_hosts_per_pipeline[pipeline_index] -= 1
 
-            all_ranks.remove(removed_ranks)
+            for rank in removed_ranks:
+                all_ranks.remove(rank)
 
         # Create new pipelines.
         # TODO: If there is no feasible pipeline, merge pipelines
@@ -134,6 +145,16 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
             dict(Counter(new_pipelines))
         )
 
+        if isinstance(self.shard_config, ShardConfig):
+            self.shard_config = dict(
+                tp_size=self.tp_size,
+                enable_all_optimization=self.shard_config.enable_all_optimization,
+                enable_fused_normalization=self.shard_config.enable_fused_normalization,
+                enable_flash_attention=self.shard_config.enable_flash_attention,
+                enable_jit_fused=self.shard_config.enable_jit_fused,
+                enable_sequence_parallelism=False,
+                enable_sequence_overlap=False,
+            )
         self.set_pipelines(new_pipelines, num_microbatches)
 
         # create copy plan (with torch.distributed)
@@ -167,6 +188,9 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
                 pp_process_group=self.pp_group,
                 tp_process_group=self.tp_group,
             )
-        dataloader.reconfigure()
+        num_microbatches = [
+            self.num_microbatches[pipeline] for pipeline in self.pipelines
+        ]
+        dataloader.reconfigure(self._pipeline_index, num_microbatches)
 
         return model, optimizer, dataloader, lr_scheduler
