@@ -23,7 +23,6 @@ class OobleckBatchSampler(HeterogeneousBatchSampler):
         shuffle: bool = True,
         seed: int = 0,
         drop_last: bool = False,
-        sample_index: int = 0,
     ):
         super().__init__(
             dataset,
@@ -34,8 +33,6 @@ class OobleckBatchSampler(HeterogeneousBatchSampler):
             seed,
             drop_last,
         )
-
-        self.sample_index = sample_index
 
     def __iter__(self) -> Iterator[list[int]]:
         if self.shuffle:
@@ -51,12 +48,8 @@ class OobleckBatchSampler(HeterogeneousBatchSampler):
         the number of iteration (len(self.num_samples)) should also not be changed,
         but just the pipeline index and num_microbatches per pipeline.
         """
-        while self.sample_index < self.num_samples:
-            index = indices[self.sample_index] * self.global_batch_size
-            # increment the sample index for the next iteration.
-            # If training fails in the current iteration, will be decreased by 1 by step_back()
-            # to retrain the same iteration.
-            self.sample_index += 1
+        for sample_index in range(self.num_samples):
+            index = indices[sample_index] * self.global_batch_size
 
             # batch start indices for the current pipeline within this iteration
             pipeline_batch_offset = sum(self.num_microbatches[: self.pipeline_index])
@@ -71,13 +64,6 @@ class OobleckBatchSampler(HeterogeneousBatchSampler):
                     + self.microbatch_size * self.num_microbatches[self.pipeline_index],
                 )
             )
-
-        # Reset index after iterating all samples
-        # After returning, the iterator will return StopIteration;
-        # and when a new iterator is created, it will start from the beginning.
-        # If an iterator is created while the sample_index is not reset,
-        # this means a failure happens in the middle and should be resumed from there.
-        self.sample_index = 0
 
     def __len__(self) -> int:
         return self.num_samples
@@ -132,14 +118,7 @@ class OobleckDataLoader(HeterogeneousDataLoader):
         )
 
     def reconfigure(self, pipeline_index: int, num_microbatches: list[int]):
-        batch_sampler: OobleckBatchSampler = cast(
-            OobleckBatchSampler, self.batch_sampler
-        )
-        sample_index = (
-            batch_sampler.sample_index - 1 if batch_sampler.sample_index > 0 else 0
-        )
-
-        self.__initialized = False
+        self._DataLoader__initialized = False
 
         batch_sampler = OobleckBatchSampler(
             self.dataset,
@@ -149,7 +128,6 @@ class OobleckDataLoader(HeterogeneousDataLoader):
             self.shuffle,
             self.seed,
             self.drop_last,
-            sample_index=sample_index,
         )
         DataLoader.__init__(
             self,

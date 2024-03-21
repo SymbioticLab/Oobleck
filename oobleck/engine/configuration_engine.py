@@ -80,47 +80,23 @@ class ConfigurationEngine:
         ), "ConfigurationEngine is not initialized."
         return ConfigurationEngine._instance
 
-    def get_host_update(self) -> tuple[list[HostInfo], list[HostInfo]]:
+    def get_host_update(self):
         """
         Get host update from the agent process.
-
-        Returns:
-            tuple[list[HostInfo], list[HostInfo]]: new dist_info and removed dist_info.
         """
-        new_dist_info: list[HostInfo] = self.pipe.recv()
-
-        added_hosts = [host for host in new_dist_info if host not in self.dist_info]
-        for host in added_hosts:
-            self.add_host(host)
-
-        removed_hosts = [host for host in self.dist_info if host not in new_dist_info]
-        for host in removed_hosts:
-            self.remove_host(host)
-
-        return added_hosts, removed_hosts
-
-    def add_host(self, host: HostInfo):
-        """TODO(insujang): implement it. Currently not support adding hosts.
-        Find if there is unused port in the middle, and use if so.
-        Otherwise, add new ranks to the end of the list.
-        """
-        raise NotImplementedError()
-
-    def remove_host(self, host: HostInfo):
-        if host not in self.dist_info:
-            return
-
         my_agent = self.dist_info[self.agent_index]
 
-        # Update dist_info and rank_map
-        self.dist_info.remove(host)
-        del self.rank_map[host]
+        new_dist_info: list[HostInfo] = self.pipe.recv()
 
-        # Update agent index
-        self.agent_index = self.dist_info.index(my_agent)
-        assert self.agent_index >= 0, "Agent index should be non-negative."
+        self.dist_info = new_dist_info
+        self.agent_index = new_dist_info.index(my_agent)
 
-        logger.debug(f"Rank map updated due to host {host} removal: {self.rank_map}")
+        self.rank_map = {
+            host: list(range(i * host.slots, (i + 1) * host.slots))
+            for i, host in enumerate(self.dist_info)
+        }
+        my_agent = self.dist_info[self.agent_index]
+        self.rank = self.rank_map[my_agent][self.local_rank]
 
     @property
     def all_ranks(self) -> list[int]:
@@ -145,24 +121,21 @@ class ConfigurationEngine:
     def receive_distributed_port(self) -> int:
         return self.pipe.recv()
 
-    def init_distributed(self) -> Optional[list[HostInfo]]:
+    def init_distributed(self):
         """
         Initialize torch.distributed.
 
         When it was initialized before, destroy it first and reinitialize.
         When destruction happened, the function returns the old dist_info.
-
-        Returns:
-            Optional[list[HostInfo]]: old dist_info if it was initialized before.
         """
-        old_dist_info = None
         if dist.is_initialized():
-            old_dist_info = self.dist_info
             # TODO: if we try to destroy a process group where some operation is stuck,
             # destroying it might be stuck as well.
             # If this is witnessed, change it to destryoing all process groups
             # manually gathered in ThreadPoolExecutor.
-            dist.destroy_process_group(dist.group.WORLD)
+            dist.destroy_process_group(dist.GroupMember.WORLD)
+
+        assert not dist.is_initialized()
 
         if self.is_master:
             store = dist.TCPStore(
@@ -202,5 +175,3 @@ class ConfigurationEngine:
 
         assert dist.is_initialized(), "Distributed environment is not initialized."
         logger.debug("Distributed environment initialized.")
-
-        return old_dist_info

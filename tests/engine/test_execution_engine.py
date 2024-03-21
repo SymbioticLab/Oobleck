@@ -35,6 +35,7 @@ from transformers import (
 
 from oobleck.elastic.run import HostInfo
 from oobleck.engine.configuration_engine import ConfigurationEngine
+from oobleck.engine.dataloader import OobleckDataLoader
 from oobleck.engine.execution_engine import ExecutionEngine
 from oobleck.engine.plugin import OobleckPlugin
 
@@ -129,10 +130,6 @@ class TestExecutionEngineClass(MultiProcessTestCase):
                     {template: 12 // len(pipelines) for template in pipelines},
                 ),
             ),
-            patch(
-                "oobleck.planner.create_pipeline_templates",
-                return_value={template.num_stages: template for template in pipelines},
-            ),
             patch.object(
                 ConfigurationEngine._instance,
                 "init_distributed",
@@ -146,14 +143,25 @@ class TestExecutionEngineClass(MultiProcessTestCase):
                 lr_scheduler=lr_scheduler,
             )
 
-        assert dist.is_initialized()
+        assert isinstance(model, HeterogeneousParallelModule)
+        assert isinstance(
+            optimizer, (HybridParallelAMPOptimizer, HybridParallelNaiveOptimizer)
+        )
+        assert isinstance(dataloader, OobleckDataLoader)
         assert (
-            dataloader.batch_sampler
+            dataloader.batch_sampler and dataloader.__initialized
         ), "HeterogeneousDataLoader.configure() is not called."
 
-        assert engine.pipeline_templates == {
-            template.num_stages: template for template in pipelines
-        }
+        assert dist.is_initialized()
+
+        assert all(
+            num_nodes == template.num_stages
+            for num_nodes, template in engine.pipeline_templates.items()
+        )
+        assert list(range(1, self.world_size // 2 + 1)) == list(
+            engine.pipeline_templates.keys()
+        )
+
         assert engine.plugin.pipelines == pipelines
         assert (
             sum(engine.plugin.num_microbatches[pipeline] for pipeline in pipelines)
