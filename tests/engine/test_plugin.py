@@ -88,7 +88,7 @@ class OobleckPluginClassBase(MultiProcessTestCase):
         print(f"dist init r={self.rank}, world={self.world_size}")
         dist.init_process_group(
             init_method=f"{FILE_SCHEMA}{self.file_name}",
-            backend="nccl",
+            backend=None,  # both gloo and nccl is initialized
             world_size=self.world_size,
             rank=self.rank,
         )
@@ -150,6 +150,23 @@ class OobleckPluginClassBase(MultiProcessTestCase):
 
         return plugin, model, optimizer, dataloader
 
+    def do_step(
+        self,
+        plugin: OobleckPlugin,
+        model: ModelWrapper,
+        optimizer: OptimizerWrapper,
+        dataloader: OobleckDataLoader,
+    ):
+        iterator = iter(dataloader)
+        plugin.execute_pipeline(
+            iterator,
+            model,
+            lambda outputs, inputs: outputs.loss,
+            optimizer,
+            return_loss=True,
+            return_outputs=True,
+        )
+
     def do_reconfigure(
         self,
         hosts_to_fail: list[int],
@@ -169,6 +186,8 @@ class OobleckPluginClassBase(MultiProcessTestCase):
             else:
                 hosts_remaining.append(host)
         self.pipe.send(hosts_remaining)
+
+        # self.do_step(plugin, model, optimizer, dataloader)
 
         with patch.object(
             configuration_engine, "init_distributed", new=self.init_distributed

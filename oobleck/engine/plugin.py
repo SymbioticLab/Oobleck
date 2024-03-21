@@ -2,6 +2,8 @@ import copy
 import gc
 from collections import Counter
 
+import torch
+import torch.distributed as dist
 from colossalai.booster.plugin.hybrid_parallel_plugin import (
     HybridParallelAMPOptimizer,
     HybridParallelNaiveOptimizer,
@@ -14,6 +16,7 @@ from oobleck_colossalai.pipeline_template import PipelineTemplate
 from oobleck_colossalai.plugin.heterogeneous_parallel_plugin import (
     HeterogeneousParallelPlugin,
 )
+from oobleck_colossalai.process_group_mesh import PP_AXIS
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import DataLoader, Dataset
 
@@ -111,30 +114,44 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
         old_rank_map = copy.deepcopy(configuration_engine.rank_map)
         old_pipelines = copy.deepcopy(self.pipelines)
 
+        num_layers = self.pipelines[0].num_layers
+        old_my_layers = torch.tensor(
+            [
+                True
+                if index in [coord[PP_AXIS] for coord in self.pg_mesh.coords]
+                else False
+                for index in range(num_layers)
+            ],
+            dtype=torch.bool,
+            device="cpu",
+        )
+
         # Reset process group
         configuration_engine.get_host_update()
         del self.pg_mesh
-        self.pg_mesh = None
         gc.collect()
         configuration_engine.init_distributed()
 
+        # each tensor indicates which layers are held by each (new) rank
+        old_layers_per_rank = [
+            torch.zeros(num_layers, dtype=torch.bool, device="cpu")
+            for _ in range(dist.get_world_size())
+        ]
+        dist.all_gather(old_layers_per_rank, old_my_layers)
+
+        # Create new pipelines.
+        # TODO: If there is no feasible pipeline, merge pipelines
         num_hosts_per_pipeline = [pipeline.num_stages for pipeline in old_pipelines]
         removed_ranks_list = [
             old_rank_map[host]
             for host in old_rank_map
             if host not in configuration_engine.rank_map
         ]
-        all_ranks = [rank for ranks in old_rank_map.values() for rank in ranks]
         for removed_ranks in removed_ranks_list:
             for pipeline_index, ranks_in_mesh in enumerate(old_pg_mesh):
                 if removed_ranks in ranks_in_mesh:
                     num_hosts_per_pipeline[pipeline_index] -= 1
 
-            for rank in removed_ranks:
-                all_ranks.remove(rank)
-
-        # Create new pipelines.
-        # TODO: If there is no feasible pipeline, merge pipelines
         new_pipelines = [
             pipeline_templates[num_stages] for num_stages in num_hosts_per_pipeline
         ]
@@ -156,8 +173,6 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
                 enable_sequence_overlap=False,
             )
         self.set_pipelines(new_pipelines, num_microbatches)
-
-        # create copy plan (with torch.distributed)
 
         # copy missing layers
 
