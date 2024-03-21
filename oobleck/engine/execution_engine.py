@@ -47,7 +47,7 @@ class ExecutionEngine:
         self.base_dir = configuration_engine.base_dir
         self.booster = Booster(plugin=plugin, **booster_kwargs)
 
-        self.pipeline_templates: list[PipelineTemplate] | None = None
+        self.pipeline_templates: dict[int, PipelineTemplate] | None = None
 
     @property
     def is_master(self) -> bool:
