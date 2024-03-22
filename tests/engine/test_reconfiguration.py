@@ -11,7 +11,6 @@ import torch.distributed as dist
 from colossalai.interface import ModelWrapper, OptimizerWrapper
 from conftest import (
     config,
-    init_profile_data,
     template_1stage,
     template_2stages,
     template_3stages,
@@ -48,6 +47,7 @@ class OobleckReconfigurationClassBase(MultiProcessTestCase):
     num_hosts: int
     tp_size: int = 1
     pipe: Connection
+    reconfiguration_count: int = 0
 
     @property
     def world_size(self) -> int:
@@ -86,7 +86,7 @@ class OobleckReconfigurationClassBase(MultiProcessTestCase):
             temp_dir,
         )
 
-        init_profile_data(temp_dir / tag / "profile" / f"mb_{microbatch_size}.csv")
+        # init_profile_data(temp_dir / tag / "profile" / f"mb_{microbatch_size}.csv")
 
         # Consume port info that is sent from agent process
         assert ConfigurationEngine.get_instance().receive_distributed_port() == 1234
@@ -96,21 +96,28 @@ class OobleckReconfigurationClassBase(MultiProcessTestCase):
         if dist.is_initialized():
             dist.destroy_process_group(dist.GroupMember.WORLD)
 
-        torch.cuda.set_device(self.rank)
+        configuration_engine = ConfigurationEngine.get_instance()
+        self.rank = configuration_engine.rank
+        self.num_hosts = configuration_engine.world_size // self.tp_size
+
         print(f"dist init r={self.rank}, world={self.world_size}")
 
         try:
             dist.init_process_group(
-                init_method=f"{FILE_SCHEMA}{self.file_name}",
+                init_method=f"{FILE_SCHEMA}{self.file_name}{self.reconfiguration_count}",
                 backend="nccl",
                 world_size=self.world_size,
                 rank=self.rank,
             )
+            self.reconfiguration_count += 1
+
         except RuntimeError as e:
             if "recompile" in e.args[0]:
                 sys.exit(TEST_SKIPS["backend_unavailable"].exit_code)
 
             raise
+
+        assert dist.is_initialized()
 
     def prepare(
         self, pipelines: list[PipelineTemplate]
@@ -170,9 +177,10 @@ class OobleckReconfigurationClassBase(MultiProcessTestCase):
 
         # Simulate agent process's behavior sending the new host info
         hosts_remaining = []
-        for host, ranks in list(configuration_engine.rank_map.items()):
+        for host, ranks in configuration_engine.rank_map.items():
             if host.port in hosts_to_fail:
                 if self.rank in ranks:
+                    print(f"Rank {self.rank} failed")
                     sys.exit(0)
             else:
                 hosts_remaining.append(host)
@@ -234,7 +242,6 @@ class TestOobleckReconfiguration3RanksClass(OobleckReconfigurationClassBase):
             [template_1stage, template_2stages]
         )
         self.do_step(plugin, model, optimizer, dataloader)
-
         self.do_reconfigure(hosts_to_fail, plugin, model, optimizer, dataloader)
 
         assert dist.get_world_size() == self.current_world_size

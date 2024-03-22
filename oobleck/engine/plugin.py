@@ -110,11 +110,10 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
         configuration_engine.init_distributed()
 
         # each tensor indicates which layers are held by each (new) rank
-        old_layers_per_rank = [
-            torch.zeros(num_layers, dtype=torch.bool, device="cuda")
-            for _ in range(dist.get_world_size())
-        ]
-        dist.all_gather(old_layers_per_rank, old_my_layers)
+        old_layers_per_rank = torch.zeros(
+            configuration_engine.world_size, num_layers, dtype=torch.bool, device="cuda"
+        )
+        dist.all_gather_into_tensor(old_layers_per_rank, old_my_layers)
 
         # Create new pipelines.
         # TODO: If there is no feasible pipeline, merge pipelines

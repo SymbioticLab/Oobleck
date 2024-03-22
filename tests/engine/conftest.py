@@ -10,7 +10,7 @@ from oobleck_colossalai.shardformer.policies.gpt2 import (
 
 config: GPT2Config = GPT2Config.from_pretrained("gpt2")
 config.is_decoder = True
-config.n_layers = 4
+config.n_layer = 4
 config.num_labels = GLUEDataBuilder.glue_task_num_labels["mrpc"]
 
 modules: list[str] = GPT2ForSequenceClassificationPolicy.get_all_modules(config)
