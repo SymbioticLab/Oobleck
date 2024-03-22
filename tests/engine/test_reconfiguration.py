@@ -1,23 +1,26 @@
 import multiprocessing
 import sys
+from multiprocessing.connection import Connection
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import numpy as np
+import torch
 import torch.distributed as dist
 from colossalai.interface import ModelWrapper, OptimizerWrapper
 from conftest import (
-    GLUEDataBuilder,
+    config,
     init_profile_data,
     template_1stage,
     template_2stages,
     template_3stages,
 )
+from data_builder import GLUEDataBuilder
 from oobleck_colossalai.pipeline_template import PipelineTemplate
 from torch.optim import Adam
-from torch.optim.lr_scheduler import LRScheduler
 from torch.testing._internal.common_distributed import (
+    TEST_SKIPS,
     MultiProcessTestCase,
     requires_nccl,
     skip_if_lt_x_gpu,
@@ -27,49 +30,28 @@ from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
 )
+from torch.utils.data import DataLoader
 from transformers import (
-    AutoConfig,
     GPT2ForSequenceClassification,
     get_linear_schedule_with_warmup,
 )
 
 from oobleck.elastic.run import HostInfo
 from oobleck.engine.configuration_engine import ConfigurationEngine
-from oobleck.engine.dataloader import OobleckDataLoader
 from oobleck.engine.plugin import OobleckPlugin
-
-config = AutoConfig.from_pretrained("gpt2")
-config.num_hidden_layers = 4
 
 tag: str = "test-gpt2"
 microbatch_size: int = 1
-global_batch_size: int = 12
 
 
-class OobleckPluginClassBase(MultiProcessTestCase):
-    current_world_size: int
-    pipelines: list[PipelineTemplate]
-
-    def generate_host_info(self, tp_size: int) -> list[HostInfo]:
-        return [
-            HostInfo("127.0.0.1", tp_size, 1234 + i) for i in range(self.world_size)
-        ]
-
-    def init_configuration_engine(self, tp_size: int, temp_dir: Path):
-        pipe, child_pipe = multiprocessing.Pipe()
-        # dist info
-        pipe.send(self.generate_host_info(tp_size))
-        # port info
-        pipe.send(1234)
-        self.pipe = pipe
-
-        ConfigurationEngine.create(
-            child_pipe, self.rank // tp_size, self.rank % tp_size, tag, temp_dir
-        )
+class OobleckReconfigurationClassBase(MultiProcessTestCase):
+    num_hosts: int
+    tp_size: int = 1
+    pipe: Connection
 
     @property
-    def world_size(self):
-        return self.current_world_size
+    def world_size(self) -> int:
+        return self.num_hosts * self.tp_size
 
     def setUp(self):
         super().setUp()
@@ -79,31 +61,71 @@ class OobleckPluginClassBase(MultiProcessTestCase):
         super().tearDown()
         ConfigurationEngine._instance = None
 
+    def init_oobleck(self):
+        torch.cuda.set_device(self.rank)
+
+        pipe, child_pipe = multiprocessing.Pipe()
+        # dist info
+        pipe.send(
+            [
+                HostInfo("127.0.0.1", self.tp_size, 1234 + i)
+                for i in range(self.world_size)
+            ]
+        )
+        # port info
+        pipe.send(1234)
+        self.pipe = pipe
+
+        temp_dir = Path(TemporaryDirectory().name)
+
+        ConfigurationEngine.create(
+            child_pipe,
+            self.rank // self.tp_size,
+            self.rank % self.tp_size,
+            tag,
+            temp_dir,
+        )
+
+        init_profile_data(temp_dir / tag / "profile" / f"mb_{microbatch_size}.csv")
+
+        # Consume port info that is sent from agent process
+        assert ConfigurationEngine.get_instance().receive_distributed_port() == 1234
+        self.init_distributed()
+
     def init_distributed(self):
         if dist.is_initialized():
             dist.destroy_process_group(dist.GroupMember.WORLD)
 
-        self.rank = ConfigurationEngine._instance.rank
-
+        torch.cuda.set_device(self.rank)
         print(f"dist init r={self.rank}, world={self.world_size}")
-        dist.init_process_group(
-            init_method=f"{FILE_SCHEMA}{self.file_name}",
-            backend=None,  # both gloo and nccl is initialized
-            world_size=self.world_size,
-            rank=self.rank,
-        )
 
-        configuration_engine = ConfigurationEngine.get_instance()
-        assert configuration_engine.rank == self.rank
-        assert configuration_engine.world_size == self.world_size
+        try:
+            dist.init_process_group(
+                init_method=f"{FILE_SCHEMA}{self.file_name}",
+                backend="nccl",
+                world_size=self.world_size,
+                rank=self.rank,
+            )
+        except RuntimeError as e:
+            if "recompile" in e.args[0]:
+                sys.exit(TEST_SKIPS["backend_unavailable"].exit_code)
+
+            raise
 
     def prepare(
-        self, plugin: OobleckPlugin
-    ) -> tuple[ModelWrapper, OptimizerWrapper, OobleckDataLoader, LRScheduler]:
-        global config
-        model = GPT2ForSequenceClassification(config)
+        self, pipelines: list[PipelineTemplate]
+    ) -> tuple[OobleckPlugin, ModelWrapper, OptimizerWrapper, DataLoader]:
+        self.init_oobleck()
 
-        dataloader = GLUEDataBuilder("gpt2", plugin).dataloader()
+        plugin = OobleckPlugin(
+            tp_size=self.tp_size,
+            microbatch_size=microbatch_size,
+            global_batch_size=len(pipelines) * 6,
+        )
+        plugin.set_pipelines(pipelines, {template: 6 for template in pipelines})
+
+        dataloader = GLUEDataBuilder("gpt2", plugin).train_dataloader()
+        model = GPT2ForSequenceClassification(config)
 
         optimizer = Adam(model.parameters())
         lr_scheduler = get_linear_schedule_with_warmup(optimizer, 0, 100)
@@ -115,39 +137,6 @@ class OobleckPluginClassBase(MultiProcessTestCase):
             lr_scheduler=lr_scheduler,
         )
 
-        return model, optimizer, dataloader, lr_scheduler
-
-    def init_test(
-        self, tp_size: int
-    ) -> tuple[OobleckPlugin, ModelWrapper, OptimizerWrapper, OobleckDataLoader]:
-        temp_dir = TemporaryDirectory()
-        self.init_configuration_engine(tp_size, Path(temp_dir.name))
-        init_profile_data(
-            Path(temp_dir.name) / tag / "profile" / f"mb_{microbatch_size}.csv"
-        )
-
-        configuration_engine = ConfigurationEngine.get_instance()
-
-        # Consume port info that is sent from agent process
-        assert configuration_engine.receive_distributed_port() == 1234
-        self.init_distributed()
-
-        plugin = OobleckPlugin(
-            tp_size=tp_size,
-            global_batch_size=global_batch_size,
-            microbatch_size=1,
-            precision="fp32",
-        )
-        plugin.set_pipelines(
-            self.pipelines,
-            {
-                pipeline: global_batch_size // len(self.pipelines)
-                for pipeline in self.pipelines
-            },
-        )
-
-        model, optimizer, dataloader, lr_scheduler = self.prepare(plugin)
-
         return plugin, model, optimizer, dataloader
 
     def do_step(
@@ -155,11 +144,10 @@ class OobleckPluginClassBase(MultiProcessTestCase):
         plugin: OobleckPlugin,
         model: ModelWrapper,
         optimizer: OptimizerWrapper,
-        dataloader: OobleckDataLoader,
+        dataloader: DataLoader,
     ):
-        iterator = iter(dataloader)
         plugin.execute_pipeline(
-            iterator,
+            iter(dataloader),
             model,
             lambda outputs, inputs: outputs.loss,
             optimizer,
@@ -167,13 +155,16 @@ class OobleckPluginClassBase(MultiProcessTestCase):
             return_outputs=True,
         )
 
+        optimizer.step()
+        optimizer.zero_grad()
+
     def do_reconfigure(
         self,
         hosts_to_fail: list[int],
         plugin: OobleckPlugin,
         model: ModelWrapper,
         optimizer: OptimizerWrapper,
-        dataloader: OobleckDataLoader,
+        dataloader: DataLoader,
     ):
         configuration_engine = ConfigurationEngine.get_instance()
 
@@ -186,8 +177,7 @@ class OobleckPluginClassBase(MultiProcessTestCase):
             else:
                 hosts_remaining.append(host)
         self.pipe.send(hosts_remaining)
-
-        # self.do_step(plugin, model, optimizer, dataloader)
+        self.num_hosts -= len(hosts_to_fail)
 
         with patch.object(
             configuration_engine, "init_distributed", new=self.init_distributed
@@ -205,17 +195,15 @@ class OobleckPluginClassBase(MultiProcessTestCase):
             )
 
 
-class TestOobleckReconfiguration3RanksClass(OobleckPluginClassBase):
+class TestOobleckReconfiguration3RanksClass(OobleckReconfigurationClassBase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.current_world_size = 3
-        self.pipelines = [template_1stage, template_2stages]
+        self.num_hosts = 3
 
     @parametrize(
-        "tp_size, hosts_to_fail, expected_new_pipelines, expected_mesh",
+        "hosts_to_fail, expected_new_pipelines, expected_mesh",
         [
             [
-                1,
                 [1235],
                 [template_1stage, template_1stage],
                 [
@@ -224,7 +212,6 @@ class TestOobleckReconfiguration3RanksClass(OobleckPluginClassBase):
                 ],
             ],
             [
-                1,
                 [1236],
                 [template_1stage, template_1stage],
                 [
@@ -233,20 +220,21 @@ class TestOobleckReconfiguration3RanksClass(OobleckPluginClassBase):
                 ],
             ],
         ],
-        name_fn=lambda tp_size,
-        hosts_to_fail,
-        *_: f"tp_size={tp_size},hosts_to_fail={hosts_to_fail}",
+        name_fn=lambda hosts_to_fail, *_: f"hosts_to_fail={hosts_to_fail}",
     )
     @requires_nccl()
     @skip_if_lt_x_gpu(3)
     def test_reconfiguration_pass(
         self,
-        tp_size: int,
         hosts_to_fail: int,
         expected_new_pipelines: list[PipelineTemplate],
         expected_mesh: list,
     ):
-        plugin, model, optimizer, dataloader = self.init_test(tp_size)
+        plugin, model, optimizer, dataloader = self.prepare(
+            [template_1stage, template_2stages]
+        )
+        self.do_step(plugin, model, optimizer, dataloader)
+
         self.do_reconfigure(hosts_to_fail, plugin, model, optimizer, dataloader)
 
         assert dist.get_world_size() == self.current_world_size
@@ -254,17 +242,15 @@ class TestOobleckReconfiguration3RanksClass(OobleckPluginClassBase):
         assert np.array_equal(plugin.stage_manager.pg_mesh.mesh, expected_mesh)
 
 
-class TestOobleckReconfiguration4RanksClass(OobleckPluginClassBase):
+class TestOobleckReconfiguration4RanksClass(OobleckReconfigurationClassBase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.current_world_size = 4
-        self.pipelines = [template_2stages, template_2stages]
+        self.num_hosts = 4
 
     @parametrize(
-        "tp_size, hosts_to_fail, expected_new_pipelines, expected_mesh",
+        "hosts_to_fail, expected_new_pipelines, expected_mesh",
         [
             [
-                1,
                 [1235],
                 [template_1stage, template_2stages],
                 [
@@ -273,7 +259,6 @@ class TestOobleckReconfiguration4RanksClass(OobleckPluginClassBase):
                 ],
             ],
             [
-                1,
                 [1237],
                 [template_2stages, template_1stage],
                 [
@@ -282,7 +267,6 @@ class TestOobleckReconfiguration4RanksClass(OobleckPluginClassBase):
                 ],
             ],
             [
-                1,
                 [1235, 1236],
                 [template_1stage, template_1stage],
                 [
@@ -291,20 +275,21 @@ class TestOobleckReconfiguration4RanksClass(OobleckPluginClassBase):
                 ],
             ],
         ],
-        name_fn=lambda tp_size, hosts_to_fail, *_: (
-            f"tp_size={tp_size},hosts_to_fail={hosts_to_fail}"
-        ),
+        name_fn=lambda hosts_to_fail, *_: (f"hosts_to_fail={hosts_to_fail}"),
     )
     @requires_nccl()
     @skip_if_lt_x_gpu(4)
     def test_reconfiguration_pass(
         self,
-        tp_size: int,
         hosts_to_fail: int,
         expected_new_pipelines: list[PipelineTemplate],
         expected_mesh: list,
     ):
-        plugin, model, optimizer, dataloader = self.init_test(tp_size)
+        plugin, model, optimizer, dataloader = self.prepare(
+            [template_2stages, template_2stages]
+        )
+        self.do_step(plugin, model, optimizer, dataloader)
+
         self.do_reconfigure(hosts_to_fail, plugin, model, optimizer, dataloader)
 
         assert dist.get_world_size() == self.current_world_size
