@@ -14,7 +14,6 @@ from torch.optim.lr_scheduler import _LRScheduler as LRScheduler
 from torch.utils.data import DataLoader
 
 from oobleck.engine.configuration_engine import ConfigurationEngine
-from oobleck.engine.dataloader import OobleckDataLoader
 from oobleck.engine.pipeline_instantiator import PipelineInstantiator
 from oobleck.engine.plugin import OobleckPlugin
 from oobleck.planner import create_pipeline_templates
@@ -61,7 +60,7 @@ class ExecutionEngine:
         model: nn.Module,
         optimizer: Optimizer | None = None,
         criterion: Callable | None = None,
-        dataloader: OobleckDataLoader | None = None,
+        dataloader: DataLoader | None = None,
         lr_scheduler: LRScheduler | None = None,
     ) -> tuple[nn.Module, Optimizer, Callable, DataLoader, LRScheduler]:
         """Initialize pipeline templates and distributed configuration."""

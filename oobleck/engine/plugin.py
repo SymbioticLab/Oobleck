@@ -13,15 +13,15 @@ from colossalai.interface import ModelWrapper, OptimizerWrapper
 from colossalai.shardformer import ShardConfig
 from loguru import logger
 from oobleck_colossalai.pipeline_template import PipelineTemplate
+from oobleck_colossalai.plugin.heterogeneous_dataloader import HeterogeneousDataLoader
 from oobleck_colossalai.plugin.heterogeneous_parallel_plugin import (
     HeterogeneousParallelPlugin,
 )
 from oobleck_colossalai.process_group_mesh import PP_AXIS
 from torch.optim.lr_scheduler import LRScheduler
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 
 from oobleck.engine.configuration_engine import ConfigurationEngine
-from oobleck.engine.dataloader import OobleckDataLoader
 from oobleck.engine.pipeline_instantiator import PipelineInstantiator
 
 
@@ -55,30 +55,6 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
             overlap_communication=False,
         )
 
-    def prepare_dataloader(
-        self,
-        dataset: Dataset,
-        shuffle: bool = False,
-        seed: int = 1024,
-        pin_memory: bool = False,
-        num_workers: int = 0,
-        **kwargs,
-    ) -> OobleckDataLoader:
-        _kwargs = kwargs.copy()
-        _kwargs.pop("sampler", None)
-        _kwargs.pop("batch_sampler", None)
-
-        return OobleckDataLoader(
-            dataset,
-            global_batch_size=self.global_batch_size,
-            microbatch_size=self.microbatch_size,
-            shuffle=shuffle,
-            seed=seed,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            **_kwargs,
-        )
-
     def on_receive_reconfiguration_notification(self):
         """
         A failure event is received from any worker.
@@ -93,7 +69,7 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
         pipeline_templates: dict[int, PipelineTemplate],
         model: ModelWrapper,
         optimizer: OptimizerWrapper,
-        dataloader: OobleckDataLoader,
+        dataloader: HeterogeneousDataLoader,
         lr_scheduler: LRScheduler | None = None,
     ) -> tuple[
         ModelWrapper,
@@ -123,18 +99,19 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
                 for index in range(num_layers)
             ],
             dtype=torch.bool,
-            device="cpu",
+            device="cuda",
         )
 
         # Reset process group
         configuration_engine.get_host_update()
         del self.pg_mesh
+        self.pg_mesh = None
         gc.collect()
         configuration_engine.init_distributed()
 
         # each tensor indicates which layers are held by each (new) rank
         old_layers_per_rank = [
-            torch.zeros(num_layers, dtype=torch.bool, device="cpu")
+            torch.zeros(num_layers, dtype=torch.bool, device="cuda")
             for _ in range(dist.get_world_size())
         ]
         dist.all_gather(old_layers_per_rank, old_my_layers)
@@ -206,6 +183,5 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
         num_microbatches = [
             self.num_microbatches[pipeline] for pipeline in self.pipelines
         ]
-        dataloader.reconfigure(self._pipeline_index, num_microbatches)
 
         return model, optimizer, dataloader, lr_scheduler

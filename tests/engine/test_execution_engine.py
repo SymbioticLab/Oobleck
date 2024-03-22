@@ -17,6 +17,7 @@ from conftest import (
     template_3stages,
 )
 from oobleck_colossalai import (
+    HeterogeneousDataLoader,
     HeterogeneousParallelModule,
     PipelineTemplate,
 )
@@ -35,7 +36,6 @@ from transformers import (
 
 from oobleck.elastic.run import HostInfo
 from oobleck.engine.configuration_engine import ConfigurationEngine
-from oobleck.engine.dataloader import OobleckDataLoader
 from oobleck.engine.execution_engine import ExecutionEngine
 from oobleck.engine.plugin import OobleckPlugin
 
@@ -147,7 +147,7 @@ class TestExecutionEngineClass(MultiProcessTestCase):
         assert isinstance(
             optimizer, (HybridParallelAMPOptimizer, HybridParallelNaiveOptimizer)
         )
-        assert isinstance(dataloader, OobleckDataLoader)
+        assert isinstance(dataloader, HeterogeneousDataLoader)
         assert (
             dataloader.batch_sampler and dataloader.__initialized
         ), "HeterogeneousDataLoader.configure() is not called."
