@@ -1,9 +1,12 @@
 import copy
 import gc
-from collections import Counter
+import itertools
+from collections import Counter, defaultdict
 
+import numpy as np
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 from colossalai.booster.plugin.hybrid_parallel_plugin import (
     HybridParallelAMPOptimizer,
     HybridParallelNaiveOptimizer,
@@ -17,7 +20,8 @@ from oobleck_colossalai.plugin.heterogeneous_dataloader import HeterogeneousData
 from oobleck_colossalai.plugin.heterogeneous_parallel_plugin import (
     HeterogeneousParallelPlugin,
 )
-from oobleck_colossalai.process_group_mesh import PP_AXIS
+from oobleck_colossalai.process_group_mesh import PP_AXIS, HeterogeneousProcessGroupMesh
+from oobleck_colossalai.shardformer.shard.placeholder import ParameterPlaceholder
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import DataLoader
 
@@ -64,6 +68,7 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
         """
         pass
 
+    @torch.no_grad()
     def reconfigure(
         self,
         pipeline_templates: dict[int, PipelineTemplate],
@@ -109,11 +114,26 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
         gc.collect()
         configuration_engine.init_distributed()
 
+        # Create a rank conversion map (old rank -> new rank)
+        # TODO: create a dedicated function for this
+        rank_conversion_map = {}
+        for host_info, ranks in old_rank_map.items():
+            if host_info not in configuration_engine.rank_map:
+                continue
+            for old_rank, new_rank in zip(
+                ranks, configuration_engine.rank_map[host_info]
+            ):
+                rank_conversion_map[old_rank] = new_rank
+
         # each tensor indicates which layers are held by each (new) rank
         old_layers_per_rank = torch.zeros(
             configuration_engine.world_size, num_layers, dtype=torch.bool, device="cuda"
         )
         dist.all_gather_into_tensor(old_layers_per_rank, old_my_layers)
+        del old_my_layers
+
+        # Prepare layer transfer before setting new pipelines
+        # Setting new pipelines will free unused layers, which some other may need.
 
         # Create new pipelines.
         # TODO: If there is no feasible pipeline, merge pipelines
@@ -132,6 +152,116 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
             pipeline_templates[num_stages] for num_stages in num_hosts_per_pipeline
         ]
 
+        new_pg_mesh = HeterogeneousProcessGroupMesh(
+            new_pipelines, self.shard_config.tensor_parallel_size
+        )
+
+        new_my_layers = torch.tensor(
+            [
+                True
+                if index in [coord[PP_AXIS] for coord in new_pg_mesh.coords]
+                else False
+                for index in range(num_layers)
+            ],
+            dtype=torch.bool,
+            device="cuda",
+        )
+
+        new_layers_per_rank = torch.zeros(
+            configuration_engine.world_size, num_layers, dtype=torch.bool, device="cuda"
+        )
+        dist.all_gather_into_tensor(new_layers_per_rank, new_my_layers)
+        del new_my_layers
+
+        # Calculate required layers (layers that are now need but not held)
+        # layer_index -> list of ranks
+        layers_required_by_rank: defaultdict[int, list[int]] = defaultdict(list)
+        for index, has_layer in np.ndenumerate(np.array(old_layers_per_rank.cpu())):
+            if not has_layer and new_layers_per_rank[index]:
+                rank, layer_index = index
+                layers_required_by_rank[layer_index].append(rank)
+
+        # Implement copy plan
+        send_recv_ops: list[dist.P2POp] = []
+
+        layers = list(
+            itertools.chain.from_iterable(self.pipelines[0].modules_per_stage)
+        )
+        layer_modules: dict[str, nn.Module] = {
+            layer_name: module
+            for name, module in model.module.named_modules()
+            for layer_name in layers
+            if name == layer_name
+        }
+
+        def get_layer_holders() -> list[int]:
+            layer_holders = []
+            for rank, has_layer in enumerate(old_layers_per_rank[:, layer_index]):
+                if has_layer:
+                    layer_holders.append(rank)
+            return layer_holders
+
+        # TODO: copy model parameters from optimizer, since they are master parameters
+        # that can be downcasted and used for model parameters.
+        # Attributes to update
+        # 1. model's parameters (placeholder -> torch.nn.Parameter with data)
+        # 2. optimizer's param_info
+        #    - param2id
+        #    - id2param
+        #    - param2shape
+        # 3. optimizer.optim's state (optimizer states for each parameter)
+        # 4. optimizer.optim's param_groups (master parameters in FP32)
+        # 5. if optimizer is an instance of MixedPrecisionOptimizer,
+        #    then optimizer's master_to_working_map and working_to_master_map
+        # 6. MixedPrecisionMixin has self.params (working params)
+        #    which MixedPrecisionOptimizer has as self.mixed_precision
+        for layer_index, ranks in layers_required_by_rank.items():
+            layer_holders = get_layer_holders()
+            if not layer_holders:
+                logger.error(
+                    f"Currently no rank has layer: {layers[layer_index]}. "
+                    "Please rerun training from last checkpoint."
+                )
+                raise RuntimeError(f"No one holds the layer: {layers[layer_index]}!")
+
+            for rank_need_layer in ranks:
+                if not layer_holders:
+                    # Empty holder "here" means that all holders is consumed and has a job.
+                    # Add more jobs to each holder.
+                    layer_holders = get_layer_holders()
+
+                sender_rank = layer_holders.pop(0)
+                if configuration_engine.rank == rank_need_layer:
+                    module = layer_modules[layers[layer_index]]
+                    parameters: list[tuple[str, ParameterPlaceholder]] = [
+                        (name, param)
+                        for name, param in module.named_parameters()
+                        if isinstance(param, ParameterPlaceholder)
+                    ]
+                    for name, param in parameters:
+                        # Create new parameter and replace the placeholder
+                        new_param = param.create()
+                        setattr(module, name, new_param)
+
+                        # Receive the parameter from the sender
+                        send_recv_ops.append(
+                            dist.P2POp(dist.irecv, new_param.data, sender_rank)
+                        )
+
+                    pass
+                elif sender_rank == configuration_engine.rank:
+                    module = layer_modules[layers[layer_index]]
+                    for name, param in module.named_parameters():
+                        send_recv_ops.append(
+                            dist.P2POp(dist.isend, param.data, rank_need_layer)
+                        )
+
+        works = dist.batch_isend_irecv(send_recv_ops)
+        for work in works:
+            work.wait()
+
+        # free no-longer necessary parameter here
+
         # Redistribute microbatches
         instantiator = PipelineInstantiator(new_pipelines, self.global_batch_size)
         _, num_microbatches = instantiator.distribute_batch(
@@ -149,8 +279,6 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
                 enable_sequence_overlap=False,
             )
         self.set_pipelines(new_pipelines, num_microbatches)
-
-        # copy missing layers
 
         # recreate optimizer, dataloader, etc
 
