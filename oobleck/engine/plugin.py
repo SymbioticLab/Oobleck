@@ -3,7 +3,7 @@ import gc
 import io
 import itertools
 from collections import Counter, defaultdict
-from typing import Any, cast
+from typing import Any, Optional, cast
 
 import numpy as np
 import torch
@@ -12,14 +12,15 @@ import torch.nn as nn
 from colossalai.accelerator import get_accelerator
 from colossalai.booster.plugin.hybrid_parallel_plugin import (
     HybridParallelAMPOptimizer,
+    HybridParallelNaiveOptimizer,
 )
-from colossalai.interface import ModelWrapper, OptimizerWrapper
 from colossalai.pipeline.schedule import OneForwardOneBackwardSchedule
 from loguru import logger
-from oobleck_colossalai.pipeline_template import PipelineTemplate
-from oobleck_colossalai.plugin.heterogeneous_dataloader import HeterogeneousDataLoader
-from oobleck_colossalai.plugin.heterogeneous_parallel_plugin import (
+from oobleck_colossalai import (
+    HeterogeneousDataLoader,
+    HeterogeneousParallelModule,
     HeterogeneousParallelPlugin,
+    PipelineTemplate,
 )
 from oobleck_colossalai.process_group_mesh import (
     DP_AXIS,
@@ -28,10 +29,11 @@ from oobleck_colossalai.process_group_mesh import (
     HeterogeneousProcessGroupMesh,
 )
 from oobleck_colossalai.shardformer.shard.placeholder import TensorPlaceholder
+from oobleck_colossalai.shardformer.shard.shardformer import ModelSharder
 from oobleck_colossalai.stage_manager import HeterogeneousPipelineStageManager
 from torch.optim.lr_scheduler import LRScheduler
 
-from oobleck.engine.configuration_engine import ConfigurationEngine
+from oobleck.engine.configuration_engine import ConfigurationEngine, HostInfo
 from oobleck.engine.pipeline_instantiator import PipelineInstantiator
 
 
@@ -42,15 +44,23 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
 
     def __init__(
         self,
-        pipelines: list[PipelineTemplate],
+        pipeline_templates: list[PipelineTemplate],
         tp_size: int,
+        global_batch_size: int,
         microbatch_size: int,
-        num_microbatches: dict[PipelineTemplate, int],
         precision: str = "fp16",
         enable_fused_normalization: bool = False,
         enable_flash_attention: bool = False,
         enable_jit_used: bool = False,
     ):
+        assert (
+            global_batch_size % microbatch_size == 0
+        ), "Global batch size must be divisible by microbatch size. "
+        pipelines, num_microbatches = self._instantiate_pipelines(
+            pipeline_templates=pipeline_templates,
+            global_num_microbatches=global_batch_size // microbatch_size,
+        )
+
         super().__init__(
             pipelines=pipelines,
             tp_size=tp_size,
@@ -63,6 +73,8 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
             enable_jit_fused=enable_jit_used,
         )
 
+        self.pipeline_templates = pipeline_templates
+
     def on_receive_reconfiguration_notification(self):
         """
         A failure event is received from any worker.
@@ -72,29 +84,99 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
         """
         pass
 
+    def _instantiate_pipelines(
+        self,
+        pipeline_templates: list[PipelineTemplate],
+        global_num_microbatches: int,
+        old_pg_mesh: Optional[list] = None,
+        old_rank_map: Optional[dict[HostInfo, list[int]]] = None,
+    ) -> tuple[list[PipelineTemplate], dict[PipelineTemplate, int]]:
+        """
+        Get pipelines to be instantiated from the list of pipeline templates.
+        Each pipeline template may be instantiated several times.
+
+        Args:
+            pipeline_templates: List of pipeline templates
+            global_num_microbatches: Number of microbatches in a global batch
+            old_pg_mesh: previous group rank mesh (HeterogeneousProcessGroupMesh.mesh).
+                Necessary for reconfiguration. None if not reconfiguration.
+            old_rank_map: previous rank map (ConfigurationEngine.rank_map).
+                Necessary for reconfiguration. None if not reconfiguration.
+
+        Returns:
+            list[PipelineTemplate]: List of pipelines to be instantiated
+            dict[PipelineTemplate, int]: Number of microbatches for each pipeline
+        """
+        pipeline_instantiator = PipelineInstantiator(
+            pipeline_templates, global_num_microbatches
+        )
+        configuration_engine = ConfigurationEngine.get_instance()
+
+        # Is this for reconfiguration?
+        if old_pg_mesh is not None and old_rank_map is not None:
+            if not hasattr(self, "pipelines"):
+                raise RuntimeError(
+                    "Existing pipelines are necessary for reconfiguration"
+                )
+
+            num_hosts_per_pipeline = [
+                pipeline.num_stages for pipeline in self.pipelines
+            ]
+            removed_ranks_list = [
+                old_rank_map[host]
+                for host in old_rank_map
+                if host not in configuration_engine.rank_map
+            ]
+
+            for removed_ranks in removed_ranks_list:
+                for pipeline_index, ranks_in_mesh in enumerate(old_pg_mesh):
+                    if removed_ranks in ranks_in_mesh:
+                        num_hosts_per_pipeline[pipeline_index] -= 1
+
+            # TODO (insujang): If there is no feasible pipeline, merge pipelines
+            pipelines = [
+                pipeline_templates[num_stages] for num_stages in num_hosts_per_pipeline
+            ]
+
+            _, num_microbatches = pipeline_instantiator.distribute_batch(
+                dict(Counter(pipelines))
+            )
+        else:
+            num_instances, num_microbatches = pipeline_instantiator.instantiate(
+                len(configuration_engine.dist_info)
+            )
+
+            pipelines = list(
+                itertools.chain.from_iterable(
+                    itertools.repeat(template, num_templates)
+                    for template, num_templates in num_instances.items()
+                )
+            )
+
+        return pipelines, num_microbatches
+
     @torch.no_grad()
     def reconfigure(
         self,
         pipeline_templates: dict[int, PipelineTemplate],
-        model: ModelWrapper,
-        optimizer: OptimizerWrapper,
+        model: HeterogeneousParallelModule,
+        optimizer: HybridParallelAMPOptimizer | HybridParallelNaiveOptimizer,
         dataloader: HeterogeneousDataLoader,
         lr_scheduler: LRScheduler | None = None,
     ):
-        if not hasattr(self, "pg_mesh"):
-            logger.warning(
-                "Received reconfiguration notification before plugin configuration."
-            )
-            return
-
         configuration_engine = ConfigurationEngine.get_instance()
+        device = get_accelerator().get_current_device()
 
-        # Get old attributes
+        # all layers in the model
+        layers = list(
+            itertools.chain.from_iterable(self.pipelines[0].modules_per_stage)
+        )
+        num_layers = len(layers)
+
+        # Backup old attributes for reconfiguration before resetting
         old_pg_mesh = copy.deepcopy(self.pg_mesh.mesh)
         old_rank_map = copy.deepcopy(configuration_engine.rank_map)
-        old_pipelines = copy.deepcopy(self.pipelines)
 
-        num_layers = self.pipelines[0].num_layers
         old_my_layers = torch.tensor(
             [
                 True
@@ -103,7 +185,7 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
                 for index in range(num_layers)
             ],
             dtype=torch.bool,
-            device="cuda",
+            device=device,
         )
 
         # Reset process group
@@ -113,20 +195,9 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
         gc.collect()
         configuration_engine.init_distributed()
 
-        # Create a rank conversion map (old rank -> new rank)
-        # TODO: create a dedicated function for this
-        rank_conversion_map = {}
-        for host_info, ranks in old_rank_map.items():
-            if host_info not in configuration_engine.rank_map:
-                continue
-            for old_rank, new_rank in zip(
-                ranks, configuration_engine.rank_map[host_info]
-            ):
-                rank_conversion_map[old_rank] = new_rank
-
         # each tensor indicates which layers are held by each (new) rank
         old_layers_per_rank = torch.zeros(
-            configuration_engine.world_size, num_layers, dtype=torch.bool, device="cuda"
+            configuration_engine.world_size, num_layers, dtype=torch.bool, device=device
         )
         dist.all_gather_into_tensor(old_layers_per_rank, old_my_layers)
         del old_my_layers
@@ -136,20 +207,12 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
 
         # Create new pipelines.
         # TODO: If there is no feasible pipeline, merge pipelines
-        num_hosts_per_pipeline = [pipeline.num_stages for pipeline in old_pipelines]
-        removed_ranks_list = [
-            old_rank_map[host]
-            for host in old_rank_map
-            if host not in configuration_engine.rank_map
-        ]
-        for removed_ranks in removed_ranks_list:
-            for pipeline_index, ranks_in_mesh in enumerate(old_pg_mesh):
-                if removed_ranks in ranks_in_mesh:
-                    num_hosts_per_pipeline[pipeline_index] -= 1
-
-        new_pipelines = [
-            pipeline_templates[num_stages] for num_stages in num_hosts_per_pipeline
-        ]
+        new_pipelines, new_num_microbatches = self._instantiate_pipelines(
+            pipeline_templates,
+            self.global_batch_size // self.microbatch_size,
+            old_pg_mesh,
+            old_rank_map,
+        )
 
         new_pg_mesh = HeterogeneousProcessGroupMesh(
             new_pipelines, self.shard_config.tensor_parallel_size
@@ -163,26 +226,41 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
                 for index in range(num_layers)
             ],
             dtype=torch.bool,
-            device="cuda",
+            device=device,
         )
 
         new_layers_per_rank = torch.zeros(
-            configuration_engine.world_size, num_layers, dtype=torch.bool, device="cuda"
+            configuration_engine.world_size, num_layers, dtype=torch.bool, device=device
         )
         dist.all_gather_into_tensor(new_layers_per_rank, new_my_layers)
         del new_my_layers
 
+        """
+        Missing layer transfer based on new pipeline configuration
+        old_layers_per_rank (torch.Tensor[world_size, num_layers]):
+            For each rank, indicates which layers are held by the rank.
+            True if the rank holds the layer, False otherwise.
+            world_size is the size after failures, and ranks are newly assigned ones.
+        new_layers_per_rank (torch.Tensor[world_size, num_layers]):
+            For each rank, indicates which layers should be held by the rank.
+            True if the rank should hold the layer, False if should not.
+
+        1. Calculate required layers (layers that are now need but not held)
+        2. For each required layer, find a rank that holds the layer
+        3. Send the layer to the rank that needs the layer
+        4. Update optimizer states and model parameters
+        5. Calculate non-required layers (layers that are held but not needed)
+        6. Free non-required layers
+        """
+
         # Calculate required layers (layers that are now need but not held)
         # layer_index -> list of ranks
-        layers_required_by_rank: defaultdict[int, list[int]] = defaultdict(list)
-        for index, has_layer in np.ndenumerate(np.array(old_layers_per_rank.cpu())):
+        layers_required_by_rank: dict[int, list[int]] = defaultdict(list)
+        for index, has_layer in np.ndenumerate(old_layers_per_rank.numpy(force=True)):
             if not has_layer and new_layers_per_rank[index]:
                 rank, layer_index = index
                 layers_required_by_rank[layer_index].append(rank)
 
-        layers = list(
-            itertools.chain.from_iterable(self.pipelines[0].modules_per_stage)
-        )
         layer_modules: dict[str, nn.Module] = {
             layer_name: module
             for name, module in model.module.named_modules()
@@ -197,20 +275,6 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
                     layer_holders.append(rank)
             return layer_holders
 
-        # TODO: copy model parameters from optimizer, since they are master parameters
-        # that can be downcasted and used for model parameters.
-        # Attributes to update
-        # 1. model's parameters (placeholder -> torch.nn.Parameter with data)
-        # 2. optimizer's param_info
-        #    - param2id
-        #    - id2param
-        #    - param2shape
-        # 3. optimizer.optim's state (optimizer states for each parameter)
-        # 4. optimizer.optim's param_groups (master parameters in FP32)
-        # 5. if optimizer is an instance of MixedPrecisionOptimizer,
-        #    then optimizer's master_to_working_map and working_to_master_map
-        # 6. MixedPrecisionMixin has self.params (working params)
-        #    which MixedPrecisionOptimizer has as self.mixed_precision
         for layer_index, ranks in layers_required_by_rank.items():
             layer_holders = get_layer_holders()
             if not layer_holders:
@@ -227,7 +291,6 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
                     layer_holders = get_layer_holders()
 
                 sender_rank = layer_holders.pop(0)
-                device = get_accelerator().get_current_device()
                 if configuration_engine.rank == rank_need_layer:
                     module = layer_modules[layers[layer_index]]
 
@@ -256,12 +319,13 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
                             == param_holder.shape
                         )
 
-                        # Get state size
+                        # Get size of optimizer state
                         state_size: torch.Tensor = torch.empty(
                             1, dtype=torch.int64, device=device
                         )
                         dist.recv(state_size, sender_rank)
-                        # Get pickled state tensor
+
+                        # Get pickled optimizer state for parameter
                         state_tensor: torch.Tensor = torch.empty(
                             state_size.item(), dtype=torch.uint8, device=device
                         )
@@ -272,6 +336,7 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
                         param_tensor = param_holder.create(dtype=torch.float32)
                         dist.recv(param_tensor, sender_rank)
 
+                        # Set the model parameter
                         model_param = torch.nn.Parameter(
                             param_tensor.to(param_holder.precision)
                             if param_holder.precision == torch.float32
@@ -327,15 +392,16 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
 
         # free no-longer necessary parameter here
         # TODO: must create _buffer_placeholders and _parameter_placeholders
+        old_layers = old_layers_per_rank.numpy(force=True)[:, configuration_engine.rank]
+        new_layers = new_layers_per_rank.numpy(force=True)[:, configuration_engine.rank]
+        for index, (old_layer, new_layer) in enumerate(zip(old_layers, new_layers)):
+            if old_layer and not new_layer:
+                module = layer_modules[layers[index]]
+                ModelSharder.set_tensors_to_placeholder(module)
 
-        # Redistribute microbatches
-        instantiator = PipelineInstantiator(new_pipelines, self.global_batch_size)
-        _, num_microbatches = instantiator.distribute_batch(
-            dict(Counter(new_pipelines))
-        )
-
+        # Update plugin attributes
         self.pipelines = new_pipelines
-        self.num_microbatches = num_microbatches
+        self.num_microbatches = new_num_microbatches
         self.pg_mesh = new_pg_mesh
         self.stage_manager = HeterogeneousPipelineStageManager(self.pg_mesh, PP_AXIS)
         self.dp_groups = self.pg_mesh.get_group_along_axis(DP_AXIS)
@@ -347,3 +413,17 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
             stage_manager=self.stage_manager,
             microbatch_size=self.microbatch_size,
         )
+
+        model.stage_manager = self.stage_manager
+        module_names = self.pipelines[self._pipeline_index].modules_per_stage[
+            self.stage_manager.stage
+        ]
+        model.dp_groups = (
+            {
+                module_name: dp_group
+                for module_name, dp_group in zip(module_names, self.dp_groups)
+            }
+            if self.dp_groups
+            else None
+        )
+        model.tp_group = self.tp_group
