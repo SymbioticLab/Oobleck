@@ -290,83 +290,75 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
                     # Add more jobs to each holder.
                     layer_holders = get_layer_holders()
 
+                module = layer_modules[layers[layer_index]]
                 sender_rank = layer_holders.pop(0)
                 if configuration_engine.rank == rank_need_layer:
-                    module = layer_modules[layers[layer_index]]
+                    for (
+                        submodule,
+                        name,
+                        placeholder,
+                    ) in ModelSharder.buffer_placeholders(
+                        module, delete_placeholders_after=True
+                    ):
+                        setattr(submodule, name, placeholder.create())
 
-                    buffer_placeholders: dict[str, TensorPlaceholder] = getattr(
-                        module, "_buffer_placeholders"
-                    )
-                    for name, buffer_holder in buffer_placeholders.items():
-                        buffer_holder: TensorPlaceholder = cast(
-                            TensorPlaceholder, buffer_holder
-                        )
-                        setattr(module, name, buffer_holder.create())
-                    delattr(module, "_buffer_placeholders")
-
-                    param_placeholders: dict[str, TensorPlaceholder] = getattr(
-                        module, "_parameter_placeholders"
-                    )
-                    for name, param_holder in param_placeholders.items():
-                        param_holder: TensorPlaceholder = cast(
-                            TensorPlaceholder, param_holder
-                        )
-
-                        # Check: whether shape is correct
-                        param_info: dict[str, Any] = optimizer.param_info
+                    for (
+                        submodule,
+                        name,
+                        placeholder,
+                    ) in ModelSharder.parameter_placeholders(
+                        module, delete_placeholders_after=True
+                    ):
+                        # Check whether shape is correct
                         assert (
-                            param_info["param2shape"][param_holder.param_id]
-                            == param_holder.shape
+                            optimizer.param_info["param2shape"][placeholder.param_id]
+                            == placeholder.shape
                         )
 
-                        # Get size of optimizer state
-                        state_size: torch.Tensor = torch.empty(
+                        size: torch.Tensor = torch.empty(
                             1, dtype=torch.int64, device=device
                         )
-                        dist.recv(state_size, sender_rank)
+                        dist.recv(size, sender_rank)
 
-                        # Get pickled optimizer state for parameter
-                        state_tensor: torch.Tensor = torch.empty(
-                            state_size.item(), dtype=torch.uint8, device=device
+                        tensor: torch.Tensor = torch.empty(
+                            size.item(), dtype=torch.uint8, device=device
                         )
-                        dist.recv(state_tensor, sender_rank)
-                        buff = io.BytesIO(state_tensor.cpu().numpy())
-                        state_tensor: dict[str, torch.Tensor] = torch.load(
+                        dist.recv(tensor, sender_rank)
+                        buff = io.BytesIO(tensor.cpu().numpy())
+                        tensor: dict[str, tuple[dict, torch.Tensor]] = torch.load(
                             buff, map_location=device
                         )
 
-                        param_tensor = param_holder.create(dtype=torch.float32)
-                        dist.recv(param_tensor, sender_rank)
+                        states: dict[str, torch.Tensor] = tensor["states"]
+                        param_tensor: torch.Tensor = tensor["parameter"]
 
-                        # Set the model parameter
-                        model_param = torch.nn.Parameter(
+                        model_parameter = torch.nn.Parameter(
                             param_tensor.to(dtype=model.mixed_precision)
                             if self.precision in ["fp16", "bf16"]
+                            and param_tensor.dtype == torch.float32
                             else param_tensor
                         )
-                        setattr(module, name, model_param)
+                        setattr(submodule, name, model_parameter)
 
                         # Set the ColossalAI Optimizer param_info
-                        optimizer.optim.state[param_tensor] = state_tensor
+                        optimizer.optim.state[param_tensor] = states
                         optimizer.optim.param_groups[0]["params"].append(param_tensor)
 
-                        optim_param_index = param_info["param2id"][
-                            param_holder.param_id
+                        optim_param_index = optimizer.param_info["param2id"][
+                            placeholder.param_id
                         ]
-                        del optimizer.param_info["param2id"][param_holder.param_id]
+                        del optimizer.param_info["param2id"][placeholder.param_id]
                         optimizer.param_info["param2id"][id(param_tensor)] = (
                             optim_param_index
                         )
                         optimizer.param_info["id2param"][optim_param_index] = id(
                             param_tensor
                         )
-                        optimizer.master_to_working_map[param_tensor] = model_param
-                        optimizer.working_to_master_map[model_param] = param_tensor
-                    delattr(module, "_parameter_placeholders")
+                        optimizer.master_to_working_map[param_tensor] = model_parameter
+                        optimizer.working_to_master_map[model_parameter] = param_tensor
 
                 elif sender_rank == configuration_engine.rank:
-                    module = layer_modules[layers[layer_index]]
-                    for name, param in module.named_parameters(recurse=False):
+                    for name, param in module.named_parameters():
                         # Find master weights
                         master_param = (
                             optimizer.working_to_master_map[param]
@@ -376,26 +368,29 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
 
                         # Pickle optimizer state
                         buff = io.BytesIO()
-                        torch.save(optimizer.optim.state[master_param], buff)
+                        torch.save(
+                            {
+                                "states": optimizer.optim.state[master_param],
+                                "parameter": master_param,
+                            },
+                            buff,
+                        )
                         buff.seek(0)
 
-                        state_tensor = torch.frombuffer(
+                        tensor: torch.Tensor = torch.frombuffer(
                             buff.getbuffer(), dtype=torch.uint8
                         ).to(device)
-                        state_size = torch.tensor(
-                            [state_tensor.numel()], dtype=torch.int64, device=device
+                        size = torch.tensor(
+                            [tensor.numel()], dtype=torch.int64, device=device
                         )
 
-                        dist.send(state_size, rank_need_layer)
-                        dist.send(state_tensor, rank_need_layer)
-
-                        # Send the parameter
-                        dist.send(master_param, rank_need_layer)
+                        dist.send(size, rank_need_layer)
+                        dist.send(tensor, rank_need_layer)
 
         # free no-longer necessary parameter here
         # TODO: must create _buffer_placeholders and _parameter_placeholders
-        old_layers = old_layers_per_rank.numpy(force=True)[:, configuration_engine.rank]
-        new_layers = new_layers_per_rank.numpy(force=True)[:, configuration_engine.rank]
+        old_layers = old_layers_per_rank.numpy(force=True)[configuration_engine.rank, :]
+        new_layers = new_layers_per_rank.numpy(force=True)[configuration_engine.rank, :]
         for index, (old_layer, new_layer) in enumerate(zip(old_layers, new_layers)):
             if old_layer and not new_layer:
                 module = layer_modules[layers[index]]
