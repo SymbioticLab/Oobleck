@@ -263,6 +263,8 @@ class TestOobleckReconfiguration3RanksClass(OobleckReconfigurationClassBase):
         assert plugin.pipelines == expected_new_pipelines
         assert np.array_equal(plugin.stage_manager.pg_mesh.mesh, expected_mesh)
 
+        self.do_step(plugin, model, optimizer, dataloader)
+
 
 class TestOobleckReconfiguration4RanksClass(OobleckReconfigurationClassBase):
     def __init__(self, *args, **kwargs):

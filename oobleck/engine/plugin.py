@@ -338,8 +338,8 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
 
                         # Set the model parameter
                         model_param = torch.nn.Parameter(
-                            param_tensor.to(param_holder.precision)
-                            if param_holder.precision == torch.float32
+                            param_tensor.to(dtype=model.mixed_precision)
+                            if self.precision in ["fp16", "bf16"]
                             else param_tensor
                         )
                         setattr(module, name, model_param)
@@ -358,8 +358,8 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
                         optimizer.param_info["id2param"][optim_param_index] = id(
                             param_tensor
                         )
-                        optimizer.master_to_working_map[id(param_tensor)] = model_param
-                        optimizer.working_to_master_map[model_param] = id(param_tensor)
+                        optimizer.master_to_working_map[param_tensor] = model_param
+                        optimizer.working_to_master_map[model_param] = param_tensor
                     delattr(module, "_parameter_placeholders")
 
                 elif sender_rank == configuration_engine.rank:
@@ -414,10 +414,13 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
             microbatch_size=self.microbatch_size,
         )
 
+        self.shard_config.tensor_parallel_process_group = self.tp_group
+        self.shard_config.pipeline_stage_manager = self.stage_manager
+
+        # TODO: how to reset shared parameters? :/
         model.stage_manager = self.stage_manager
-        module_names = self.pipelines[self._pipeline_index].modules_per_stage[
-            self.stage_manager.stage
-        ]
+        my_pipeline = self.pipelines[self._pipeline_index]
+        module_names = my_pipeline.modules_per_stage[self.stage_manager.stage]
         model.dp_groups = (
             {
                 module_name: dp_group
@@ -427,3 +430,14 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
             else None
         )
         model.tp_group = self.tp_group
+
+        from oobleck_colossalai.shardformer.policies.auto_policy import get_autopolicy
+        from oobleck_colossalai.shardformer.shard.shardformer import ShardFormer
+
+        policy = get_autopolicy(my_pipeline.model_name)
+        policy.set_model(model.module)
+        policy.set_pipeline_template(my_pipeline)
+        policy.set_shard_config(self.shard_config)
+        shardformer = ShardFormer(self.shard_config)
+        model.module, model.shared_params = shardformer.optimize(model.module, policy)
+        pass
