@@ -1,29 +1,35 @@
 import copy
 import gc
+import io
 import itertools
 from collections import Counter, defaultdict
+from typing import Any, cast
 
 import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from colossalai.accelerator import get_accelerator
 from colossalai.booster.plugin.hybrid_parallel_plugin import (
     HybridParallelAMPOptimizer,
-    HybridParallelNaiveOptimizer,
-    get_param_info,
 )
 from colossalai.interface import ModelWrapper, OptimizerWrapper
-from colossalai.shardformer import ShardConfig
+from colossalai.pipeline.schedule import OneForwardOneBackwardSchedule
 from loguru import logger
 from oobleck_colossalai.pipeline_template import PipelineTemplate
 from oobleck_colossalai.plugin.heterogeneous_dataloader import HeterogeneousDataLoader
 from oobleck_colossalai.plugin.heterogeneous_parallel_plugin import (
     HeterogeneousParallelPlugin,
 )
-from oobleck_colossalai.process_group_mesh import PP_AXIS, HeterogeneousProcessGroupMesh
-from oobleck_colossalai.shardformer.shard.placeholder import ParameterPlaceholder
+from oobleck_colossalai.process_group_mesh import (
+    DP_AXIS,
+    PP_AXIS,
+    TP_AXIS,
+    HeterogeneousProcessGroupMesh,
+)
+from oobleck_colossalai.shardformer.shard.placeholder import TensorPlaceholder
+from oobleck_colossalai.stage_manager import HeterogeneousPipelineStageManager
 from torch.optim.lr_scheduler import LRScheduler
-from torch.utils.data import DataLoader
 
 from oobleck.engine.configuration_engine import ConfigurationEngine
 from oobleck.engine.pipeline_instantiator import PipelineInstantiator
@@ -36,27 +42,25 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
 
     def __init__(
         self,
+        pipelines: list[PipelineTemplate],
         tp_size: int,
-        global_batch_size: int,
         microbatch_size: int,
+        num_microbatches: dict[PipelineTemplate, int],
         precision: str = "fp16",
         enable_fused_normalization: bool = False,
         enable_flash_attention: bool = False,
         enable_jit_used: bool = False,
     ):
         super().__init__(
+            pipelines=pipelines,
             tp_size=tp_size,
-            global_batch_size=global_batch_size,
             microbatch_size=microbatch_size,
+            num_microbatches=num_microbatches,
             precision=precision,
-            zero_stage=0,
             enable_all_optimization=False,
             enable_fused_normalization=enable_fused_normalization,
             enable_flash_attention=enable_flash_attention,
             enable_jit_fused=enable_jit_used,
-            cpu_offload=False,
-            communication_dtype=None,
-            overlap_communication=False,
         )
 
     def on_receive_reconfiguration_notification(self):
@@ -76,12 +80,7 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
         optimizer: OptimizerWrapper,
         dataloader: HeterogeneousDataLoader,
         lr_scheduler: LRScheduler | None = None,
-    ) -> tuple[
-        ModelWrapper,
-        OptimizerWrapper,
-        DataLoader,
-        LRScheduler,
-    ]:
+    ):
         if not hasattr(self, "pg_mesh"):
             logger.warning(
                 "Received reconfiguration notification before plugin configuration."
@@ -181,9 +180,6 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
                 rank, layer_index = index
                 layers_required_by_rank[layer_index].append(rank)
 
-        # Implement copy plan
-        send_recv_ops: list[dist.P2POp] = []
-
         layers = list(
             itertools.chain.from_iterable(self.pipelines[0].modules_per_stage)
         )
@@ -231,36 +227,106 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
                     layer_holders = get_layer_holders()
 
                 sender_rank = layer_holders.pop(0)
+                device = get_accelerator().get_current_device()
                 if configuration_engine.rank == rank_need_layer:
                     module = layer_modules[layers[layer_index]]
-                    parameters: list[tuple[str, ParameterPlaceholder]] = [
-                        (name, param)
-                        for name, param in module.named_parameters()
-                        if isinstance(param, ParameterPlaceholder)
-                    ]
-                    for name, param in parameters:
-                        # Create new parameter and replace the placeholder
-                        new_param = param.create()
-                        setattr(module, name, new_param)
 
-                        # Receive the parameter from the sender
-                        send_recv_ops.append(
-                            dist.P2POp(dist.irecv, new_param.data, sender_rank)
+                    buffer_placeholders: dict[str, TensorPlaceholder] = getattr(
+                        module, "_buffer_placeholders"
+                    )
+                    for name, buffer_holder in buffer_placeholders.items():
+                        buffer_holder: TensorPlaceholder = cast(
+                            TensorPlaceholder, buffer_holder
+                        )
+                        setattr(module, name, buffer_holder.create())
+                    delattr(module, "_buffer_placeholders")
+
+                    param_placeholders: dict[str, TensorPlaceholder] = getattr(
+                        module, "_parameter_placeholders"
+                    )
+                    for name, param_holder in param_placeholders.items():
+                        param_holder: TensorPlaceholder = cast(
+                            TensorPlaceholder, param_holder
                         )
 
-                    pass
+                        # Check: whether shape is correct
+                        param_info: dict[str, Any] = optimizer.param_info
+                        assert (
+                            param_info["param2shape"][param_holder.param_id]
+                            == param_holder.shape
+                        )
+
+                        # Get state size
+                        state_size: torch.Tensor = torch.empty(
+                            1, dtype=torch.int64, device=device
+                        )
+                        dist.recv(state_size, sender_rank)
+                        # Get pickled state tensor
+                        state_tensor: torch.Tensor = torch.empty(
+                            state_size.item(), dtype=torch.uint8, device=device
+                        )
+                        dist.recv(state_tensor, sender_rank)
+                        buff = io.BytesIO(state_tensor.cpu().numpy())
+                        state_tensor: torch.Tensor = torch.load(buff)
+
+                        param_tensor = param_holder.create(dtype=torch.float32)
+                        dist.recv(param_tensor, sender_rank)
+
+                        model_param = torch.nn.Parameter(
+                            param_tensor.to(param_holder.precision)
+                            if param_holder.precision == torch.float32
+                            else param_tensor
+                        )
+                        setattr(module, name, model_param)
+
+                        # Set the ColossalAI Optimizer param_info
+                        optimizer.optim.state[param_tensor] = state_tensor
+                        optimizer.optim.param_groups[0]["params"].append(param_tensor)
+
+                        optim_param_index = param_info["param2id"][
+                            param_holder.param_id
+                        ]
+                        del optimizer.param_info["param2id"][param_holder.param_id]
+                        optimizer.param_info["param2id"][id(param_tensor)] = (
+                            optim_param_index
+                        )
+                        optimizer.param_info["id2param"][optim_param_index] = id(
+                            param_tensor
+                        )
+                        optimizer.master_to_working_map[id(param_tensor)] = model_param
+                        optimizer.working_to_master_map[model_param] = id(param_tensor)
+                    delattr(module, "_parameter_placeholders")
+
                 elif sender_rank == configuration_engine.rank:
                     module = layer_modules[layers[layer_index]]
-                    for name, param in module.named_parameters():
-                        send_recv_ops.append(
-                            dist.P2POp(dist.isend, param.data, rank_need_layer)
+                    for name, param in module.named_parameters(recurse=False):
+                        # Find master weights
+                        master_param = (
+                            optimizer.working_to_master_map[param]
+                            if isinstance(optimizer, HybridParallelAMPOptimizer)
+                            else param
                         )
 
-        works = dist.batch_isend_irecv(send_recv_ops)
-        for work in works:
-            work.wait()
+                        # Pickle optimizer state
+                        buff = io.BytesIO()
+                        torch.save(optimizer.optim.state[master_param], buff)
+                        buff.seek(0)
+
+                        state_tensor = torch.frombuffer(
+                            buff.getbuffer(), dtype=torch.uint8
+                        ).to(device)
+                        state_size = torch.tensor(
+                            [state_tensor.numel()], dtype=torch.int64, device=device
+                        )
+
+                        dist.send(state_size, rank_need_layer)
+                        dist.send(state_tensor, rank_need_layer)
+
+                        # Send the parameter
+                        dist.send(master_param, rank_need_layer)
 
         # free no-longer necessary parameter here
+        # TODO: must create _buffer_placeholders and _parameter_placeholders
 
         # Redistribute microbatches
         instantiator = PipelineInstantiator(new_pipelines, self.global_batch_size)
@@ -268,47 +334,16 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
             dict(Counter(new_pipelines))
         )
 
-        if isinstance(self.shard_config, ShardConfig):
-            self.shard_config = dict(
-                tp_size=self.tp_size,
-                enable_all_optimization=self.shard_config.enable_all_optimization,
-                enable_fused_normalization=self.shard_config.enable_fused_normalization,
-                enable_flash_attention=self.shard_config.enable_flash_attention,
-                enable_jit_fused=self.shard_config.enable_jit_fused,
-                enable_sequence_parallelism=False,
-                enable_sequence_overlap=False,
-            )
-        self.set_pipelines(new_pipelines, num_microbatches)
+        self.pipelines = new_pipelines
+        self.num_microbatches = num_microbatches
+        self.pg_mesh = new_pg_mesh
+        self.stage_manager = HeterogeneousPipelineStageManager(self.pg_mesh, PP_AXIS)
+        self.dp_groups = self.pg_mesh.get_group_along_axis(DP_AXIS)
+        self.tp_group = self.pg_mesh.get_group_along_axis(TP_AXIS)
+        self.pp_group = self.pg_mesh.get_group_along_axis(PP_AXIS)
 
-        # recreate optimizer, dataloader, etc
-
-        # TODO: this re-initializing optimizer may end up losing internal states.
-        # Must copy those optimizer states as well.
-        param_info = get_param_info(optimizer.optim)
-        if self.precision in ["fp16", "bf16"]:
-            optimizer = HybridParallelAMPOptimizer(
-                optimizer.optim,
-                model,
-                use_pipeline=self.enable_pipeline_parallelism,
-                param_info=param_info,
-                precision=self.precision,
-                max_norm=self.max_norm,
-                pp_process_group=self.pp_group,
-                tp_process_group=self.tp_group,
-                **self.amp_config,
-            )
-        else:
-            optimizer = HybridParallelNaiveOptimizer(
-                optimizer.optim,
-                model,
-                use_pipeline=self.enable_pipeline_parallelism,
-                param_info=param_info,
-                max_norm=self.max_norm,
-                pp_process_group=self.pp_group,
-                tp_process_group=self.tp_group,
-            )
-        num_microbatches = [
-            self.num_microbatches[pipeline] for pipeline in self.pipelines
-        ]
-
-        return model, optimizer, dataloader, lr_scheduler
+        self._pipeline_index = self.pg_mesh.coords[0][DP_AXIS]
+        self.schedule = OneForwardOneBackwardSchedule(
+            stage_manager=self.stage_manager,
+            microbatch_size=self.microbatch_size,
+        )
