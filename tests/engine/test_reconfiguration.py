@@ -8,6 +8,8 @@ from unittest.mock import patch
 import numpy as np
 import torch
 import torch.distributed as dist
+from colossalai.accelerator import get_accelerator
+from colossalai.checkpoint_io.utils import save_state_dict_shards
 from colossalai.interface import ModelWrapper, OptimizerWrapper
 from conftest import (
     config,
@@ -208,13 +210,16 @@ class OobleckReconfigurationClassBase(MultiProcessTestCase):
             ),
             patch(
                 "oobleck.engine.plugin.PipelineInstantiator.distribute_batch",
-                return_value=(
+                side_effect=lambda self, num_templates: (
                     0,
                     {
-                        template_1stage: global_batch_size // 2,
-                        template_2stages: global_batch_size // 2,
+                        template_1stage: global_batch_size
+                        // sum(num_templates.values()),
+                        template_2stages: global_batch_size
+                        // sum(num_templates.values()),
                     },
                 ),
+                autospec=True,
             ),
         ):
             self.current_world_size = len(hosts_remaining)
@@ -263,7 +268,7 @@ class TestOobleckReconfiguration3RanksClass(OobleckReconfigurationClassBase):
     @skip_if_lt_x_gpu(3)
     def test_reconfiguration_pass(
         self,
-        hosts_to_fail: int,
+        hosts_to_fail: list[int],
         expected_new_pipelines: list[PipelineTemplate],
         expected_mesh: list,
     ):
@@ -321,7 +326,7 @@ class TestOobleckReconfiguration4RanksClass(OobleckReconfigurationClassBase):
     @skip_if_lt_x_gpu(4)
     def test_reconfiguration_pass(
         self,
-        hosts_to_fail: int,
+        hosts_to_fail: list[int],
         expected_new_pipelines: list[PipelineTemplate],
         expected_mesh: list,
     ):
@@ -338,6 +343,81 @@ class TestOobleckReconfiguration4RanksClass(OobleckReconfigurationClassBase):
         assert np.array_equal(plugin.stage_manager.pg_mesh.mesh, expected_mesh)
 
         self.do_step(plugin, model, optimizer, dataloader)
+
+    @parametrize(
+        "hosts_to_fail, expected_num_pipeline_stages, hosts_to_checkpoint",
+        [
+            [[1234], [1, 2], [1235]],
+            [[1235], [1, 2], [1234]],
+            [[1236], [2, 1], [1234, 1235]],
+            [[1234, 1237], [1, 1], [1235]],
+            [[1234, 1235], [2], [1236, 1237]],
+        ],
+    )
+    @requires_nccl()
+    @skip_if_lt_x_gpu(4)
+    def test_checkpoint_after_reconfiguration(
+        self,
+        hosts_to_fail: list[int],
+        expected_num_pipeline_stages: list[int],
+        hosts_to_checkpoint: list[int],
+    ):
+        plugin, model, optimizer, dataloader = self.prepare(
+            [template_2stages, template_2stages]
+        )
+        self.do_step(plugin, model, optimizer, dataloader)
+        model, optimizer, dataloader = self.do_reconfigure(
+            hosts_to_fail, plugin, model, optimizer, dataloader
+        )
+        self.do_step(plugin, model, optimizer, dataloader)
+
+        assert expected_num_pipeline_stages == [
+            pipeline.num_stages for pipeline in plugin.pipelines
+        ]
+
+        configuration_engine = ConfigurationEngine.get_instance()
+
+        temp_dir = [
+            (
+                Path(TemporaryDirectory().name).as_posix()
+                if dist.get_rank() == 0
+                else None
+            )
+        ]
+        dist.broadcast_object_list(
+            temp_dir, src=0, device=get_accelerator().get_current_device()
+        )
+        temp_dir = Path(temp_dir[0])
+
+        with patch(
+            "colossalai.checkpoint_io.hybrid_parallel_checkpoint_io.save_state_dict_shards",
+            wraps=save_state_dict_shards,
+        ) as mock:
+            checkpoint_io = plugin.get_checkpoint_io()
+
+            checkpoint_io.save_model(
+                model,
+                (temp_dir / "model").as_posix(),
+                shard=True,
+                use_safetensors=True,
+            )
+            checkpoint_io.save_optimizer(
+                optimizer, (temp_dir / "optim").as_posix(), shard=True
+            )
+
+            dist.barrier()
+            torch.cuda.synchronize()
+
+            host = configuration_engine.dist_info[configuration_engine.agent_index].port
+            if host in hosts_to_checkpoint:
+                mock.assert_called()
+            else:
+                mock.assert_not_called()
+
+            assert (temp_dir / "model").exists()
+            assert (temp_dir / "optim").exists()
+
+        # TODO: Check if checkpoint is correct
 
 
 instantiate_parametrized_tests(TestOobleckReconfiguration3RanksClass)
