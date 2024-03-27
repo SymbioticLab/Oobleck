@@ -3,7 +3,7 @@ import gc
 import io
 import itertools
 from collections import Counter, defaultdict
-from typing import Any, Optional, cast
+from typing import Optional
 
 import numpy as np
 import torch
@@ -14,7 +14,6 @@ from colossalai.booster.plugin.hybrid_parallel_plugin import (
     HybridParallelAMPOptimizer,
     HybridParallelNaiveOptimizer,
 )
-from colossalai.pipeline.schedule import OneForwardOneBackwardSchedule
 from loguru import logger
 from oobleck_colossalai import (
     HeterogeneousDataLoader,
@@ -23,14 +22,10 @@ from oobleck_colossalai import (
     PipelineTemplate,
 )
 from oobleck_colossalai.process_group_mesh import (
-    DP_AXIS,
     PP_AXIS,
-    TP_AXIS,
     HeterogeneousProcessGroupMesh,
 )
-from oobleck_colossalai.shardformer.shard.placeholder import TensorPlaceholder
 from oobleck_colossalai.shardformer.shard.shardformer import ModelSharder
-from oobleck_colossalai.stage_manager import HeterogeneousPipelineStageManager
 from torch.optim.lr_scheduler import LRScheduler
 
 from oobleck.engine.configuration_engine import ConfigurationEngine, HostInfo
@@ -163,7 +158,12 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
         optimizer: HybridParallelAMPOptimizer | HybridParallelNaiveOptimizer,
         dataloader: HeterogeneousDataLoader,
         lr_scheduler: LRScheduler | None = None,
-    ):
+    ) -> tuple[
+        HeterogeneousParallelPlugin,
+        HybridParallelAMPOptimizer | HybridParallelNaiveOptimizer,
+        HeterogeneousDataLoader,
+        LRScheduler | None,
+    ]:
         configuration_engine = ConfigurationEngine.get_instance()
         device = get_accelerator().get_current_device()
 
@@ -397,44 +397,9 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
                 ModelSharder.set_tensors_to_placeholder(module)
 
         # Update plugin attributes
-        self.pipelines = new_pipelines
-        self.num_microbatches = new_num_microbatches
-        self.pg_mesh = new_pg_mesh
-        self.stage_manager = HeterogeneousPipelineStageManager(self.pg_mesh, PP_AXIS)
-        self.dp_groups = self.pg_mesh.get_group_along_axis(DP_AXIS)
-        self.tp_group = self.pg_mesh.get_group_along_axis(TP_AXIS)
-        self.pp_group = self.pg_mesh.get_group_along_axis(PP_AXIS)
-
-        self._pipeline_index = self.pg_mesh.coords[0][DP_AXIS]
-        self.schedule = OneForwardOneBackwardSchedule(
-            stage_manager=self.stage_manager,
-            microbatch_size=self.microbatch_size,
+        self.__post_init__(new_pipelines, self.tp_size, new_num_microbatches)
+        model, optimizer, _, dataloader, lr_scheduler = self.configure(
+            model, optimizer, None, dataloader, lr_scheduler, forced=True
         )
 
-        self.shard_config.tensor_parallel_process_group = self.tp_group
-        self.shard_config.pipeline_stage_manager = self.stage_manager
-
-        # TODO: how to reset shared parameters? :/
-        model.stage_manager = self.stage_manager
-        my_pipeline = self.pipelines[self._pipeline_index]
-        module_names = my_pipeline.modules_per_stage[self.stage_manager.stage]
-        model.dp_groups = (
-            {
-                module_name: dp_group
-                for module_name, dp_group in zip(module_names, self.dp_groups)
-            }
-            if self.dp_groups
-            else None
-        )
-        model.tp_group = self.tp_group
-
-        from oobleck_colossalai.shardformer.policies.auto_policy import get_autopolicy
-        from oobleck_colossalai.shardformer.shard.shardformer import ShardFormer
-
-        policy = get_autopolicy(my_pipeline.model_name)
-        policy.set_model(model.module)
-        policy.set_pipeline_template(my_pipeline)
-        policy.set_shard_config(self.shard_config)
-        shardformer = ShardFormer(self.shard_config)
-        model.module, model.shared_params = shardformer.optimize(model.module, policy)
-        pass
+        return model, optimizer, dataloader, lr_scheduler

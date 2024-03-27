@@ -187,7 +187,7 @@ class OobleckReconfigurationClassBase(MultiProcessTestCase):
         model: ModelWrapper,
         optimizer: OptimizerWrapper,
         dataloader: DataLoader,
-    ):
+    ) -> tuple[ModelWrapper, OptimizerWrapper, DataLoader]:
         configuration_engine = ConfigurationEngine.get_instance()
 
         # Simulate agent process's behavior sending the new host info
@@ -202,11 +202,23 @@ class OobleckReconfigurationClassBase(MultiProcessTestCase):
         self.pipe.send(hosts_remaining)
         self.num_hosts -= len(hosts_to_fail)
 
-        with patch.object(
-            configuration_engine, "init_distributed", new=self.init_distributed
+        with (
+            patch.object(
+                configuration_engine, "init_distributed", new=self.init_distributed
+            ),
+            patch(
+                "oobleck.engine.plugin.PipelineInstantiator.distribute_batch",
+                return_value=(
+                    0,
+                    {
+                        template_1stage: global_batch_size // 2,
+                        template_2stages: global_batch_size // 2,
+                    },
+                ),
+            ),
         ):
             self.current_world_size = len(hosts_remaining)
-            plugin.reconfigure(
+            model, optimizer, dataloader, _ = plugin.reconfigure(
                 pipeline_templates={
                     1: template_1stage,
                     2: template_2stages,
@@ -216,6 +228,8 @@ class OobleckReconfigurationClassBase(MultiProcessTestCase):
                 optimizer=optimizer,
                 dataloader=dataloader,
             )
+
+        return model, optimizer, dataloader
 
 
 class TestOobleckReconfiguration3RanksClass(OobleckReconfigurationClassBase):
@@ -257,7 +271,9 @@ class TestOobleckReconfiguration3RanksClass(OobleckReconfigurationClassBase):
             [template_1stage, template_2stages]
         )
         self.do_step(plugin, model, optimizer, dataloader)
-        self.do_reconfigure(hosts_to_fail, plugin, model, optimizer, dataloader)
+        model, optimizer, dataloader = self.do_reconfigure(
+            hosts_to_fail, plugin, model, optimizer, dataloader
+        )
 
         assert dist.get_world_size() == self.current_world_size
         assert plugin.pipelines == expected_new_pipelines
@@ -313,12 +329,15 @@ class TestOobleckReconfiguration4RanksClass(OobleckReconfigurationClassBase):
             [template_2stages, template_2stages]
         )
         self.do_step(plugin, model, optimizer, dataloader)
-
-        self.do_reconfigure(hosts_to_fail, plugin, model, optimizer, dataloader)
+        model, optimizer, dataloader = self.do_reconfigure(
+            hosts_to_fail, plugin, model, optimizer, dataloader
+        )
 
         assert dist.get_world_size() == self.current_world_size
         assert plugin.pipelines == expected_new_pipelines
         assert np.array_equal(plugin.stage_manager.pg_mesh.mesh, expected_mesh)
+
+        self.do_step(plugin, model, optimizer, dataloader)
 
 
 instantiate_parametrized_tests(TestOobleckReconfiguration3RanksClass)
