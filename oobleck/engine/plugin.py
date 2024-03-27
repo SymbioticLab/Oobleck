@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from colossalai.accelerator import get_accelerator
+from colossalai.amp.naive_amp.mixed_precision_optimizer import MixedPrecisionOptimizer
 from colossalai.booster.plugin.hybrid_parallel_plugin import (
     HybridParallelAMPOptimizer,
     HybridParallelNaiveOptimizer,
@@ -275,6 +276,17 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
                     layer_holders.append(rank)
             return layer_holders
 
+        adds_to_param_info: dict[str, dict] = {
+            "param2id": {},
+            "id2param": {},
+            "param2shape": {},
+        }
+        removes_from_param_info: dict[str, list] = {
+            "param2id": [],
+            "id2param": [],
+            "param2shape": [],
+        }
+
         for layer_index, ranks in layers_required_by_rank.items():
             layer_holders = get_layer_holders()
             if not layer_holders:
@@ -309,12 +321,6 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
                     ) in ModelSharder.parameter_placeholders(
                         module, delete_placeholders_after=True
                     ):
-                        # Check whether shape is correct
-                        assert (
-                            optimizer.param_info["param2shape"][placeholder.param_id]
-                            == placeholder.shape
-                        )
-
                         size: torch.Tensor = torch.empty(
                             1, dtype=torch.int64, device=device
                         )
@@ -330,32 +336,48 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
                         )
 
                         states: dict[str, torch.Tensor] = tensor["states"]
-                        param_tensor: torch.Tensor = tensor["parameter"]
+                        master_tensor: torch.Tensor = tensor["parameter"]
 
-                        model_parameter = torch.nn.Parameter(
-                            param_tensor.to(dtype=model.mixed_precision)
-                            if self.precision in ["fp16", "bf16"]
-                            and param_tensor.dtype == torch.float32
-                            else param_tensor
+                        # Check whether shape is correct
+                        assert master_tensor.shape == placeholder.shape, (
+                            f"{name} Shape mismatch between placeholder and parameter. "
+                            f"received parameter shape: {master_tensor.shape}, "
+                            f"placeholder shape: {placeholder.shape}"
                         )
-                        setattr(submodule, name, model_parameter)
 
-                        # Set the ColossalAI Optimizer param_info
-                        optimizer.optim.state[param_tensor] = states
-                        optimizer.optim.param_groups[0]["params"].append(param_tensor)
+                        p = torch.nn.Parameter(
+                            master_tensor.to(dtype=model.mixed_precision)
+                            if isinstance(optimizer, MixedPrecisionOptimizer)
+                            and master_tensor.dtype == torch.float32
+                            else master_tensor
+                        )
+                        setattr(submodule, name, p)
 
+                        # TODO: check if it is still tensor (not nn.parameter) if we do fp32 training
+                        optimizer.optim.state[master_tensor] = states
+                        optimizer.optim.param_groups[0]["params"].append(master_tensor)
+
+                        if isinstance(optimizer, MixedPrecisionOptimizer):
+                            optimizer.master_to_working_map[master_tensor] = p
+                            optimizer.working_to_master_map[p] = master_tensor
+
+                        # Cache updates and apply them later
+                        # This is because of potential duplicated IDs:
+                        # We maintain IDs for parameters that have already been freed,
+                        # some additional parameters may take the same ID.
+                        # In this case sequentially updating param_info messes up.
                         optim_param_index = optimizer.param_info["param2id"][
                             placeholder.param_id
                         ]
-                        del optimizer.param_info["param2id"][placeholder.param_id]
-                        optimizer.param_info["param2id"][id(param_tensor)] = (
-                            optim_param_index
+                        removes_from_param_info["param2id"].append(placeholder.param_id)
+                        removes_from_param_info["id2param"].append(optim_param_index)
+                        removes_from_param_info["param2shape"].append(
+                            placeholder.param_id
                         )
-                        optimizer.param_info["id2param"][optim_param_index] = id(
-                            param_tensor
-                        )
-                        optimizer.master_to_working_map[param_tensor] = model_parameter
-                        optimizer.working_to_master_map[model_parameter] = param_tensor
+
+                        adds_to_param_info["param2id"][id(p)] = optim_param_index
+                        adds_to_param_info["id2param"][optim_param_index] = id(p)
+                        adds_to_param_info["param2shape"][id(p)] = p.shape
 
                 elif sender_rank == configuration_engine.rank:
                     for name, param in module.named_parameters():
@@ -387,6 +409,14 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
                         dist.send(size, rank_need_layer)
                         dist.send(tensor, rank_need_layer)
 
+        for param_info_key, items in removes_from_param_info.items():
+            for item in items:
+                del optimizer.param_info[param_info_key][item]
+
+        for param_info_key, items in adds_to_param_info.items():
+            param_info: dict = optimizer.param_info[param_info_key]
+            param_info.update(items)
+
         # free no-longer necessary parameter here
         # TODO: must create _buffer_placeholders and _parameter_placeholders
         old_layers = old_layers_per_rank.numpy(force=True)[configuration_engine.rank, :]
@@ -396,7 +426,6 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
                 module = layer_modules[layers[index]]
                 ModelSharder.set_tensors_to_placeholder(module)
 
-        # Update plugin attributes
         self.__post_init__(new_pipelines, self.tp_size, new_num_microbatches)
         model, optimizer, _, dataloader, lr_scheduler = self.configure(
             model, optimizer, None, dataloader, lr_scheduler, forced=True
