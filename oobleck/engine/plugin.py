@@ -131,7 +131,9 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
 
             # TODO (insujang): If there is no feasible pipeline, merge pipelines
             pipelines = [
-                pipeline_templates[num_stages] for num_stages in num_hosts_per_pipeline
+                pipeline_templates[num_stages]
+                for num_stages in num_hosts_per_pipeline
+                if num_stages > 0
             ]
 
             _, num_microbatches = pipeline_instantiator.distribute_batch(
