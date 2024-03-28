@@ -1,3 +1,4 @@
+import json
 import multiprocessing
 import sys
 from multiprocessing.connection import Connection
@@ -417,7 +418,37 @@ class TestOobleckReconfiguration4RanksClass(OobleckReconfigurationClassBase):
             assert (temp_dir / "model").exists()
             assert (temp_dir / "optim").exists()
 
-        # TODO: Check if checkpoint is correct
+        # Load model checkpoint
+        model_json_path = temp_dir / "model" / "model.safetensors.index.json"
+        model_json = json.loads(model_json_path.read_text())
+        assert "metadata" in model_json and "weight_map" in model_json
+
+        model = GPT2ForSequenceClassification(config)
+
+        params = [name for name, _ in model.named_parameters()] + [
+            name for name, _ in model.named_buffers()
+        ]
+        assert set(params) == set(model_json["weight_map"].keys())
+        for file_name in set(model_json["weight_map"].values()):
+            assert (temp_dir / "model" / file_name).exists()
+
+        # Load optimizer checkpoint
+        optim_json_path = temp_dir / "optim" / "pytorch_optim.bin.index.json"
+        optim_json = json.loads(optim_json_path.read_text())
+        assert "metadata" in optim_json and "weight_map" in optim_json
+
+        optimizer = Adam(model.parameters())
+        assert set(range(len(optimizer.param_groups[0]["params"]))) == set(
+            int(name) for name in optim_json["weight_map"].keys()
+        )
+        for file_name in set(optim_json["weight_map"].values()):
+            assert (temp_dir / "optim" / file_name).exists()
+
+        model, optimizer, *_ = plugin.configure(
+            model, optimizer, None, dataloader, None
+        )
+        checkpoint_io.load_model(model, model_json_path.as_posix())
+        checkpoint_io.load_optimizer(optimizer, optim_json_path.as_posix())
 
 
 instantiate_parametrized_tests(TestOobleckReconfiguration3RanksClass)
