@@ -152,9 +152,10 @@ agent process; a join uses a new ID. Both paths create a new WORLD rather than
 editing groups in place.
 
 Expected logs show the proposal generation and reason set, full WORLD teardown,
-compiled ownership, transfer schedule hash and source/destination byte balance,
-local worker readiness, `generation_active`, replay of the uncommitted logical
-batch, and exactly one commit. A cascading failure should show the partial
+compiled ownership, all-worker `prepared` consensus, coordinator rendezvous
+publication, transfer schedule hash and source/destination byte balance, final
+worker readiness, `generation_active`, replay of the uncommitted logical batch,
+and exactly one commit. A cascading failure should show the partial
 recovery marked superseded before the newest snapshot is prepared.
 
 ## Cleanup and troubleshooting
