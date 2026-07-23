@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -374,6 +375,7 @@ class OobleckParallelContext:
         self._loaders: list[PreparedDataLoader] = []
         self._closed = False
         self._needs_survivor_recovery = needs_survivor_recovery
+        self._commit_lock = threading.RLock()
 
     @property
     def model(self) -> torch.nn.Module:
@@ -419,11 +421,12 @@ class OobleckParallelContext:
         self.scaler = scaler
 
     def announce_generation(self, plan: OobleckExecutionPlan) -> bool:
-        if plan.generation <= self.generation:
-            return False
-        if self._pending_plan is None or plan.generation > self._pending_plan.generation:
-            self._pending_plan = plan
-        return True
+        with self._commit_lock:
+            if plan.generation <= self.generation:
+                return False
+            if self._pending_plan is None or plan.generation > self._pending_plan.generation:
+                self._pending_plan = plan
+            return True
 
     def _activate_latest_generation(self) -> None:
         while self._pending_plan is not None:
@@ -527,38 +530,73 @@ class OobleckParallelContext:
             raise RuntimeError("context is closed")
         if self.optimizer is None:
             raise RuntimeError("call configure_optimization() before step()")
+
+        transition_pending = getattr(self, "_generation_transition_pending", None)
+        wait_for_generation = getattr(self, "_wait_for_generation_barrier", None)
+
+        def managed_transition_pending() -> bool:
+            return callable(transition_pending) and bool(transition_pending())
+
+        def wait_if_managed() -> None:
+            if managed_transition_pending():
+                if not callable(wait_for_generation):
+                    raise RuntimeError("managed generation has no control-plane waiter")
+                wait_for_generation()
+
         attempts = 0
         while True:
+            wait_if_managed()
             attempts += 1
             if self._pending_plan is not None:
                 self._activate_latest_generation()
+            attempt_generation = self.generation
             self.optimizer.zero_grad(set_to_none=True)
-            loss, result = self._execute_attempt(batch, execution_plan, output, criterion)
-            sync = getattr(self.partition.external_context, "sync_gradients", None)
-            if callable(sync):
-                sync()
-            heterogeneous_sync = getattr(self, "_heterogeneous_gradient_sync", None)
-            if heterogeneous_sync is not None:
-                heterogeneous_sync.sync()
-            if self._pending_plan is not None:
+            try:
+                loss, result = self._execute_attempt(batch, execution_plan, output, criterion)
+                sync = getattr(self.partition.external_context, "sync_gradients", None)
+                if callable(sync):
+                    sync()
+                heterogeneous_sync = getattr(self, "_heterogeneous_gradient_sync", None)
+                if heterogeneous_sync is not None:
+                    heterogeneous_sync.sync()
+            except Exception:
+                if self.generation == attempt_generation and not managed_transition_pending():
+                    raise
                 self.optimizer.zero_grad(set_to_none=True)
-                self._activate_latest_generation()
+                wait_if_managed()
                 continue
-            if self.scaler is not None:
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                self.optimizer.step()
-            if self.scheduler is not None:
-                self.scheduler.step()
-            self.committed_step += 1
-            for loader in self._loaders:
+
+            retry = False
+            with self._commit_lock:
                 if (
-                    loader.sampler.descriptor_at(loader.sampler.committed_cursor)
-                    == batch.descriptor
+                    self.generation != attempt_generation
+                    or self._pending_plan is not None
+                    or managed_transition_pending()
                 ):
-                    loader.sampler.commit(batch.descriptor)
-                    break
+                    retry = True
+                else:
+                    if self.scaler is not None:
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    else:
+                        self.optimizer.step()
+                    if self.scheduler is not None:
+                        self.scheduler.step()
+                    self.committed_step += 1
+                    for loader in self._loaders:
+                        if (
+                            loader.sampler.descriptor_at(loader.sampler.committed_cursor)
+                            == batch.descriptor
+                        ):
+                            loader.sampler.commit(batch.descriptor)
+                            break
+            if retry:
+                self.optimizer.zero_grad(set_to_none=True)
+                if managed_transition_pending():
+                    wait_if_managed()
+                elif self._pending_plan is not None:
+                    self._activate_latest_generation()
+                continue
             return OobleckStepResult(
                 True,
                 self.committed_step,

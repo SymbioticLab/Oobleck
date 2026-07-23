@@ -9,9 +9,11 @@ from oobleck.elastic.membership import (
 from oobleck.elastic.hostfile import InitialHost, load_initial_hostfile, ssh_agent_command
 from oobleck.elastic.local_ipc import LocalWorkerClient, LocalWorkerRelay
 from oobleck.elastic.service import (
+    ControlStatus,
     MasterControlService,
     NodeAgentClient,
     inspect_membership,
+    inspect_status,
     request_drain,
 )
 from oobleck.elastic.transport import (
@@ -30,6 +32,7 @@ from oobleck.elastic.workers import LocalWorkerSupervisor, run_agent_service
 __all__ = [
     "AsyncioTcpControlTransport",
     "ControlConnection",
+    "ControlStatus",
     "ControlTransport",
     "FrameTooLarge",
     "IncarnationMismatch",
@@ -50,6 +53,7 @@ __all__ = [
     "read_frame",
     "write_frame",
     "inspect_membership",
+    "inspect_status",
     "load_initial_hostfile",
     "request_drain",
     "run_agent_service",

@@ -5,7 +5,13 @@ from __future__ import annotations
 import asyncio
 
 from oobleck.elastic.service_base import MasterControlService as _MasterControlService
-from oobleck.elastic.service_public_base import NodeAgentClient, inspect_membership, request_drain
+from oobleck.elastic.service_public_base import (
+    ControlStatus,
+    NodeAgentClient,
+    inspect_membership,
+    inspect_status,
+    request_drain,
+)
 from oobleck.elastic.transport import MessageEnvelope
 
 
@@ -20,4 +26,11 @@ class MasterControlService(_MasterControlService):
             return
 
 
-__all__ = ["MasterControlService", "NodeAgentClient", "inspect_membership", "request_drain"]
+__all__ = [
+    "ControlStatus",
+    "MasterControlService",
+    "NodeAgentClient",
+    "inspect_membership",
+    "inspect_status",
+    "request_drain",
+]

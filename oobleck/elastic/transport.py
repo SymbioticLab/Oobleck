@@ -30,6 +30,15 @@ _PAYLOAD_FIELDS = {
     "generation_rendezvous": {"snapshot_hash", "plan_checksum", "compatibility_digest"},
     "generation_active": {"snapshot_hash", "plan_checksum", "compatibility_digest"},
     "inspect": set(),
+    "inspect_status": set(),
+    "status": {
+        "nodes",
+        "reasons",
+        "snapshot_hash",
+        "active_generation",
+        "prepared_agents",
+        "ready_agents",
+    },
     "request_drain": {"node_id"},
     "drain_command": {"node_id"},
     "drain_accepted": {"node_id"},
@@ -61,11 +70,18 @@ def _validate_payload(message_type: str, payload: Mapping[str, object]) -> None:
                 or not all(type(item) is str for item in values)
             ):
                 raise ProtocolError(f"register {field} must be a non-empty list of strings")
-    elif message_type == "membership":
+    elif message_type in {"membership", "status"}:
         if type(payload["nodes"]) is not list or type(payload["reasons"]) is not list:
-            raise ProtocolError("membership nodes and reasons must be lists")
+            raise ProtocolError(f"{message_type} nodes and reasons must be lists")
         if type(payload["snapshot_hash"]) is not str:
-            raise ProtocolError("membership snapshot_hash must be a string")
+            raise ProtocolError(f"{message_type} snapshot_hash must be a string")
+        if message_type == "status":
+            if type(payload["active_generation"]) is not int or payload["active_generation"] < 0:
+                raise ProtocolError("status active_generation must be non-negative")
+            for field in ("prepared_agents", "ready_agents"):
+                values = payload[field]
+                if type(values) is not list or not all(type(item) is str for item in values):
+                    raise ProtocolError(f"status {field} must be a list of strings")
     elif message_type in {
         "generation_prepared",
         "generation_ready",

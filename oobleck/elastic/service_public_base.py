@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import socket
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Mapping, Sequence
 
@@ -22,6 +23,22 @@ from oobleck.elastic.transport import (
     ControlTransport,
     MessageEnvelope,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class ControlStatus:
+    snapshot: MembershipSnapshot
+    active_generation: int
+    prepared_agents: tuple[str, ...]
+    ready_agents: tuple[str, ...]
+
+    @property
+    def generation(self) -> int:
+        return self.snapshot.generation
+
+    @property
+    def active(self) -> bool:
+        return self.active_generation == self.snapshot.generation
 
 
 class NodeAgentClient:
@@ -393,6 +410,39 @@ async def inspect_membership(
         await connection.close()
 
 
+async def inspect_status(
+    host: str,
+    port: int,
+    *,
+    transport: ControlTransport | None = None,
+) -> ControlStatus:
+    selected = transport or AsyncioTcpControlTransport()
+    connection = await selected.connect(host, port)
+    try:
+        identity = str(uuid.uuid4())
+        await connection.send(MessageEnvelope(1, "inspect_status", "operator", identity, 0, 0, {}))
+        message = await connection.receive()
+        if message.message_type != "status":
+            raise ValueError("master returned an invalid status response")
+        payload = message.payload
+        snapshot = membership_snapshot_from_payload(
+            message.generation,
+            {
+                "nodes": payload["nodes"],
+                "reasons": payload["reasons"],
+                "snapshot_hash": payload["snapshot_hash"],
+            },
+        )
+        return ControlStatus(
+            snapshot,
+            int(payload["active_generation"]),
+            tuple(str(item) for item in payload["prepared_agents"]),
+            tuple(str(item) for item in payload["ready_agents"]),
+        )
+    finally:
+        await connection.close()
+
+
 async def request_drain(
     host: str,
     port: int,
@@ -426,8 +476,10 @@ async def request_drain(
 
 
 __all__ = [
+    "ControlStatus",
     "MasterControlService",
     "NodeAgentClient",
     "inspect_membership",
+    "inspect_status",
     "request_drain",
 ]

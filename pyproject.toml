@@ -41,6 +41,7 @@ include = [
     "oobleck/types.py",
     "oobleck/data.py",
     "oobleck/data_base.py",
+    "oobleck/acceptance.py",
     "oobleck/state_base.py",
     "oobleck/state_transfer.py",
     "oobleck/planning",
