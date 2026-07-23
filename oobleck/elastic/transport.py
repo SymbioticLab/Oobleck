@@ -29,14 +29,23 @@ _PAYLOAD_FIELDS = {
     },
     "generation_ready": {"snapshot_hash", "plan_checksum", "compatibility_digest"},
     "drain": set(),
-    "membership": {"nodes", "reasons", "snapshot_hash", "previous_execution_plan"},
+    "membership": {
+        "nodes",
+        "removed_nodes",
+        "added_nodes",
+        "detection_seconds",
+        "snapshot_hash",
+        "previous_execution_plan",
+    },
     "generation_rendezvous": {"snapshot_hash", "plan_checksum", "compatibility_digest"},
     "generation_active": {"snapshot_hash", "plan_checksum", "compatibility_digest"},
     "inspect": set(),
     "inspect_status": set(),
     "status": {
         "nodes",
-        "reasons",
+        "removed_nodes",
+        "added_nodes",
+        "detection_seconds",
         "snapshot_hash",
         "active_generation",
         "prepared_agents",
@@ -80,8 +89,16 @@ def _validate_payload(message_type: str, payload: Mapping[str, object]) -> None:
             ):
                 raise ProtocolError(f"register {field} must be a non-empty list of strings")
     elif message_type in {"membership", "status"}:
-        if type(payload["nodes"]) is not list or type(payload["reasons"]) is not list:
-            raise ProtocolError(f"{message_type} nodes and reasons must be lists")
+        for field in ("nodes", "removed_nodes", "added_nodes"):
+            if type(payload[field]) is not list:
+                raise ProtocolError(f"{message_type} {field} must be a list")
+        detection_seconds = payload["detection_seconds"]
+        if (
+            not isinstance(detection_seconds, (int, float))
+            or isinstance(detection_seconds, bool)
+            or detection_seconds < 0
+        ):
+            raise ProtocolError(f"{message_type} detection_seconds must be non-negative")
         if type(payload["snapshot_hash"]) is not str:
             raise ProtocolError(f"{message_type} snapshot_hash must be a string")
         if message_type == "membership":

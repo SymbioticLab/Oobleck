@@ -102,7 +102,14 @@ def runtime_metric(
             "activation_seconds": transition.activation_seconds,
             "total_seconds": transition.total_seconds,
             "source_scheduling_error_bytes": transition.source_scheduling_error_bytes,
-            "transition_kind": transition.transition_kind,
+            "removed_members": [
+                {"agent_id": agent_id, "incarnation_id": incarnation_id}
+                for agent_id, incarnation_id in transition.removed_members
+            ],
+            "added_members": [
+                {"agent_id": agent_id, "incarnation_id": incarnation_id}
+                for agent_id, incarnation_id in transition.added_members
+            ],
             "graceful_cutover": transition.graceful_cutover,
             "cutover_committed_step": transition.cutover_committed_step,
         }
@@ -196,8 +203,21 @@ def verify_churn_metrics(
             recovery = item.get("recovery")
             if not isinstance(recovery, Mapping) or not recovery.get("graceful_cutover"):
                 continue
-            if recovery.get("transition_kind") != "join":
-                raise AssertionError("graceful cutover must be a join transition")
+            removed_members = recovery.get("removed_members")
+            added_members = recovery.get("added_members")
+            if removed_members != [] or not isinstance(added_members, list) or not added_members:
+                raise AssertionError("graceful cutover must contain additions and no removals")
+            for field, members in (
+                ("removed_members", removed_members),
+                ("added_members", added_members),
+            ):
+                if not isinstance(members, list) or not all(
+                    isinstance(member, Mapping)
+                    and set(member) == {"agent_id", "incarnation_id"}
+                    and all(isinstance(value, str) and value for value in member.values())
+                    for member in members
+                ):
+                    raise ValueError(f"recovery {field} identities are invalid")
             cutover = recovery.get("cutover_committed_step")
             if not isinstance(cutover, int) or isinstance(cutover, bool) or cutover < 0:
                 raise ValueError("graceful cutover committed step must be non-negative")
@@ -210,13 +230,13 @@ def verify_churn_metrics(
                 and _metric_int(item, "committed_step") > cutover
             ]
             if not resumed:
-                raise AssertionError("graceful join did not resume after the cutover step")
+                raise AssertionError("graceful addition did not resume after the cutover step")
             first_resumed = resumed[0]
             if (
                 _metric_int(first_resumed, "committed_step") != cutover + 1
                 or _metric_int(first_resumed, "attempts") != 1
             ):
-                raise AssertionError("graceful join replayed or skipped the next logical batch")
+                raise AssertionError("graceful addition replayed or skipped the next logical batch")
         graceful_transition_count += len(graceful)
         for item in ordered:
             strategies = item["strategies"]

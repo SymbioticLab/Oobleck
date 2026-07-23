@@ -75,7 +75,8 @@ async def _agent(config: AgentConfig) -> None:
                 {
                     "generation": message.generation,
                     "nodes": [item["agent_id"] for item in message.payload["nodes"]],
-                    "reasons": message.payload["reasons"],
+                    "removed_nodes": message.payload["removed_nodes"],
+                    "added_nodes": message.payload["added_nodes"],
                 },
                 sort_keys=True,
             ),

@@ -49,6 +49,9 @@ class MasterControlService:
         self._rendezvous_metadata: tuple[str, str] | None = None
         self._proposed_execution_plan: OobleckExecutionPlan | None = None
         self.active_execution_plan: OobleckExecutionPlan | None = None
+        self._accumulated_removed: dict[tuple[str, str], NodeIdentity] = {}
+        self._accumulated_added: dict[tuple[str, str], NodeIdentity] = {}
+        self._accumulated_detection_seconds = 0.0
         self._ready_agents: dict[str, tuple[str, str]] = {}
         self.active_generation = 0
 
@@ -75,14 +78,38 @@ class MasterControlService:
         )
         self._server = None
 
-    def _begin_generation(self, snapshot: MembershipSnapshot) -> MembershipSnapshot:
-        """Install a proposal and bind the last activated plan into its hash."""
+    def _clear_accumulated_operations(self) -> None:
+        self._accumulated_removed.clear()
+        self._accumulated_added.clear()
+        self._accumulated_detection_seconds = 0.0
 
+    def _begin_generation(self, snapshot: MembershipSnapshot) -> MembershipSnapshot:
+        """Install a proposal and accumulate operations since last activation."""
+
+        for member in snapshot.removed_nodes:
+            self._accumulated_removed[(member.agent_id, member.incarnation_id)] = member
+        for member in snapshot.added_nodes:
+            self._accumulated_added[(member.agent_id, member.incarnation_id)] = member
+        self._accumulated_detection_seconds = max(
+            self._accumulated_detection_seconds, snapshot.detection_seconds
+        )
         snapshot = MembershipSnapshot(
             snapshot.generation,
             snapshot.nodes,
-            snapshot.reasons,
+            tuple(
+                sorted(
+                    self._accumulated_removed.values(),
+                    key=lambda member: (member.agent_id, member.incarnation_id),
+                )
+            ),
+            tuple(
+                sorted(
+                    self._accumulated_added.values(),
+                    key=lambda member: (member.agent_id, member.incarnation_id),
+                )
+            ),
             previous_execution_plan=self.active_execution_plan,
+            detection_seconds=self._accumulated_detection_seconds,
         )
         self._proposed_snapshot = snapshot
         self._prepared_agents.clear()
@@ -92,6 +119,7 @@ class MasterControlService:
         if not snapshot.nodes:
             self.active_generation = snapshot.generation
             self.active_execution_plan = None
+            self._clear_accumulated_operations()
         return snapshot
 
     async def _expire_leases(self) -> None:
@@ -114,7 +142,7 @@ class MasterControlService:
             if first.message_type in {"inspect", "inspect_status"}:
                 if first.payload:
                     raise ProtocolError(f"{first.message_type} payload must be empty")
-                snapshot = self.membership.snapshot()
+                snapshot = self._proposed_snapshot or self.membership.snapshot()
                 reply = (
                     self._membership_message(snapshot)
                     if first.message_type == "inspect"
@@ -272,6 +300,7 @@ class MasterControlService:
                                 raise ProtocolError("active generation has no consensus plan")
                             self.active_generation = proposed.generation
                             self.active_execution_plan = self._proposed_execution_plan
+                            self._clear_accumulated_operations()
                             active_message = self._generation_active_message(proposed, *metadata)
                     elif message.message_type == "drain":
                         self.membership.drain(
@@ -339,7 +368,9 @@ class MasterControlService:
             snapshot.generation,
             {
                 "nodes": [asdict(node) for node in snapshot.nodes],
-                "reasons": list(snapshot.reasons),
+                "removed_nodes": [asdict(node) for node in snapshot.removed_nodes],
+                "added_nodes": [asdict(node) for node in snapshot.added_nodes],
+                "detection_seconds": snapshot.detection_seconds,
                 "snapshot_hash": snapshot.snapshot_hash,
                 "previous_execution_plan": (
                     snapshot.previous_execution_plan.to_dict()
@@ -359,7 +390,9 @@ class MasterControlService:
             snapshot.generation,
             {
                 "nodes": [asdict(node) for node in snapshot.nodes],
-                "reasons": list(snapshot.reasons),
+                "removed_nodes": [asdict(node) for node in snapshot.removed_nodes],
+                "added_nodes": [asdict(node) for node in snapshot.added_nodes],
+                "detection_seconds": snapshot.detection_seconds,
                 "snapshot_hash": snapshot.snapshot_hash,
                 "active_generation": self.active_generation,
                 "prepared_agents": sorted(self._prepared_agents),

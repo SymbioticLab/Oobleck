@@ -114,7 +114,45 @@ def test_membership_coalesces_failures_and_rejects_stale_messages():
     failed = state.publish()
     assert failed is not None and failed.generation == 2
     assert failed.nodes == ()
-    assert len(failed.reasons) == 2
+    assert failed.removed_nodes == (a, b)
+    assert failed.added_nodes == ()
+
+
+@pytest.mark.parametrize("trigger", ("disconnect", "drain", "lease"))
+def test_all_removal_triggers_publish_the_same_membership_operation(trigger):
+    now = [0.0]
+    state = MembershipStateMachine(lease_timeout_s=5, clock=lambda: now[0])
+    node = NodeIdentity("a", "a1", ("10.0.0.1",), ("0",))
+    state.register(node, 0)
+    initial = state.publish()
+    assert initial is not None and initial.added_nodes == (node,)
+    if trigger == "disconnect":
+        assert state.disconnect("a", "a1")
+    elif trigger == "drain":
+        state.drain("a", "a1", 1, 1)
+    else:
+        now[0] = 5.0
+        assert state.expire_leases() == ("a",)
+    removed = state.publish()
+    assert removed is not None
+    assert removed.nodes == ()
+    assert removed.removed_nodes == (node,)
+    assert removed.added_nodes == ()
+    assert removed.detection_seconds == (5 if trigger == "lease" else 0)
+
+
+def test_same_node_id_new_incarnation_is_removal_plus_addition():
+    state = MembershipStateMachine(lease_timeout_s=5, clock=lambda: 0.0)
+    old = NodeIdentity("a", "old", ("10.0.0.1",), ("0",))
+    new = NodeIdentity("a", "new", ("10.0.0.2",), ("0",))
+    state.register(old, 0)
+    assert state.publish().added_nodes == (old,)
+    state.register(new, 0)
+    restarted = state.publish()
+    assert restarted is not None
+    assert restarted.nodes == (new,)
+    assert restarted.removed_nodes == (old,)
+    assert restarted.added_nodes == (new,)
 
 
 def test_incomplete_frame_and_lease_expiry_use_failure_path():
@@ -136,4 +174,6 @@ def test_incomplete_frame_and_lease_expiry_use_failure_path():
     expired = state.publish()
     assert expired is not None and expired.generation == 2
     assert expired.nodes == ()
-    assert expired.reasons == ("lease-expired:a",)
+    assert expired.removed_nodes == (NodeIdentity("a", "a1", ("10.0.0.1",), ("0",)),)
+    assert expired.added_nodes == ()
+    assert expired.detection_seconds == 5

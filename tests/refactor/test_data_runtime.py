@@ -222,30 +222,38 @@ def test_heterogeneous_pipelines_execute_disjoint_global_microbatches():
 
 def test_complete_membership_snapshot_announces_deterministic_execution_plan():
     _, ctx = context()
-    replacement = MembershipSnapshot(
+    original = NodeIdentity("local-node", "original", ("127.0.0.1",), ("0",))
+    restarted_node = NodeIdentity("local-node", "restarted", ("127.0.0.1",), ("0",))
+    restarted = MembershipSnapshot(
         1,
-        (NodeIdentity("local-node", "replacement", ("127.0.0.1",), ("0",)),),
-        ("replacement:local-node",),
+        (restarted_node,),
+        (original,),
+        (restarted_node,),
     )
-    assert ctx.apply_membership(replacement)
+    assert ctx.apply_membership(restarted)
     assert ctx._pending_plan.generation == 1
     assert ctx._pending_plan.previous_generation == 0
     assert ctx._pending_plan.plan_checksum
-    assert not ctx.apply_membership(replacement)
+    assert not ctx.apply_membership(restarted)
     assert ctx._generation_control_metrics[1][0] == 0.0
 
+    lease_node = NodeIdentity("local-node", "lease", ("127.0.0.1",), ("0",))
     lease_expired = MembershipSnapshot(
         2,
-        (NodeIdentity("local-node", "lease", ("127.0.0.1",), ("0",)),),
-        ("lease-expired:local-node",),
+        (lease_node,),
+        (restarted_node,),
+        (lease_node,),
+        detection_seconds=ctx.config.lease_timeout_s,
     )
     assert ctx.apply_membership(lease_expired)
     assert ctx._generation_control_metrics[2][0] == ctx.config.lease_timeout_s
 
+    bad_node = NodeIdentity("local-node", "bad", ("127.0.0.1",), ("0", "1"))
     invalid = MembershipSnapshot(
         3,
-        (NodeIdentity("local-node", "bad", ("127.0.0.1",), ("0", "1")),),
-        ("replacement:local-node",),
+        (bad_node,),
+        (lease_node,),
+        (bad_node,),
     )
     with pytest.raises(ValueError, match="fixed TP width"):
         ctx.apply_membership(invalid)
@@ -378,7 +386,7 @@ def test_initial_prepare_defers_world_initialization_until_activation():
         ctx.close()
 
 
-def test_managed_replacement_prepares_before_rendezvous_activation():
+def test_managed_same_id_restart_prepares_before_rendezvous_activation():
     _, ctx = context()
     initialized = []
     ctx.owner_plan.world_initializer = lambda plan: initialized.append(plan.generation)
@@ -449,20 +457,26 @@ def test_concurrent_membership_replays_inflight_managed_step_after_active_barrie
     ctx.close()
 
 
+def _node(node_id: str, incarnation_id: str | None = None) -> NodeIdentity:
+    return NodeIdentity(node_id, incarnation_id or f"{node_id}-1", ("127.0.0.1",), ("0",))
+
+
 def _membership(
     generation: int,
     node_ids: tuple[str, ...],
-    reasons: tuple[str, ...],
-    previous_plan,
+    *,
+    removed: tuple[str, ...] = (),
+    added: tuple[str, ...] = (),
+    previous_plan=None,
+    detection_seconds: float = 0.0,
 ):
     return MembershipSnapshot(
         generation,
-        tuple(
-            NodeIdentity(node_id, f"{node_id}-{generation}", ("127.0.0.1",), ("0",))
-            for node_id in node_ids
-        ),
-        reasons,
+        tuple(_node(node_id) for node_id in node_ids),
+        tuple(_node(node_id) for node_id in removed),
+        tuple(_node(node_id) for node_id in added),
         previous_execution_plan=previous_plan,
+        detection_seconds=detection_seconds,
     )
 
 
@@ -494,7 +508,7 @@ def test_batch_sampler_state_round_trip_restores_committed_cursor():
     ctx.close()
 
 
-def test_pure_join_during_step_commits_once_then_blocks_next_step():
+def test_pure_addition_during_step_commits_once_then_blocks_next_step():
     model, ctx = context(max_nodes=2)
     dataset = Samples()
     sampler = ctx.create_batch_sampler(dataset, shuffle=False)
@@ -521,9 +535,11 @@ def test_pure_join_during_step_commits_once_then_blocks_next_step():
     )
     worker.start()
     assert entered.wait(timeout=5)
-    join = _membership(1, ("local-node", "node-b"), ("join:node-b",), ctx.execution_plan)
-    assert ctx.apply_membership(join)
-    assert ctx._deferred_join_plan is not None
+    addition = _membership(
+        1, ("local-node", "node-b"), added=("node-b",), previous_plan=ctx.execution_plan
+    )
+    assert ctx.apply_membership(addition)
+    assert ctx._deferred_addition_plan is not None
     assert ctx._pending_plan is None
     release.set()
     worker.join(timeout=5)
@@ -533,7 +549,7 @@ def test_pure_join_during_step_commits_once_then_blocks_next_step():
     assert results[0].committed_step == 1
     assert sampler.committed_cursor == 1
     assert ctx._pending_plan.generation == 1
-    assert ctx._transition_metadata[1] == ("join", True, 1)
+    assert ctx._transition_metadata[1] == ((), (("node-b", "node-b-1"),), True, 1)
 
     blocked = threading.Thread(
         target=lambda: ctx.step(
@@ -553,7 +569,7 @@ def test_pure_join_during_step_commits_once_then_blocks_next_step():
     ctx.close()
 
 
-def test_multiple_joins_coalesce_and_failure_supersedes_graceful_cutover():
+def test_multiple_additions_coalesce_and_failure_supersedes_graceful_cutover():
     model, ctx = context(max_nodes=3, global_batch_size=6)
     dataset = Samples()
     sampler = ctx.create_batch_sampler(dataset, shuffle=False)
@@ -581,18 +597,28 @@ def test_multiple_joins_coalesce_and_failure_supersedes_graceful_cutover():
     worker.start()
     assert entered.wait(timeout=5)
     active = ctx.execution_plan
-    assert ctx.apply_membership(_membership(1, ("local-node", "node-b"), ("join:node-b",), active))
+    assert ctx.apply_membership(
+        _membership(1, ("local-node", "node-b"), added=("node-b",), previous_plan=active)
+    )
     assert ctx.apply_membership(
         _membership(
             2,
             ("local-node", "node-b", "node-c"),
-            ("join:node-c",),
-            active,
+            added=("node-b", "node-c"),
+            previous_plan=active,
         )
     )
-    assert ctx._deferred_join_plan.generation == 2
-    assert ctx.apply_membership(_membership(3, ("local-node",), ("disconnect:node-b",), active))
-    assert ctx._deferred_join_plan is None
+    assert ctx._deferred_addition_plan.generation == 2
+    assert ctx.apply_membership(
+        _membership(
+            3,
+            ("local-node",),
+            removed=("node-b", "node-c"),
+            added=("node-b", "node-c"),
+            previous_plan=active,
+        )
+    )
+    assert ctx._deferred_addition_plan is None
     assert ctx._pending_plan.generation == 3
     ctx.owner_plan.world_initializer = None
     release.set()
@@ -604,32 +630,64 @@ def test_multiple_joins_coalesce_and_failure_supersedes_graceful_cutover():
     assert results[0].attempts == 2
     assert results[0].generation == 3
     assert results[0].committed_step == 1
-    assert ctx._transition_metadata[3] == ("disconnect", False, 0)
+    assert ctx._transition_metadata[3] == (
+        (("node-b", "node-b-1"), ("node-c", "node-c-1")),
+        (("node-b", "node-b-1"), ("node-c", "node-c-1")),
+        False,
+        0,
+    )
     ctx.close()
 
 
-def test_idle_pure_join_promotes_immediately_and_is_classified_graceful():
-    from oobleck.elastic.membership import is_pure_join
+def test_idle_pure_addition_promotes_immediately_and_is_classified_graceful():
+    from oobleck.elastic.membership import is_pure_addition
 
-    _, ctx = context(max_nodes=2)
-    snapshot = _membership(1, ("local-node", "node-b"), ("join:node-b",), ctx.execution_plan)
-    assert is_pure_join(snapshot, ctx.execution_plan)
-    assert not is_pure_join(
-        _membership(1, ("local-node",), ("join:node-b",), ctx.execution_plan),
+    _, ctx = context(max_nodes=3, global_batch_size=6)
+    snapshot = _membership(
+        1, ("local-node", "node-b"), added=("node-b",), previous_plan=ctx.execution_plan
+    )
+    assert is_pure_addition(snapshot, ctx.execution_plan)
+    assert not is_pure_addition(
+        _membership(1, ("local-node",), previous_plan=ctx.execution_plan),
         ctx.execution_plan,
     )
-    assert not is_pure_join(
+    assert not is_pure_addition(
         _membership(
-            1, ("local-node", "node-b"), ("join:node-b", "drain:node-a"), ctx.execution_plan
+            1,
+            ("local-node", "node-b"),
+            removed=("local-node",),
+            added=("node-b",),
+            previous_plan=ctx.execution_plan,
         ),
         ctx.execution_plan,
     )
-    assert not is_pure_join(
-        _membership(1, ("node-b",), ("join:node-b",), ctx.execution_plan),
+    assert not is_pure_addition(
+        _membership(
+            1,
+            ("node-b",),
+            removed=("local-node",),
+            added=("node-b",),
+            previous_plan=ctx.execution_plan,
+        ),
         ctx.execution_plan,
     )
     assert ctx.apply_membership(snapshot)
-    assert ctx._deferred_join_plan is None
+    assert ctx._deferred_addition_plan is None
     assert ctx._pending_plan.generation == 1
-    assert ctx._transition_metadata[1] == ("join", True, 0)
+    assert ctx._transition_metadata[1] == ((), (("node-b", "node-b-1"),), True, 0)
+    assert ctx.apply_membership(
+        _membership(
+            2,
+            ("local-node", "node-b", "node-c"),
+            added=("node-b", "node-c"),
+            previous_plan=ctx.execution_plan,
+        )
+    )
+    assert ctx._pending_plan.generation == 2
+    assert ctx._transition_metadata[2] == (
+        (),
+        (("node-b", "node-b-1"), ("node-c", "node-c-1")),
+        True,
+        0,
+    )
     ctx.close()

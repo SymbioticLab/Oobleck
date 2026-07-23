@@ -37,7 +37,11 @@ def _managed_gloo_worker(rank: int, port: int, results: Any) -> None:
             NodeIdentity("node-a", "a1", ("127.0.0.1",), ("0",)),
             NodeIdentity("node-b", "b1", ("127.0.0.1",), ("0",)),
         ),
-        ("initial-cohort",),
+        (),
+        (
+            NodeIdentity("node-a", "a1", ("127.0.0.1",), ("0",)),
+            NodeIdentity("node-b", "b1", ("127.0.0.1",), ("0",)),
+        ),
     )
     node_id = ("node-a", "node-b")[rank]
     model, context, loader = build_training(
@@ -69,16 +73,23 @@ def _managed_gloo_worker(rank: int, port: int, results: Any) -> None:
         torch.testing.assert_close(gathered[0], gathered[1])
         assert step.committed_step == 1
 
-        replacement = MembershipSnapshot(
+        restarted = MembershipSnapshot(
             5,
             (
                 NodeIdentity("node-a", "a2", ("127.0.0.1",), ("0",)),
                 NodeIdentity("node-b", "b2", ("127.0.0.1",), ("0",)),
             ),
-            ("replacement-cohort",),
+            (
+                NodeIdentity("node-a", "a1", ("127.0.0.1",), ("0",)),
+                NodeIdentity("node-b", "b1", ("127.0.0.1",), ("0",)),
+            ),
+            (
+                NodeIdentity("node-a", "a2", ("127.0.0.1",), ("0",)),
+                NodeIdentity("node-b", "b2", ("127.0.0.1",), ("0",)),
+            ),
         )
         context.enable_control_plane_barrier()
-        assert context.apply_membership(replacement)
+        assert context.apply_membership(restarted)
         context.prepare_generation()
         context.activate_generation()
         context.mark_generation_active(5)
@@ -130,7 +141,7 @@ def test_membership_bootstraps_two_process_world_and_synchronized_step():
     assert observed == [(0, 2, 5), (1, 2, 5)]
 
 
-def _graceful_join_gloo_worker(
+def _graceful_addition_gloo_worker(
     rank: int,
     port: int,
     shared: Any,
@@ -182,7 +193,11 @@ def _graceful_join_gloo_worker(
             NodeIdentity("node-a", "a1", ("127.0.0.1",), ("0",)),
             NodeIdentity("node-b", "b1", ("127.0.0.1",), ("0",)),
         ),
-        ("initial-cohort",),
+        (),
+        (
+            NodeIdentity("node-a", "a1", ("127.0.0.1",), ("0",)),
+            NodeIdentity("node-b", "b1", ("127.0.0.1",), ("0",)),
+        ),
     )
     node_id = ("node-a", "node-b", "node-c")[rank]
     context = None
@@ -209,7 +224,8 @@ def _graceful_join_gloo_worker(
                 NodeIdentity("node-b", "b1", ("127.0.0.1",), ("0",)),
                 NodeIdentity("node-c", "c1", ("127.0.0.1",), ("0",)),
             ),
-            ("join:node-c",),
+            (),
+            (NodeIdentity("node-c", "c1", ("127.0.0.1",), ("0",)),),
             previous_execution_plan=previous,
         )
         context.enable_control_plane_barrier()
@@ -241,7 +257,7 @@ def _graceful_join_gloo_worker(
         trainer.start()
         assert entered.wait(timeout=10)
         assert context.apply_membership(target)
-        assert context._deferred_join_plan is not None
+        assert context._deferred_addition_plan is not None
         release.set()
         trainer.join(timeout=20)
         assert not trainer.is_alive()
@@ -255,7 +271,8 @@ def _graceful_join_gloo_worker(
         context.activate_generation()
         context.mark_generation_active(5)
         transition = context.recovery_history[-1]
-        assert transition.transition_kind == "join"
+        assert transition.removed_members == ()
+        assert transition.added_members == (("node-c", "c1"),)
         assert transition.graceful_cutover
         assert transition.cutover_committed_step == 1
     else:
@@ -268,7 +285,8 @@ def _graceful_join_gloo_worker(
                 NodeIdentity("node-b", "b1", ("127.0.0.1",), ("0",)),
                 NodeIdentity("node-c", "c1", ("127.0.0.1",), ("0",)),
             ),
-            ("join:node-c",),
+            (),
+            (NodeIdentity("node-c", "c1", ("127.0.0.1",), ("0",)),),
             previous_execution_plan=previous,
         )
         model, prepared, dataset = prepare_training(
@@ -283,9 +301,7 @@ def _graceful_join_gloo_worker(
         assert prepared.recover_from_survivors
         cutover_barrier.wait()
         context = prepared.activate()
-        model, context, loader = configure_training(
-            model, context, dataset, device="cuda"
-        )
+        model, context, loader = configure_training(model, context, dataset, device="cuda")
         context.recover_from_survivors()
 
     try:
@@ -303,9 +319,7 @@ def _graceful_join_gloo_worker(
                 logits.flatten(0, 1), microbatch["labels"].to(logits.device).flatten()
             ),
         )
-        checksum = sum(
-            parameter.detach().double().sum() for parameter in model.parameters()
-        )
+        checksum = sum(parameter.detach().double().sum() for parameter in model.parameters())
         gathered = [torch.zeros_like(checksum) for _ in range(3)]
         dist.all_gather(gathered, checksum)
         for value in gathered[1:]:
@@ -328,7 +342,7 @@ def _graceful_join_gloo_worker(
 
 
 @pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="Gloo is unavailable")
-def test_pure_join_expands_gloo_world_without_replaying_committed_batch():
+def test_pure_addition_expands_gloo_world_without_replaying_committed_batch():
     port = _free_tcp_port()
     process_context = mp.get_context("spawn")
     manager = process_context.Manager()
@@ -338,7 +352,7 @@ def test_pure_join_expands_gloo_world_without_replaying_committed_batch():
     results = process_context.Queue()
     processes = [
         process_context.Process(
-            target=_graceful_join_gloo_worker,
+            target=_graceful_addition_gloo_worker,
             args=(
                 rank,
                 port,
@@ -358,12 +372,10 @@ def test_pure_join_expands_gloo_world_without_replaying_committed_batch():
         if process.is_alive():
             process.terminate()
             process.join(timeout=5)
-            pytest.fail("graceful-join Gloo worker timed out")
+            pytest.fail("graceful-addition Gloo worker timed out")
         assert process.exitcode == 0
     observed = sorted(results.get(timeout=5) for _ in processes)
-    assert {(item[1], item[2], item[3], item[4]) for item in observed} == {
-        (1, 1, 2, 5)
-    }
+    assert {(item[1], item[2], item[3], item[4]) for item in observed} == {(1, 1, 2, 5)}
     assert len({item[5] for item in observed}) == 1
     assert len({item[6] for item in observed}) == 1
     manager.shutdown()

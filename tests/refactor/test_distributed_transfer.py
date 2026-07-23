@@ -187,7 +187,7 @@ class TestDistributedStateTransfer(GlooDistributedTestBase):
         torch.testing.assert_close(model.weight.grad, torch.full_like(model.weight.grad, 1.25))
         synchronizer.close()
 
-    def test_joining_rank_recovers_parameter_and_optimizer_without_local_snapshot(self):
+    def test_added_rank_recovers_parameter_and_optimizer_without_local_snapshot(self):
         assert dist.get_backend() == "gloo"
         device = torch.device("cuda", self.rank % torch.cuda.device_count())
 

@@ -98,9 +98,10 @@ def test_churn_verifier_rejects_commit_gaps_memory_growth_and_group_leaks():
         )
 
 
-def test_churn_verifier_validates_graceful_join_resume_without_replay():
+def test_churn_verifier_validates_graceful_addition_resume_without_replay():
     recovery = {
-        "transition_kind": "join",
+        "removed_members": [],
+        "added_members": [{"agent_id": "node-b", "incarnation_id": "b1"}],
         "graceful_cutover": True,
         "cutover_committed_step": 1,
     }
@@ -146,6 +147,7 @@ def test_chaos_runner_injects_cascade_before_activation_and_verifies_metrics(tmp
             tuple(
                 NodeIdentity(node, f"{node}-{generation}", ("127.0.0.1",), ("0",)) for node in nodes
             ),
+            (),
             (),
         )
         agents = nodes if active else ()

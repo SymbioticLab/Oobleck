@@ -471,7 +471,9 @@ async def inspect_status(
             message.generation,
             {
                 "nodes": payload["nodes"],
-                "reasons": payload["reasons"],
+                "removed_nodes": payload["removed_nodes"],
+                "added_nodes": payload["added_nodes"],
+                "detection_seconds": payload["detection_seconds"],
                 "snapshot_hash": payload["snapshot_hash"],
                 "previous_execution_plan": None,
             },

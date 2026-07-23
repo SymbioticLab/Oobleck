@@ -10,7 +10,7 @@ from typing import Any, Callable, Iterable
 import torch
 
 from oobleck.distributed import destroy_process_group_universe
-from oobleck.elastic.membership import MembershipSnapshot, is_pure_join
+from oobleck.elastic.membership import MembershipSnapshot, is_pure_addition
 from oobleck.recovery import capture_context_state, restore_context_state
 from oobleck.runtime_base import *  # noqa: F403
 from oobleck.runtime_base import OobleckParallelContext
@@ -40,7 +40,8 @@ class GenerationTransitionMetrics:
     state_transfer_seconds: float = 0.0
     straggler_round_seconds: float = 0.0
     source_scheduling_error_bytes: int = 0
-    transition_kind: str = "hard"
+    removed_members: tuple[tuple[str, str], ...] = ()
+    added_members: tuple[tuple[str, str], ...] = ()
     graceful_cutover: bool = False
     cutover_committed_step: int | None = None
 
@@ -72,9 +73,17 @@ def _init_with_recovery(self: OobleckParallelContext, *args: Any, **kwargs: Any)
     self.recovery_history: list[GenerationTransitionMetrics] = []
     self._generation_control_metrics: dict[int, tuple[float, float]] = {}
     self._prepared_transition: _PreparedGenerationTransition | None = None
-    self._deferred_join_plan = None
+    self._deferred_addition_plan = None
     self._step_in_progress = False
-    self._transition_metadata: dict[int, tuple[str, bool, int | None]] = {}
+    self._transition_metadata: dict[
+        int,
+        tuple[
+            tuple[tuple[str, str], ...],
+            tuple[tuple[str, str], ...],
+            bool,
+            int | None,
+        ],
+    ] = {}
     self._generation_condition = threading.Condition()
     self._heterogeneous_gradient_sync = (
         None
@@ -154,17 +163,23 @@ def _record_superseded(
             source_scheduling_error_bytes=(
                 0 if report is None else report.source_scheduling_error_bytes
             ),
-            transition_kind=_transition_fields(self, transition.target.generation)[0],
-            graceful_cutover=_transition_fields(self, transition.target.generation)[1],
-            cutover_committed_step=_transition_fields(self, transition.target.generation)[2],
+            removed_members=_transition_fields(self, transition.target.generation)[0],
+            added_members=_transition_fields(self, transition.target.generation)[1],
+            graceful_cutover=_transition_fields(self, transition.target.generation)[2],
+            cutover_committed_step=_transition_fields(self, transition.target.generation)[3],
         )
     )
 
 
 def _transition_fields(
     self: OobleckParallelContext, generation: int
-) -> tuple[str, bool, int | None]:
-    return self._transition_metadata.get(generation, ("hard", False, None))
+) -> tuple[
+    tuple[tuple[str, str], ...],
+    tuple[tuple[str, str], ...],
+    bool,
+    int | None,
+]:
+    return self._transition_metadata.get(generation, ((), (), False, None))
 
 
 def _prepare_latest_generation(self: OobleckParallelContext) -> bool:
@@ -298,9 +313,10 @@ def _activate_prepared_generation(self: OobleckParallelContext) -> bool:
             state_transfer_seconds=self.last_recovery_report.transfer_seconds,
             straggler_round_seconds=self.last_recovery_report.straggler_round_seconds,
             source_scheduling_error_bytes=(self.last_recovery_report.source_scheduling_error_bytes),
-            transition_kind=_transition_fields(self, target.generation)[0],
-            graceful_cutover=_transition_fields(self, target.generation)[1],
-            cutover_committed_step=_transition_fields(self, target.generation)[2],
+            removed_members=_transition_fields(self, target.generation)[0],
+            added_members=_transition_fields(self, target.generation)[1],
+            graceful_cutover=_transition_fields(self, target.generation)[2],
+            cutover_committed_step=_transition_fields(self, target.generation)[3],
         )
     )
     self._prepared_transition = None
@@ -317,13 +333,8 @@ def _activate_latest_generation(self: OobleckParallelContext) -> None:
             _activate_prepared_generation(self)
 
 
-def _transition_kind(reasons: tuple[str, ...]) -> str:
-    prefixes = {reason.split(":", 1)[0] for reason in reasons}
-    if prefixes == {"join"}:
-        return "join"
-    if len(prefixes) != 1:
-        return "mixed"
-    return next(iter(prefixes), "hard")
+def _member_ids(nodes: tuple[Any, ...]) -> tuple[tuple[str, str], ...]:
+    return tuple((node.agent_id, node.incarnation_id) for node in nodes)
 
 
 def _apply_membership(self: OobleckParallelContext, snapshot: MembershipSnapshot) -> bool:
@@ -333,8 +344,8 @@ def _apply_membership(self: OobleckParallelContext, snapshot: MembershipSnapshot
         self.generation,
         self._pending_plan.generation if self._pending_plan is not None else -1,
         (
-            self._deferred_join_plan.generation
-            if self._deferred_join_plan is not None
+            self._deferred_addition_plan.generation
+            if self._deferred_addition_plan is not None
             else -1
         ),
         (
@@ -371,31 +382,24 @@ def _apply_membership(self: OobleckParallelContext, snapshot: MembershipSnapshot
     )
     execution_plan = self.owner_plan.build_execution_plan()
     planning_seconds = time.perf_counter() - planning_started
-    detection_seconds = (
-        self.config.lease_timeout_s
-        if any(reason.startswith("lease-expired:") for reason in snapshot.reasons)
-        else 0.0
-    )
+    detection_seconds = snapshot.detection_seconds
     self._generation_control_metrics[snapshot.generation] = (
         detection_seconds,
         planning_seconds,
     )
-    graceful = is_pure_join(snapshot, self.execution_plan)
+    graceful = is_pure_addition(snapshot, self.execution_plan)
     with self._commit_lock:
-        can_defer = graceful and (
-            self._deferred_join_plan is not None
-            or (self._pending_plan is None and self._prepared_transition is None)
-        )
-        deferred = can_defer and self._step_in_progress
+        deferred = graceful and self._step_in_progress
         self._transition_metadata[snapshot.generation] = (
-            _transition_kind(snapshot.reasons),
-            can_defer,
+            _member_ids(snapshot.removed_nodes),
+            _member_ids(snapshot.added_nodes),
+            graceful,
             None if deferred else self.committed_step,
         )
         if deferred:
-            self._deferred_join_plan = execution_plan
+            self._deferred_addition_plan = execution_plan
         else:
-            self._deferred_join_plan = None
+            self._deferred_addition_plan = None
             if (
                 self._pending_plan is None
                 or execution_plan.generation > self._pending_plan.generation
@@ -458,9 +462,7 @@ def _mark_generation_active(self: OobleckParallelContext, generation: int) -> No
         self._generation_condition.notify_all()
 
 
-def _wait_until_generation_preparable(
-    self: OobleckParallelContext, generation: int
-) -> bool:
+def _wait_until_generation_preparable(self: OobleckParallelContext, generation: int) -> bool:
     """Wait for a graceful step boundary; return false when superseded."""
 
     deadline = time.monotonic() + self.config.rendezvous_timeout_s
@@ -475,8 +477,8 @@ def _wait_until_generation_preparable(
                 self._pending_plan.generation if self._pending_plan is not None else -1
             )
             deferred_generation = (
-                self._deferred_join_plan.generation
-                if self._deferred_join_plan is not None
+                self._deferred_addition_plan.generation
+                if self._deferred_addition_plan is not None
                 else -1
             )
             newest = max(prepared_generation, pending_generation, deferred_generation)
@@ -488,7 +490,7 @@ def _wait_until_generation_preparable(
                 return False
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError("timed out waiting for graceful join boundary")
+                raise TimeoutError("timed out waiting for graceful addition boundary")
             self._generation_condition.wait(timeout=remaining)
 
 
@@ -506,26 +508,28 @@ def _step_with_control_barrier(self: OobleckParallelContext, *args: Any, **kwarg
     finally:
         with self._commit_lock:
             self._step_in_progress = False
-            target = self._deferred_join_plan
-            self._deferred_join_plan = None
+            target = self._deferred_addition_plan
+            self._deferred_addition_plan = None
             if target is not None and (
-                self._pending_plan is None
-                or target.generation > self._pending_plan.generation
+                self._pending_plan is None or target.generation > self._pending_plan.generation
             ):
                 self._pending_plan = target
-                kind, graceful, _ = self._transition_metadata[target.generation]
+                removed, added, graceful, _ = self._transition_metadata[target.generation]
                 self._transition_metadata[target.generation] = (
-                    kind, graceful, self.committed_step
+                    removed,
+                    added,
+                    graceful,
+                    self.committed_step,
                 )
         with self._generation_condition:
             self._generation_condition.notify_all()
 
 
 def _recover_from_survivors(self: OobleckParallelContext) -> None:
-    """Bootstrap a joining worker that owns no pre-generation state."""
+    """Bootstrap an added worker that owns no pre-generation state."""
 
     if not self._needs_survivor_recovery:
-        raise RuntimeError("materialize with recover_from_survivors=True for a joining worker")
+        raise RuntimeError("materialize with recover_from_survivors=True for an added worker")
     self.last_recovery_report = restore_context_state(self, None)
     self._heterogeneous_gradient_sync = activate_gradient_synchronizer(
         self.model,
@@ -555,9 +559,7 @@ OobleckParallelContext.activate_generation = _activate_generation
 OobleckParallelContext.prepared_execution_plan = property(_prepared_execution_plan)
 OobleckParallelContext._generation_transition_pending = _generation_transition_pending
 OobleckParallelContext._wait_for_generation_barrier = _wait_for_generation_barrier
-OobleckParallelContext.wait_until_generation_preparable = (
-    _wait_until_generation_preparable
-)
+OobleckParallelContext.wait_until_generation_preparable = _wait_until_generation_preparable
 OobleckParallelContext.mark_generation_active = _mark_generation_active
 OobleckParallelContext.step = _step_with_control_barrier
 OobleckParallelContext.recover_from_survivors = _recover_from_survivors

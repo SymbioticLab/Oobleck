@@ -26,6 +26,31 @@ def _test_plan(generation: int, instance_id: str = "shared") -> OobleckExecution
     )
 
 
+def test_master_accumulates_removals_and_additions_until_activation():
+    from oobleck.elastic import MembershipSnapshot, NodeIdentity
+
+    service = MasterControlService()
+    a = NodeIdentity("node-a", "a1", ("127.0.0.1",), ("0",))
+    b = NodeIdentity("node-b", "b1", ("127.0.0.1",), ("0",))
+    c = NodeIdentity("node-c", "c1", ("127.0.0.1",), ("0",))
+
+    service._begin_generation(MembershipSnapshot(1, (a, b), (), (a, b)))
+    service._clear_accumulated_operations()
+
+    failed = service._begin_generation(MembershipSnapshot(2, (a,), (b,), ()))
+    assert failed.removed_nodes == (b,)
+    assert failed.added_nodes == ()
+
+    expanded = service._begin_generation(MembershipSnapshot(3, (a, c), (), (c,)))
+    assert expanded.removed_nodes == (b,)
+    assert expanded.added_nodes == (c,)
+
+    cancelled = service._begin_generation(MembershipSnapshot(4, (a,), (c,), ()))
+    assert cancelled.nodes == (a,)
+    assert cancelled.removed_nodes == (b, c)
+    assert cancelled.added_nodes == (c,)
+
+
 def test_agents_join_and_concurrent_disconnects_publish_complete_snapshots():
     async def check():
         service = MasterControlService(lease_timeout_s=2, lease_check_interval_s=0.05)
@@ -165,7 +190,9 @@ def test_local_workers_must_agree_on_plan_and_compatibility(tmp_path):
         7,
         {
             "nodes": [],
-            "reasons": [],
+            "removed_nodes": [],
+            "added_nodes": [],
+            "detection_seconds": 0.0,
             "snapshot_hash": "membership",
             "previous_execution_plan": None,
         },
@@ -247,10 +274,15 @@ def test_master_rejects_cross_agent_plan_disagreement():
                 },
             )
         )
-        replacement = await asyncio.wait_for(first.receive(), timeout=2)
-        assert replacement.message_type == "membership"
-        assert replacement.generation == 3
-        assert replacement.payload["reasons"] == ["disconnect:node-b"]
+        superseding = await asyncio.wait_for(first.receive(), timeout=2)
+        assert superseding.message_type == "membership"
+        assert superseding.generation == 3
+        assert [item["agent_id"] for item in superseding.payload["removed_nodes"]] == ["node-b"]
+        assert [item["agent_id"] for item in superseding.payload["added_nodes"]] == [
+            "node-a",
+            "node-b",
+        ]
+        assert "reasons" not in superseding.payload
         assert service.active_generation != 2
         await first.close()
         await second.close()
@@ -369,19 +401,21 @@ def test_local_worker_consumes_failure_while_graceful_boundary_waits(tmp_path):
     from oobleck.elastic import LocalWorkerClient, MembershipSnapshot, MessageEnvelope, NodeIdentity
 
     previous = _test_plan(1)
-    joining = MembershipSnapshot(
+    addition = MembershipSnapshot(
         2,
         (
             NodeIdentity("node-a", "a1", ("127.0.0.1",), ("0",)),
             NodeIdentity("node-b", "b1", ("127.0.0.1",), ("0",)),
         ),
-        ("join:node-b",),
+        (),
+        (NodeIdentity("node-b", "b1", ("127.0.0.1",), ("0",)),),
         previous_execution_plan=previous,
     )
     failure = MembershipSnapshot(
         3,
         (NodeIdentity("node-a", "a1", ("127.0.0.1",), ("0",)),),
-        ("disconnect:node-b",),
+        (NodeIdentity("node-b", "b1", ("127.0.0.1",), ("0",)),),
+        (NodeIdentity("node-b", "b1", ("127.0.0.1",), ("0",)),),
         previous_execution_plan=previous,
     )
 
@@ -394,7 +428,9 @@ def test_local_worker_consumes_failure_while_graceful_boundary_waits(tmp_path):
             snapshot.generation,
             {
                 "nodes": [asdict(node) for node in snapshot.nodes],
-                "reasons": list(snapshot.reasons),
+                "removed_nodes": [asdict(node) for node in snapshot.removed_nodes],
+                "added_nodes": [asdict(node) for node in snapshot.added_nodes],
+                "detection_seconds": snapshot.detection_seconds,
                 "snapshot_hash": snapshot.snapshot_hash,
                 "previous_execution_plan": previous.to_dict(),
             },
@@ -433,7 +469,7 @@ def test_local_worker_consumes_failure_while_graceful_boundary_waits(tmp_path):
         worker.connection = Connection()
         worker.generation = 2
         started = time.monotonic()
-        snapshot, plan = await worker._prepare_context_responsively(Context(), joining, None)
+        snapshot, plan = await worker._prepare_context_responsively(Context(), addition, None)
         assert time.monotonic() - started < 2
         assert snapshot.generation == plan.generation == 3
 

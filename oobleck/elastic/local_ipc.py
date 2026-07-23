@@ -435,10 +435,14 @@ class LocalWorkerClient:
         previous = snapshot.previous_execution_plan
         if previous is not None:
             owner._last_execution_plan = previous
-        previous_nodes = (
-            {node_id for node_id, _ in previous.rank_map} if previous is not None else set()
+        local_identity = next(
+            (node for node in snapshot.nodes if node.agent_id == self.node_id), None
         )
-        joining = previous is not None and self.node_id not in previous_nodes
+        added_worker = (
+            previous is not None
+            and local_identity is not None
+            and local_identity in snapshot.added_nodes
+        )
         tp = int(getattr(owner.parallel_config, "tensor_parallel_size"))
         if any(len(node.gpu_ids) != tp for node in snapshot.nodes):
             raise ValueError("membership does not match the fixed tensor-parallel width")
@@ -448,7 +452,7 @@ class LocalWorkerClient:
         return owner.prepare(
             prepared.device,
             prepared.dtype,
-            recover_from_survivors=(prepared.recover_from_survivors or joining),
+            recover_from_survivors=(prepared.recover_from_survivors or added_worker),
         )
 
     async def activate_prepared(

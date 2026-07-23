@@ -59,7 +59,7 @@ def restore_context_state(context: Any, snapshot: RecoverySnapshot | None) -> Re
         )
     metadata = _gather_metadata(snapshot, rank=rank, dist=dist, world_size=world_size)
     if not metadata:
-        raise RuntimeError("no surviving committed state source joined recovery")
+        raise RuntimeError("no surviving committed state source participated in recovery")
     metadata_finished = time.perf_counter()
     steps = {item.committed_step for item in metadata}
     if len(steps) != 1:

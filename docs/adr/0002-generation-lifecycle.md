@@ -9,15 +9,13 @@ master marks the generation active.
 
 ## Cutover decision
 
-A proposal is a **graceful join** only when its stable node set strictly contains
-the active plan and every reason is `join:*`. If no step is running, preparation
+A proposal is a **graceful addition** only when its accumulated operation set contains at least one added incarnation and no removed incarnations. If no step is running, preparation
 starts immediately. If a step is running, that one step may commit under the old
-generation; the runtime then promotes the newest coalesced join plan and blocks
+generation; the runtime then promotes the newest coalesced addition plan and blocks
 the next step until `generation_active`. The committed batch is not replayed.
 
-Failures, drains, replacements, removals, and mixed snapshots are **hard
-transitions**. They immediately make the active attempt uncommittable. A hard
-transition also supersedes any deferred join, and the interrupted logical batch
+Any snapshot containing a removal is a **hard transition**, including a same-ID restart or an addition that supersedes removal recovery. They immediately make the active attempt uncommittable. A hard
+transition also supersedes any deferred addition, and the interrupted logical batch
 is replayed after recovery. A newer snapshot always supersedes an older prepared
 or partially activated generation.
 
