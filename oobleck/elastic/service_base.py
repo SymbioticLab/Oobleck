@@ -17,7 +17,6 @@ from oobleck.elastic.transport import (
     ControlTransport,
     MessageEnvelope,
     ProtocolError,
-    PROTOCOL_VERSION,
 )
 
 from oobleck.types import OobleckExecutionPlan
@@ -133,7 +132,6 @@ class MasterControlService:
                         raise ProtocolError(f"node {node_id!r} is not active")
                     self._master_sequence += 1
                     command = MessageEnvelope(
-                        PROTOCOL_VERSION,
                         "drain_command",
                         "master",
                         "master",
@@ -144,7 +142,6 @@ class MasterControlService:
                     await active[1].send(command)
                 await connection.send(
                     MessageEnvelope(
-                        PROTOCOL_VERSION,
                         "drain_accepted",
                         "master",
                         "master",
@@ -203,11 +200,12 @@ class MasterControlService:
                                 message.payload["execution_plan"]
                             )
                         except (TypeError, ValueError) as exc:
-                            raise ProtocolError("agent submitted an invalid execution plan") from exc
+                            raise ProtocolError(
+                                "agent submitted an invalid execution plan"
+                            ) from exc
                         if (
                             execution_plan.generation != proposed.generation
-                            or execution_plan.plan_checksum
-                            != message.payload["plan_checksum"]
+                            or execution_plan.plan_checksum != message.payload["plan_checksum"]
                             or (execution_plan.compatibility_digest or "")
                             != message.payload["compatibility_digest"]
                         ):
@@ -334,7 +332,6 @@ class MasterControlService:
     def _membership_message(self, snapshot: MembershipSnapshot) -> MessageEnvelope:
         self._master_sequence += 1
         return MessageEnvelope(
-            PROTOCOL_VERSION,
             "membership",
             "master",
             "master",
@@ -355,7 +352,6 @@ class MasterControlService:
     def _status_message(self, snapshot: MembershipSnapshot) -> MessageEnvelope:
         self._master_sequence += 1
         return MessageEnvelope(
-            PROTOCOL_VERSION,
             "status",
             "master",
             "master",
@@ -379,7 +375,6 @@ class MasterControlService:
     ) -> MessageEnvelope:
         self._master_sequence += 1
         return MessageEnvelope(
-            PROTOCOL_VERSION,
             "generation_rendezvous",
             "master",
             "master",
@@ -400,7 +395,6 @@ class MasterControlService:
     ) -> MessageEnvelope:
         self._master_sequence += 1
         return MessageEnvelope(
-            PROTOCOL_VERSION,
             "generation_active",
             "master",
             "master",
@@ -440,7 +434,6 @@ class NodeAgentClient:
         self.connection = await self.transport.connect(host, port)
         await self.connection.send(
             MessageEnvelope(
-                PROTOCOL_VERSION,
                 "register",
                 self.node_id,
                 self.incarnation_id,
@@ -464,7 +457,6 @@ class NodeAgentClient:
             self.sequence += 1
             await self.connection.send(
                 MessageEnvelope(
-                    PROTOCOL_VERSION,
                     "heartbeat",
                     self.node_id,
                     self.incarnation_id,
@@ -486,6 +478,11 @@ class NodeAgentClient:
         self.sequence += 1
         await self.connection.send(
             MessageEnvelope(
-                PROTOCOL_VERSION, "drain", self.node_id, self.incarnation_id, self.sequence, self.generation, {}
+                "drain",
+                self.node_id,
+                self.incarnation_id,
+                self.sequence,
+                self.generation,
+                {},
             )
         )

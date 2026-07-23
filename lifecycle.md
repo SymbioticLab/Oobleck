@@ -288,8 +288,8 @@ discards the attempt's gradients and does not advance any of those objects.
 
 Failures, joins, graceful drains, and replacements all enter the same generation
 protocol. The master converts each event into a complete, monotonically newer
-`MembershipSnapshot`; it never sends rank-local membership patches. Protocol
-version 2 binds the previous active execution plan into the snapshot hash, and
+`MembershipSnapshot`; it never sends rank-local membership patches. The control
+protocol binds the previous active execution plan into the snapshot hash, and
 prepared acknowledgements carry the complete checksummed target plan. The master
 stores that plan only after the generation becomes active.
 

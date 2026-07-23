@@ -9,10 +9,8 @@ from dataclasses import asdict, dataclass
 from typing import Awaitable, Callable, Mapping, Protocol
 
 
-PROTOCOL_VERSION = 2
 DEFAULT_MAX_FRAME_BYTES = 1 << 20
 _FIELDS = {
-    "protocol_version",
     "message_type",
     "agent_id",
     "incarnation_id",
@@ -138,7 +136,6 @@ def _validate_payload(message_type: str, payload: Mapping[str, object]) -> None:
 
 @dataclass(frozen=True, slots=True)
 class MessageEnvelope:
-    protocol_version: int
     message_type: str
     agent_id: str
     incarnation_id: str
@@ -147,10 +144,6 @@ class MessageEnvelope:
     payload: Mapping[str, object]
 
     def __post_init__(self) -> None:
-        if self.protocol_version != PROTOCOL_VERSION:
-            raise ProtocolError(
-                f"unsupported protocol version {self.protocol_version}; expected {PROTOCOL_VERSION}"
-            )
         if not self.message_type or not self.agent_id or not self.incarnation_id:
             raise ProtocolError("message_type, agent_id, and incarnation_id are required")
         if self.sequence_number < 0 or self.generation < 0:
@@ -168,7 +161,6 @@ class MessageEnvelope:
             extra = sorted(set(value) - _FIELDS)
             raise ProtocolError(f"invalid envelope fields; missing={missing}, extra={extra}")
         expected_types = {
-            "protocol_version": int,
             "message_type": str,
             "agent_id": str,
             "incarnation_id": str,

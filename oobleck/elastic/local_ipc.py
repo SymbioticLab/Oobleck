@@ -20,7 +20,6 @@ from oobleck.elastic.transport import (
     ControlConnection,
     MessageEnvelope,
     ProtocolError,
-    PROTOCOL_VERSION,
 )
 from oobleck.types import (
     OobleckExecutionPlan,
@@ -348,7 +347,6 @@ class LocalWorkerClient:
         self.connection = ControlConnection(reader, writer)
         await self.connection.send(
             MessageEnvelope(
-                PROTOCOL_VERSION,
                 "worker_register",
                 self.worker_id,
                 self.incarnation_id,
@@ -399,7 +397,6 @@ class LocalWorkerClient:
         self.sequence += 1
         await self.connection.send(
             MessageEnvelope(
-                PROTOCOL_VERSION,
                 "worker_ack",
                 self.worker_id,
                 self.incarnation_id,
@@ -410,9 +407,7 @@ class LocalWorkerClient:
                     "snapshot_hash": metadata[0],
                     "plan_checksum": metadata[1],
                     "compatibility_digest": metadata[2],
-                    "execution_plan": (
-                        execution_plan.to_dict() if phase == "prepared" else None
-                    ),
+                    "execution_plan": (execution_plan.to_dict() if phase == "prepared" else None),
                 },
             )
         )
@@ -441,9 +436,7 @@ class LocalWorkerClient:
         if previous is not None:
             owner._last_execution_plan = previous
         previous_nodes = (
-            {node_id for node_id, _ in previous.rank_map}
-            if previous is not None
-            else set()
+            {node_id for node_id, _ in previous.rank_map} if previous is not None else set()
         )
         joining = previous is not None and self.node_id not in previous_nodes
         tp = int(getattr(owner.parallel_config, "tensor_parallel_size"))
@@ -451,9 +444,7 @@ class LocalWorkerClient:
             raise ValueError("membership does not match the fixed tensor-parallel width")
         coordinator = min(snapshot.nodes, key=lambda node: node.agent_id)
         owner.set_rendezvous_address(coordinator.addresses[0])
-        owner.set_membership(
-            tuple(node.agent_id for node in snapshot.nodes), snapshot.generation
-        )
+        owner.set_membership(tuple(node.agent_id for node in snapshot.nodes), snapshot.generation)
         return owner.prepare(
             prepared.device,
             prepared.dtype,
@@ -477,9 +468,7 @@ class LocalWorkerClient:
             if prepared.execution_plan.generation != snapshot.generation:
                 prepared = self._reprepare(prepared, snapshot)
             metadata = self._metadata(prepared.execution_plan, snapshot)
-            await self._acknowledge(
-                "prepared", snapshot, metadata, prepared.execution_plan
-            )
+            await self._acknowledge("prepared", snapshot, metadata, prepared.execution_plan)
             while True:
                 message = await self.connection.receive()
                 if message.message_type == "membership":

@@ -23,11 +23,10 @@ or partially activated generation.
 
 ## Plan and state consensus
 
-Control protocol version 2 carries the complete versioned, checksummed execution
+The control protocol carries the complete versioned, checksummed execution
 plan in prepared acknowledgements. The master retains it as the previous active
 plan only after readiness consensus activates that generation, then binds it into
 the hash of later membership proposals. Fresh workers seed reconfiguration from
 that plan, configure their DataLoader and optimization objects before recovery,
 and receive model, optimizer, scheduler, scaler, committed-step, sampler-epoch,
-and sampler-cursor state from incumbents. Rolling protocol-v1/v2 interoperability
-is intentionally unsupported.
+and sampler-cursor state from incumbents.

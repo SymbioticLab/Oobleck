@@ -94,7 +94,7 @@ python examples/run_agent.py \
 ```
 
 Node IDs remain stable across replacements; each agent process creates a fresh
-incarnation. Protocol-v2 proposals carry the previous active plan, and every
+incarnation. Membership proposals carry the previous active plan, and every
 prepared worker acknowledges the same complete checksummed target plan. A newer
 proposal supersedes older preparation, all agents acknowledge readiness, and only
 then does the master publish `generation_active`.

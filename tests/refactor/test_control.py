@@ -21,9 +21,11 @@ from oobleck.elastic.transport import ProtocolError, SerializedWriter
 
 def test_frames_support_fragmentation_and_coalescing():
     async def check():
-        first = MessageEnvelope(2, "heartbeat", "a", "i", 1, 0, {})
-        second = MessageEnvelope(2, "heartbeat", "a", "i", 2, 0, {})
-        payload = encode_frame(first) + encode_frame(second)
+        first = MessageEnvelope("heartbeat", "a", "i", 1, 0, {})
+        second = MessageEnvelope("heartbeat", "a", "i", 2, 0, {})
+        first_frame = encode_frame(first)
+        assert b"protocol_version" not in first_frame
+        payload = first_frame + encode_frame(second)
         reader = asyncio.StreamReader()
         for byte in payload[:7]:
             reader.feed_data(bytes([byte]))
@@ -37,7 +39,6 @@ def test_frames_support_fragmentation_and_coalescing():
 
 def test_oversized_frame_is_rejected():
     message = MessageEnvelope(
-        2,
         "register",
         "a",
         "i",
@@ -48,13 +49,13 @@ def test_oversized_frame_is_rejected():
     with pytest.raises(FrameTooLarge):
         encode_frame(message, max_frame_bytes=32)
     with pytest.raises(ProtocolError, match="non-empty list of strings"):
-        MessageEnvelope(2, "register", "a", "i", 0, 0, {"addresses": "host", "gpu_ids": [0]})
+        MessageEnvelope("register", "a", "i", 0, 0, {"addresses": "host", "gpu_ids": [0]})
 
 
 def test_malformed_frame_and_strict_field_types_are_rejected():
     async def check():
         reader = asyncio.StreamReader()
-        body = json.dumps({"protocol_version": True}).encode()
+        body = json.dumps({"message_type": True}).encode()
         reader.feed_data(struct.pack(">I", len(body)) + body)
         with pytest.raises(ProtocolError):
             await read_frame(reader)
@@ -83,7 +84,7 @@ def test_serialized_writer_applies_drain_backpressure():
     async def check():
         raw = Writer()
         writer = SerializedWriter(raw, queue_size=1)
-        message = MessageEnvelope(2, "heartbeat", "a", "i", 1, 0, {})
+        message = MessageEnvelope("heartbeat", "a", "i", 1, 0, {})
         pending = asyncio.create_task(writer.send(message))
         await asyncio.sleep(0)
         assert not pending.done()

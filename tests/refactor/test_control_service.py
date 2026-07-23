@@ -15,12 +15,8 @@ from oobleck.types import OobleckExecutionPlan, PipelineInstance, PipelineTempla
 
 
 def _test_plan(generation: int, instance_id: str = "shared") -> OobleckExecutionPlan:
-    template = PipelineTemplate(
-        "control-test", ((0, 1), (1, 2)), 1, 0.0, 0.0
-    )
-    instance = PipelineInstance(
-        instance_id, template, ("node-a", "node-b"), ((0,), (1,)), 0
-    )
+    template = PipelineTemplate("control-test", ((0, 1), (1, 2)), 1, 0.0, 0.0)
+    instance = PipelineInstance(instance_id, template, ("node-a", "node-b"), ((0,), (1,)), 0)
     return OobleckExecutionPlan(
         generation,
         (instance,),
@@ -162,13 +158,17 @@ def test_local_workers_must_agree_on_plan_and_compatibility(tmp_path):
 
     relay = LocalWorkerRelay(tmp_path / "relay.sock", "node-a", expected_workers=2)
     relay._latest_membership = MessageEnvelope(
-        2,
         "membership",
         "master",
         "master",
         1,
         7,
-        {"nodes": [], "reasons": [], "snapshot_hash": "membership", "previous_execution_plan": None},
+        {
+            "nodes": [],
+            "reasons": [],
+            "snapshot_hash": "membership",
+            "previous_execution_plan": None,
+        },
     )
     relay._workers = {"gpu-0": object(), "gpu-1": object()}
     relay._acknowledged = {
@@ -192,7 +192,6 @@ def test_master_rejects_cross_agent_plan_disagreement():
         second = await transport.connect("127.0.0.1", port)
         await first.send(
             MessageEnvelope(
-                2,
                 "register",
                 "node-a",
                 "a1",
@@ -204,7 +203,6 @@ def test_master_rejects_cross_agent_plan_disagreement():
         assert (await first.receive()).generation == 1
         await second.send(
             MessageEnvelope(
-                2,
                 "register",
                 "node-b",
                 "b1",
@@ -221,7 +219,6 @@ def test_master_rejects_cross_agent_plan_disagreement():
         second_plan = _test_plan(2, "plan-b")
         await first.send(
             MessageEnvelope(
-                2,
                 "generation_prepared",
                 "node-a",
                 "a1",
@@ -237,7 +234,6 @@ def test_master_rejects_cross_agent_plan_disagreement():
         )
         await second.send(
             MessageEnvelope(
-                2,
                 "generation_prepared",
                 "node-b",
                 "b1",
@@ -275,7 +271,6 @@ def test_master_enforces_prepared_rendezvous_ready_active_order():
         second = await transport.connect("127.0.0.1", port)
         await first.send(
             MessageEnvelope(
-                2,
                 "register",
                 "node-a",
                 "a1",
@@ -287,7 +282,6 @@ def test_master_enforces_prepared_rendezvous_ready_active_order():
         await first.receive()
         await second.send(
             MessageEnvelope(
-                2,
                 "register",
                 "node-b",
                 "b1",
@@ -306,27 +300,29 @@ def test_master_enforces_prepared_rendezvous_ready_active_order():
             "plan_checksum": execution_plan.plan_checksum,
             "compatibility_digest": "compat",
         }
-        prepared_metadata = {
-            **metadata, "execution_plan": execution_plan.to_dict()
-        }
+        prepared_metadata = {**metadata, "execution_plan": execution_plan.to_dict()}
 
-        await first.send(MessageEnvelope(2, "generation_prepared", "node-a", "a1", 1, 2, prepared_metadata))
+        await first.send(
+            MessageEnvelope("generation_prepared", "node-a", "a1", 1, 2, prepared_metadata)
+        )
         await asyncio.sleep(0.02)
         assert service._rendezvous_metadata is None
         assert service.active_generation != 2
 
-        await second.send(MessageEnvelope(2, "generation_prepared", "node-b", "b1", 1, 2, prepared_metadata))
+        await second.send(
+            MessageEnvelope("generation_prepared", "node-b", "b1", 1, 2, prepared_metadata)
+        )
         first_rendezvous = await first.receive()
         second_rendezvous = await second.receive()
         assert first_rendezvous.message_type == "generation_rendezvous"
         assert second_rendezvous == first_rendezvous
         assert service.active_generation != 2
 
-        await first.send(MessageEnvelope(2, "generation_ready", "node-a", "a1", 2, 2, metadata))
+        await first.send(MessageEnvelope("generation_ready", "node-a", "a1", 2, 2, metadata))
         await asyncio.sleep(0.02)
         assert service.active_generation != 2
 
-        await second.send(MessageEnvelope(2, "generation_ready", "node-b", "b1", 2, 2, metadata))
+        await second.send(MessageEnvelope("generation_ready", "node-b", "b1", 2, 2, metadata))
         first_active = await first.receive()
         second_active = await second.receive()
         assert first_active.message_type == "generation_active"
@@ -391,7 +387,6 @@ def test_local_worker_consumes_failure_while_graceful_boundary_waits(tmp_path):
 
     def message(snapshot):
         return MessageEnvelope(
-            2,
             "membership",
             "master",
             "master",
@@ -438,9 +433,7 @@ def test_local_worker_consumes_failure_while_graceful_boundary_waits(tmp_path):
         worker.connection = Connection()
         worker.generation = 2
         started = time.monotonic()
-        snapshot, plan = await worker._prepare_context_responsively(
-            Context(), joining, None
-        )
+        snapshot, plan = await worker._prepare_context_responsively(Context(), joining, None)
         assert time.monotonic() - started < 2
         assert snapshot.generation == plan.generation == 3
 
