@@ -1,0 +1,25 @@
+{
+  "balanced_max_source_bytes": 16777216,
+  "balanced_source_bytes": {
+    "0": 16777216,
+    "1": 16777216,
+    "2": 16777216,
+    "3": 16777216
+  },
+  "legacy_first_source_max_bytes": 67108864,
+  "max_source_load_reduction": 0.75,
+  "maximum_round_destination_bytes": 16777216,
+  "maximum_round_source_bytes": 4194304,
+  "planning_seconds": 0.00039029866456985474,
+  "round_count": 4,
+  "scenario": {
+    "chunk_bytes": 4194304,
+    "destinations": 1,
+    "round_bytes": 16777216,
+    "surviving_replicas": 4,
+    "tensor_bytes": 67108864
+  },
+  "schedule_hash": "475c9bd581858e75ea756c8a47535aee45174a3530e0bd79a7aec04f015c6c88",
+  "schema_version": 1,
+  "transfer_count": 16
+}

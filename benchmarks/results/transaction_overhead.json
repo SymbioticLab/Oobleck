@@ -1,0 +1,23 @@
+{
+  "baseline_step_seconds": 0.00040008220821619034,
+  "committed_step": 5,
+  "numerically_equivalent": true,
+  "oobleck_steady_step_seconds": 0.0013069706037640572,
+  "recovery_attempts": 2,
+  "recovery_extra_seconds": 0.0015370016917586327,
+  "recovery_step_seconds": 0.00284397229552269,
+  "replayed_sample_indices": [
+    16,
+    17,
+    18,
+    19
+  ],
+  "scenario": {
+    "device": "cpu",
+    "global_batch_size": 4,
+    "microbatch_size": 2,
+    "steady_steps": 4
+  },
+  "schema_version": 1,
+  "steady_state_overhead_ratio": 3.266755124131429
+}
