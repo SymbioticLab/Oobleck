@@ -4,11 +4,48 @@ from __future__ import annotations
 
 import re
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 from typing import Iterable
 
 
 class ProcessGroupLayoutError(RuntimeError):
     pass
+
+
+def initialize_process_group(
+    *,
+    backend: str,
+    master_address: str,
+    master_port: int,
+    rank: int,
+    world_size: int,
+    timeout_s: float,
+) -> None:
+    """Create one validated replacement WORLD from deterministic rendezvous data."""
+
+    import torch.distributed as dist
+
+    if dist.is_initialized():
+        raise RuntimeError("WORLD must be fully retired before replacement")
+    if not backend or not master_address:
+        raise ValueError("backend and rendezvous address are required")
+    if not 1 <= master_port <= 65535:
+        raise ValueError("rendezvous port must be between 1 and 65535")
+    if world_size < 1 or not 0 <= rank < world_size:
+        raise ValueError("rank/world_size are invalid")
+    if timeout_s <= 0:
+        raise ValueError("rendezvous timeout must be positive")
+    host = f"[{master_address}]" if ":" in master_address else master_address
+    dist.init_process_group(
+        backend=backend,
+        init_method=f"tcp://{host}:{master_port}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=timeout_s),
+    )
+    if dist.get_rank() != rank or dist.get_world_size() != world_size:
+        destroy_process_group_universe()
+        raise RuntimeError("initialized WORLD does not match the generation rank map")
 
 
 _REQUIRED = (

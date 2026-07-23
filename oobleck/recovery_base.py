@@ -61,6 +61,17 @@ class RecoveryReport:
     def maximum_destination_bytes(self) -> int:
         return max((value for _, value in self.destination_bytes), default=0)
 
+    @property
+    def source_scheduling_error_bytes(self) -> int:
+        planned = dict(self.source_bytes)
+        actual = dict(self.actual_source_bytes)
+        ranks = set(planned) | set(actual)
+        return max((abs(actual.get(rank, 0) - planned.get(rank, 0)) for rank in ranks), default=0)
+
+    @property
+    def straggler_round_seconds(self) -> float:
+        return max((duration for _, _, duration in self.round_durations), default=0.0)
+
 
 def version_manifest(manifest: StateManifest, committed_step: int) -> StateManifest:
     return StateManifest(

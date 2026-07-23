@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
 import torch
 from torch.utils.data import DataLoader, Dataset
 
 from oobleck import OobleckConfig, OobleckParallelizationPlan
+from oobleck.types import stable_rank_map
+
+if TYPE_CHECKING:
+    from oobleck.elastic import MembershipSnapshot
 
 
 class FakeTextDataset(Dataset):
@@ -57,9 +63,18 @@ def build_dataset(
     return load_dataset(name, configuration, split=split)
 
 
-def _build_model(model_backend: str) -> tuple[torch.nn.Module, object, object | None, int]:
+def _build_model(
+    model_backend: str, tensor_parallel_size: int, world_size: int
+) -> tuple[torch.nn.Module, object, object | None, int]:
+    if tensor_parallel_size < 1 or world_size < tensor_parallel_size:
+        raise ValueError("tensor_parallel_size and world_size are inconsistent")
     if model_backend == "tiny":
-        return TinyLanguageModel(), ExampleParallelConfig(), None, 256
+        return (
+            TinyLanguageModel(),
+            ExampleParallelConfig(tensor_parallel_size=tensor_parallel_size),
+            None,
+            256,
+        )
     if model_backend != "cornstarch":
         raise ValueError("model_backend must be 'tiny' or 'cornstarch'")
     try:
@@ -83,8 +98,13 @@ def _build_model(model_backend: str) -> tuple[torch.nn.Module, object, object | 
     )
     model = from_hf_config(hf_config, model_kind="language")
     model.set_random_init()
-    cornstarch_plan = ParallelizationPlan(global_ranks=[0])
-    return model, ParallelConfig(tensor_parallel_size=1), cornstarch_plan, 64
+    cornstarch_plan = ParallelizationPlan(global_ranks=range(world_size))
+    return (
+        model,
+        ParallelConfig(tensor_parallel_size=tensor_parallel_size),
+        cornstarch_plan,
+        64,
+    )
 
 
 def build_training(
@@ -94,12 +114,54 @@ def build_training(
     split: str = "train",
     device: str = "cuda",
     model_backend: str = "tiny",
+    membership_snapshot: "MembershipSnapshot | None" = None,
+    local_node_id: str | None = None,
+    local_tp_lane: int = 0,
+    max_nodes: int = 1,
+    rendezvous_port: int = 29500,
+    distributed_backend: str = "auto",
 ):
-    model, parallel_config, cornstarch_plan, vocab_size = _build_model(model_backend)
+    nodes = (
+        tuple(sorted(node.agent_id for node in membership_snapshot.nodes))
+        if membership_snapshot is not None
+        else ()
+    )
+    tensor_parallel_size = (
+        len(membership_snapshot.nodes[0].gpu_ids) if membership_snapshot is not None else 1
+    )
+    if membership_snapshot is not None:
+        widths = {len(node.gpu_ids) for node in membership_snapshot.nodes}
+        if widths != {tensor_parallel_size}:
+            raise ValueError("every membership node must contribute the fixed TP width")
+        if local_node_id not in nodes:
+            raise ValueError("local_node_id must identify a node in the membership snapshot")
+        if not 0 <= local_tp_lane < tensor_parallel_size:
+            raise ValueError("local_tp_lane is outside the fixed TP width")
+        if len(nodes) > max_nodes:
+            raise ValueError("membership exceeds configured max_nodes")
+    rank_map = dict(stable_rank_map(nodes, tensor_parallel_size)) if nodes else {}
+    rank = rank_map[local_node_id][local_tp_lane] if local_node_id is not None else 0
+    world_size = max(1, len(nodes) * tensor_parallel_size)
+    model, parallel_config, cornstarch_plan, vocab_size = _build_model(
+        model_backend, tensor_parallel_size, world_size
+    )
     plan = OobleckParallelizationPlan(
-        OobleckConfig(global_batch_size=8, microbatch_size=2, max_nodes=1, seed=42),
+        OobleckConfig(
+            global_batch_size=8,
+            microbatch_size=2,
+            max_nodes=max_nodes,
+            seed=42,
+            rendezvous_port=rendezvous_port,
+            distributed_backend=distributed_backend,
+        ),
+        node_ids=nodes,
+        rank=rank,
         cornstarch_plan=cornstarch_plan,
     )
+    if membership_snapshot is not None:
+        plan.set_membership(nodes, membership_snapshot.generation)
+        coordinator = min(membership_snapshot.nodes, key=lambda node: node.agent_id)
+        plan.set_rendezvous_address(coordinator.addresses[0])
     plan.parallelize(model, parallel_config)
     context = plan.materialize(device, dtype=torch.float32)
     dataset = build_dataset(

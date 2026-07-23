@@ -17,7 +17,7 @@ from oobleck.data import (
     logical_seed,
     prepare_dataloader,
 )
-from oobleck.distributed import destroy_process_group_universe
+from oobleck.distributed import destroy_process_group_universe, initialize_process_group
 from oobleck.planning import (
     PipelineTemplate,
     RecoveryUnavailable,
@@ -71,6 +71,7 @@ class OobleckParallelizationPlan:
         self._local_node_id: str | None = None
         self._tp_lane: int | None = None
         self._target_rank = rank
+        self._rendezvous_address: str | None = None
 
     def parallelize(self, model: torch.nn.Module, parallel_config: object) -> None:
         if self.model is not None:
@@ -121,6 +122,34 @@ class OobleckParallelizationPlan:
             self._generation = generation
         elif changed:
             self._generation += 1
+
+    def set_rendezvous_address(self, address: str) -> None:
+        if not address:
+            raise ValueError("rendezvous address must not be empty")
+        self._rendezvous_address = address
+        if self.world_initializer is None:
+            self.world_initializer = self.initialize_world
+
+    def initialize_world(self, execution_plan: OobleckExecutionPlan) -> None:
+        """Initialize WORLD for a managed generation using its concrete rank map."""
+
+        if self._rendezvous_address is None:
+            raise RuntimeError("managed WORLD initialization requires a rendezvous address")
+        world_size = sum(len(ranks) for _, ranks in execution_plan.rank_map)
+        backend = self.config.distributed_backend
+        if backend == "auto":
+            backend = "nccl" if torch.cuda.is_available() else "gloo"
+        rendezvous_port = self.config.rendezvous_port + execution_plan.generation
+        if rendezvous_port > 65535:
+            raise ValueError("rendezvous_port plus membership generation exceeds 65535")
+        initialize_process_group(
+            backend=backend,
+            master_address=self._rendezvous_address,
+            master_port=rendezvous_port,
+            rank=self.rank_for_plan(execution_plan),
+            world_size=world_size,
+            timeout_s=self.config.rendezvous_timeout_s,
+        )
 
     def _default_template(self) -> PipelineTemplate:
         assert self.model is not None and self.parallel_config is not None
