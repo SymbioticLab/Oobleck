@@ -38,6 +38,19 @@ def _partition(layers: Sequence[LayerExecutionResult], stages: int) -> tuple[tup
     )
 
 
+def _max_microbatches(
+    activation_memory: int, persistent_memory: int, device_memory_bytes: int | None
+) -> int | None:
+    if device_memory_bytes is None:
+        return None
+    available = device_memory_bytes - persistent_memory
+    if available < 0 or (activation_memory > 0 and available < activation_memory):
+        raise ValueError("pipeline template cannot fit one microbatch in device memory")
+    if activation_memory == 0:
+        return None
+    return available // activation_memory
+
+
 def create_pipeline_templates(
     model_name: str,
     profile_data: Sequence[LayerExecutionResult],
@@ -45,11 +58,14 @@ def create_pipeline_templates(
     tensor_parallel_size: int = 1,
     *,
     fingerprint: CompatibilityFingerprint | None = None,
+    device_memory_bytes: int | None = None,
 ) -> dict[int, PipelineTemplate]:
     if not model_name or not profile_data or not num_nodes:
         raise ValueError("model_name, profile_data, and num_nodes must be non-empty")
     if tensor_parallel_size < 1:
         raise ValueError("tensor_parallel_size must be positive")
+    if device_memory_bytes is not None and device_memory_bytes < 1:
+        raise ValueError("device_memory_bytes must be positive when supplied")
     if tuple(layer.layer_index for layer in profile_data) != tuple(range(len(profile_data))):
         raise ValueError("profile_data must have contiguous global layer indices")
     try:
@@ -73,7 +89,11 @@ def create_pipeline_templates(
                 float(value["communication_time"]),
                 int(value["activation_memory"]),
                 int(value["persistent_memory"]),
-                value["max_microbatches"],
+                _max_microbatches(
+                    int(value["activation_memory"]),
+                    int(value["persistent_memory"]),
+                    device_memory_bytes,
+                ),
                 fingerprint,
                 int(value["schema_version"]),
             )
@@ -109,6 +129,9 @@ def create_pipeline_templates(
             backward,
             activation_memory=activation_memory,
             persistent_memory=persistent_memory,
+            max_microbatches=_max_microbatches(
+                activation_memory, persistent_memory, device_memory_bytes
+            ),
             fingerprint=fingerprint,
         )
     return results

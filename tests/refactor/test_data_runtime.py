@@ -226,9 +226,18 @@ def test_complete_membership_snapshot_announces_deterministic_execution_plan():
     assert ctx._pending_plan.previous_generation == 0
     assert ctx._pending_plan.plan_checksum
     assert not ctx.apply_membership(replacement)
+    assert ctx._generation_control_metrics[1][0] == 0.0
+
+    lease_expired = MembershipSnapshot(
+        2,
+        (NodeIdentity("local-node", "lease", ("127.0.0.1",), ("0",)),),
+        ("lease-expired:local-node",),
+    )
+    assert ctx.apply_membership(lease_expired)
+    assert ctx._generation_control_metrics[2][0] == ctx.config.lease_timeout_s
 
     invalid = MembershipSnapshot(
-        2,
+        3,
         (NodeIdentity("local-node", "bad", ("127.0.0.1",), ("0", "1")),),
         ("replacement:local-node",),
     )

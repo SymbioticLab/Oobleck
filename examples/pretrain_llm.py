@@ -29,6 +29,9 @@ class ExampleTrainingConfig:
     dataset_name: str | None = None
     dataset_config: str | None = None
     split: str = "train"
+    max_nodes: int = 16
+    rendezvous_port: int = 29500
+    distributed_backend: str = "auto"
 
 
 def _one_step(model, context, loader, selected: str, model_backend: str):
@@ -74,6 +77,9 @@ def train_one_step(
     dataset_config: str | None = None,
     split: str = "train",
     model_backend: str = "tiny",
+    max_nodes: int = 1,
+    rendezvous_port: int = 29500,
+    distributed_backend: str = "auto",
 ):
     selected = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model, context, loader = build_training(
@@ -82,6 +88,9 @@ def train_one_step(
         dataset_config=dataset_config,
         split=split,
         model_backend=model_backend,
+        max_nodes=max_nodes,
+        rendezvous_port=rendezvous_port,
+        distributed_backend=distributed_backend,
     )
     try:
         return _one_step(model, context, loader, selected, model_backend)
@@ -96,14 +105,22 @@ async def train_managed(config: ExampleTrainingConfig):
     node_id = os.environ["OOBLECK_NODE_ID"]
     worker_id = os.environ["OOBLECK_WORKER_ID"]
     selected = config.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    worker = LocalWorkerClient(socket_path, node_id, worker_id)
+    await worker.connect()
+    snapshot = await worker.receive()
     model, context, loader = build_training(
         device=selected,
         dataset_name=config.dataset_name,
         dataset_config=config.dataset_config,
         split=config.split,
         model_backend=config.model_backend,
+        membership_snapshot=snapshot,
+        local_node_id=node_id,
+        local_tp_lane=int(os.environ["OOBLECK_LOCAL_RANK"]),
+        max_nodes=config.max_nodes,
+        rendezvous_port=config.rendezvous_port,
+        distributed_backend=config.distributed_backend,
     )
-    worker = LocalWorkerClient(socket_path, node_id, worker_id)
     active = asyncio.Event()
 
     async def prepare(snapshot) -> None:
@@ -112,9 +129,13 @@ async def train_managed(config: ExampleTrainingConfig):
     async def activated(generation: int) -> None:
         active.set()
 
-    await worker.connect()
     relay_task = asyncio.create_task(
-        worker.run_context(context, on_snapshot=prepare, on_active=activated)
+        worker.run_context(
+            context,
+            initial_snapshot=snapshot,
+            on_snapshot=prepare,
+            on_active=activated,
+        )
     )
     try:
         await asyncio.wait_for(active.wait(), timeout=30.0)
@@ -139,6 +160,9 @@ def main() -> None:
             dataset_config=config.dataset_config,
             split=config.split,
             model_backend=config.model_backend,
+            max_nodes=config.max_nodes,
+            rendezvous_port=config.rendezvous_port,
+            distributed_backend=config.distributed_backend,
         )
     print(
         f"committed_step={result.committed_step} generation={result.generation} "

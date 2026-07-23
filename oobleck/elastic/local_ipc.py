@@ -245,6 +245,7 @@ class LocalWorkerClient:
         self,
         context: Any,
         *,
+        initial_snapshot: MembershipSnapshot | None = None,
         on_snapshot: Callable[[MembershipSnapshot], Awaitable[None]] | None = None,
         on_active: Callable[[int], Awaitable[None]] | None = None,
     ) -> None:
@@ -253,7 +254,9 @@ class LocalWorkerClient:
         enable_barrier = getattr(context, "enable_control_plane_barrier", None)
         if callable(enable_barrier):
             enable_barrier()
-        pending: MembershipSnapshot | None = None
+        if initial_snapshot is not None and initial_snapshot.generation != self.generation:
+            raise ValueError("initial snapshot must be the latest received membership")
+        pending: MembershipSnapshot | None = initial_snapshot
         while True:
             snapshot = pending or await self.receive()
             pending = None

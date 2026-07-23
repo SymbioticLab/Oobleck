@@ -33,6 +33,12 @@ class GenerationTransitionMetrics:
     recovery_seconds: float
     total_seconds: float
     superseded: bool = False
+    detection_seconds: float = 0.0
+    configuration_planning_seconds: float = 0.0
+    state_planning_seconds: float = 0.0
+    state_transfer_seconds: float = 0.0
+    straggler_round_seconds: float = 0.0
+    source_scheduling_error_bytes: int = 0
 
 
 def _init_with_recovery(self: OobleckParallelContext, *args: Any, **kwargs: Any) -> None:
@@ -45,6 +51,7 @@ def _init_with_recovery(self: OobleckParallelContext, *args: Any, **kwargs: Any)
     self._control_plane_managed = False
     self._control_active_generation = self.generation
     self.recovery_history: list[GenerationTransitionMetrics] = []
+    self._generation_control_metrics: dict[int, tuple[float, float]] = {}
     self._heterogeneous_gradient_sync = (
         None
         if self._needs_survivor_recovery
@@ -112,6 +119,9 @@ def _activate_latest_generation(self: OobleckParallelContext) -> None:
     while self._pending_plan is not None:
         target = self._pending_plan
         self._pending_plan = None
+        detection_seconds, configuration_planning_seconds = self._generation_control_metrics.pop(
+            target.generation, (0.0, 0.0)
+        )
         attempt_started = time.perf_counter()
         teardown_started = attempt_started
         _retire_world(self)
@@ -147,6 +157,8 @@ def _activate_latest_generation(self: OobleckParallelContext) -> None:
                     0.0,
                     time.perf_counter() - attempt_started,
                     True,
+                    detection_seconds=detection_seconds,
+                    configuration_planning_seconds=configuration_planning_seconds,
                 )
             )
             continue
@@ -183,6 +195,14 @@ def _activate_latest_generation(self: OobleckParallelContext) -> None:
                     recovery_seconds,
                     time.perf_counter() - attempt_started,
                     True,
+                    detection_seconds=detection_seconds,
+                    configuration_planning_seconds=configuration_planning_seconds,
+                    state_planning_seconds=self.last_recovery_report.planning_seconds,
+                    state_transfer_seconds=self.last_recovery_report.transfer_seconds,
+                    straggler_round_seconds=self.last_recovery_report.straggler_round_seconds,
+                    source_scheduling_error_bytes=(
+                        self.last_recovery_report.source_scheduling_error_bytes
+                    ),
                 )
             )
             continue
@@ -196,6 +216,14 @@ def _activate_latest_generation(self: OobleckParallelContext) -> None:
                 activation_seconds,
                 recovery_seconds,
                 time.perf_counter() - transition_started,
+                detection_seconds=detection_seconds,
+                configuration_planning_seconds=configuration_planning_seconds,
+                state_planning_seconds=self.last_recovery_report.planning_seconds,
+                state_transfer_seconds=self.last_recovery_report.transfer_seconds,
+                straggler_round_seconds=self.last_recovery_report.straggler_round_seconds,
+                source_scheduling_error_bytes=(
+                    self.last_recovery_report.source_scheduling_error_bytes
+                ),
             )
         )
         break
@@ -218,10 +246,24 @@ def _apply_membership(self: OobleckParallelContext, snapshot: MembershipSnapshot
         raise ValueError(
             f"membership nodes {invalid} do not match fixed TP width {tensor_parallel_size}"
         )
+    coordinator = min(snapshot.nodes, key=lambda node: node.agent_id)
+    self.owner_plan.set_rendezvous_address(coordinator.addresses[0])
+    planning_started = time.perf_counter()
     self.owner_plan.set_membership(
         tuple(node.agent_id for node in snapshot.nodes), snapshot.generation
     )
-    return self.announce_generation(self.owner_plan.build_execution_plan())
+    execution_plan = self.owner_plan.build_execution_plan()
+    planning_seconds = time.perf_counter() - planning_started
+    detection_seconds = (
+        self.config.lease_timeout_s
+        if any(reason.startswith("lease-expired:") for reason in snapshot.reasons)
+        else 0.0
+    )
+    self._generation_control_metrics[snapshot.generation] = (
+        detection_seconds,
+        planning_seconds,
+    )
+    return self.announce_generation(execution_plan)
 
 
 def _enable_control_plane_barrier(self: OobleckParallelContext) -> None:
@@ -273,6 +315,8 @@ def _close_with_topology(self: OobleckParallelContext) -> None:
         self._heterogeneous_gradient_sync.close()
         self._heterogeneous_gradient_sync = None
     _base_close(self)
+    if _world_initialized():
+        destroy_process_group_universe()
 
 
 OobleckParallelContext.__init__ = _init_with_recovery

@@ -84,6 +84,7 @@ class ProfileCommandConfig:
     cornstarch_version: str | None = None
     warmup_steps: int = 2
     measurement_steps: int = 5
+    device_memory_bytes: int | None = None
 
     def __post_init__(self) -> None:
         if not self.model or self.tensor_parallel_size < 1 or self.microbatch_size < 1:
@@ -94,6 +95,8 @@ class ProfileCommandConfig:
             raise ValueError("provide either profile or measurement_factory, not both")
         if self.warmup_steps < 0 or self.measurement_steps < 1:
             raise ValueError("profiling step counts are invalid")
+        if self.device_memory_bytes is not None and self.device_memory_bytes < 1:
+            raise ValueError("device_memory_bytes must be positive when supplied")
 
 
 @dataclass(frozen=True, slots=True)

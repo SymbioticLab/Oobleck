@@ -8,6 +8,7 @@ import torch
 from oobleck import OobleckConfig, OobleckParallelizationPlan, RuntimeCompatibility
 from oobleck.planning import (
     CompatibilityFingerprint,
+    LayerExecutionResult,
     ModelProfile,
     ModelProfiler,
     PipelineInstance,
@@ -68,6 +69,18 @@ def test_profiler_measures_and_records_materialized_layers(tmp_path):
     )
     assert all(item.persistent_memory > 0 for item in templates.values())
     assert all(item.activation_memory >= 0 for item in templates.values())
+
+
+def test_template_capacity_uses_device_memory_budget():
+    layers = (
+        LayerExecutionResult(0, "l0", 1.0, 1.0, 300, 100, 200),
+        LayerExecutionResult(1, "l1", 1.0, 1.0, 300, 100, 200),
+    )
+    templates = create_pipeline_templates("tiny", layers, (1, 2), device_memory_bytes=1000)
+    assert templates[1].max_microbatches == 3
+    assert templates[2].max_microbatches == 8
+    with pytest.raises(ValueError, match="cannot fit one microbatch"):
+        create_pipeline_templates("tiny", layers, (1,), device_memory_bytes=500)
 
 
 def test_composition_assigns_every_node_and_batch_once():

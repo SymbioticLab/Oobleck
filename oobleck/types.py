@@ -326,6 +326,9 @@ class OobleckConfig:
     seed: int = 0
     heartbeat_interval_s: float = 1.0
     lease_timeout_s: float = 5.0
+    rendezvous_port: int = 29500
+    rendezvous_timeout_s: float = 60.0
+    distributed_backend: str = "auto"
     max_control_frame_bytes: int = 1 << 20
     state_transfer_chunk_bytes: int = 64 << 20
     state_transfer_round_bytes: int = 256 << 20
@@ -344,6 +347,12 @@ class OobleckConfig:
             raise ValueError("heartbeat_interval_s must be positive")
         if self.lease_timeout_s <= self.heartbeat_interval_s:
             raise ValueError("lease_timeout_s must exceed heartbeat_interval_s")
+        if not 1 <= self.rendezvous_port <= 65535:
+            raise ValueError("rendezvous_port must be between 1 and 65535")
+        if self.rendezvous_timeout_s <= 0:
+            raise ValueError("rendezvous_timeout_s must be positive")
+        if self.distributed_backend not in {"auto", "gloo", "nccl"}:
+            raise ValueError("distributed_backend must be auto, gloo, or nccl")
         if self.max_control_frame_bytes < 256:
             raise ValueError("max_control_frame_bytes must be >= 256")
         if self.state_transfer_chunk_bytes < 1:

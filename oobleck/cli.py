@@ -204,12 +204,22 @@ def _profile(config: ProfileCommandConfig) -> None:
     )
     if requested != actual:
         raise ValueError(f"profile compatibility mismatch: requested={requested}, actual={actual}")
+    device_memory_bytes = config.device_memory_bytes
+    if device_memory_bytes is None:
+        import torch
+
+        if not torch.cuda.is_available():
+            raise ValueError("device_memory_bytes is required when profiling without a CUDA device")
+        device_memory_bytes = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).total_memory
     templates = create_pipeline_templates(
         config.model,
         profile.layers,
         config.resource_counts,
         config.tensor_parallel_size,
         fingerprint=fingerprint,
+        device_memory_bytes=device_memory_bytes,
     )
     save_templates(config.output, tuple(templates.values()), fingerprint)
 

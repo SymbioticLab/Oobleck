@@ -46,6 +46,7 @@ class LocalWorkerSupervisor:
                     "LOCAL_RANK": "0",
                     "OOBLECK_GPU_ID": gpu_id,
                     "OOBLECK_LOCAL_RANK": str(local_rank),
+                    "OOBLECK_TP_SIZE": str(len(self.gpu_ids)),
                     "OOBLECK_LOCAL_WORKER_SOCKET": str(self.socket_path),
                     "OOBLECK_NODE_ID": self.node_id,
                     "OOBLECK_WORKER_ID": f"{self.node_id}:gpu-{gpu_id}",
