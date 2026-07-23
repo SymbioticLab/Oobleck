@@ -1,4 +1,4 @@
-"""Opt-in multi-node NCCL chaos and long-churn acceptance orchestrator."""
+"""Optional multi-node NCCL chaos and long-churn validation orchestrator."""
 
 from __future__ import annotations
 

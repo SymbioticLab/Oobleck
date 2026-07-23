@@ -1,7 +1,8 @@
-# Multi-node NCCL chaos and churn acceptance
+# Optional multi-node NCCL chaos and churn validation
 
-This is an opt-in destructive validation for dedicated machines. It is not run
-by the regular developer test commands. Use disposable agent processes, the
+This is optional, opt-in destructive validation for dedicated machines. It is not
+a completion or merge gate and is not run by the regular developer test
+commands. Use disposable agent processes, the
 exact pinned Cornstarch commit, identical per-node GPU counts, a shared metrics
 directory, and a master address reachable from every worker.
 
