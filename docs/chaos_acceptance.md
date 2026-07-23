@@ -49,7 +49,8 @@ The example covers:
 - two agents killed concurrently across pipelines;
 - a second failure injected after a newer membership proposal but before that
   proposal becomes active;
-- replacement of a stable node identity and addition of a new identity;
+- replacement of a stable node identity and a pure new-ID addition whose current
+  step commits with `attempts=1` before the expanded generation activates;
 - required observation of simple, borrow, and merge recovery strategies.
 
 Run only after reviewing every command:
@@ -69,12 +70,18 @@ sequential failures.
 ## Long-running churn and leak checks
 
 For a churn run, repeat drain/failure and replacement/join events in the
-manifest for at least 25 generation changes. Keep the workload running across
+manifest for at least 25 generation changes. Keep at least one hard-failure event
+when `require_replay` is enabled; a pure-join-only campaign should disable that
+global replay requirement and instead require `transition_kind=join`,
+`graceful_cutover=true`, a cutover committed step, and `attempts=1`. Keep the
+workload running across
 the entire sequence. The verifier rejects:
 
 - a worker generation moving backwards;
 - skipped or duplicated committed-step metrics;
-- a run with no replayed logical batch (`attempts > 1`);
+- a hard-failure campaign with no replayed logical batch (`attempts > 1`);
+- a pure-join transition that reports replay or skips/duplicates a committed step
+  after the recorded cutover;
 - missing required simple/borrow/merge strategies;
 - CUDA reserved-memory growth above
   `max_cuda_reserved_growth_bytes`;
@@ -92,12 +99,14 @@ The output is versioned JSON containing:
 
 - initial and final membership generations;
 - per-event detection and total recovery duration;
+- transition kind, graceful/hard cutover, and cutover committed step;
 - whether the event cascaded before activation;
 - per-worker generation, step, replay, CUDA-memory, and process-group growth;
 - observed reconfiguration strategies;
 - Oobleck commit, Cornstarch/PyTorch/CUDA/NCCL/datasets versions, GPU model,
   runtime compatibility digests, and generation-plan checksums.
 
-Worker JSONL records also contain the decomposed recovery timings and source
-scheduling error. Preserve the manifest, worker JSONL files, master/agent logs,
+Worker JSONL records also contain the decomposed recovery timings, source
+scheduling error, transition kind, graceful-cutover flag, and committed cutover
+step. Preserve the manifest, worker JSONL files, master/agent logs,
 and final result together for a reproducible paper-style run.

@@ -265,6 +265,8 @@ class PipelineInstance:
 class OobleckExecutionPlan:
     """Checksummed, immutable topology for one membership generation."""
 
+    SERIALIZATION_VERSION = 1
+
     generation: int
     instances: tuple[PipelineInstance, ...]
     rank_map: tuple[tuple[str, tuple[int, ...]], ...]
@@ -308,6 +310,56 @@ class OobleckExecutionPlan:
                 for item in self.instances
             ],
         }
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the complete, checksummed plan for control-plane consensus."""
+
+        return {
+            "schema_version": self.SERIALIZATION_VERSION,
+            **self._unsigned_dict(),
+            "plan_checksum": self.plan_checksum,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "OobleckExecutionPlan":
+        """Strictly reconstruct a plan and verify its embedded checksum."""
+
+        expected = {
+            "schema_version",
+            "generation",
+            "previous_generation",
+            "compatibility_digest",
+            "rank_map",
+            "instances",
+            "plan_checksum",
+        }
+        if set(value) != expected:
+            raise ValueError("execution plan fields are invalid")
+        if value["schema_version"] != cls.SERIALIZATION_VERSION:
+            schema_version = value["schema_version"]
+            raise ValueError(f"unsupported execution plan schema {schema_version!r}")
+        instances_value = value["instances"]
+        rank_map_value = value["rank_map"]
+        if not isinstance(instances_value, list) or not isinstance(rank_map_value, list):
+            raise ValueError("execution plan instances and rank_map must be lists")
+        instances = []
+        for item in instances_value:
+            if not isinstance(item, Mapping):
+                raise ValueError("execution plan instance must be an object")
+            data = dict(item)
+            data["template"] = PipelineTemplate.from_dict(data["template"])
+            data["node_ids"] = tuple(data["node_ids"])
+            data["ranks"] = tuple(tuple(group) for group in data["ranks"])
+            instances.append(PipelineInstance(**data))
+        rank_map = tuple((str(node_id), tuple(ranks)) for node_id, ranks in rank_map_value)
+        return cls(
+            generation=value["generation"],
+            instances=tuple(instances),
+            rank_map=rank_map,
+            previous_generation=value["previous_generation"],
+            compatibility_digest=value["compatibility_digest"],
+            plan_checksum=value["plan_checksum"],
+        )
 
     def rank_local_stage(self, rank: int) -> PipelineStageSpec:
         for instance in self.instances:

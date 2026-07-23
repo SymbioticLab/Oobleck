@@ -1,11 +1,33 @@
 # ADR 0002: Replace the complete distributed universe
 
-Every join, drain, replacement, or failure creates a monotonically newer full
-membership snapshot. Workers close schedules and meshes, shut down known
-backends concurrently, destroy WORLD, clear version-checked c10d registries,
-and compile ownership without a distributed world. Each worker then reports the
-checksummed plan as prepared. Only after every agent agrees does the master
-publish rendezvous parameters; workers create the replacement WORLD, activate
-local partitions, recover state, and report readiness. The master marks the
-generation active only after that final barrier. A newer membership snapshot
-supersedes any prepared or partially activated recovery.
+Every membership change creates a monotonically newer complete snapshot and a
+replacement WORLD; Oobleck never edits the active process-group universe in
+place. Workers close schedules and meshes, shut down known backends concurrently,
+destroy WORLD, clear version-checked c10d registries, compile ownership without a
+distributed world, recover committed state, and pass the ready barrier before the
+master marks the generation active.
+
+## Cutover decision
+
+A proposal is a **graceful join** only when its stable node set strictly contains
+the active plan and every reason is `join:*`. If no step is running, preparation
+starts immediately. If a step is running, that one step may commit under the old
+generation; the runtime then promotes the newest coalesced join plan and blocks
+the next step until `generation_active`. The committed batch is not replayed.
+
+Failures, drains, replacements, removals, and mixed snapshots are **hard
+transitions**. They immediately make the active attempt uncommittable. A hard
+transition also supersedes any deferred join, and the interrupted logical batch
+is replayed after recovery. A newer snapshot always supersedes an older prepared
+or partially activated generation.
+
+## Plan and state consensus
+
+Control protocol version 2 carries the complete versioned, checksummed execution
+plan in prepared acknowledgements. The master retains it as the previous active
+plan only after readiness consensus activates that generation, then binds it into
+the hash of later membership proposals. Fresh workers seed reconfiguration from
+that plan, configure their DataLoader and optimization objects before recovery,
+and receive model, optimizer, scheduler, scaler, committed-step, sampler-epoch,
+and sampler-cursor state from incumbents. Rolling protocol-v1/v2 interoperability
+is intentionally unsupported.

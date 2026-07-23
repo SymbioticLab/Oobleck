@@ -167,6 +167,15 @@ def restore_context_state(context: Any, snapshot: RecoverySnapshot | None) -> Re
             context.scheduler.load_state_dict(copy.deepcopy(canonical.scheduler_state))
         if context.scaler is not None and canonical.scaler_state is not None:
             context.scaler.load_state_dict(copy.deepcopy(canonical.scaler_state))
+    sampler_states = metadata[0].sampler_states
+    if any(item.sampler_states != sampler_states for item in metadata[1:]):
+        raise RuntimeError("surviving ranks disagree on committed sampler state")
+    if sampler_states:
+        loaders = getattr(context, "_loaders", ())
+        if len(sampler_states) != len(loaders):
+            raise RuntimeError("recovery sampler metadata does not match configured loaders")
+        for loader, state in zip(loaders, sampler_states):
+            loader.sampler.load_state_dict(copy.deepcopy(state))
     context.committed_step = committed_step
     if dist is not None:
         dist.barrier()

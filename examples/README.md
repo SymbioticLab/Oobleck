@@ -94,8 +94,9 @@ python examples/run_agent.py \
 ```
 
 Node IDs remain stable across replacements; each agent process creates a fresh
-incarnation. A membership proposal supersedes any older preparation, local
-workers recover and acknowledge it, all agents acknowledge readiness, and only
+incarnation. Protocol-v2 proposals carry the previous active plan, and every
+prepared worker acknowledges the same complete checksummed target plan. A newer
+proposal supersedes older preparation, all agents acknowledge readiness, and only
 then does the master publish `generation_active`.
 
 For bootstrap only, an optional hostfile may start the initial agents over SSH:
@@ -116,7 +117,9 @@ python -m oobleck.cli training-launch-config \
 ```
 
 The hostfile is not consulted for later joins. New or replacement agents simply
-run the normal agent command and self-register.
+run the normal agent command and self-register. A pure new-ID join may compile
+early, but the master withholds rendezvous until incumbents finish their current
+step, report prepared, and block the next step.
 
 Inspect the full checksummed membership snapshot with:
 
@@ -131,7 +134,7 @@ cascading failure scenarios, long-running leak bounds, and machine-readable
 results. The regular suite exercises multi-rank model and optimizer recovery on
 the single CUDA GPU over Gloo.
 
-## Drain, failure, replacement, and replay
+## Drain, failure, replacement, join, and replay
 
 A graceful drain is a complete generation boundary:
 
@@ -151,13 +154,19 @@ python examples/fail_agent.py \
 Invoke it for two validated agents in the same detection window to demonstrate
 a simultaneous failure. A replacement uses the same stable node ID in a fresh
 agent process; a join uses a new ID. Both paths create a new WORLD rather than
-editing groups in place.
+editing groups in place. Replacements, drains, failures, and mixed changes are
+hard transitions that replay an interrupted batch. A pure join lets the current
+step commit once under the old generation, blocks the next step, restores the
+new worker from that committed state and sampler cursor, and resumes with the
+next batch without replay.
 
 Expected logs show the proposal generation and reason set, full WORLD teardown,
 compiled ownership, all-worker `prepared` consensus, coordinator rendezvous
 publication, transfer schedule hash and source/destination byte balance, final
-worker readiness, `generation_active`, replay of the uncommitted logical batch,
-and exactly one commit. A cascading failure should show the partial
+worker readiness and `generation_active`. Hard-transition logs then show replay
+of the uncommitted logical batch and exactly one commit; pure-join logs instead
+show `attempts=1`, the old-generation cutover commit, and the next logical batch
+under the expanded generation. A cascading failure should show the partial
 recovery marked superseded before the newest snapshot is prepared.
 
 ## Cleanup and troubleshooting

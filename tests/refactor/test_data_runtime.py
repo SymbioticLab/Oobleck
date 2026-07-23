@@ -33,10 +33,15 @@ class ParallelConfig:
     expert_parallel_size: int = 1
 
 
-def context():
+def context(max_nodes: int = 1, global_batch_size: int = 4):
     model = torch.nn.Linear(1, 1)
     plan = OobleckParallelizationPlan(
-        OobleckConfig(global_batch_size=4, microbatch_size=2, max_nodes=1, seed=9)
+        OobleckConfig(
+            global_batch_size=global_batch_size,
+            microbatch_size=2,
+            max_nodes=max_nodes,
+            seed=9,
+        )
     )
     plan.parallelize(model, ParallelConfig())
     return model, plan.materialize("cpu")
@@ -441,4 +446,190 @@ def test_concurrent_membership_replays_inflight_managed_step_after_active_barrie
     assert result[0].committed_step == 1
     assert result[0].generation == 1
     assert sampler.committed_cursor == 1
+    ctx.close()
+
+
+def _membership(
+    generation: int,
+    node_ids: tuple[str, ...],
+    reasons: tuple[str, ...],
+    previous_plan,
+):
+    return MembershipSnapshot(
+        generation,
+        tuple(
+            NodeIdentity(node_id, f"{node_id}-{generation}", ("127.0.0.1",), ("0",))
+            for node_id in node_ids
+        ),
+        reasons,
+        previous_execution_plan=previous_plan,
+    )
+
+
+def test_execution_plan_round_trip_is_versioned_and_checksummed():
+    _, ctx = context()
+    serialized = ctx.execution_plan.to_dict()
+    restored = type(ctx.execution_plan).from_dict(serialized)
+    assert serialized["schema_version"] == 1
+    assert restored == ctx.execution_plan
+    assert restored.plan_checksum == ctx.execution_plan.plan_checksum
+    corrupted = dict(serialized)
+    corrupted["plan_checksum"] = "bad"
+    with pytest.raises(ValueError, match="checksum"):
+        type(ctx.execution_plan).from_dict(corrupted)
+    ctx.close()
+
+
+def test_batch_sampler_state_round_trip_restores_committed_cursor():
+    _, ctx = context()
+    sampler = ctx.create_batch_sampler(Samples(), shuffle=True)
+    descriptor = sampler.descriptor_at(0)
+    sampler.commit(descriptor)
+    state = sampler.state_dict()
+    restored = ctx.create_batch_sampler(Samples(), shuffle=True)
+    restored.load_state_dict(state)
+    assert restored.epoch == sampler.epoch
+    assert restored.committed_cursor == 1
+    assert restored.descriptor_at(1) == sampler.descriptor_at(1)
+    ctx.close()
+
+
+def test_pure_join_during_step_commits_once_then_blocks_next_step():
+    model, ctx = context(max_nodes=2)
+    dataset = Samples()
+    sampler = ctx.create_batch_sampler(dataset, shuffle=False)
+    loader = ctx.prepare_dataloader(DataLoader(dataset, batch_sampler=sampler))
+    ctx.configure_optimization(
+        optimizer_factory=lambda parameters: torch.optim.SGD(parameters, lr=0.01)
+    )
+    ctx.enable_control_plane_barrier()
+    batch = next(iter(loader))
+    entered = threading.Event()
+    release = threading.Event()
+    results = []
+
+    def criterion(output, microbatch):
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(timeout=5)
+        return ((output - microbatch["y"]) ** 2).mean()
+
+    worker = threading.Thread(
+        target=lambda: results.append(
+            ctx.step(batch, lambda item: model(item["x"]), criterion=criterion)
+        )
+    )
+    worker.start()
+    assert entered.wait(timeout=5)
+    join = _membership(1, ("local-node", "node-b"), ("join:node-b",), ctx.execution_plan)
+    assert ctx.apply_membership(join)
+    assert ctx._deferred_join_plan is not None
+    assert ctx._pending_plan is None
+    release.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert results[0].attempts == 1
+    assert results[0].generation == 0
+    assert results[0].committed_step == 1
+    assert sampler.committed_cursor == 1
+    assert ctx._pending_plan.generation == 1
+    assert ctx._transition_metadata[1] == ("join", True, 1)
+
+    blocked = threading.Thread(
+        target=lambda: ctx.step(
+            next(iter(loader)),
+            lambda item: model(item["x"]),
+            criterion=lambda output, item: output.sum(),
+        )
+    )
+    blocked.start()
+    blocked.join(timeout=0.1)
+    assert blocked.is_alive()
+    ctx._control_plane_managed = False
+    ctx._pending_plan = None
+    with ctx._generation_condition:
+        ctx._generation_condition.notify_all()
+    blocked.join(timeout=5)
+    ctx.close()
+
+
+def test_multiple_joins_coalesce_and_failure_supersedes_graceful_cutover():
+    model, ctx = context(max_nodes=3, global_batch_size=6)
+    dataset = Samples()
+    sampler = ctx.create_batch_sampler(dataset, shuffle=False)
+    loader = ctx.prepare_dataloader(DataLoader(dataset, batch_sampler=sampler))
+    ctx.configure_optimization(
+        optimizer_factory=lambda parameters: torch.optim.SGD(parameters, lr=0.01)
+    )
+    ctx.enable_control_plane_barrier()
+    batch = next(iter(loader))
+    entered = threading.Event()
+    release = threading.Event()
+    results = []
+
+    def criterion(output, microbatch):
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(timeout=5)
+        return ((output - microbatch["y"]) ** 2).mean()
+
+    worker = threading.Thread(
+        target=lambda: results.append(
+            ctx.step(batch, lambda item: model(item["x"]), criterion=criterion)
+        )
+    )
+    worker.start()
+    assert entered.wait(timeout=5)
+    active = ctx.execution_plan
+    assert ctx.apply_membership(_membership(1, ("local-node", "node-b"), ("join:node-b",), active))
+    assert ctx.apply_membership(
+        _membership(
+            2,
+            ("local-node", "node-b", "node-c"),
+            ("join:node-c",),
+            active,
+        )
+    )
+    assert ctx._deferred_join_plan.generation == 2
+    assert ctx.apply_membership(_membership(3, ("local-node",), ("disconnect:node-b",), active))
+    assert ctx._deferred_join_plan is None
+    assert ctx._pending_plan.generation == 3
+    ctx.owner_plan.world_initializer = None
+    release.set()
+    ctx.prepare_generation()
+    ctx.activate_generation()
+    ctx.mark_generation_active(3)
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert results[0].attempts == 2
+    assert results[0].generation == 3
+    assert results[0].committed_step == 1
+    assert ctx._transition_metadata[3] == ("disconnect", False, 0)
+    ctx.close()
+
+
+def test_idle_pure_join_promotes_immediately_and_is_classified_graceful():
+    from oobleck.elastic.membership import is_pure_join
+
+    _, ctx = context(max_nodes=2)
+    snapshot = _membership(1, ("local-node", "node-b"), ("join:node-b",), ctx.execution_plan)
+    assert is_pure_join(snapshot, ctx.execution_plan)
+    assert not is_pure_join(
+        _membership(1, ("local-node",), ("join:node-b",), ctx.execution_plan),
+        ctx.execution_plan,
+    )
+    assert not is_pure_join(
+        _membership(
+            1, ("local-node", "node-b"), ("join:node-b", "drain:node-a"), ctx.execution_plan
+        ),
+        ctx.execution_plan,
+    )
+    assert not is_pure_join(
+        _membership(1, ("node-b",), ("join:node-b",), ctx.execution_plan),
+        ctx.execution_plan,
+    )
+    assert ctx.apply_membership(snapshot)
+    assert ctx._deferred_join_plan is None
+    assert ctx._pending_plan.generation == 1
+    assert ctx._transition_metadata[1] == ("join", True, 0)
     ctx.close()

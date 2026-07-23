@@ -21,8 +21,9 @@ def metric(
     reserved: int = 100,
     groups: int = 1,
     initialized: bool = True,
+    recovery=None,
 ):
-    return {
+    value = {
         "schema_version": 1,
         "event": event,
         "timestamp_ns": timestamp,
@@ -38,6 +39,9 @@ def metric(
         "process_group_count": groups,
         "distributed_initialized": initialized,
     }
+    if recovery is not None:
+        value["recovery"] = recovery
+    return value
 
 
 def test_churn_verifier_proves_replay_strategies_memory_and_clean_close(tmp_path):
@@ -91,6 +95,27 @@ def test_churn_verifier_rejects_commit_gaps_memory_growth_and_group_leaks():
         verify_churn_metrics(
             [metric(1, step=1, attempts=2), metric(2, event="closed", groups=1)],
             require_clean_close=True,
+        )
+
+
+def test_churn_verifier_validates_graceful_join_resume_without_replay():
+    recovery = {
+        "transition_kind": "join",
+        "graceful_cutover": True,
+        "cutover_committed_step": 1,
+    }
+    result = verify_churn_metrics(
+        [metric(1, step=1), metric(2, generation=2, step=2, recovery=recovery)],
+        require_replay=False,
+    )
+    assert result["graceful_transitions"] == 1
+    with pytest.raises(AssertionError, match="replayed or skipped"):
+        verify_churn_metrics(
+            [
+                metric(1, step=1),
+                metric(2, generation=2, step=2, attempts=2, recovery=recovery),
+            ],
+            require_replay=False,
         )
 
 

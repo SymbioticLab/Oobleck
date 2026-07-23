@@ -187,7 +187,22 @@ def prepare_training(
         coordinator = min(membership_snapshot.nodes, key=lambda node: node.agent_id)
         plan.set_rendezvous_address(coordinator.addresses[0])
     plan.parallelize(model, parallel_config)
-    prepared = plan.prepare(device, dtype=torch.float32)
+    previous_plan = (
+        membership_snapshot.previous_execution_plan
+        if membership_snapshot is not None
+        else None
+    )
+    if previous_plan is not None:
+        plan._last_execution_plan = previous_plan
+    previous_nodes = (
+        {node_id for node_id, _ in previous_plan.rank_map}
+        if previous_plan is not None
+        else set()
+    )
+    joining = previous_plan is not None and local_node_id not in previous_nodes
+    prepared = plan.prepare(
+        device, dtype=torch.float32, recover_from_survivors=joining
+    )
     return model, prepared, dataset
 
 

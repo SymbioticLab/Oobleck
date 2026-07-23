@@ -22,7 +22,42 @@ from oobleck.elastic.transport import (
     ControlConnection,
     ControlTransport,
     MessageEnvelope,
+    PROTOCOL_VERSION,
 )
+from oobleck.types import (
+    OobleckExecutionPlan,
+    PipelineInstance,
+    PipelineTemplate,
+    stable_rank_map,
+)
+
+
+def _control_only_plan(snapshot: MembershipSnapshot) -> OobleckExecutionPlan:
+    """Build a deterministic placeholder when an agent has no GPU-worker relay."""
+
+    node_ids = tuple(node.agent_id for node in snapshot.nodes)
+    tp = len(snapshot.nodes[0].gpu_ids)
+    rank_map = stable_rank_map(node_ids, tp)
+    template = PipelineTemplate(
+        "control-only",
+        tuple((index, index + 1) for index in range(len(node_ids))),
+        tp,
+        0.0,
+        0.0,
+    )
+    instance = PipelineInstance(
+        "control-only",
+        template,
+        node_ids,
+        tuple(dict(rank_map)[node_id] for node_id in node_ids),
+        0,
+    )
+    previous = (
+        snapshot.previous_execution_plan.generation
+        if snapshot.previous_execution_plan is not None
+        else (snapshot.generation - 1 if snapshot.generation else None)
+    )
+    return OobleckExecutionPlan(snapshot.generation, (instance,), rank_map, previous)
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,7 +119,7 @@ class NodeAgentClient:
         self._prepared_sent_generation = -1
         self._rendezvous_generation = -1
         self._ready_sent_generation = -1
-        self._phase_metadata: tuple[str, str] | None = None
+        self._phase_metadata: tuple[str, str, dict[str, object]] | None = None
         self._send_lock = asyncio.Lock()
         self._ready_lock = asyncio.Lock()
         self._stopping = False
@@ -112,7 +147,7 @@ class NodeAgentClient:
             self.sequence += 1
             await self.connection.send(
                 MessageEnvelope(
-                    1,
+                    PROTOCOL_VERSION,
                     message_type,
                     self.node_id,
                     self.incarnation_id,
@@ -128,6 +163,7 @@ class NodeAgentClient:
         snapshot_hash: str,
         plan_checksum: str,
         compatibility_digest: str,
+        execution_plan: dict[str, object],
     ) -> None:
         snapshot = self.snapshot
         if (
@@ -135,7 +171,10 @@ class NodeAgentClient:
             and generation == snapshot.generation
             and snapshot_hash == snapshot.snapshot_hash
         ):
-            self._phase_metadata = (plan_checksum, compatibility_digest)
+            plan = OobleckExecutionPlan.from_dict(execution_plan)
+            if plan.plan_checksum != plan_checksum:
+                raise ValueError("local prepared plan checksum is inconsistent")
+            self._phase_metadata = (plan_checksum, compatibility_digest, plan.to_dict())
             await self._send_prepared_if_possible(generation)
 
     async def _local_workers_ready(
@@ -151,7 +190,9 @@ class NodeAgentClient:
             and generation == snapshot.generation
             and snapshot_hash == snapshot.snapshot_hash
         ):
-            if self._phase_metadata != (plan_checksum, compatibility_digest):
+            if self._phase_metadata is None or self._phase_metadata[:2] != (
+                plan_checksum, compatibility_digest
+            ):
                 raise ValueError("local ready metadata differs from local preparation")
             await self._send_ready_if_possible(generation)
 
@@ -171,10 +212,14 @@ class NodeAgentClient:
                     return
                 if self._phase_metadata is None:
                     return
-                plan_checksum, compatibility_digest = self._phase_metadata
+                plan_checksum, compatibility_digest, execution_plan = self._phase_metadata
             else:
-                plan_checksum, compatibility_digest = snapshot.snapshot_hash, ""
-                self._phase_metadata = (plan_checksum, compatibility_digest)
+                execution_plan = _control_only_plan(snapshot).to_dict()
+                plan_checksum = str(execution_plan["plan_checksum"])
+                compatibility_digest = ""
+                self._phase_metadata = (
+                    plan_checksum, compatibility_digest, execution_plan
+                )
             self._prepared_sent_generation = generation
             try:
                 await self._send_agent_message(
@@ -184,6 +229,7 @@ class NodeAgentClient:
                         "snapshot_hash": snapshot.snapshot_hash,
                         "plan_checksum": plan_checksum,
                         "compatibility_digest": compatibility_digest,
+                        "execution_plan": execution_plan,
                     },
                 )
             except BaseException:
@@ -206,7 +252,7 @@ class NodeAgentClient:
                 generation
             ):
                 return
-            plan_checksum, compatibility_digest = self._phase_metadata
+            plan_checksum, compatibility_digest, _ = self._phase_metadata
             self._ready_sent_generation = generation
             try:
                 await self._send_agent_message(
@@ -280,7 +326,7 @@ class NodeAgentClient:
         snapshot = self.snapshot
         if snapshot is None:
             raise ValueError("master activated a generation before membership")
-        ready_metadata = self._phase_metadata or (snapshot.snapshot_hash, "")
+        ready_metadata = self._phase_metadata or (snapshot.snapshot_hash, "", {})
         if message.generation != snapshot.generation or message.payload != {
             "snapshot_hash": snapshot.snapshot_hash,
             "plan_checksum": ready_metadata[0],
@@ -300,7 +346,7 @@ class NodeAgentClient:
         self.connection = await self.transport.connect(host, port)
         await self.connection.send(
             MessageEnvelope(
-                1,
+                PROTOCOL_VERSION,
                 "register",
                 self.node_id,
                 self.incarnation_id,
@@ -402,7 +448,7 @@ async def inspect_membership(
     connection = await selected.connect(host, port)
     try:
         identity = str(uuid.uuid4())
-        await connection.send(MessageEnvelope(1, "inspect", "operator", identity, 0, 0, {}))
+        await connection.send(MessageEnvelope(PROTOCOL_VERSION, "inspect", "operator", identity, 0, 0, {}))
         message = await connection.receive()
         client = NodeAgentClient("operator", ("inspection",), transport=selected)
         return await client._consume_membership(message)
@@ -420,7 +466,7 @@ async def inspect_status(
     connection = await selected.connect(host, port)
     try:
         identity = str(uuid.uuid4())
-        await connection.send(MessageEnvelope(1, "inspect_status", "operator", identity, 0, 0, {}))
+        await connection.send(MessageEnvelope(PROTOCOL_VERSION, "inspect_status", "operator", identity, 0, 0, {}))
         message = await connection.receive()
         if message.message_type != "status":
             raise ValueError("master returned an invalid status response")
@@ -431,6 +477,7 @@ async def inspect_status(
                 "nodes": payload["nodes"],
                 "reasons": payload["reasons"],
                 "snapshot_hash": payload["snapshot_hash"],
+                "previous_execution_plan": None,
             },
         )
         return ControlStatus(
@@ -458,7 +505,7 @@ async def request_drain(
         identity = str(uuid.uuid4())
         await connection.send(
             MessageEnvelope(
-                1,
+                PROTOCOL_VERSION,
                 "request_drain",
                 "operator",
                 identity,

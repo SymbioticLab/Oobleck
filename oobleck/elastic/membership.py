@@ -8,6 +8,8 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Callable, Mapping
 
+from oobleck.types import OobleckExecutionPlan
+
 
 class StaleGeneration(RuntimeError):
     pass
@@ -48,12 +50,18 @@ class MembershipSnapshot:
     nodes: tuple[NodeIdentity, ...]
     reasons: tuple[str, ...]
     snapshot_hash: str = field(default="", compare=False)
+    previous_execution_plan: OobleckExecutionPlan | None = None
 
     def __post_init__(self) -> None:
         payload = {
             "generation": self.generation,
             "nodes": [asdict(item) for item in self.nodes],
             "reasons": self.reasons,
+            "previous_execution_plan": (
+                self.previous_execution_plan.to_dict()
+                if self.previous_execution_plan is not None
+                else None
+            ),
         }
         expected = hashlib.sha256(
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
@@ -68,7 +76,12 @@ def membership_snapshot_from_payload(
 ) -> MembershipSnapshot:
     """Strictly reconstruct a checksummed snapshot from a control payload."""
 
-    if set(payload) != {"nodes", "reasons", "snapshot_hash"}:
+    if set(payload) != {
+        "nodes",
+        "reasons",
+        "previous_execution_plan",
+        "snapshot_hash",
+    }:
         raise ValueError("membership payload fields are invalid")
     nodes_value = payload["nodes"]
     reasons_value = payload["reasons"]
@@ -107,11 +120,35 @@ def membership_snapshot_from_payload(
         )
     if not all(isinstance(reason, str) for reason in reasons_value):
         raise ValueError("membership reasons must be strings")
+    previous_value = payload["previous_execution_plan"]
+    if previous_value is not None and not isinstance(previous_value, Mapping):
+        raise ValueError("previous_execution_plan must be an object or null")
+    previous_plan = (
+        OobleckExecutionPlan.from_dict(previous_value)
+        if previous_value is not None
+        else None
+    )
     return MembershipSnapshot(
         generation,
         tuple(nodes),
         tuple(reasons_value),
         payload["snapshot_hash"],
+        previous_plan,
+    )
+
+
+def is_pure_join(
+    snapshot: MembershipSnapshot,
+    active_plan: OobleckExecutionPlan | None,
+) -> bool:
+    """Return whether a proposal is only stable-ID additions to the active plan."""
+
+    if active_plan is None or not snapshot.reasons:
+        return False
+    active_nodes = {node_id for node_id, _ in active_plan.rank_map}
+    target_nodes = {node.agent_id for node in snapshot.nodes}
+    return active_nodes < target_nodes and all(
+        reason.startswith("join:") for reason in snapshot.reasons
     )
 
 

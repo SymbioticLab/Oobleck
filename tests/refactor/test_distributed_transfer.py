@@ -223,6 +223,19 @@ class TestDistributedStateTransfer(GlooDistributedTestBase):
         def optimizer_factory(parameters):
             return torch.optim.AdamW(parameters, lr=0.01)
 
+        class Stateful:
+            def __init__(self, value):
+                self.value = value
+
+            def state_dict(self):
+                return {"value": self.value}
+
+            def load_state_dict(self, state):
+                self.value = state["value"]
+
+        def scheduler_factory(optimizer):
+            return Stateful(0)
+
         if self.rank == 0:
             source_model = StateModel(("a", "b"), 5.0)
             source_optimizer = optimizer_factory(source_model.parameters())
@@ -234,15 +247,16 @@ class TestDistributedStateTransfer(GlooDistributedTestBase):
                 model=source_model,
                 partition=SimpleNamespace(manifest=manifest(("a", "b"), 5)),
                 optimizer=source_optimizer,
-                scheduler=None,
-                scaler=None,
+                scheduler=Stateful(7),
+                scaler=Stateful(9),
                 committed_step=5,
                 owner_plan=SimpleNamespace(rank=0),
                 compiled=SimpleNamespace(world_size=self.world_size),
                 config=SimpleNamespace(state_transfer_chunk_bytes=8, transfer_alignment_bytes=4),
                 device=device,
                 _optimizer_factory=optimizer_factory,
-                _scheduler_factory=None,
+                _scheduler_factory=scheduler_factory,
+                _loaders=[SimpleNamespace(sampler=Stateful(3))],
             )
             snapshot = capture_context_state(context)
             expected = (
@@ -257,15 +271,16 @@ class TestDistributedStateTransfer(GlooDistributedTestBase):
                 model=target_model,
                 partition=SimpleNamespace(manifest=manifest(("b",), 0)),
                 optimizer=optimizer_factory(target_model.parameters()),
-                scheduler=None,
-                scaler=None,
+                scheduler=Stateful(0),
+                scaler=Stateful(0),
                 committed_step=0,
                 owner_plan=SimpleNamespace(rank=1),
                 compiled=SimpleNamespace(world_size=self.world_size),
                 config=SimpleNamespace(state_transfer_chunk_bytes=8, transfer_alignment_bytes=4),
                 device=device,
                 _optimizer_factory=optimizer_factory,
-                _scheduler_factory=None,
+                _scheduler_factory=scheduler_factory,
+                _loaders=[SimpleNamespace(sampler=Stateful(0))],
             )
             snapshot = None
             expected = None
@@ -275,6 +290,9 @@ class TestDistributedStateTransfer(GlooDistributedTestBase):
         report = restore_context_state(context, snapshot)
 
         assert context.committed_step == 5
+        assert context.scheduler.value == 7
+        assert context.scaler.value == 9
+        assert context._loaders[0].sampler.value == 3
         assert report.total_seconds > 0
         assert report.actual_source_bytes == report.source_bytes
         assert report.round_durations

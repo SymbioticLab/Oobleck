@@ -11,6 +11,24 @@ from oobleck.elastic import (
     request_drain,
 )
 
+from oobleck.types import OobleckExecutionPlan, PipelineInstance, PipelineTemplate
+
+
+def _test_plan(generation: int, instance_id: str = "shared") -> OobleckExecutionPlan:
+    template = PipelineTemplate(
+        "control-test", ((0, 1), (1, 2)), 1, 0.0, 0.0
+    )
+    instance = PipelineInstance(
+        instance_id, template, ("node-a", "node-b"), ((0,), (1,)), 0
+    )
+    return OobleckExecutionPlan(
+        generation,
+        (instance,),
+        (("node-a", (0,)), ("node-b", (1,))),
+        generation - 1,
+        "compat",
+    )
+
 
 def test_agents_join_and_concurrent_disconnects_publish_complete_snapshots():
     async def check():
@@ -144,13 +162,13 @@ def test_local_workers_must_agree_on_plan_and_compatibility(tmp_path):
 
     relay = LocalWorkerRelay(tmp_path / "relay.sock", "node-a", expected_workers=2)
     relay._latest_membership = MessageEnvelope(
-        1,
+        2,
         "membership",
         "master",
         "master",
         1,
         7,
-        {"nodes": [], "reasons": [], "snapshot_hash": "membership"},
+        {"nodes": [], "reasons": [], "snapshot_hash": "membership", "previous_execution_plan": None},
     )
     relay._workers = {"gpu-0": object(), "gpu-1": object()}
     relay._acknowledged = {
@@ -174,7 +192,7 @@ def test_master_rejects_cross_agent_plan_disagreement():
         second = await transport.connect("127.0.0.1", port)
         await first.send(
             MessageEnvelope(
-                1,
+                2,
                 "register",
                 "node-a",
                 "a1",
@@ -186,7 +204,7 @@ def test_master_rejects_cross_agent_plan_disagreement():
         assert (await first.receive()).generation == 1
         await second.send(
             MessageEnvelope(
-                1,
+                2,
                 "register",
                 "node-b",
                 "b1",
@@ -199,9 +217,11 @@ def test_master_rejects_cross_agent_plan_disagreement():
         second_proposal = await second.receive()
         assert first_proposal.generation == second_proposal.generation == 2
         snapshot_hash = first_proposal.payload["snapshot_hash"]
+        first_plan = _test_plan(2, "plan-a")
+        second_plan = _test_plan(2, "plan-b")
         await first.send(
             MessageEnvelope(
-                1,
+                2,
                 "generation_prepared",
                 "node-a",
                 "a1",
@@ -209,14 +229,15 @@ def test_master_rejects_cross_agent_plan_disagreement():
                 2,
                 {
                     "snapshot_hash": snapshot_hash,
-                    "plan_checksum": "plan-a",
+                    "plan_checksum": first_plan.plan_checksum,
                     "compatibility_digest": "compat",
+                    "execution_plan": first_plan.to_dict(),
                 },
             )
         )
         await second.send(
             MessageEnvelope(
-                1,
+                2,
                 "generation_prepared",
                 "node-b",
                 "b1",
@@ -224,8 +245,9 @@ def test_master_rejects_cross_agent_plan_disagreement():
                 2,
                 {
                     "snapshot_hash": snapshot_hash,
-                    "plan_checksum": "plan-b",
+                    "plan_checksum": second_plan.plan_checksum,
                     "compatibility_digest": "compat",
+                    "execution_plan": second_plan.to_dict(),
                 },
             )
         )
@@ -253,7 +275,7 @@ def test_master_enforces_prepared_rendezvous_ready_active_order():
         second = await transport.connect("127.0.0.1", port)
         await first.send(
             MessageEnvelope(
-                1,
+                2,
                 "register",
                 "node-a",
                 "a1",
@@ -265,7 +287,7 @@ def test_master_enforces_prepared_rendezvous_ready_active_order():
         await first.receive()
         await second.send(
             MessageEnvelope(
-                1,
+                2,
                 "register",
                 "node-b",
                 "b1",
@@ -278,29 +300,33 @@ def test_master_enforces_prepared_rendezvous_ready_active_order():
         second_membership = await second.receive()
         assert first_membership.generation == second_membership.generation == 2
         snapshot_hash = first_membership.payload["snapshot_hash"]
+        execution_plan = _test_plan(2)
         metadata = {
             "snapshot_hash": snapshot_hash,
-            "plan_checksum": "same-plan",
-            "compatibility_digest": "same-runtime",
+            "plan_checksum": execution_plan.plan_checksum,
+            "compatibility_digest": "compat",
+        }
+        prepared_metadata = {
+            **metadata, "execution_plan": execution_plan.to_dict()
         }
 
-        await first.send(MessageEnvelope(1, "generation_prepared", "node-a", "a1", 1, 2, metadata))
+        await first.send(MessageEnvelope(2, "generation_prepared", "node-a", "a1", 1, 2, prepared_metadata))
         await asyncio.sleep(0.02)
         assert service._rendezvous_metadata is None
         assert service.active_generation != 2
 
-        await second.send(MessageEnvelope(1, "generation_prepared", "node-b", "b1", 1, 2, metadata))
+        await second.send(MessageEnvelope(2, "generation_prepared", "node-b", "b1", 1, 2, prepared_metadata))
         first_rendezvous = await first.receive()
         second_rendezvous = await second.receive()
         assert first_rendezvous.message_type == "generation_rendezvous"
         assert second_rendezvous == first_rendezvous
         assert service.active_generation != 2
 
-        await first.send(MessageEnvelope(1, "generation_ready", "node-a", "a1", 2, 2, metadata))
+        await first.send(MessageEnvelope(2, "generation_ready", "node-a", "a1", 2, 2, metadata))
         await asyncio.sleep(0.02)
         assert service.active_generation != 2
 
-        await second.send(MessageEnvelope(1, "generation_ready", "node-b", "b1", 2, 2, metadata))
+        await second.send(MessageEnvelope(2, "generation_ready", "node-b", "b1", 2, 2, metadata))
         first_active = await first.receive()
         second_active = await second.receive()
         assert first_active.message_type == "generation_active"
@@ -334,6 +360,117 @@ def test_status_reports_prepared_ready_and_active_generation():
         await client.close()
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+        await service.close()
+
+    asyncio.run(check())
+
+
+def test_local_worker_consumes_failure_while_graceful_boundary_waits(tmp_path):
+    from dataclasses import asdict
+    import time
+    import threading
+
+    from oobleck.elastic import LocalWorkerClient, MembershipSnapshot, MessageEnvelope, NodeIdentity
+
+    previous = _test_plan(1)
+    joining = MembershipSnapshot(
+        2,
+        (
+            NodeIdentity("node-a", "a1", ("127.0.0.1",), ("0",)),
+            NodeIdentity("node-b", "b1", ("127.0.0.1",), ("0",)),
+        ),
+        ("join:node-b",),
+        previous_execution_plan=previous,
+    )
+    failure = MembershipSnapshot(
+        3,
+        (NodeIdentity("node-a", "a1", ("127.0.0.1",), ("0",)),),
+        ("disconnect:node-b",),
+        previous_execution_plan=previous,
+    )
+
+    def message(snapshot):
+        return MessageEnvelope(
+            2,
+            "membership",
+            "master",
+            "master",
+            snapshot.generation,
+            snapshot.generation,
+            {
+                "nodes": [asdict(node) for node in snapshot.nodes],
+                "reasons": list(snapshot.reasons),
+                "snapshot_hash": snapshot.snapshot_hash,
+                "previous_execution_plan": previous.to_dict(),
+            },
+        )
+
+    class Connection:
+        def __init__(self):
+            self.queue = asyncio.Queue()
+            self.queue.put_nowait(message(failure))
+
+        async def receive(self):
+            return await self.queue.get()
+
+    class Context:
+        def __init__(self):
+            self.generation = 1
+            self.release = threading.Event()
+            self.prepared_execution_plan = previous
+
+        def apply_membership(self, snapshot):
+            self.generation = snapshot.generation
+            self.prepared_execution_plan = _test_plan(snapshot.generation)
+            if snapshot.generation == 3:
+                self.release.set()
+
+        def wait_until_generation_preparable(self, generation):
+            if generation == 2:
+                assert self.release.wait(timeout=5)
+            return generation == self.generation
+
+        def prepare_generation(self):
+            return None
+
+    async def check():
+        worker = LocalWorkerClient(tmp_path / "unused.sock", "node-a", "gpu-0")
+        worker.connection = Connection()
+        worker.generation = 2
+        started = time.monotonic()
+        snapshot, plan = await worker._prepare_context_responsively(
+            Context(), joining, None
+        )
+        assert time.monotonic() - started < 2
+        assert snapshot.generation == plan.generation == 3
+
+    asyncio.run(check())
+
+
+def test_membership_binds_the_previous_plan_only_after_activation():
+    async def check():
+        service = MasterControlService(lease_timeout_s=2, lease_check_interval_s=0.02)
+        server = await service.start("127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        first = NodeAgentClient("node-a", ("0",), heartbeat_interval_s=0.01)
+        await first.connect("127.0.0.1", port)
+        first_task = asyncio.create_task(first.run())
+        for _ in range(200):
+            if service.active_generation == 1:
+                break
+            await asyncio.sleep(0.01)
+        assert service.active_execution_plan is not None
+
+        second = NodeAgentClient("node-b", ("0",), heartbeat_interval_s=0.01)
+        proposal = await second.connect("127.0.0.1", port)
+        previous = proposal.payload["previous_execution_plan"]
+        assert previous is not None
+        assert previous["plan_checksum"] == service.active_execution_plan.plan_checksum
+
+        await second.close()
+        await first.close()
+        first_task.cancel()
+        await asyncio.gather(first_task, return_exceptions=True)
         await service.close()
 
     asyncio.run(check())
