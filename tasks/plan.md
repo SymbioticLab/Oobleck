@@ -450,7 +450,7 @@ Add `examples/README.md` with:
 - expected logs for generation changes, WORLD teardown, state transfer, replay, and resume;
 - cleanup instructions, troubleshooting, and a warning that the failure helper is for disposable example jobs.
 
-Exercise the examples through local import/configuration tests and add a subprocess smoke test for the one-node flow. Multi-node/NCCL execution remains an explicitly documented manual or dedicated-runner test.
+Exercise the examples through local import/configuration tests and add a subprocess smoke test for the one-node flow. Multi-GPU and multi-node NCCL execution is optional, environment-dependent validation documented for manual or dedicated runners; it is not a completion gate.
 
 ## 17. Pull-request sequence
 
@@ -535,7 +535,7 @@ Exercise the examples through local import/configuration tests and add a subproc
 
 ### PR 10 — Research validation and operator documentation
 
-- Add multi-node NCCL chaos tests and long-running churn tests.
+- Add an optional multi-node NCCL chaos and long-running churn harness for environments with suitable dedicated hardware.
 - Reproduce simple, borrow, and merge recovery examples from the paper, including simultaneous failures affecting multiple pipelines.
 - Add deployment, profiling, debugging, compatibility, and failure-mode documentation.
 - Publish benchmark scripts and machine-readable results for steady-state and recovery overhead.
@@ -588,13 +588,15 @@ Master/agent protocol tests that do not execute training may run on CPU. Cover c
 
 ### GPU tests
 
+The single-CUDA-GPU, multi-rank Gloo suite is the mandatory distributed validation baseline. Every test that requires multiple physical GPUs with NCCL or multiple nodes with NCCL is optional, environment-dependent validation and is not a definition-of-done or merge gate. Equivalent planner, control-plane, replay, state-transfer, and lifecycle behavior must still be covered by the mandatory single-GPU Gloo and local tests.
+
 - the mandatory single-CUDA-GPU, multi-rank Gloo suite described above;
-- single-node, multi-GPU NCCL smoke tests when a suitable runner is available;
+- optional single-node, multi-GPU NCCL smoke tests when a suitable runner is available;
 - DTensor TP correctness and state-manifest stability;
 - heterogeneous PP/TP gradient equivalence against a non-pipelined reference;
 - optimizer/scaler/scheduler equivalence across a recovery;
 - recovery-latency and maximum-source-load comparison against the legacy first-source policy;
-- real multi-node NCCL abrupt-failure tests where the control plane triggers recovery without waiting for NCCL timeout;
+- optional real multi-node NCCL abrupt-failure tests where the control plane triggers recovery without waiting for NCCL timeout;
 - simultaneous multi-agent failure and cascading failure-during-recovery tests;
 - pipeline merge followed by successful replay and continued loss convergence;
 - repeated churn under memory-leak and communicator-leak monitoring.
@@ -641,4 +643,4 @@ Roll out in this order:
 
 ## 21. Definition of done
 
-The refactor is complete when an Oobleck job based on the pinned Cornstarch `refactor-oobleck` commit can start from meta model ownership without WORLD, run heterogeneous pipeline replicas, detect one or multiple simultaneous node losses through the CPU control plane, abort the uncommitted step, fully destroy WORLD, choose a configuration using simple/borrow/merge, recreate WORLD, redistribute all missing training state using all-to-all, replay the same logical global batch, and continue training with numerically correct updates. A newer failure during recovery must safely supersede the in-progress generation. The same generation mechanism must also handle graceful drains and joining or replacement nodes, with distributed unit tests on the single CUDA GPU over Gloo and documented end-to-end examples for each path.
+The refactor is complete when an Oobleck job based on the pinned Cornstarch `refactor-oobleck` commit can start from meta model ownership without WORLD, run heterogeneous pipeline replicas, detect one or multiple simultaneous node losses through the CPU control plane, abort the uncommitted step, fully destroy WORLD, choose a configuration using simple/borrow/merge, recreate WORLD, redistribute all missing training state using all-to-all, replay the same logical global batch, and continue training with numerically correct updates. A newer failure during recovery must safely supersede the in-progress generation. The same generation mechanism must also handle graceful drains and joining or replacement nodes, with distributed unit tests on the single CUDA GPU over Gloo and documented end-to-end examples for each path. Multi-GPU and multi-node NCCL runs are optional environment-specific validation and are not required for this definition of done.
