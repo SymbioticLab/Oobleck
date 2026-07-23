@@ -201,7 +201,7 @@ def test_master_rejects_cross_agent_plan_disagreement():
         await first.send(
             MessageEnvelope(
                 1,
-                "generation_ready",
+                "generation_prepared",
                 "node-a",
                 "a1",
                 1,
@@ -216,7 +216,7 @@ def test_master_rejects_cross_agent_plan_disagreement():
         await second.send(
             MessageEnvelope(
                 1,
-                "generation_ready",
+                "generation_prepared",
                 "node-b",
                 "b1",
                 1,
@@ -233,6 +233,79 @@ def test_master_rejects_cross_agent_plan_disagreement():
         assert replacement.generation == 3
         assert replacement.payload["reasons"] == ["disconnect:node-b"]
         assert service.active_generation != 2
+        await first.close()
+        await second.close()
+        await service.close()
+
+    asyncio.run(check())
+
+
+def test_master_enforces_prepared_rendezvous_ready_active_order():
+    async def check():
+        from oobleck.elastic import AsyncioTcpControlTransport, MessageEnvelope
+
+        service = MasterControlService(lease_timeout_s=2, lease_check_interval_s=0.05)
+        server = await service.start("127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        transport = AsyncioTcpControlTransport()
+        first = await transport.connect("127.0.0.1", port)
+        second = await transport.connect("127.0.0.1", port)
+        await first.send(
+            MessageEnvelope(
+                1,
+                "register",
+                "node-a",
+                "a1",
+                0,
+                0,
+                {"addresses": ["127.0.0.1"], "gpu_ids": ["0"]},
+            )
+        )
+        await first.receive()
+        await second.send(
+            MessageEnvelope(
+                1,
+                "register",
+                "node-b",
+                "b1",
+                0,
+                0,
+                {"addresses": ["127.0.0.1"], "gpu_ids": ["0"]},
+            )
+        )
+        first_membership = await first.receive()
+        second_membership = await second.receive()
+        assert first_membership.generation == second_membership.generation == 2
+        snapshot_hash = first_membership.payload["snapshot_hash"]
+        metadata = {
+            "snapshot_hash": snapshot_hash,
+            "plan_checksum": "same-plan",
+            "compatibility_digest": "same-runtime",
+        }
+
+        await first.send(MessageEnvelope(1, "generation_prepared", "node-a", "a1", 1, 2, metadata))
+        await asyncio.sleep(0.02)
+        assert service._rendezvous_metadata is None
+        assert service.active_generation != 2
+
+        await second.send(MessageEnvelope(1, "generation_prepared", "node-b", "b1", 1, 2, metadata))
+        first_rendezvous = await first.receive()
+        second_rendezvous = await second.receive()
+        assert first_rendezvous.message_type == "generation_rendezvous"
+        assert second_rendezvous == first_rendezvous
+        assert service.active_generation != 2
+
+        await first.send(MessageEnvelope(1, "generation_ready", "node-a", "a1", 2, 2, metadata))
+        await asyncio.sleep(0.02)
+        assert service.active_generation != 2
+
+        await second.send(MessageEnvelope(1, "generation_ready", "node-b", "b1", 2, 2, metadata))
+        first_active = await first.receive()
+        second_active = await second.receive()
+        assert first_active.message_type == "generation_active"
+        assert second_active == first_active
+        assert service.active_generation == 2
+
         await first.close()
         await second.close()
         await service.close()

@@ -42,6 +42,8 @@ class MasterControlService:
         self._lease_task: asyncio.Task[None] | None = None
         self._master_sequence = 0
         self._proposed_snapshot: MembershipSnapshot | None = None
+        self._prepared_agents: dict[str, tuple[str, str]] = {}
+        self._rendezvous_metadata: tuple[str, str] | None = None
         self._ready_agents: dict[str, tuple[str, str]] = {}
         self.active_generation = 0
 
@@ -72,7 +74,9 @@ class MasterControlService:
         """Install a proposal and invalidate every older readiness result."""
 
         self._proposed_snapshot = snapshot
+        self._prepared_agents.clear()
         self._ready_agents.clear()
+        self._rendezvous_metadata = None
         if not snapshot.nodes:
             self.active_generation = snapshot.generation
 
@@ -155,6 +159,7 @@ class MasterControlService:
             while True:
                 message = await connection.receive()
                 snapshot = None
+                rendezvous_message = None
                 active_message = None
                 async with self._lock:
                     if message.message_type == "heartbeat":
@@ -164,6 +169,36 @@ class MasterControlService:
                             message.sequence_number,
                             message.generation,
                         )
+                    elif message.message_type == "generation_prepared":
+                        proposed = self._proposed_snapshot
+                        if (
+                            proposed is None
+                            or message.generation != proposed.generation
+                            or message.payload["snapshot_hash"] != proposed.snapshot_hash
+                        ):
+                            continue
+                        metadata = (
+                            str(message.payload["plan_checksum"]),
+                            str(message.payload["compatibility_digest"]),
+                        )
+                        self.membership.acknowledge(
+                            message.agent_id,
+                            message.incarnation_id,
+                            message.sequence_number,
+                            message.generation,
+                        )
+                        if self._prepared_agents and metadata not in set(
+                            self._prepared_agents.values()
+                        ):
+                            raise ProtocolError(
+                                "agents disagree on prepared execution plan or runtime compatibility"
+                            )
+                        self._prepared_agents[message.agent_id] = metadata
+                        if set(self._prepared_agents) == set(self.membership.agent_ids):
+                            self._rendezvous_metadata = metadata
+                            rendezvous_message = self._generation_rendezvous_message(
+                                proposed, *metadata
+                            )
                     elif message.message_type == "generation_ready":
                         proposed = self._proposed_snapshot
                         if (
@@ -176,6 +211,12 @@ class MasterControlService:
                             str(message.payload["plan_checksum"]),
                             str(message.payload["compatibility_digest"]),
                         )
+                        if self._rendezvous_metadata is None:
+                            raise ProtocolError("agent became ready before rendezvous publication")
+                        if metadata != self._rendezvous_metadata:
+                            raise ProtocolError(
+                                "ready agent disagrees with the prepared generation"
+                            )
                         if self._ready_agents and metadata not in set(self._ready_agents.values()):
                             raise ProtocolError(
                                 "agents disagree on execution plan or runtime compatibility"
@@ -202,6 +243,8 @@ class MasterControlService:
                             self._begin_generation(snapshot)
                     else:
                         raise ProtocolError(f"unsupported agent message {message.message_type!r}")
+                if rendezvous_message is not None:
+                    await self._broadcast_message(rendezvous_message)
                 if active_message is not None:
                     await self._broadcast_message(active_message)
                 if message.message_type == "drain":
@@ -257,6 +300,27 @@ class MasterControlService:
                 "nodes": [asdict(node) for node in snapshot.nodes],
                 "reasons": list(snapshot.reasons),
                 "snapshot_hash": snapshot.snapshot_hash,
+            },
+        )
+
+    def _generation_rendezvous_message(
+        self,
+        snapshot: MembershipSnapshot,
+        plan_checksum: str,
+        compatibility_digest: str,
+    ) -> MessageEnvelope:
+        self._master_sequence += 1
+        return MessageEnvelope(
+            1,
+            "generation_rendezvous",
+            "master",
+            "master",
+            self._master_sequence,
+            snapshot.generation,
+            {
+                "snapshot_hash": snapshot.snapshot_hash,
+                "plan_checksum": plan_checksum,
+                "compatibility_digest": compatibility_digest,
             },
         )
 

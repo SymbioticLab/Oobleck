@@ -79,6 +79,7 @@ def _managed_gloo_worker(rank: int, port: int, results: Any) -> None:
         context.enable_control_plane_barrier()
         assert context.apply_membership(replacement)
         context.prepare_generation()
+        context.activate_generation()
         context.mark_generation_active(5)
         transition = context.recovery_history[-1]
         assert transition.generation == 5

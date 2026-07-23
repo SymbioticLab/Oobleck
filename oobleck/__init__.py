@@ -10,6 +10,7 @@ from oobleck.runtime import (
     GenerationTransitionMetrics,
     OobleckParallelContext,
     OobleckParallelizationPlan,
+    OobleckPreparedContext,
     OobleckStepResult,
 )
 from oobleck.state import (
@@ -44,6 +45,7 @@ __all__ = [
     "OobleckExecutionPlan",
     "OobleckParallelContext",
     "OobleckParallelizationPlan",
+    "OobleckPreparedContext",
     "OobleckStepResult",
     "PipelineInstance",
     "PipelineStageSpec",

@@ -114,7 +114,7 @@ def _build_model(
     )
 
 
-def build_training(
+def prepare_training(
     *,
     dataset_name: str | None = None,
     dataset_config: str | None = None,
@@ -187,7 +187,13 @@ def build_training(
         coordinator = min(membership_snapshot.nodes, key=lambda node: node.agent_id)
         plan.set_rendezvous_address(coordinator.addresses[0])
     plan.parallelize(model, parallel_config)
-    context = plan.materialize(device, dtype=torch.float32)
+    prepared = plan.prepare(device, dtype=torch.float32)
+    return model, prepared, dataset
+
+
+def configure_training(model, context, dataset, *, device: str):
+    """Create data and optimization state only after the generation WORLD is active."""
+
     sampler = context.create_batch_sampler(dataset, shuffle=True)
     dataloader = DataLoader(
         dataset,
@@ -204,6 +210,14 @@ def build_training(
         ),
     )
     return model, context, loader
+
+
+def build_training(**kwargs):
+    """Compatibility wrapper that prepares and activates a standalone runtime."""
+
+    model, prepared, dataset = prepare_training(**kwargs)
+    context = prepared.activate()
+    return configure_training(model, context, dataset, device=str(prepared.device))
 
 
 def train_one_step(device: str | None = None):
