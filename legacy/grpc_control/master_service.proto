@@ -1,0 +1,35 @@
+syntax = "proto3";
+import "google/protobuf/empty.proto";
+
+service OobleckMaster {
+    rpc GetDistInfo(google.protobuf.Empty) returns (DistInfo) {}
+    rpc GetCode(google.protobuf.Empty) returns (CodeInfo) {}
+    rpc SetMasterRankPort(PortInfo) returns (google.protobuf.Empty) {}
+    rpc GetMasterRankPort(google.protobuf.Empty) returns (PortInfo) {}
+    rpc WatchReconfigurationNotification(google.protobuf.Empty) returns (stream DistInfo) {}
+    rpc KillAgent(AgentInfo) returns (google.protobuf.Empty) {}
+}
+
+message HostInfo {
+    string ip = 1;
+    string devices = 2;
+    uint32 port = 3;
+    string status = 4;
+}
+
+message DistInfo {
+    repeated HostInfo hosts = 1;
+}
+
+message CodeInfo {
+    string path = 1;
+    repeated string args = 2;
+}
+
+message PortInfo {
+    uint32 port = 1;
+}
+
+message AgentInfo {
+    uint32 agent_index = 1;
+}
