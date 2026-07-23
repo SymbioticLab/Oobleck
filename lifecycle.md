@@ -284,14 +284,27 @@ replica gradients, and then atomically advances:
 If a membership change becomes pending before that atomic commit, Oobleck
 discards the attempt's gradients and does not advance any of those objects.
 
-### 5. Detect failures and propagate membership events
+### 5. Handle membership changes
+
+Failures, joins, graceful drains, and replacements all enter the same generation
+protocol. The master converts each event into a complete, monotonically newer
+`MembershipSnapshot`; it never sends rank-local membership patches. Workers
+first agree on that snapshot and a deterministic execution plan, then replace
+the distributed generation through the common path in Section 5.3.
+
+If another event arrives while a generation is being prepared or activated, the
+newer complete snapshot supersedes the stale generation. Workers abandon the
+stale plan, close any partially initialized distributed state, and prepare only
+the newest membership.
+
+#### 5.1. Detect failures and publish reduced membership
 
 [`elastic/service.py`](oobleck/elastic/service.py) and
 [`elastic/service_public_base.py`](oobleck/elastic/service_public_base.py) run
 the reconnecting agent streams. A TCP close is an immediate failure signal;
 otherwise [`elastic/membership.py`](oobleck/elastic/membership.py) expires the
-agent's heartbeat lease. The same state machine handles explicit drains, new
-nodes, and a new incarnation replacing an old node identity.
+agent heartbeat lease. The master removes the failed incarnation and publishes
+the complete reduced live set.
 
 ```mermaid
 sequenceDiagram
@@ -307,83 +320,67 @@ sequenceDiagram
         M->>M: lease expires and removes agent
     end
     M->>M: coalesce live set and publish generation N+1
-    M-->>SA: complete membership snapshot N+1
+    M-->>SA: complete reduced membership snapshot N+1
     SA-->>SW: snapshot N+1 over local IPC
-    SW->>SW: apply_membership and announce pending execution plan
+    SW->>SW: apply_membership and announce pending recovery plan
     Note over SW: An in-flight step cannot commit after the pending generation is visible
     opt Another failure, join, drain, or replacement arrives
         M->>M: publish generation N+2
         M-->>SA: newer complete snapshot N+2
-        SA-->>SW: N+2 supersedes prepared/activating N+1
+        SA-->>SW: N+2 supersedes prepared or activating N+1
     end
 ```
 
-The event path is:
+The failure event path is:
 
 ```text
 master membership state machine
-  -> complete membership snapshot over TCP
-  -> node agent
+  -> complete reduced membership snapshot over TCP
+  -> surviving node agent
   -> local Unix-domain relay
   -> every local GPU worker
   -> OobleckParallelContext.apply_membership()
 ```
 
-The master coalesces the current live set into a generation rather than sending
-rank-local patches. If another event arrives while a generation is preparing or
-recovering, the newer complete snapshot supersedes the stale generation; that
-generation is torn down and never becomes active.
+A failed worker may be required by the current pipeline schedule or collective,
+so the in-flight logical batch generally cannot finish. Once the reduced
+membership becomes pending, surviving workers preserve the last committed
+cursor and enter the shared replacement path in Section 5.3. Any uncommitted
+attempt is replayed after the new generation becomes active.
 
-#### 5-1. Add nodes and scale out
+#### 5.2. Register added nodes and publish expanded membership
 
 A new node starts one CPU agent and its configured GPU workers. The agent
 registers a new stable node ID, incarnation, addresses, and GPU inventory with
 the master. Registration proposes a complete membership generation containing
-both the incumbent and joining nodes; it does not add ranks to the active WORLD
-in place.
+both incumbent and joining nodes; it does not add ranks to the active WORLD in
+place.
 
 ```mermaid
 sequenceDiagram
     participant JA as Joining node CPU agent
     participant JW as Joining node GPU workers
     participant M as CPU master process
-    participant SA as Incumbent node agents
-    participant SW as Incumbent GPU workers
+    participant IA as Incumbent node agents
+    participant IW as Incumbent GPU workers
 
     JA->>M: register(new stable ID, incarnation, addresses, GPU IDs)
-    M->>M: publish complete membership generation N+1
-    M-->>JA: snapshot N+1
-    M-->>SA: snapshot N+1
-    JA-->>JW: membership over local IPC
-    SA-->>SW: membership over local IPC
-    par Prepare without WORLD
-        SW->>SW: snapshot committed state, retire WORLD,<br/>compose join plan, compile ownership
-        JW->>JW: compose the same plan and compile ownership<br/>with no pre-generation state
+    M->>M: validate registration and publish generation N+1
+    M-->>JA: complete expanded membership snapshot N+1
+    M-->>IA: complete expanded membership snapshot N+1
+    JA-->>JW: snapshot N+1 over local IPC
+    IA-->>IW: snapshot N+1 over local IPC
+    par Build the expanded plan
+        IW->>IW: apply_membership and compose the join plan
+        JW->>JW: validate snapshot and compose the same plan
     end
-    JW-->>JA: worker_ack(prepared)
-    SW-->>SA: worker_ack(prepared)
-    JA-->>M: generation_prepared
-    SA-->>M: generation_prepared
-    M-->>JA: generation_rendezvous
-    M-->>SA: generation_rendezvous
-    par Replacement WORLD creation
-        JW->>SW: join torch.distributed rendezvous
-        SW->>JW: symmetric WORLD and mesh participation
-    end
-    SW-->>JW: transfer required committed state
-    Note over SW,JW: Missing parameter, buffer, optimizer, and training metadata<br/>move through the deterministic all-to-all schedule
-    JW-->>JA: worker_ack(ready)
-    SW-->>SA: worker_ack(ready)
-    JA-->>M: generation_ready
-    SA-->>M: generation_ready
-    M-->>JA: generation_active
-    M-->>SA: generation_active
+    Note over JW,IW: Continue through the shared generation replacement in Section 5.3
 ```
 
 When [`planning/reconfiguration.py`](oobleck/planning/reconfiguration.py) sees
 a node identity that was not in the previous execution plan, it calls the
 heterogeneous composer over the entire expanded membership, up to
-`max_nodes`, and records the strategy as `join`. The objective is still
+`max_nodes`, and records the strategy as `join`. The objective remains
 throughput first. If candidates have equal predicted iteration time, it
 maximizes retained state bytes, minimizes moved incumbent nodes, and finally
 uses stable identities as deterministic tie-breakers. Consequently, a join may
@@ -392,85 +389,98 @@ different heterogeneous combination; it is not necessarily an append-only
 layout change.
 
 All workers derive a new stable rank map, so an incumbent numeric global rank
-may change when a lexicographically earlier node ID joins even though its stable
+may change when a lexicographically earlier node ID joins even though stable
 node and pipeline identities remain retained. Each worker validates the fixed
 per-node TP width, compatibility digest, snapshot hash, and plan checksum before
 the master publishes rendezvous data.
 
-Incumbent workers capture the last committed state before destroying the old
-WORLD. For this bootstrap, joining workers must prepare with
-`recover_from_survivors=True`; after activation, `recover_from_survivors()` enters
-recovery without a local snapshot. They receive their assigned parameters,
-persistent buffers, optimizer slots, and committed training metadata from
-surviving sources in the replacement WORLD. State already owned by an
-incumbent may remain local; every missing logical bundle uses the same
-deterministic all-to-all transfer described in Section 6.
-Training resumes only after all incumbent and joining agents pass the ready
-barrier and the master broadcasts `generation_active`.
+The current runtime uses the same pending-generation commit guard for joins and
+failures. If an expanded membership becomes visible before the atomic step
+commit, that attempt does not commit and is replayed after Section 5.3. If the
+step commits first, its new state and sampler cursor become the recovery source,
+and training resumes from the following logical batch.
 
-If the expanded membership cannot form a supported template composition, exceeds
-`max_nodes`, has the wrong TP width, or disagrees on compatibility or plan
-checksums, the proposed generation cannot become active. A still newer join,
-failure, drain, or replacement snapshot supersedes this preparation in the same
-way as any other membership event.
+If the expanded membership cannot form a supported template composition,
+exceeds `max_nodes`, has the wrong TP width, or disagrees on compatibility or
+plan checksums, the proposed generation cannot become active. A still newer
+join, failure, drain, or replacement snapshot supersedes the proposal in the
+same way as any other membership event.
 
-### 6. Reconfigure workers and copy committed state
+#### 5.3. Replace the generation and transfer committed state
 
-The recovery methods layered onto `OobleckParallelContext` in
-[`runtime.py`](oobleck/runtime.py) perform two coordinated phases.
-
-When `apply_membership()` receives the newer snapshot, it first updates the
-stable membership/rank map and builds a pending execution plan. For a recovery,
-[`planning/reconfiguration.py`](oobleck/planning/reconfiguration.py) chooses
-the simple, borrow, or merge layout before the active world is retired.
+The generation-replacement methods layered onto `OobleckParallelContext` in
+[`runtime.py`](oobleck/runtime.py) perform a common prepare phase followed by an
+activate-and-recover phase. `apply_membership()` first updates the stable
+membership and rank map and builds a pending execution plan. Removed nodes use
+the simple, borrow, or merge planner; added nodes use the `join` composition
+path. In both cases, the next plan is chosen before the active WORLD is retired.
 
 ```mermaid
 flowchart TD
-    subgraph each["On every surviving GPU worker"]
-        APPLY["Apply snapshot and build simple / borrow / merge plan"]
-        SNAP["Capture committed model, optimizer,<br/>scheduler, scaler, and cursor state"]
-        CLOSE["Invalidate prefetch and close schedules,<br/>meshes, partitions, sync groups"]
-        DESTROY["Concurrently shut down groups,<br/>destroy WORLD, clear c10d registries"]
-        COMPILE["Compile new rank-local ownership<br/>without WORLD"]
-        APPLY --> SNAP --> CLOSE --> DESTROY --> COMPILE
+    EVENT["Receive complete membership snapshot"] --> PLAN["Build deterministic failure, drain,<br/>replacement, or join plan"]
+    PLAN --> ISNAP
+    PLAN --> JCOMPILE
+
+    subgraph incumbents["On incumbent GPU workers"]
+        ISNAP["Capture committed model, optimizer,<br/>scheduler, scaler, and cursor state"]
+        ICLOSE["Invalidate prefetch and close schedules,<br/>meshes, partitions, and sync groups"]
+        IDESTROY["Concurrently shut down groups,<br/>destroy WORLD, clear c10d registries"]
+        ICOMPILE["Compile new rank-local ownership<br/>without WORLD"]
+        ISNAP --> ICLOSE --> IDESTROY --> ICOMPILE
     end
-    COMPILE --> PREP["All-agent prepared barrier"]
-    PREP --> INIT["Create replacement WORLD<br/>and activate local partition"]
-    INIT --> MANIFEST["Gather old/new logical manifests<br/>and plan retained/missing bundles"]
-    MANIFEST --> COPY["Variable-split all_to_all_single rounds<br/>across surviving source and destination workers"]
+
+    subgraph joiners["On joining GPU workers, if any"]
+        JCOMPILE["Compile target ownership without WORLD;<br/>no pre-generation state is available"]
+    end
+
+    ICOMPILE --> PREP["All-agent prepared barrier"]
+    JCOMPILE --> PREP
+    PREP --> INIT["Create replacement WORLD<br/>and activate local partitions"]
+    INIT --> MANIFEST["Gather old and new logical manifests;<br/>plan retained and missing bundles"]
+    MANIFEST --> COPY["Variable-split all_to_all_single rounds<br/>from committed sources to target destinations"]
     COPY --> RESTORE["Restore tensors and training metadata;<br/>rebuild gradient groups"]
     RESTORE --> READY["All-agent ready barrier"]
     READY --> ACTIVE["Master broadcasts generation_active"]
-    ACTIVE --> REPLAY["Replay interrupted logical batch<br/>from unchanged committed cursor"]
+    ACTIVE --> PENDING{"Was a logical batch left uncommitted?"}
+    PENDING -- "Yes" --> REPLAY["Replay it from the unchanged committed cursor"]
+    PENDING -- "No" --> NEXT["Continue with the next logical batch"]
 ```
 
 **Prepare the new generation:**
 
-1. [`recovery_base.py`](oobleck/recovery_base.py) captures the last committed
-   parameter, persistent-buffer, optimizer, scheduler, scaler, and step state.
-2. Prepared DataLoaders invalidate prefetched but uncommitted batches.
-3. The active Cornstarch partition, schedules, meshes, and heterogeneous
-   gradient groups close.
+1. On incumbent workers, [`recovery_base.py`](oobleck/recovery_base.py) captures
+   the last committed parameter, persistent-buffer, optimizer, scheduler,
+   scaler, and step state. Joining workers have no pre-generation snapshot.
+2. Incumbent DataLoaders invalidate prefetched but uncommitted batches.
+3. Incumbents close the active Cornstarch partition, schedules, meshes, and
+   heterogeneous gradient groups. Joining workers have no old partition to
+   retire.
 4. [`distributed/lifecycle.py`](oobleck/distributed/lifecycle.py) concurrently
-   shuts down every known backend, destroys WORLD, clears the audited PyTorch
-   c10d registries, and verifies that WORLD is no longer initialized.
-5. Cornstarch compiles the pending plan's new local ownership while no
-   distributed world exists.
+   shuts down every known backend on incumbents, destroys the old WORLD, clears
+   the audited PyTorch c10d registries, and verifies that WORLD is no longer
+   initialized.
+5. Every participating worker compiles the target rank-local ownership while no
+   distributed world exists and reports the plan through the prepared barrier.
 
 **Activate and recover after rendezvous:**
 
-1. Oobleck creates the replacement WORLD and activates the compiled partition.
+1. Incumbent and joining workers create the replacement WORLD and activate their
+   compiled local partitions.
 2. [`state_base.py`](oobleck/state_base.py) matches old and new state through
    stable logical keys, TP lanes, placements, and committed versions.
-3. [`state.py`](oobleck/state.py) plans retained shards and missing state
-   transfers. It chunks complete parameter/optimizer bundles and balances source,
-   destination, round, and link load across surviving replicas.
+3. [`state.py`](oobleck/state.py) plans retained shards and missing transfers. It
+   chunks complete parameter and optimizer bundles and balances source,
+   destination, round, and link load across available committed replicas.
 4. [`state_transfer.py`](oobleck/state_transfer.py) executes the immutable,
-   checksummed schedule with variable-split `all_to_all_single` rounds.
+   checksummed schedule with variable-split `all_to_all_single` rounds. Joining
+   workers enter as destinations without a local snapshot; incumbents may be
+   sources, destinations, or both under the new layout.
 5. [`recovery.py`](oobleck/recovery.py) restores parameters, buffers, optimizer
-   slots and groups, scheduler, scaler, and committed-step metadata, then rebuilds
-   heterogeneous gradient synchronization.
+   slots and groups, scheduler, scaler, and committed-step metadata, then
+   rebuilds heterogeneous gradient synchronization.
 
-After every worker reports ready, the master activates the generation. The
-interrupted logical batch is fetched again from the unchanged committed cursor
-and replayed; it can commit exactly once under the new generation.
+After every participating worker reports ready, the master activates the
+replacement generation. An interrupted logical batch is fetched again from the
+unchanged committed cursor and can commit exactly once. If the previous batch
+committed before the membership transition became pending, execution instead
+continues from the next logical batch.
