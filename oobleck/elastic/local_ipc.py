@@ -1,0 +1,302 @@
+"""Unix-domain generation barrier between one CPU agent and local GPU workers."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import stat
+import uuid
+from pathlib import Path
+from typing import Any, Awaitable, Callable
+
+from oobleck.elastic.membership import (
+    MembershipSnapshot,
+    membership_snapshot_from_payload,
+)
+from oobleck.elastic.transport import (
+    DEFAULT_MAX_FRAME_BYTES,
+    ControlConnection,
+    MessageEnvelope,
+    ProtocolError,
+)
+
+WorkerReadyCallback = Callable[[int, str], Awaitable[None]]
+
+
+class LocalWorkerRelay:
+    """Broadcast generations and aggregate readiness from local GPU workers."""
+
+    def __init__(
+        self,
+        path: str | Path,
+        node_id: str,
+        *,
+        expected_workers: int = 1,
+        on_generation_ready: WorkerReadyCallback | None = None,
+        max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
+    ) -> None:
+        if expected_workers < 1:
+            raise ValueError("expected_workers must be positive")
+        self.path = Path(path)
+        self.node_id = node_id
+        self.expected_workers = expected_workers
+        self.on_generation_ready = on_generation_ready
+        self.max_frame_bytes = max_frame_bytes
+        self._server: asyncio.AbstractServer | None = None
+        self._workers: dict[str, ControlConnection] = {}
+        self._latest_membership: MessageEnvelope | None = None
+        self._latest_active: MessageEnvelope | None = None
+        self._acknowledged: set[str] = set()
+        self._ready_notified_generation = -1
+        self._lock = asyncio.Lock()
+
+    @property
+    def worker_ids(self) -> tuple[str, ...]:
+        return tuple(sorted(self._workers))
+
+    def generation_ready(self, generation: int) -> bool:
+        latest = self._latest_membership
+        return (
+            latest is not None
+            and latest.generation == generation
+            and len(self._workers) == self.expected_workers
+            and len(self._acknowledged) == self.expected_workers
+        )
+
+    async def start(self) -> None:
+        if self._server is not None:
+            raise RuntimeError("local worker relay is already running")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.exists():
+            mode = self.path.stat().st_mode
+            if not stat.S_ISSOCK(mode):
+                raise ValueError(f"refusing to replace non-socket path {self.path}")
+            self.path.unlink()
+
+        async def accept(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            connection = ControlConnection(reader, writer, max_frame_bytes=self.max_frame_bytes)
+            await self._handle(connection)
+
+        self._server = await asyncio.start_unix_server(accept, path=self.path)
+
+    async def _handle(self, connection: ControlConnection) -> None:
+        worker_id: str | None = None
+        try:
+            registration = await connection.receive()
+            if registration.message_type != "worker_register":
+                raise ProtocolError("local worker must register first")
+            if registration.payload != {"node_id": self.node_id}:
+                raise ProtocolError("local worker registered for a different node")
+            worker_id = registration.agent_id
+            async with self._lock:
+                previous = self._workers.get(worker_id)
+                if previous is None and len(self._workers) >= self.expected_workers:
+                    raise ProtocolError("more local workers registered than configured GPUs")
+                self._workers[worker_id] = connection
+                latest_membership = self._latest_membership
+                latest_active = self._latest_active
+            if previous is not None:
+                await previous.close()
+            if latest_membership is not None:
+                await connection.send(latest_membership)
+            if (
+                latest_active is not None
+                and latest_membership is not None
+                and latest_active.generation == latest_membership.generation
+            ):
+                await connection.send(latest_active)
+            while True:
+                message = await connection.receive()
+                if message.message_type != "worker_ack":
+                    raise ProtocolError("local workers may only acknowledge generations")
+                if (
+                    message.agent_id != worker_id
+                    or message.incarnation_id != registration.incarnation_id
+                    or message.payload != {"phase": "ready"}
+                ):
+                    raise ProtocolError("invalid local worker readiness acknowledgement")
+                callback: WorkerReadyCallback | None = None
+                snapshot_hash = ""
+                async with self._lock:
+                    latest = self._latest_membership
+                    if latest is None or message.generation != latest.generation:
+                        continue
+                    self._acknowledged.add(worker_id)
+                    if (
+                        self.generation_ready(message.generation)
+                        and self._ready_notified_generation != message.generation
+                    ):
+                        self._ready_notified_generation = message.generation
+                        callback = self.on_generation_ready
+                        snapshot_hash = str(latest.payload["snapshot_hash"])
+                if callback is not None:
+                    await callback(message.generation, snapshot_hash)
+        except (asyncio.IncompleteReadError, ConnectionError, BrokenPipeError):
+            pass
+        finally:
+            if worker_id is not None:
+                async with self._lock:
+                    if self._workers.get(worker_id) is connection:
+                        self._workers.pop(worker_id, None)
+                        self._acknowledged.discard(worker_id)
+            with contextlib.suppress(Exception):
+                await connection.close()
+
+    async def publish(self, message: MessageEnvelope) -> None:
+        if message.message_type not in {"membership", "generation_active"}:
+            raise ValueError("local relay accepts membership and generation_active messages")
+        async with self._lock:
+            if message.message_type == "membership":
+                self._latest_membership = message
+                self._latest_active = None
+                self._acknowledged.clear()
+                self._ready_notified_generation = -1
+            else:
+                latest = self._latest_membership
+                if (
+                    latest is None
+                    or message.generation != latest.generation
+                    or message.payload != {"snapshot_hash": latest.payload["snapshot_hash"]}
+                ):
+                    raise ProtocolError("active generation does not match local membership")
+                self._latest_active = message
+            workers = tuple(self._workers.items())
+        results = await asyncio.gather(
+            *(connection.send(message) for _, connection in workers),
+            return_exceptions=True,
+        )
+        failed = [
+            worker_id
+            for (worker_id, _), result in zip(workers, results)
+            if isinstance(result, BaseException)
+        ]
+        if failed:
+            async with self._lock:
+                for worker_id in failed:
+                    self._workers.pop(worker_id, None)
+                    self._acknowledged.discard(worker_id)
+
+    async def close(self) -> None:
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
+            self._server = None
+        async with self._lock:
+            workers = tuple(self._workers.values())
+            self._workers.clear()
+            self._acknowledged.clear()
+        await asyncio.gather(*(worker.close() for worker in workers), return_exceptions=True)
+        if self.path.exists() and stat.S_ISSOCK(self.path.stat().st_mode):
+            self.path.unlink()
+
+
+class LocalWorkerClient:
+    """Prepare a generation, acknowledge it, then wait for the CPU barrier."""
+
+    def __init__(self, path: str | Path, node_id: str, worker_id: str) -> None:
+        if not node_id or not worker_id:
+            raise ValueError("node_id and worker_id are required")
+        self.path = Path(path)
+        self.node_id = node_id
+        self.worker_id = worker_id
+        self.incarnation_id = str(uuid.uuid4())
+        self.connection: ControlConnection | None = None
+        self.generation = -1
+        self.active_generation = -1
+        self.sequence = 0
+
+    async def connect(self) -> None:
+        reader, writer = await asyncio.open_unix_connection(self.path)
+        self.connection = ControlConnection(reader, writer)
+        await self.connection.send(
+            MessageEnvelope(
+                1,
+                "worker_register",
+                self.worker_id,
+                self.incarnation_id,
+                0,
+                0,
+                {"node_id": self.node_id},
+            )
+        )
+
+    def _parse_membership(self, message: MessageEnvelope) -> MembershipSnapshot:
+        if message.message_type != "membership":
+            raise ProtocolError("local agent sent a non-membership message")
+        snapshot = membership_snapshot_from_payload(message.generation, message.payload)
+        if snapshot.generation <= self.generation:
+            raise ProtocolError("local agent sent a stale membership generation")
+        self.generation = snapshot.generation
+        return snapshot
+
+    async def receive(self) -> MembershipSnapshot:
+        if self.connection is None:
+            raise RuntimeError("local worker is not connected")
+        while True:
+            message = await self.connection.receive()
+            if message.message_type == "generation_active":
+                if message.generation < self.generation:
+                    continue
+                self.active_generation = message.generation
+                continue
+            return self._parse_membership(message)
+
+    async def run_context(
+        self,
+        context: Any,
+        *,
+        on_snapshot: Callable[[MembershipSnapshot], Awaitable[None]] | None = None,
+        on_active: Callable[[int], Awaitable[None]] | None = None,
+    ) -> None:
+        if self.connection is None:
+            raise RuntimeError("local worker is not connected")
+        enable_barrier = getattr(context, "enable_control_plane_barrier", None)
+        if callable(enable_barrier):
+            enable_barrier()
+        pending: MembershipSnapshot | None = None
+        while True:
+            snapshot = pending or await self.receive()
+            pending = None
+            context.apply_membership(snapshot)
+            if on_snapshot is not None:
+                await on_snapshot(snapshot)
+            self.sequence += 1
+            await self.connection.send(
+                MessageEnvelope(
+                    1,
+                    "worker_ack",
+                    self.worker_id,
+                    self.incarnation_id,
+                    self.sequence,
+                    snapshot.generation,
+                    {"phase": "ready"},
+                )
+            )
+            while True:
+                message = await self.connection.receive()
+                if message.message_type == "membership":
+                    pending = self._parse_membership(message)
+                    break
+                if message.message_type != "generation_active":
+                    raise ProtocolError("local agent sent an invalid generation phase")
+                if message.generation < snapshot.generation:
+                    continue
+                if message.generation != snapshot.generation or message.payload != {
+                    "snapshot_hash": snapshot.snapshot_hash
+                }:
+                    raise ProtocolError("active generation does not match prepared membership")
+                self.active_generation = message.generation
+                mark_active = getattr(context, "mark_generation_active", None)
+                if callable(mark_active):
+                    mark_active(message.generation)
+                if on_active is not None:
+                    await on_active(message.generation)
+                break
+
+    async def close(self) -> None:
+        if self.connection is not None:
+            await self.connection.close()
+            self.connection = None
+
+
+__all__ = ["LocalWorkerClient", "LocalWorkerRelay"]
