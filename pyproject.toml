@@ -1,53 +1,63 @@
 [project]
 name = "oobleck"
-description = "A framework for efficient fault tolerance in large scale distributed training with pipeline template."
+description = "Heterogeneous elastic pipeline training for Cornstarch."
 readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.10"
-version = "0.1.1"
-authors = [
-    {name = "Insu Jang", email = "insujang@umich.edu"}
-]
-maintainers = [
-    {name = "Insu Jang", email = "insujang@umich.edu"}
-]
+version = "0.2.0"
+authors = [{name = "Insu Jang", email = "insujang@umich.edu"}]
 dependencies = [
-    "torch",
-    "transformers>=4.36.0",
-    "colossalai==0.3.6",
-    "click",
-    "loguru",
-    "fabric",
+    "torch>=2.6.0",
+    "datasets>=2.18.0",
+    "tyro>=0.8.0",
+    "loguru>=0.7.0",
     "cornstarch",
-    "grpcio",
-    "pulp",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "torch>=2.1.0",
-    "ruff",
-    "black>=23.0",
-    "isort>=5.12",
-    "pytest",
-    "pytest-mock",
-    "pytest-grpc",
-    "grpcio-tools",
-    "datasets",
+    "pyright>=1.1.390",
+    "ruff>=0.6.0",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
 ]
 
 [project.scripts]
 oobleck = "oobleck.cli:main"
 
 [tool.ruff]
-# Never enforce `E501` (line length violations).
+line-length = 100
+exclude = ["legacy"]
+
+[tool.ruff.lint]
 ignore = ["E501"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests/refactor"]
+
+[tool.pyright]
+include = [
+    "oobleck/config.py",
+    "oobleck/types.py",
+    "oobleck/data.py",
+    "oobleck/data_base.py",
+    "oobleck/state_base.py",
+    "oobleck/state_transfer.py",
+    "oobleck/planning",
+    "oobleck/elastic/hostfile.py",
+    "oobleck/elastic/membership.py",
+    "oobleck/elastic/transport.py",
+    "benchmarks",
+]
+exclude = ["legacy"]
+pythonVersion = "3.12"
+typeCheckingMode = "basic"
+reportMissingImports = false
+
 [tool.setuptools.packages.find]
-# Pure Python packages/modules
 where = ["."]
 include = ["oobleck*"]
-exclude = ["examples", "tests"]
+exclude = ["examples*", "tests*"]
 
 [[tool.setuptools-rust.ext-modules]]
 target = "oobleck.planning.planner"
@@ -55,5 +65,5 @@ path = "Cargo.toml"
 binding = "PyO3"
 
 [build-system]
-requires = ["setuptools>=63.0.0", "wheel", "setuptools-rust"]
+requires = ["setuptools>=68.0", "wheel", "setuptools-rust>=1.9"]
 build-backend = "setuptools.build_meta"

@@ -1,0 +1,163 @@
+"""Public Oobleck LLM example with standalone and agent-managed execution."""
+
+from __future__ import annotations
+
+import asyncio
+import os
+from dataclasses import dataclass
+from pathlib import Path
+import sys
+
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from examples.pretrain_llm_base import (
+    ExampleParallelConfig,
+    FakeTextDataset,
+    TinyLanguageModel,
+    build_dataset,
+    build_training,
+)
+from oobleck.elastic import LocalWorkerClient
+
+
+@dataclass(frozen=True)
+class ExampleTrainingConfig:
+    device: str | None = None
+    model_backend: str = "tiny"
+    dataset_name: str | None = None
+    dataset_config: str | None = None
+    split: str = "train"
+
+
+def _one_step(model, context, loader, selected: str, model_backend: str):
+    batch = next(iter(loader))
+    if model_backend == "cornstarch":
+        from cornstarch.models import CornstarchExecutionPlan, ExecutionFuture
+
+        execution = CornstarchExecutionPlan()
+        merged = execution.merge_modality_encoder_outputs(
+            language_model=model,
+            input_ids=ExecutionFuture("input_ids"),
+            labels=ExecutionFuture("labels"),
+            modality_token_ids={},
+            encoder_outputs={},
+            language_model_inputs={},
+        )
+        output = execution.run_language_model(module=model, inputs=merged)
+        return context.step(
+            batch,
+            lambda microbatch: output.execute(
+                inputs={
+                    key: value.to(selected, non_blocking=True) for key, value in microbatch.items()
+                }
+            ),
+            criterion=lambda language_model_output, _: language_model_output.loss,
+        )
+    if model_backend != "tiny":
+        raise ValueError("model_backend must be 'tiny' or 'cornstarch'")
+    return context.step(
+        batch,
+        lambda microbatch: model(microbatch["input_ids"].to(selected, non_blocking=True)),
+        criterion=lambda logits, microbatch: torch.nn.functional.cross_entropy(
+            logits.flatten(0, 1),
+            microbatch["labels"].to(logits.device, non_blocking=True).flatten(),
+        ),
+    )
+
+
+def train_one_step(
+    device: str | None = None,
+    *,
+    dataset_name: str | None = None,
+    dataset_config: str | None = None,
+    split: str = "train",
+    model_backend: str = "tiny",
+):
+    selected = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    model, context, loader = build_training(
+        device=selected,
+        dataset_name=dataset_name,
+        dataset_config=dataset_config,
+        split=split,
+        model_backend=model_backend,
+    )
+    try:
+        return _one_step(model, context, loader, selected, model_backend)
+    finally:
+        context.close()
+
+
+async def train_managed(config: ExampleTrainingConfig):
+    """Prepare through the local agent and train only after generation_active."""
+
+    socket_path = os.environ["OOBLECK_LOCAL_WORKER_SOCKET"]
+    node_id = os.environ["OOBLECK_NODE_ID"]
+    worker_id = os.environ["OOBLECK_WORKER_ID"]
+    selected = config.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    model, context, loader = build_training(
+        device=selected,
+        dataset_name=config.dataset_name,
+        dataset_config=config.dataset_config,
+        split=config.split,
+        model_backend=config.model_backend,
+    )
+    worker = LocalWorkerClient(socket_path, node_id, worker_id)
+    active = asyncio.Event()
+
+    async def prepare(snapshot) -> None:
+        context.prepare_generation()
+
+    async def activated(generation: int) -> None:
+        active.set()
+
+    await worker.connect()
+    relay_task = asyncio.create_task(
+        worker.run_context(context, on_snapshot=prepare, on_active=activated)
+    )
+    try:
+        await asyncio.wait_for(active.wait(), timeout=30.0)
+        return _one_step(model, context, loader, selected, config.model_backend)
+    finally:
+        relay_task.cancel()
+        await asyncio.gather(relay_task, return_exceptions=True)
+        await worker.close()
+        context.close()
+
+
+def main() -> None:
+    import tyro
+
+    config = tyro.cli(ExampleTrainingConfig)
+    if "OOBLECK_LOCAL_WORKER_SOCKET" in os.environ:
+        result = asyncio.run(train_managed(config))
+    else:
+        result = train_one_step(
+            config.device,
+            dataset_name=config.dataset_name,
+            dataset_config=config.dataset_config,
+            split=config.split,
+            model_backend=config.model_backend,
+        )
+    print(
+        f"committed_step={result.committed_step} generation={result.generation} "
+        f"attempts={result.attempts} loss={result.loss:.4f}",
+        flush=True,
+    )
+
+
+if __name__ == "__main__":
+    main()
+
+
+__all__ = [
+    "ExampleParallelConfig",
+    "ExampleTrainingConfig",
+    "FakeTextDataset",
+    "TinyLanguageModel",
+    "build_dataset",
+    "build_training",
+    "train_managed",
+    "train_one_step",
+]

@@ -1,64 +1,45 @@
-<h1 align="center">Oobleck<br>
-Resilient Distributed Training Framework</h1>
+# Oobleck
 
-Oobleck is a large-model training framework with fast fault recovery support utilizing the concept of *pipeline templates*.
+Oobleck is a heterogeneous elastic pipeline-training runtime built around
+Cornstarch's plan/context model. It chooses rank-local ownership before WORLD,
+uses checksummed membership generations, fully replaces the process-group
+universe on every change, and treats each logical global batch as a replayable
+transaction.
 
-It is the first training framework that realizes:
+```python
+plan = OobleckParallelizationPlan(
+    OobleckConfig(global_batch_size=128, microbatch_size=2, max_nodes=16)
+)
+plan.parallelize(model, ParallelConfig(tensor_parallel_size=8))
+context = plan.materialize("cuda", dtype=torch.bfloat16)
 
-- **Dynamic reconfiguration**: Oobleck can reconfigure distributed training configurtation without restart after failures.
-- **Pipeline template instantiation**: Oobleck pre-generates a set of pipeline templates, and then combine their instantiated pipelines to form a distributed execution plan. The same set of pipeline templates is reused and different pipelines are instantiated after failures.
-
-## Getting Started
-
-### Install
-
-Use `pip` to install Oobleck:
-```
-pip install oobleck
-```
-
-Oobleck relies on [`cornstarch`](https://github.com/Symbioticlab/cornstarch) for pipeline template and [`Colossal-AI`](https://github.com/hpcaitech/ColossalAI) for training backend.
-Optionally, install [`apex`](https://github.com/nvidia/apex), [`xformers`](https://github.com/facebookresearch/xformers) and [`flash-attn`](https://github.com/Dao-AILab/flash-attention) to boost throughput (follow instructions in each README).
-
-### Run
-
-Please refer to [this README](./examples/README.md).
-
-### Cluster Management
-
-Oobleck provides a command line interface (CLI) that manages the cluster. Use `oobleck` to access the master agent:
-
-```
-$ oobleck --ip <master_ip> --port <master_port> <command> <command_options>
-```
-where master port can be found in `stdout` of running:
-
-```
-| INFO     | __main__:serve:430 - Running master service on port 45145
+sampler = context.create_batch_sampler(dataset, shuffle=True)
+dataloader = DataLoader(dataset, batch_sampler=sampler, persistent_workers=False)
+loader = context.prepare_dataloader(dataloader)
+context.configure_optimization(
+    optimizer_factory=lambda parameters: torch.optim.AdamW(parameters, lr=1e-4)
+)
+for batch in loader:
+    context.step(batch, execution_plan, output, criterion)
 ```
 
-Currently you can see the list of agents and send a request to gracefully terminate an agent:
+The first release supports stable map-style datasets and fixed per-node tensor
+parallel width. Oobleck selects heterogeneous pipeline and effective data
+parallel layouts. Context/expert parallelism, streaming-dataset replay, elastic
+TP width, multimodal models, and master high availability are out of scope.
 
+See [the examples](examples/README.md), the architecture decisions in
+`docs/adr/`, and `tasks/plan.md` for the full design and acceptance contract.
+
+## Development
+
+```bash
+pytest -q
+cargo test
+python examples/run_local.py
+python benchmarks/recovery_schedule.py
+python benchmarks/transaction_overhead.py
 ```
-$ oobleck --ip <master_ip> --port <master_port> get_agent_list
-=== Agents ===
-[0] IP: node1:10000 Status: up (device indices: 0,1)
-[1] IP: node1:10000 Status: up (device indices: 2,3)
-[2] IP: node2:10000 Status: up (device indices: 0,1)
-[3] IP: node2:10000 Status: up (device indices: 2,3)
-==============
 
-$ oobleck --ip <master_ip> --port <master_port> kill_agent --agent_index 2
-| INFO     | __main__:KillAgent:340 - Terminating agent 2 on node1:10000
-```
-
-## Citation
-
-```bibtex
-@inproceedings{oobleck-sosp23,
-    title     = {Oobleck: Resilient Distributed Training of Large Models Using Pipeline Templates},
-    author    = {Jang, Insu and Yang, Zhenning and Zhang, Zhen and Jin, Xin and Chowdhury, Mosharaf},
-    booktitle = {ACM SIGOPS 29th Symposium of Operating Systems and Principles (SOSP '23)},
-    year      = {2023},
-}
-```
+The Rust planner binding requires PyO3 and `pyo3-build-config` 0.24.1 or newer;
+its exact transitive versions are recorded in `Cargo.lock`.
