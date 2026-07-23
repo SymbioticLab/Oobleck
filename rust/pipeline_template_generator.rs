@@ -212,6 +212,8 @@ mod test {
                 } else {
                     (i + 1) as u64
                 },
+                activation_memory: (i + 1) as u64,
+                persistent_memory: (i + 1) as u64 * 2,
             });
         }
 

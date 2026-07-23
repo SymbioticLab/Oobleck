@@ -1,72 +1,136 @@
-import functools
-import importlib
+"""Versioned profiles and a small, model-agnostic measurement backend."""
+
+from __future__ import annotations
+
 import json
-from dataclasses import asdict, dataclass, field
-from enum import Enum
-from functools import reduce
+import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any, Callable, Sequence
 
 import torch
-import torch.distributed as dist
-import torch.nn as nn
-from colossalai.accelerator import get_accelerator
-from colossalai.amp.naive_amp.mixed_precision_optimizer import MixedPrecisionOptimizer
-from colossalai.booster.plugin.hybrid_parallel_plugin import get_param_info
-from colossalai.interface import OptimizerWrapper
-from colossalai.shardformer import ShardConfig, ShardFormer
-from cornstarch.pipeline_template import PipelineTemplate
-from loguru import logger
-from torch.distributed import FileStore
-from transformers import PretrainedConfig, PreTrainedModel
 
-from oobleck.engine.configuration_engine import ConfigurationEngine
+from oobleck.types import CompatibilityFingerprint
 
 
-@dataclass
+PROFILE_SCHEMA_VERSION = 2
+
+
+@dataclass(frozen=True, slots=True)
 class LayerExecutionResult:
     layer_index: int
     layer_name: str
     forward: float
     backward: float
     mem_required: int
+    activation_memory: int = 0
+    persistent_memory: int = 0
+
+    def __post_init__(self) -> None:
+        if self.layer_index < 0 or not self.layer_name:
+            raise ValueError("layer identity is invalid")
+        if (
+            self.forward < 0
+            or self.backward < 0
+            or self.mem_required < 0
+            or self.activation_memory < 0
+            or self.persistent_memory < 0
+        ):
+            raise ValueError("profile measurements must be non-negative")
 
 
 class JsonEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, LayerExecutionResult):
+    def default(self, obj: object) -> object:
+        if isinstance(obj, (LayerExecutionResult, CompatibilityFingerprint)):
             return asdict(obj)
         return super().default(obj)
 
 
-class ModelProfiler:
-    """A class for profiling a model.
+@dataclass(frozen=True, slots=True)
+class ModelProfile:
+    fingerprint: CompatibilityFingerprint
+    microbatch_size: int
+    layers: tuple[LayerExecutionResult, ...]
+    schema_version: int = PROFILE_SCHEMA_VERSION
 
-    Profiling includes:
-    - Forward and backward latency (in ms) for each layer
-    - Maximum memory consumption (in bytes) for each layer
+    def __post_init__(self) -> None:
+        if self.schema_version != PROFILE_SCHEMA_VERSION:
+            raise ValueError(f"unsupported profile schema {self.schema_version}")
+        if self.microbatch_size < 1 or not self.layers:
+            raise ValueError("profile must contain a positive microbatch and layers")
+        if tuple(item.layer_index for item in self.layers) != tuple(range(len(self.layers))):
+            raise ValueError("profile layers must have contiguous global indices")
 
-    Args:
-        model (nn.Module): The model to be profiled.
-        layers (list[str]): A list of layer names to be profiled.
-        model must have modules with the given names.
+    def save(self, path: str | Path) -> None:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps(asdict(self), cls=JsonEncoder, sort_keys=True, indent=2) + "\n"
+        )
+
+    @classmethod
+    def load(
+        cls, path: str | Path, expected: CompatibilityFingerprint | None = None
+    ) -> "ModelProfile":
+        target = Path(path)
+        try:
+            value = json.loads(target.read_text())
+            profile = cls(
+                CompatibilityFingerprint(**value["fingerprint"]),
+                value["microbatch_size"],
+                tuple(LayerExecutionResult(**item) for item in value["layers"]),
+                value["schema_version"],
+            )
+        except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Cannot load profile cache {target}: {exc}") from exc
+        if expected is not None and profile.fingerprint != expected:
+            raise ValueError(
+                f"Profile cache {target} is stale or incompatible "
+                f"(cached={profile.fingerprint.digest}, requested={expected.digest}). "
+                "Regenerate it with the offline profile command."
+            )
+        return profile
+
+
+ProfileInputFactory = Callable[[int, int], object]
+ProfileLossFactory = Callable[[object], torch.Tensor]
+
+
+@dataclass(frozen=True, slots=True)
+class ProfilingWorkload:
+    """Materialized layers and input construction for offline profiling.
+
+    ``input_factory(layer_index, iteration)`` may return one positional input,
+    a tuple of positional inputs, or ``(args, kwargs)``. Supplying inputs per
+    layer avoids imposing a Cornstarch model or pipeline signature here.
     """
+
+    layers: tuple[torch.nn.Module, ...]
+    input_factory: ProfileInputFactory
+    loss_factory: ProfileLossFactory | None = None
+
+    def __post_init__(self) -> None:
+        if not self.layers or not callable(self.input_factory):
+            raise ValueError("a profiling workload requires layers and an input factory")
+        if self.loss_factory is not None and not callable(self.loss_factory):
+            raise ValueError("loss_factory must be callable")
+
+
+class ModelProfiler:
+    """Profile serialization plus a narrow forward/backward measurement API."""
 
     def __init__(
         self,
         tag: str,
-        model_name_or_path: str,
-        optimizer_class: str,
-        config: PretrainedConfig,
-        precision: str,
-        tp_size: int,
-        base_dir: Path,
-    ):
-        self.model_name_or_path = model_name_or_path
-        self.optimizer_class = optimizer_class
-        self.precision = precision
-        self.model_config = config
-        self.tp_size = tp_size
-        self.profile_dir = base_dir / tag / "profile"
+        *,
+        fingerprint: CompatibilityFingerprint | None = None,
+        base_dir: str | Path = ".",
+        **legacy: Any,
+    ) -> None:
+        self.tag = tag
+        self.fingerprint = fingerprint
+        self.profile_dir = Path(base_dir) / tag / "profile"
+        self.legacy = legacy
 
     @staticmethod
     def get_profile_path(
@@ -75,367 +139,162 @@ class ModelProfiler:
         profile_dir.mkdir(parents=True, exist_ok=True)
         return profile_dir / f"profile_tp{tp_size}_mb{microbatch_size}_{precision}.json"
 
-    def init_profile(self, inputs: dict[str, torch.Tensor]):
-        """Profile the model with a new child process.
+    def record(
+        self,
+        path: str | Path,
+        microbatch_size: int,
+        layers: Sequence[LayerExecutionResult],
+    ) -> ModelProfile:
+        if self.fingerprint is None:
+            raise ValueError("a compatibility fingerprint is required to record profiles")
+        profile = ModelProfile(self.fingerprint, microbatch_size, tuple(layers))
+        profile.save(path)
+        return profile
 
-        All processes calls this function, and all workers in the first agent
-        actually profile the model.
+    def load(self, path: str | Path) -> ModelProfile:
+        return ModelProfile.load(path, self.fingerprint)
+
+    @staticmethod
+    def _arguments(value: object) -> tuple[tuple[object, ...], dict[str, object]]:
+        if (
+            isinstance(value, tuple)
+            and len(value) == 2
+            and isinstance(value[0], tuple)
+            and isinstance(value[1], dict)
+        ):
+            return value
+        if isinstance(value, tuple):
+            return value, {}
+        if isinstance(value, dict):
+            return (), value
+        return (value,), {}
+
+    @staticmethod
+    def _default_loss(output: object) -> torch.Tensor:
+        tensors: list[torch.Tensor] = []
+
+        def collect(value: object) -> None:
+            if isinstance(value, torch.Tensor) and value.is_floating_point():
+                tensors.append(value)
+            elif isinstance(value, dict):
+                for item in value.values():
+                    collect(item)
+            elif isinstance(value, (tuple, list)):
+                for item in value:
+                    collect(item)
+
+        collect(output)
+        differentiable = [item for item in tensors if item.requires_grad]
+        if not differentiable:
+            raise ValueError(
+                "profiled layer output has no differentiable floating-point tensor; "
+                "provide a loss_factory"
+            )
+        zero = torch.zeros((), device=differentiable[0].device)
+        return sum((item.float().sum() for item in differentiable), zero)
+
+    @staticmethod
+    def _persistent_bytes(layer: torch.nn.Module) -> int:
+        state = tuple(layer.parameters(recurse=True)) + tuple(layer.buffers(recurse=True))
+        return sum(item.numel() * item.element_size() for item in state)
+
+    def measure(
+        self,
+        workload: ProfilingWorkload,
+        *,
+        warmup_steps: int = 2,
+        measurement_steps: int = 5,
+    ) -> tuple[LayerExecutionResult, ...]:
+        """Measure materialized layers without legacy model wrappers.
+
+        CUDA synchronization brackets each timing interval. ``mem_required``
+        includes persistent state and peak additional CUDA allocation. CPU
+        measurements report persistent bytes and support offline smoke tests.
         """
-        assert not dist.is_initialized(), "torch.distributed should not be initialized."
-        configuration_engine = ConfigurationEngine.get_instance()
 
-        if configuration_engine.agent_index != 0:
-            return
+        if warmup_steps < 0 or measurement_steps < 1:
+            raise ValueError("warmup_steps must be non-negative and measurement_steps positive")
+        loss_factory = workload.loss_factory or self._default_loss
+        results: list[LayerExecutionResult] = []
+        for layer_index, layer in enumerate(workload.layers):
+            try:
+                first_tensor = next(layer.parameters())
+            except StopIteration:
+                first_tensor = next(layer.buffers(), None)
+            device = (
+                first_tensor.device
+                if first_tensor is not None and first_tensor.device.type == "cuda"
+                else None
+            )
+            if device is not None:
+                torch.cuda.synchronize(device)
+                torch.cuda.reset_peak_memory_stats(device)
+                baseline_memory = torch.cuda.memory_allocated(device)
+            else:
+                device = None
+                baseline_memory = 0
 
-        microbatch_size = inputs["input_ids"].shape[0]
-        profile_path = ModelProfiler.get_profile_path(
-            self.profile_dir, self.tp_size, microbatch_size, self.precision
+            forward_seconds = 0.0
+            backward_seconds = 0.0
+            total_steps = warmup_steps + measurement_steps
+            for iteration in range(total_steps):
+                layer.zero_grad(set_to_none=True)
+                args, kwargs = self._arguments(workload.input_factory(layer_index, iteration))
+                if device is not None:
+                    torch.cuda.synchronize(device)
+                started = time.perf_counter()
+                output = layer(*args, **kwargs)
+                if device is not None:
+                    torch.cuda.synchronize(device)
+                after_forward = time.perf_counter()
+                loss = loss_factory(output)
+                loss.backward()
+                if device is not None:
+                    torch.cuda.synchronize(device)
+                after_backward = time.perf_counter()
+                if iteration >= warmup_steps:
+                    forward_seconds += after_forward - started
+                    backward_seconds += after_backward - after_forward
+
+            peak_extra = 0
+            if device is not None:
+                peak_extra = max(0, torch.cuda.max_memory_allocated(device) - baseline_memory)
+            layer_name = getattr(layer, "_oobleck_profile_name", None)
+            persistent_memory = self._persistent_bytes(layer)
+            results.append(
+                LayerExecutionResult(
+                    layer_index,
+                    str(layer_name or f"{type(layer).__name__}.{layer_index}"),
+                    forward_seconds / measurement_steps,
+                    backward_seconds / measurement_steps,
+                    persistent_memory + peak_extra,
+                    peak_extra,
+                    persistent_memory,
+                )
+            )
+        return tuple(results)
+
+    def measure_and_record(
+        self,
+        path: str | Path,
+        microbatch_size: int,
+        workload: ProfilingWorkload,
+        *,
+        warmup_steps: int = 2,
+        measurement_steps: int = 5,
+    ) -> ModelProfile:
+        return self.record(
+            path,
+            microbatch_size,
+            self.measure(
+                workload,
+                warmup_steps=warmup_steps,
+                measurement_steps=measurement_steps,
+            ),
         )
-        if profile_path.exists():
-            logger.debug(f"Profile exists: {profile_path}")
-            return
-
-        context = torch.multiprocessing.get_context("spawn")
-        process = context.Process(
-            target=ModelProfiler._profile_model,
-            kwargs={
-                "model_name_or_path": self.model_name_or_path,
-                "model_config": self.model_config,
-                "optimizer_class": self.optimizer_class,
-                "profile_dir": self.profile_dir,
-                "local_rank": configuration_engine.local_rank,
-                "tp_size": self.tp_size,
-                "precision": self.precision,
-                "inputs": inputs,
-            },
-            daemon=True,
-        )
-        process.start()
-        process.join()
 
     def load_profile(self, microbatch_size: int) -> list[LayerExecutionResult]:
-        """Load profile data from storage.
-
-        Only rank 0 loads profile data, which is broadcasted to all others.
-        """
-        assert dist.is_initialized(), "torch.distributed is not initialized."
-
-        configuration_engine = ConfigurationEngine.get_instance()
-        device = get_accelerator().get_current_device()
-        size_tensor = torch.empty(1, dtype=torch.int64, device=device)
-        if configuration_engine.rank == 0:
-            profile_path = ModelProfiler.get_profile_path(
-                self.profile_dir, self.tp_size, microbatch_size, self.precision
-            )
-            data = profile_path.read_bytes()
-            data_tensor = torch.tensor(list(data), dtype=torch.uint8, device=device)
-            size_tensor[0] = data_tensor.numel()
-
-        dist.broadcast(size_tensor, src=0)
-
-        if configuration_engine.rank != 0:
-            data_tensor = torch.empty(
-                size_tensor.item(), dtype=torch.uint8, device=device
-            )
-
-        dist.broadcast(data_tensor, src=0)
-        torch.cuda.synchronize()
-
-        data = json.loads(data_tensor.cpu().numpy().tobytes())
-        return [
-            LayerExecutionResult(
-                layer_index=layer["layer_index"],
-                layer_name=layer["layer_name"],
-                forward=layer["forward"],
-                backward=layer["backward"],
-                mem_required=layer["mem_required"],
-            )
-            for layer in data["layers"]
-        ]
-
-    @staticmethod
-    def get_module_by_name(model: nn.Module, name: str) -> nn.Module:
-        """Get a module by its name."""
-        names = name.split(".")
-        return reduce(getattr, names, model)
-
-    @staticmethod
-    def _profile_model(
-        model_name_or_path: str,
-        model_config: PretrainedConfig,
-        optimizer_class: str,
-        profile_dir: Path,
-        local_rank: int,
-        tp_size: int,
-        precision: str,
-        inputs: dict[str, torch.Tensor],
-        warmup: int = 3,
-    ):
-        class EventTiming(Enum):
-            FORWARD_START = 0
-            FORWARD_END = 1
-            BACKWARD_START = 2
-            BACKWARD_END = 3
-            OPTIMIZER_STEP_START = 4
-            OPTIMIZER_STEP_END = 5
-
-        @dataclass
-        class ProfileData:
-            module_name: str
-            events: dict[EventTiming, torch.cuda.Event] = field(default_factory=dict)
-            memory: dict[EventTiming, int] = field(default_factory=dict)
-
-        store_path = profile_dir / "store"
-        logger.debug(
-            f"Profiler initiating torch.distributed: {store_path} with {tp_size} workers"
-        )
-
-        store = FileStore(str(store_path), tp_size)
-        dist.init_process_group(
-            backend="nccl",
-            world_size=tp_size,
-            rank=local_rank,
-            store=store,
-        )
-
-        assert dist.get_world_size() == tp_size, "World size mismatch"
-        logger.debug(f"Sharding model with {tp_size} ranks")
-
-        module_name, cls = model_name_or_path.rsplit(".", 1)
-        module = importlib.import_module(module_name)
-        model: PreTrainedModel = getattr(module, cls)(model_config).to("cpu")
-        model.gradient_checkpointing_enable()
-
-        layers = PipelineTemplate.get_modules(model)
-        profile_data: dict[str, ProfileData] = {
-            layer_name: ProfileData(
-                module_name=layer_name,
-                events={
-                    timing: torch.cuda.Event(enable_timing=True)
-                    for timing in EventTiming
-                },
-            )
-            for layer_name in layers
-        }
-
-        optim_name, cls = optimizer_class.rsplit(".", 1)
-        module = importlib.import_module(optim_name)
-        optim_cls = getattr(module, cls)
-
-        if tp_size > 1:
-            # FIXME (insujang): copy user shardconfig as well
-            shard_config = ShardConfig(
-                tensor_parallel_process_group=dist.new_group(),
-                pipeline_stage_manager=None,
-                enable_tensor_parallelism=True,
-                enable_flash_attention=False,
-            )
-            shardformer = ShardFormer(shard_config)
-
-            model, _ = shardformer.optimize(model)
-
-        mixed_precision = None
-        if precision == "fp16":
-            mixed_precision = torch.float16
-        elif precision == "bf16":
-            mixed_precision = torch.bfloat16
-        if mixed_precision is not None:
-            model = model.to(dtype=mixed_precision)
-
-        optimizer = optim_cls(model.parameters())
-        optim_param_info = get_param_info(optimizer)
-        if precision in ["fp16", "bf16"]:
-            optimizer = MixedPrecisionOptimizer(optimizer, precision=precision)
-        else:
-            optimizer = OptimizerWrapper(optimizer)
-
-        # Configure hooks for each layer
-        def forward_pre_hook(module_name: str, module: nn.Module, inputs):
-            module.to("cuda")
-            profile_data[module_name].memory[EventTiming.FORWARD_START] = (
-                torch.cuda.memory_allocated()
-            )
-            event = profile_data[module_name].events[EventTiming.FORWARD_START]
-            event.record()
-
-        def forward_hook(module_name: str, module: nn.Module, inputs, outputs):
-            profile_data[module_name].memory[EventTiming.FORWARD_END] = (
-                torch.cuda.memory_allocated()
-            )
-            event = profile_data[module_name].events[EventTiming.FORWARD_END]
-            event.record()
-            module.to("cpu")
-
-        modules_to_offload: list[tuple[str, torch.nn.Module]] = []
-
-        def backward_pre_hook(module_name: str, module: nn.Module, grad_output):
-            module.to("cuda")
-            profile_data[module_name].memory[EventTiming.BACKWARD_START] = (
-                torch.cuda.memory_allocated()
-            )
-            event = profile_data[module_name].events[EventTiming.BACKWARD_START]
-            event.record()
-
-        def backward_hook(module_name, module: nn.Module, grad_input, grad_output):
-            event = profile_data[module_name].events[EventTiming.BACKWARD_END]
-            event.record()
-
-            profile_data[module_name].memory[EventTiming.BACKWARD_END] = profile_data[
-                module_name
-            ].memory[EventTiming.BACKWARD_START] + sum(
-                p.numel() * p.element_size() for p in module.parameters()
-            )
-
-            for _, m in modules_to_offload:
-                m.to("cpu")
-            modules_to_offload.clear()
-            modules_to_offload.append((module_name, module))
-
-        # Move inputs to cuda
-        for name in inputs.keys():
-            inputs[name] = inputs[name].to("cuda")
-
-        logger.info("Profiler started...")
-
-        for layer_name in layers:
-            module = ModelProfiler.get_module_by_name(model, layer_name)
-
-            module.register_forward_pre_hook(
-                functools.partial(forward_pre_hook, layer_name)
-            )
-            module.register_forward_hook(functools.partial(forward_hook, layer_name))
-            module.register_full_backward_pre_hook(
-                functools.partial(backward_pre_hook, layer_name)
-            )
-            module.register_full_backward_hook(
-                functools.partial(backward_hook, layer_name)
-            )
-
-        with torch.no_grad():
-            for _ in range(warmup):
-                model(**inputs)
-
-        should_continue: bool = True
-
-        while should_continue:
-            for param in model.parameters():
-                param.grad = None
-
-            logger.debug("Iterating until overflow solved...")
-            outputs = model(**inputs)
-            optimizer.backward(outputs.loss)
-            torch.cuda.synchronize()
-
-            modules_to_offload.clear()
-            for param in model.parameters():
-                param.data = param.data.to("cpu")
-                param.grad.data = param.grad.data.to("cpu")
-
-            if (
-                mixed_precision is None
-                or not optimizer.mixed_precision.should_skip_step()
-            ):
-                should_continue = False
-
-                for layer_name in layers:
-                    profile_data[layer_name].memory[
-                        EventTiming.OPTIMIZER_STEP_START
-                    ] = 0
-                    profile_data[layer_name].memory[EventTiming.OPTIMIZER_STEP_END] = 0
-                optimizer.step()
-
-                num_parameters = 0
-                working_to_master_map = (
-                    optimizer.get_working_to_master_map()
-                    if (precision in ["fp16", "bf16"])
-                    else None
-                )
-                for layer_name in layers:
-                    module = ModelProfiler.get_module_by_name(model, layer_name)
-                    for param_name, p in module.named_parameters():
-                        if f"{layer_name}.{param_name}" in model._tied_weights_keys:
-                            continue
-
-                        if precision in ["fp16", "bf16"]:
-                            optim_param_index_id = optim_param_info["id2param"][
-                                num_parameters
-                            ]
-                            master_tensor = working_to_master_map[optim_param_index_id]
-                            states: dict[torch.Tensor, dict] = (
-                                optimizer.optim.state.get(master_tensor)
-                            )
-                        else:
-                            states: dict[torch.Tensor, dict] = (
-                                optimizer.optim.state.get(p)
-                            )
-
-                        if states:
-                            for name, state in states.items():
-                                if isinstance(state, torch.Tensor):
-                                    profile_data[layer_name].memory[
-                                        EventTiming.OPTIMIZER_STEP_END
-                                    ] += state.numel() * state.element_size()
-
-                        num_parameters += 1
-
-            optimizer.zero_grad()
-
-        logger.debug("Profiler finished.")
-
-        rank = dist.get_rank()
-        if rank == 0:
-            microbatch_size = inputs["input_ids"].shape[0]
-            profile_path = ModelProfiler.get_profile_path(
-                profile_dir, tp_size, microbatch_size, precision
-            )
-            logger.debug(f"Writing results to {profile_path}")
-
-            data = {
-                "model_name": model_name_or_path,
-                "microbatch_size": microbatch_size,
-                "tp_size": tp_size,
-                "precision": precision,
-                "layers": [],
-            }
-            for index, (layer_name, layer_profile) in enumerate(profile_data.items()):
-                data["layers"].append(
-                    asdict(
-                        LayerExecutionResult(
-                            layer_index=index,
-                            layer_name=layer_name,
-                            forward=layer_profile.events[
-                                EventTiming.FORWARD_START
-                            ].elapsed_time(
-                                layer_profile.events[EventTiming.FORWARD_END]
-                            ),
-                            backward=layer_profile.events[
-                                EventTiming.BACKWARD_START
-                            ].elapsed_time(
-                                layer_profile.events[EventTiming.BACKWARD_END]
-                            ),
-                            mem_required=(
-                                layer_profile.memory[EventTiming.FORWARD_END]
-                                - layer_profile.memory[EventTiming.FORWARD_START]
-                            )
-                            + (
-                                layer_profile.memory[EventTiming.BACKWARD_END]
-                                - layer_profile.memory[EventTiming.BACKWARD_START]
-                            )
-                            + (
-                                layer_profile.memory[EventTiming.OPTIMIZER_STEP_END]
-                                - layer_profile.memory[EventTiming.OPTIMIZER_STEP_START]
-                            ),
-                        )
-                    )
-                )
-
-            with profile_path.open("w") as f:
-                json.dump(data, f, cls=JsonEncoder)
-
-        dist.barrier()
-        torch.cuda.synchronize()
-
-        dist.destroy_process_group()
-
-        if rank == 0:
-            store_path.unlink()
+        precision = str(self.legacy.get("precision", "unknown"))
+        tp_size = int(self.legacy.get("tp_size", 1))
+        path = self.get_profile_path(self.profile_dir, tp_size, microbatch_size, precision)
+        return list(ModelProfile.load(path, self.fingerprint).layers)

@@ -1,7 +1,7 @@
 use crate::pipeline_template_generator::PipelineTemplateGenerator;
 mod execution_result;
 mod pipeline_template_generator;
-use env_logger;
+
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::fmt;
@@ -13,9 +13,7 @@ struct PlannerError {
 
 impl PlannerError {
     fn new(message: &str) -> Self {
-        PlannerError {
-            message: message.to_string(),
-        }
+        Self { message: message.to_string() }
     }
 }
 
@@ -33,101 +31,55 @@ impl From<PlannerError> for PyErr {
     }
 }
 
-#[pyfunction]
+#[pyfunction(signature = (model_name, profile_data, num_nodes, tensor_parallel_size=1))]
 fn create_pipeline_templates(
+    py: Python<'_>,
     model_name: String,
     profile_data: Vec<execution_result::LayerExecutionResult>,
     mut num_nodes: Vec<u32>,
+    tensor_parallel_size: u32,
 ) -> PyResult<Py<PyDict>> {
-    num_nodes.sort();
+    if num_nodes.is_empty() {
+        return Err(PlannerError::new("num_nodes must not be empty").into());
+    }
+    if tensor_parallel_size == 0 {
+        return Err(PlannerError::new("tensor_parallel_size must be positive").into());
+    }
+    num_nodes.sort_unstable();
+    num_nodes.dedup();
 
     let mut generator = PipelineTemplateGenerator::new(profile_data);
-    generator.divide_and_conquer(num_nodes[num_nodes.len() - 1])?;
+    generator.divide_and_conquer(*num_nodes.last().unwrap())?;
+    let results = PyDict::new(py);
 
-    Python::with_gil(|py| {
-        let results = PyDict::new_bound(py);
+    for num_node in num_nodes {
+        let result = generator.get_pipeline_template(num_node)?;
+        let template = PyDict::new(py);
+        let ranges: Vec<(u32, u32)> = result
+            .stages
+            .iter()
+            .map(|stage| stage.layers)
+            .collect();
+        template.set_item("template_id", format!("{}-stages-{}", model_name, num_node))?;
+        template.set_item("layer_ranges", ranges)?;
+        template.set_item("tensor_parallel_size", tensor_parallel_size)?;
+        template.set_item("forward_time", result.forward_time())?;
+        template.set_item("backward_time", result.backward_time())?;
+        template.set_item("communication_time", 0.0)?;
+        template.set_item("activation_memory", result.activation_memory())?;
+        template.set_item("persistent_memory", result.persistent_memory())?;
+        template.set_item("max_microbatches", py.None())?;
+        template.set_item("fingerprint", py.None())?;
+        template.set_item("schema_version", 1)?;
+        results.set_item(num_node, template)?;
+    }
 
-        let module = PyModule::import_bound(py, "cornstarch.pipeline_template")?;
-        let class = module.getattr("PipelineTemplate")?.into_py(py);
-
-        for num_node in num_nodes {
-            let result = generator.get_pipeline_template(num_node).unwrap();
-            let py_template = class
-                .call1(
-                    py,
-                    (
-                        model_name.as_str(),
-                        result.get_modules_per_stage(&generator.layer_execution_results),
-                        result.latency(),
-                        result.stages[result.kstar].latency(),
-                        result.mem_required(),
-                    ),
-                )?
-                .to_object(py);
-            results.set_item(result.stages.len(), py_template)?;
-        }
-
-        Ok(results.into())
-    })
+    Ok(results.unbind())
 }
 
 #[pymodule]
-fn planner(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn planner(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let _ = env_logger::try_init();
     m.add_function(wrap_pyfunction!(create_pipeline_templates, m)?)?;
     Ok(())
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    use crate::execution_result::LayerExecutionResult;
-
-    fn prepare(
-        num_layers: u32,
-        same_latency: bool,
-        mut num_nodes: Vec<u32>,
-    ) -> Vec<LayerExecutionResult> {
-        let mut layer_results = vec![];
-        for i in 0..num_layers {
-            layer_results.push(LayerExecutionResult {
-                layer_index: i,
-                layer_name: format!("layer{}", i),
-                forward: if same_latency {
-                    1 as f64
-                } else {
-                    (i + 1) as f64
-                },
-                backward: if same_latency {
-                    1 as f64
-                } else {
-                    (i + 1) as f64
-                },
-                mem_required: if same_latency {
-                    1 as u64
-                } else {
-                    (i + 1) as u64
-                },
-            });
-        }
-
-        num_nodes.sort();
-
-        layer_results
-    }
-
-    #[test]
-    fn test_create_pipeline_templates() {
-        let num_layers = 5;
-        let num_nodes = vec![1, 2, 3, 4, 5];
-        let layer_results = prepare(num_layers, true, num_nodes.clone());
-
-        let model_name = "gpt2".to_string();
-
-        create_pipeline_templates(model_name, layer_results, num_nodes).unwrap();
-
-        // let py = Python::acquire_gil();
-        // let py_result = result.extract::<PyList>(py).unwrap();
-        // assert_eq!(py_result.len(py), num_nodes.len());
-    }
 }
