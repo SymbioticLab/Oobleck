@@ -19,4 +19,5 @@ __pycache__/
 .cache
 
 *.lock
+!Cargo.lock
 target
