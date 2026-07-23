@@ -23,9 +23,11 @@ _FIELDS = {
 _PAYLOAD_FIELDS = {
     "register": {"addresses", "gpu_ids"},
     "heartbeat": set(),
+    "generation_prepared": {"snapshot_hash", "plan_checksum", "compatibility_digest"},
     "generation_ready": {"snapshot_hash", "plan_checksum", "compatibility_digest"},
     "drain": set(),
     "membership": {"nodes", "reasons", "snapshot_hash"},
+    "generation_rendezvous": {"snapshot_hash", "plan_checksum", "compatibility_digest"},
     "generation_active": {"snapshot_hash", "plan_checksum", "compatibility_digest"},
     "inspect": set(),
     "request_drain": {"node_id"},
@@ -64,7 +66,12 @@ def _validate_payload(message_type: str, payload: Mapping[str, object]) -> None:
             raise ProtocolError("membership nodes and reasons must be lists")
         if type(payload["snapshot_hash"]) is not str:
             raise ProtocolError("membership snapshot_hash must be a string")
-    elif message_type in {"generation_ready", "generation_active"}:
+    elif message_type in {
+        "generation_prepared",
+        "generation_ready",
+        "generation_rendezvous",
+        "generation_active",
+    }:
         for field in ("snapshot_hash", "plan_checksum"):
             if type(payload[field]) is not str or not payload[field]:
                 raise ProtocolError(f"{message_type} {field} must be a non-empty string")
@@ -79,8 +86,8 @@ def _validate_payload(message_type: str, payload: Mapping[str, object]) -> None:
         if type(payload["node_id"]) is not str or not payload["node_id"]:
             raise ProtocolError(f"{message_type} node_id must be a non-empty string")
     elif message_type == "worker_ack":
-        if payload["phase"] != "ready":
-            raise ProtocolError("worker_ack phase must be 'ready'")
+        if payload["phase"] not in {"prepared", "ready"}:
+            raise ProtocolError("worker_ack phase must be 'prepared' or 'ready'")
         for field in ("snapshot_hash", "plan_checksum"):
             if type(payload[field]) is not str or not payload[field]:
                 raise ProtocolError(f"worker_ack {field} must be a non-empty string")

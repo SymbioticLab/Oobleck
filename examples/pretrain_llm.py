@@ -18,6 +18,8 @@ from examples.pretrain_llm_base import (
     TinyLanguageModel,
     build_dataset,
     build_training,
+    configure_training,
+    prepare_training,
 )
 from oobleck.elastic import LocalWorkerClient
 
@@ -99,7 +101,7 @@ def train_one_step(
 
 
 async def train_managed(config: ExampleTrainingConfig):
-    """Prepare through the local agent and train only after generation_active."""
+    """Compile before rendezvous and train only after generation_active."""
 
     socket_path = os.environ["OOBLECK_LOCAL_WORKER_SOCKET"]
     node_id = os.environ["OOBLECK_NODE_ID"]
@@ -108,7 +110,7 @@ async def train_managed(config: ExampleTrainingConfig):
     worker = LocalWorkerClient(socket_path, node_id, worker_id)
     await worker.connect()
     snapshot = await worker.receive()
-    model, context, loader = build_training(
+    model, prepared, dataset = prepare_training(
         device=selected,
         dataset_name=config.dataset_name,
         dataset_config=config.dataset_config,
@@ -121,24 +123,14 @@ async def train_managed(config: ExampleTrainingConfig):
         rendezvous_port=config.rendezvous_port,
         distributed_backend=config.distributed_backend,
     )
-    active = asyncio.Event()
+    context = await worker.activate_prepared(prepared, snapshot)
+    model, context, loader = configure_training(model, context, dataset, device=selected)
 
     async def prepare(snapshot) -> None:
         context.prepare_generation()
 
-    async def activated(generation: int) -> None:
-        active.set()
-
-    relay_task = asyncio.create_task(
-        worker.run_context(
-            context,
-            initial_snapshot=snapshot,
-            on_snapshot=prepare,
-            on_active=activated,
-        )
-    )
+    relay_task = asyncio.create_task(worker.run_context(context, on_snapshot=prepare))
     try:
-        await asyncio.wait_for(active.wait(), timeout=30.0)
         return _one_step(model, context, loader, selected, config.model_backend)
     finally:
         relay_task.cancel()
@@ -182,6 +174,8 @@ __all__ = [
     "TinyLanguageModel",
     "build_dataset",
     "build_training",
+    "configure_training",
+    "prepare_training",
     "train_managed",
     "train_one_step",
 ]

@@ -42,6 +42,37 @@ class OobleckStepResult:
     output: Any = None
 
 
+@dataclass(slots=True)
+class OobleckPreparedContext:
+    """Rank-local ownership compiled before the distributed WORLD exists."""
+
+    owner_plan: "OobleckParallelizationPlan"
+    execution_plan: OobleckExecutionPlan
+    compiled: CompiledLocalPartition
+    device: torch.device
+    dtype: torch.dtype | None
+    recover_from_survivors: bool = False
+    _activated: bool = False
+
+    def activate(self) -> "OobleckParallelContext":
+        if self._activated:
+            raise RuntimeError("prepared context has already been activated")
+        if self.owner_plan.world_initializer is not None:
+            self.owner_plan.world_initializer(self.execution_plan)
+        partition = self.compiled.activate(self.device, self.dtype)
+        self._activated = True
+        return OobleckParallelContext(
+            config=self.owner_plan.config,
+            owner_plan=self.owner_plan,
+            execution_plan=self.execution_plan,
+            compiled=self.compiled,
+            partition=partition,
+            device=self.device,
+            dtype=self.dtype,
+            needs_survivor_recovery=self.recover_from_survivors,
+        )
+
+
 class OobleckParallelizationPlan:
     """Prepare rank-local ownership before creating the distributed world."""
 
@@ -288,20 +319,30 @@ class OobleckParallelizationPlan:
         *,
         recover_from_survivors: bool = False,
     ) -> "OobleckParallelContext":
+        return self.prepare(
+            device,
+            dtype,
+            recover_from_survivors=recover_from_survivors,
+        ).activate()
+
+    def prepare(
+        self,
+        device: str | torch.device = "cuda",
+        dtype: torch.dtype | None = None,
+        *,
+        recover_from_survivors: bool = False,
+    ) -> OobleckPreparedContext:
+        """Compile local ownership without initializing WORLD or allocating state."""
+
         execution_plan = self.build_execution_plan()
         compiled = self.compile(execution_plan)
-        if self.world_initializer is not None:
-            self.world_initializer(execution_plan)
-        activated = compiled.activate(device, dtype)
-        return OobleckParallelContext(
-            config=self.config,
+        return OobleckPreparedContext(
             owner_plan=self,
             execution_plan=execution_plan,
             compiled=compiled,
-            partition=activated,
             device=torch.device(device),
             dtype=dtype,
-            needs_survivor_recovery=recover_from_survivors,
+            recover_from_survivors=recover_from_survivors,
         )
 
 

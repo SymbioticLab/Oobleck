@@ -64,8 +64,10 @@ class NodeAgentClient:
         self._port: int | None = None
         self._last_master_sequence = -1
         self._prepared_generation = -1
+        self._prepared_sent_generation = -1
+        self._rendezvous_generation = -1
         self._ready_sent_generation = -1
-        self._ready_metadata: tuple[str, str] | None = None
+        self._phase_metadata: tuple[str, str] | None = None
         self._send_lock = asyncio.Lock()
         self._ready_lock = asyncio.Lock()
         self._stopping = False
@@ -74,6 +76,7 @@ class NodeAgentClient:
                 local_worker_socket,
                 node_id,
                 expected_workers=len(self.gpu_ids),
+                on_generation_prepared=self._local_workers_prepared,
                 on_generation_ready=self._local_workers_ready,
             )
             if local_worker_socket is not None
@@ -102,6 +105,22 @@ class NodeAgentClient:
                 )
             )
 
+    async def _local_workers_prepared(
+        self,
+        generation: int,
+        snapshot_hash: str,
+        plan_checksum: str,
+        compatibility_digest: str,
+    ) -> None:
+        snapshot = self.snapshot
+        if (
+            snapshot is not None
+            and generation == snapshot.generation
+            and snapshot_hash == snapshot.snapshot_hash
+        ):
+            self._phase_metadata = (plan_checksum, compatibility_digest)
+            await self._send_prepared_if_possible(generation)
+
     async def _local_workers_ready(
         self,
         generation: int,
@@ -115,8 +134,44 @@ class NodeAgentClient:
             and generation == snapshot.generation
             and snapshot_hash == snapshot.snapshot_hash
         ):
-            self._ready_metadata = (plan_checksum, compatibility_digest)
+            if self._phase_metadata != (plan_checksum, compatibility_digest):
+                raise ValueError("local ready metadata differs from local preparation")
             await self._send_ready_if_possible(generation)
+
+    async def _send_prepared_if_possible(self, generation: int) -> None:
+        async with self._ready_lock:
+            snapshot = self.snapshot
+            if (
+                self.connection is None
+                or snapshot is None
+                or generation != snapshot.generation
+                or self._prepared_generation != generation
+                or self._prepared_sent_generation >= generation
+            ):
+                return
+            if self.local_worker_relay is not None:
+                if not self.local_worker_relay.generation_prepared(generation):
+                    return
+                if self._phase_metadata is None:
+                    return
+                plan_checksum, compatibility_digest = self._phase_metadata
+            else:
+                plan_checksum, compatibility_digest = snapshot.snapshot_hash, ""
+                self._phase_metadata = (plan_checksum, compatibility_digest)
+            self._prepared_sent_generation = generation
+            try:
+                await self._send_agent_message(
+                    "generation_prepared",
+                    generation,
+                    {
+                        "snapshot_hash": snapshot.snapshot_hash,
+                        "plan_checksum": plan_checksum,
+                        "compatibility_digest": compatibility_digest,
+                    },
+                )
+            except BaseException:
+                self._prepared_sent_generation = -1
+                raise
 
     async def _send_ready_if_possible(self, generation: int) -> None:
         async with self._ready_lock:
@@ -125,18 +180,16 @@ class NodeAgentClient:
                 self.connection is None
                 or snapshot is None
                 or generation != snapshot.generation
-                or self._prepared_generation != generation
+                or self._rendezvous_generation != generation
                 or self._ready_sent_generation >= generation
+                or self._phase_metadata is None
             ):
                 return
-            if self.local_worker_relay is not None:
-                if not self.local_worker_relay.generation_ready(generation):
-                    return
-                if self._ready_metadata is None:
-                    return
-                plan_checksum, compatibility_digest = self._ready_metadata
-            else:
-                plan_checksum, compatibility_digest = snapshot.snapshot_hash, ""
+            if self.local_worker_relay is not None and not self.local_worker_relay.generation_ready(
+                generation
+            ):
+                return
+            plan_checksum, compatibility_digest = self._phase_metadata
             self._ready_sent_generation = generation
             try:
                 await self._send_agent_message(
@@ -169,15 +222,37 @@ class NodeAgentClient:
         self.generation = snapshot.generation
         self.snapshot = snapshot
         self._prepared_generation = -1
+        self._prepared_sent_generation = -1
+        self._rendezvous_generation = -1
         self._ready_sent_generation = -1
-        self._ready_metadata = None
+        self._phase_metadata = None
         if self.local_worker_relay is not None:
             await self.local_worker_relay.publish(message)
         if self.on_membership is not None:
             await self.on_membership(message)
         self._prepared_generation = snapshot.generation
-        await self._send_ready_if_possible(snapshot.generation)
+        await self._send_prepared_if_possible(snapshot.generation)
         return snapshot
+
+    async def _consume_rendezvous(self, message: MessageEnvelope) -> None:
+        if message.message_type != "generation_rendezvous":
+            raise ValueError("expected a generation_rendezvous message")
+        self._validate_master_sequence(message)
+        if message.generation < self.generation:
+            return
+        snapshot = self.snapshot
+        if snapshot is None or self._phase_metadata is None:
+            raise ValueError("master published rendezvous before local preparation")
+        if message.generation != snapshot.generation or message.payload != {
+            "snapshot_hash": snapshot.snapshot_hash,
+            "plan_checksum": self._phase_metadata[0],
+            "compatibility_digest": self._phase_metadata[1],
+        }:
+            raise ValueError("master rendezvous does not match local preparation")
+        self._rendezvous_generation = message.generation
+        if self.local_worker_relay is not None:
+            await self.local_worker_relay.publish(message)
+        await self._send_ready_if_possible(message.generation)
 
     async def _consume_active(self, message: MessageEnvelope) -> None:
         if message.message_type != "generation_active":
@@ -188,7 +263,7 @@ class NodeAgentClient:
         snapshot = self.snapshot
         if snapshot is None:
             raise ValueError("master activated a generation before membership")
-        ready_metadata = self._ready_metadata or (snapshot.snapshot_hash, "")
+        ready_metadata = self._phase_metadata or (snapshot.snapshot_hash, "")
         if message.generation != snapshot.generation or message.payload != {
             "snapshot_hash": snapshot.snapshot_hash,
             "plan_checksum": ready_metadata[0],
@@ -240,6 +315,8 @@ class NodeAgentClient:
                 return
             if message.message_type == "membership":
                 await self._consume_membership(message)
+            elif message.message_type == "generation_rendezvous":
+                await self._consume_rendezvous(message)
             elif message.message_type == "generation_active":
                 await self._consume_active(message)
             else:

@@ -41,6 +41,21 @@ class GenerationTransitionMetrics:
     source_scheduling_error_bytes: int = 0
 
 
+@dataclass(slots=True)
+class _PreparedGenerationTransition:
+    target: Any
+    compiled: Any
+    snapshot: Any
+    snapshot_seconds: float
+    teardown_seconds: float
+    compile_seconds: float
+    transition_started: float
+    attempt_started: float
+    detection_seconds: float
+    configuration_planning_seconds: float
+    superseded_recorded: bool = False
+
+
 def _init_with_recovery(self: OobleckParallelContext, *args: Any, **kwargs: Any) -> None:
     _base_init(self, *args, **kwargs)
     self._optimizer_factory: (
@@ -52,6 +67,7 @@ def _init_with_recovery(self: OobleckParallelContext, *args: Any, **kwargs: Any)
     self._control_active_generation = self.generation
     self.recovery_history: list[GenerationTransitionMetrics] = []
     self._generation_control_metrics: dict[int, tuple[float, float]] = {}
+    self._prepared_transition: _PreparedGenerationTransition | None = None
     self._heterogeneous_gradient_sync = (
         None
         if self._needs_survivor_recovery
@@ -99,22 +115,65 @@ def _retire_world(self: OobleckParallelContext) -> None:
         destroy_process_group_universe()
 
 
-def _activate_latest_generation(self: OobleckParallelContext) -> None:
-    """Replace WORLD and recover only the last committed training state.
-
-    The snapshot is captured once.  If a newer membership arrives during
-    preparation or activation, the partially created generation is retired and
-    the same committed snapshot is applied to the newest complete plan.
-    """
-
-    if self._pending_plan is None:
+def _record_superseded(
+    self: OobleckParallelContext,
+    transition: _PreparedGenerationTransition,
+    *,
+    world_seconds: float = 0.0,
+    activation_seconds: float = 0.0,
+    recovery_seconds: float = 0.0,
+) -> None:
+    if transition.superseded_recorded:
         return
-    transition_started = time.perf_counter()
-    snapshot_started = transition_started
-    snapshot = capture_context_state(self)
-    snapshot_seconds = time.perf_counter() - snapshot_started
-    for loader in self._loaders:
-        loader.invalidate_prefetch()
+    transition.superseded_recorded = True
+    report = self.last_recovery_report if recovery_seconds else None
+    self.recovery_history.append(
+        GenerationTransitionMetrics(
+            transition.target.generation,
+            transition.snapshot_seconds,
+            transition.teardown_seconds,
+            transition.compile_seconds,
+            world_seconds,
+            activation_seconds,
+            recovery_seconds,
+            time.perf_counter() - transition.attempt_started,
+            True,
+            detection_seconds=transition.detection_seconds,
+            configuration_planning_seconds=transition.configuration_planning_seconds,
+            state_planning_seconds=0.0 if report is None else report.planning_seconds,
+            state_transfer_seconds=0.0 if report is None else report.transfer_seconds,
+            straggler_round_seconds=0.0 if report is None else report.straggler_round_seconds,
+            source_scheduling_error_bytes=(
+                0 if report is None else report.source_scheduling_error_bytes
+            ),
+        )
+    )
+
+
+def _prepare_latest_generation(self: OobleckParallelContext) -> bool:
+    """Retire WORLD and compile the newest ownership without creating a new WORLD."""
+
+    existing = self._prepared_transition
+    if self._pending_plan is None:
+        return existing is not None
+
+    if existing is None:
+        transition_started = time.perf_counter()
+        snapshot_started = transition_started
+        snapshot = capture_context_state(self)
+        snapshot_seconds = time.perf_counter() - snapshot_started
+        for loader in self._loaders:
+            loader.invalidate_prefetch()
+        teardown_started = time.perf_counter()
+        _retire_world(self)
+        teardown_seconds = time.perf_counter() - teardown_started
+    else:
+        transition_started = existing.transition_started
+        snapshot = existing.snapshot
+        snapshot_seconds = existing.snapshot_seconds
+        teardown_seconds = 0.0
+        _record_superseded(self, existing)
+        self._prepared_transition = None
 
     while self._pending_plan is not None:
         target = self._pending_plan
@@ -123,110 +182,119 @@ def _activate_latest_generation(self: OobleckParallelContext) -> None:
             target.generation, (0.0, 0.0)
         )
         attempt_started = time.perf_counter()
-        teardown_started = attempt_started
-        _retire_world(self)
-        teardown_seconds = time.perf_counter() - teardown_started
-
-        # Compilation is deliberately process-group independent and occurs
-        # after the old universe is gone but before the replacement is created.
-        compile_started = time.perf_counter()
+        compile_started = attempt_started
         compiled = self.owner_plan.compile(target)
         compile_seconds = time.perf_counter() - compile_started
-        world_started = time.perf_counter()
-        if self.owner_plan.world_initializer is not None:
-            self.owner_plan.world_initializer(target)
-        world_seconds = time.perf_counter() - world_started
-        activation_started = time.perf_counter()
-        activated = compiled.activate(self.device, self.dtype)
-        activation_seconds = time.perf_counter() - activation_started
-
-        # A complete newer snapshot supersedes this generation before any
-        # committed state is installed or the generation is made visible.
+        transition = _PreparedGenerationTransition(
+            target,
+            compiled,
+            snapshot,
+            snapshot_seconds,
+            teardown_seconds,
+            compile_seconds,
+            transition_started,
+            attempt_started,
+            detection_seconds,
+            configuration_planning_seconds,
+        )
         if self._pending_plan is not None and self._pending_plan.generation > target.generation:
-            activated.close()
-            if _world_initialized():
-                destroy_process_group_universe()
-            self.recovery_history.append(
-                GenerationTransitionMetrics(
-                    target.generation,
-                    snapshot_seconds,
-                    teardown_seconds,
-                    compile_seconds,
-                    world_seconds,
-                    activation_seconds,
-                    0.0,
-                    time.perf_counter() - attempt_started,
-                    True,
-                    detection_seconds=detection_seconds,
-                    configuration_planning_seconds=configuration_planning_seconds,
-                )
-            )
+            _record_superseded(self, transition)
+            teardown_seconds = 0.0
             continue
+        self._prepared_transition = transition
+        return True
+    return False
 
-        self.compiled = compiled
-        self.partition = activated
-        self.execution_plan = target
-        self.owner_plan.rank = compiled.rank
-        self.owner_plan._last_execution_plan = target
-        for loader in self._loaders:
-            loader.reconfigure(target.instances)
-        recovery_started = time.perf_counter()
-        self.last_recovery_report = restore_context_state(self, snapshot)
-        recovery_seconds = time.perf_counter() - recovery_started
-        self._heterogeneous_gradient_sync = activate_gradient_synchronizer(
-            self.model,
-            self.partition.manifest,
-            self.execution_plan,
-            microbatch_size=self.config.microbatch_size,
-        )
 
-        if self._pending_plan is not None:
-            # Recovery completed at a safe boundary, but this generation is
-            # already stale.  Reuse the original committed snapshot so an
-            # intermediate activation can never become a source of truth.
-            self.recovery_history.append(
-                GenerationTransitionMetrics(
-                    target.generation,
-                    snapshot_seconds,
-                    teardown_seconds,
-                    compile_seconds,
-                    world_seconds,
-                    activation_seconds,
-                    recovery_seconds,
-                    time.perf_counter() - attempt_started,
-                    True,
-                    detection_seconds=detection_seconds,
-                    configuration_planning_seconds=configuration_planning_seconds,
-                    state_planning_seconds=self.last_recovery_report.planning_seconds,
-                    state_transfer_seconds=self.last_recovery_report.transfer_seconds,
-                    straggler_round_seconds=self.last_recovery_report.straggler_round_seconds,
-                    source_scheduling_error_bytes=(
-                        self.last_recovery_report.source_scheduling_error_bytes
-                    ),
-                )
-            )
-            continue
-        self.recovery_history.append(
-            GenerationTransitionMetrics(
-                target.generation,
-                snapshot_seconds,
-                teardown_seconds,
-                compile_seconds,
-                world_seconds,
-                activation_seconds,
-                recovery_seconds,
-                time.perf_counter() - transition_started,
-                detection_seconds=detection_seconds,
-                configuration_planning_seconds=configuration_planning_seconds,
-                state_planning_seconds=self.last_recovery_report.planning_seconds,
-                state_transfer_seconds=self.last_recovery_report.transfer_seconds,
-                straggler_round_seconds=self.last_recovery_report.straggler_round_seconds,
-                source_scheduling_error_bytes=(
-                    self.last_recovery_report.source_scheduling_error_bytes
-                ),
-            )
+def _activate_prepared_generation(self: OobleckParallelContext) -> bool:
+    """Create WORLD, activate ownership, and recover after rendezvous publication."""
+
+    transition = self._prepared_transition
+    if transition is None:
+        raise RuntimeError("no prepared generation is waiting for rendezvous")
+    target = transition.target
+    world_started = time.perf_counter()
+    if self.owner_plan.world_initializer is not None:
+        self.owner_plan.world_initializer(target)
+    world_seconds = time.perf_counter() - world_started
+    activation_started = time.perf_counter()
+    activated = transition.compiled.activate(self.device, self.dtype)
+    activation_seconds = time.perf_counter() - activation_started
+
+    if self._pending_plan is not None and self._pending_plan.generation > target.generation:
+        activated.close()
+        if _world_initialized():
+            destroy_process_group_universe()
+        _record_superseded(
+            self,
+            transition,
+            world_seconds=world_seconds,
+            activation_seconds=activation_seconds,
         )
-        break
+        self._prepared_transition = transition
+        _prepare_latest_generation(self)
+        return False
+
+    self.compiled = transition.compiled
+    self.partition = activated
+    self.execution_plan = target
+    self.owner_plan.rank = transition.compiled.rank
+    self.owner_plan._last_execution_plan = target
+    for loader in self._loaders:
+        loader.reconfigure(target.instances)
+    recovery_started = time.perf_counter()
+    self.last_recovery_report = restore_context_state(self, transition.snapshot)
+    recovery_seconds = time.perf_counter() - recovery_started
+    self._heterogeneous_gradient_sync = activate_gradient_synchronizer(
+        self.model,
+        self.partition.manifest,
+        self.execution_plan,
+        microbatch_size=self.config.microbatch_size,
+    )
+
+    if self._pending_plan is not None:
+        _record_superseded(
+            self,
+            transition,
+            world_seconds=world_seconds,
+            activation_seconds=activation_seconds,
+            recovery_seconds=recovery_seconds,
+        )
+        _retire_world(self)
+        self._prepared_transition = transition
+        _prepare_latest_generation(self)
+        return False
+
+    self.recovery_history.append(
+        GenerationTransitionMetrics(
+            target.generation,
+            transition.snapshot_seconds,
+            transition.teardown_seconds,
+            transition.compile_seconds,
+            world_seconds,
+            activation_seconds,
+            recovery_seconds,
+            time.perf_counter() - transition.transition_started,
+            detection_seconds=transition.detection_seconds,
+            configuration_planning_seconds=transition.configuration_planning_seconds,
+            state_planning_seconds=self.last_recovery_report.planning_seconds,
+            state_transfer_seconds=self.last_recovery_report.transfer_seconds,
+            straggler_round_seconds=self.last_recovery_report.straggler_round_seconds,
+            source_scheduling_error_bytes=(self.last_recovery_report.source_scheduling_error_bytes),
+        )
+    )
+    self._prepared_transition = None
+    return True
+
+
+def _activate_latest_generation(self: OobleckParallelContext) -> None:
+    """Compatibility path that performs both generation phases synchronously."""
+
+    while self._pending_plan is not None or self._prepared_transition is not None:
+        if self._prepared_transition is None or self._pending_plan is not None:
+            _prepare_latest_generation(self)
+        if self._prepared_transition is not None:
+            _activate_prepared_generation(self)
 
 
 def _apply_membership(self: OobleckParallelContext, snapshot: MembershipSnapshot) -> bool:
@@ -235,6 +303,11 @@ def _apply_membership(self: OobleckParallelContext, snapshot: MembershipSnapshot
     newest_generation = max(
         self.generation,
         self._pending_plan.generation if self._pending_plan is not None else -1,
+        (
+            self._prepared_transition.target.generation
+            if self._prepared_transition is not None
+            else -1
+        ),
     )
     if snapshot.generation <= newest_generation:
         return False
@@ -274,7 +347,20 @@ def _enable_control_plane_barrier(self: OobleckParallelContext) -> None:
 def _prepare_generation(self: OobleckParallelContext) -> None:
     if not self._control_plane_managed:
         raise RuntimeError("enable the control-plane barrier before preparation")
-    _activate_latest_generation(self)
+    if not _prepare_latest_generation(self):
+        raise RuntimeError("no newer generation is available to prepare")
+
+
+def _activate_generation(self: OobleckParallelContext) -> None:
+    if not self._control_plane_managed:
+        raise RuntimeError("enable the control-plane barrier before activation")
+    if not _activate_prepared_generation(self):
+        raise RuntimeError("prepared generation was superseded during activation")
+
+
+def _prepared_execution_plan(self: OobleckParallelContext) -> Any:
+    transition = self._prepared_transition
+    return self.execution_plan if transition is None else transition.target
 
 
 def _mark_generation_active(self: OobleckParallelContext, generation: int) -> None:
@@ -287,7 +373,9 @@ def _mark_generation_active(self: OobleckParallelContext, generation: int) -> No
 
 def _step_with_control_barrier(self: OobleckParallelContext, *args: Any, **kwargs: Any) -> Any:
     if self._control_plane_managed and (
-        self._pending_plan is not None or self._control_active_generation != self.generation
+        self._pending_plan is not None
+        or self._prepared_transition is not None
+        or self._control_active_generation != self.generation
     ):
         raise RuntimeError(
             "generation is prepared but not active through the CPU control-plane barrier"
@@ -325,6 +413,8 @@ OobleckParallelContext._activate_latest_generation = _activate_latest_generation
 OobleckParallelContext.apply_membership = _apply_membership
 OobleckParallelContext.enable_control_plane_barrier = _enable_control_plane_barrier
 OobleckParallelContext.prepare_generation = _prepare_generation
+OobleckParallelContext.activate_generation = _activate_generation
+OobleckParallelContext.prepared_execution_plan = property(_prepared_execution_plan)
 OobleckParallelContext.mark_generation_active = _mark_generation_active
 OobleckParallelContext.step = _step_with_control_barrier
 OobleckParallelContext.recover_from_survivors = _recover_from_survivors

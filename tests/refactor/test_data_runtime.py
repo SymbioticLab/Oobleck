@@ -349,3 +349,45 @@ def test_collator_may_return_an_explicit_microbatch_list():
         [2.0, 3.0],
     ]
     ctx.close()
+
+
+def test_initial_prepare_defers_world_initialization_until_activation():
+    model = torch.nn.Linear(1, 1)
+    initialized = []
+    plan = OobleckParallelizationPlan(
+        OobleckConfig(global_batch_size=4, microbatch_size=2, max_nodes=1),
+        world_initializer=lambda execution_plan: initialized.append(execution_plan.generation),
+    )
+    plan.parallelize(model, ParallelConfig())
+
+    prepared = plan.prepare("cpu")
+    assert initialized == []
+    assert prepared.execution_plan.generation == 0
+
+    ctx = prepared.activate()
+    try:
+        assert initialized == [0]
+        assert ctx.generation == 0
+    finally:
+        ctx.close()
+
+
+def test_managed_replacement_prepares_before_rendezvous_activation():
+    _, ctx = context()
+    initialized = []
+    ctx.owner_plan.world_initializer = lambda plan: initialized.append(plan.generation)
+    newer = replace(ctx.execution_plan, generation=1, previous_generation=0, plan_checksum="")
+    ctx.enable_control_plane_barrier()
+    assert ctx.announce_generation(newer)
+
+    ctx.prepare_generation()
+    assert initialized == []
+    assert ctx.generation == 0
+    assert ctx.prepared_execution_plan.generation == 1
+    assert ctx.partition.closed
+
+    ctx.activate_generation()
+    assert initialized == [1]
+    assert ctx.generation == 1
+    ctx.mark_generation_active(1)
+    ctx.close()
