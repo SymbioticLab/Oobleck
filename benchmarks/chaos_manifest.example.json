@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "master_host": "10.0.0.10",
+  "master_port": 29600,
+  "initial_nodes": ["node-a", "node-b", "node-c", "node-d", "node-e", "node-f"],
+  "events": [
+    {
+      "name": "simultaneous-cross-pipeline-failure",
+      "commands": [
+        ["ssh", "10.0.0.15", "python", "examples/fail_agent.py", "--pid", "PID_E", "--expected-node-id", "node-e", "--confirmation", "FAIL:node-e"],
+        ["ssh", "10.0.0.16", "python", "examples/fail_agent.py", "--pid", "PID_F", "--expected-node-id", "node-f", "--confirmation", "FAIL:node-f"]
+      ],
+      "expected_nodes": ["node-a", "node-b", "node-c", "node-d"],
+      "cascade_commands": [],
+      "cascade_expected_nodes": [],
+      "timeout_s": 120.0
+    },
+    {
+      "name": "failure-during-recovery",
+      "commands": [
+        ["ssh", "10.0.0.14", "python", "examples/fail_agent.py", "--pid", "PID_D", "--expected-node-id", "node-d", "--confirmation", "FAIL:node-d"]
+      ],
+      "expected_nodes": ["node-a", "node-b", "node-c"],
+      "cascade_commands": [
+        ["ssh", "10.0.0.13", "python", "examples/fail_agent.py", "--pid", "PID_C", "--expected-node-id", "node-c", "--confirmation", "FAIL:node-c"]
+      ],
+      "cascade_expected_nodes": ["node-a", "node-b"],
+      "timeout_s": 120.0
+    },
+    {
+      "name": "replacement-and-join",
+      "commands": [
+        ["ssh", "10.0.0.13", "systemd-run", "--user", "--collect", "--unit", "oobleck-node-c", "python", "examples/run_agent.py", "--node-id", "node-c", "--master-host", "10.0.0.10", "--master-port", "29600", "--gpu-ids", "0", "--addresses", "10.0.0.13", "--local-worker-socket", "/tmp/oobleck-node-c.sock", "--worker-script", "examples/pretrain_llm.py", "--worker-args", "--steps", "100000", "--metrics-output", "/shared/oobleck-{worker_id}.jsonl"],
+        ["ssh", "10.0.0.17", "systemd-run", "--user", "--collect", "--unit", "oobleck-node-g", "python", "examples/run_agent.py", "--node-id", "node-g", "--master-host", "10.0.0.10", "--master-port", "29600", "--gpu-ids", "0", "--addresses", "10.0.0.17", "--local-worker-socket", "/tmp/oobleck-node-g.sock", "--worker-script", "examples/pretrain_llm.py", "--worker-args", "--steps", "100000", "--metrics-output", "/shared/oobleck-{worker_id}.jsonl"]
+      ],
+      "expected_nodes": ["node-a", "node-b", "node-c", "node-g"],
+      "cascade_commands": [],
+      "cascade_expected_nodes": [],
+      "timeout_s": 180.0
+    }
+  ],
+  "metric_files": [
+    "/shared/oobleck-node-a-gpu-0.jsonl",
+    "/shared/oobleck-node-b-gpu-0.jsonl",
+    "/shared/oobleck-node-c-gpu-0.jsonl",
+    "/shared/oobleck-node-d-gpu-0.jsonl",
+    "/shared/oobleck-node-e-gpu-0.jsonl",
+    "/shared/oobleck-node-f-gpu-0.jsonl",
+    "/shared/oobleck-node-g-gpu-0.jsonl"
+  ],
+  "required_strategies": ["simple", "borrow", "merge"],
+  "poll_interval_s": 0.01,
+  "max_cuda_reserved_growth_bytes": 268435456,
+  "require_clean_close": false,
+  "max_process_group_growth": 32
+}

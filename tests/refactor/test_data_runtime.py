@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 import pytest
+import threading
 import torch
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 
@@ -390,4 +391,54 @@ def test_managed_replacement_prepares_before_rendezvous_activation():
     assert initialized == [1]
     assert ctx.generation == 1
     ctx.mark_generation_active(1)
+    ctx.close()
+
+
+def test_concurrent_membership_replays_inflight_managed_step_after_active_barrier():
+    model, ctx = context()
+    dataset = Samples()
+    sampler = ctx.create_batch_sampler(dataset, shuffle=False)
+    loader = ctx.prepare_dataloader(DataLoader(dataset, batch_sampler=sampler))
+    ctx.configure_optimization(
+        optimizer_factory=lambda parameters: torch.optim.SGD(parameters, lr=0.01)
+    )
+    ctx.enable_control_plane_barrier()
+    batch = next(iter(loader))
+    newer = replace(ctx.execution_plan, generation=1, previous_generation=0, plan_checksum="")
+    announced = threading.Event()
+    result = []
+    errors = []
+    first_attempt = True
+
+    def criterion(output, microbatch):
+        nonlocal first_attempt
+        if first_attempt:
+            first_attempt = False
+            assert ctx.announce_generation(newer)
+            announced.set()
+        return ((output - microbatch["y"]) ** 2).mean()
+
+    def train():
+        try:
+            result.append(ctx.step(batch, lambda item: model(item["x"]), criterion=criterion))
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=train)
+    worker.start()
+    assert announced.wait(timeout=5)
+    ctx.prepare_generation()
+    assert worker.is_alive()
+    ctx.activate_generation()
+    assert worker.is_alive()
+    ctx.mark_generation_active(1)
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert errors == []
+    assert len(result) == 1
+    assert result[0].attempts == 2
+    assert result[0].committed_step == 1
+    assert result[0].generation == 1
+    assert sampler.committed_cursor == 1
     ctx.close()

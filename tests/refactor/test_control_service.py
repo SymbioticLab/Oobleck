@@ -7,6 +7,7 @@ from oobleck.elastic import (
     MasterControlService,
     NodeAgentClient,
     inspect_membership,
+    inspect_status,
     request_drain,
 )
 
@@ -308,6 +309,31 @@ def test_master_enforces_prepared_rendezvous_ready_active_order():
 
         await first.close()
         await second.close()
+        await service.close()
+
+    asyncio.run(check())
+
+
+def test_status_reports_prepared_ready_and_active_generation():
+    async def check():
+        service = MasterControlService(lease_timeout_s=2, lease_check_interval_s=0.02)
+        server = await service.start("127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        client = NodeAgentClient("node-a", ("0",), heartbeat_interval_s=0.01)
+        await client.connect("127.0.0.1", port)
+        task = asyncio.create_task(client.run())
+        for _ in range(100):
+            status = await inspect_status("127.0.0.1", port)
+            if status.active:
+                break
+            await asyncio.sleep(0.01)
+        assert status.generation == 1
+        assert status.active_generation == 1
+        assert status.prepared_agents == ("node-a",)
+        assert status.ready_agents == ("node-a",)
+        await client.close()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
         await service.close()
 
     asyncio.run(check())

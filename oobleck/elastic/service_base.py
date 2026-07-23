@@ -97,10 +97,16 @@ class MasterControlService:
         identity: NodeIdentity | None = None
         try:
             first = await connection.receive()
-            if first.message_type == "inspect":
+            if first.message_type in {"inspect", "inspect_status"}:
                 if first.payload:
-                    raise ProtocolError("inspect payload must be empty")
-                await connection.send(self._membership_message(self.membership.snapshot()))
+                    raise ProtocolError(f"{first.message_type} payload must be empty")
+                snapshot = self.membership.snapshot()
+                reply = (
+                    self._membership_message(snapshot)
+                    if first.message_type == "inspect"
+                    else self._status_message(snapshot)
+                )
+                await connection.send(reply)
                 return
             if first.message_type == "request_drain":
                 if set(first.payload) != {"node_id"}:
@@ -300,6 +306,25 @@ class MasterControlService:
                 "nodes": [asdict(node) for node in snapshot.nodes],
                 "reasons": list(snapshot.reasons),
                 "snapshot_hash": snapshot.snapshot_hash,
+            },
+        )
+
+    def _status_message(self, snapshot: MembershipSnapshot) -> MessageEnvelope:
+        self._master_sequence += 1
+        return MessageEnvelope(
+            1,
+            "status",
+            "master",
+            "master",
+            self._master_sequence,
+            snapshot.generation,
+            {
+                "nodes": [asdict(node) for node in snapshot.nodes],
+                "reasons": list(snapshot.reasons),
+                "snapshot_hash": snapshot.snapshot_hash,
+                "active_generation": self.active_generation,
+                "prepared_agents": sorted(self._prepared_agents),
+                "ready_agents": sorted(self._ready_agents),
             },
         )
 

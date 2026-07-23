@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
@@ -68,6 +69,7 @@ def _init_with_recovery(self: OobleckParallelContext, *args: Any, **kwargs: Any)
     self.recovery_history: list[GenerationTransitionMetrics] = []
     self._generation_control_metrics: dict[int, tuple[float, float]] = {}
     self._prepared_transition: _PreparedGenerationTransition | None = None
+    self._generation_condition = threading.Condition()
     self._heterogeneous_gradient_sync = (
         None
         if self._needs_survivor_recovery
@@ -363,23 +365,37 @@ def _prepared_execution_plan(self: OobleckParallelContext) -> Any:
     return self.execution_plan if transition is None else transition.target
 
 
+def _generation_transition_pending(self: OobleckParallelContext) -> bool:
+    return self._control_plane_managed and (
+        self._pending_plan is not None
+        or self._prepared_transition is not None
+        or self._control_active_generation != self.generation
+    )
+
+
+def _wait_for_generation_barrier(self: OobleckParallelContext) -> None:
+    deadline = time.monotonic() + self.config.rendezvous_timeout_s
+    with self._generation_condition:
+        while _generation_transition_pending(self):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timed out waiting for generation_active")
+            self._generation_condition.wait(timeout=remaining)
+
+
 def _mark_generation_active(self: OobleckParallelContext, generation: int) -> None:
     if generation != self.generation:
         raise RuntimeError(
             f"cannot activate generation {generation}; prepared generation is {self.generation}"
         )
     self._control_active_generation = generation
+    with self._generation_condition:
+        self._generation_condition.notify_all()
 
 
 def _step_with_control_barrier(self: OobleckParallelContext, *args: Any, **kwargs: Any) -> Any:
-    if self._control_plane_managed and (
-        self._pending_plan is not None
-        or self._prepared_transition is not None
-        or self._control_active_generation != self.generation
-    ):
-        raise RuntimeError(
-            "generation is prepared but not active through the CPU control-plane barrier"
-        )
+    if _generation_transition_pending(self):
+        _wait_for_generation_barrier(self)
     return _base_step(self, *args, **kwargs)
 
 
@@ -415,6 +431,8 @@ OobleckParallelContext.enable_control_plane_barrier = _enable_control_plane_barr
 OobleckParallelContext.prepare_generation = _prepare_generation
 OobleckParallelContext.activate_generation = _activate_generation
 OobleckParallelContext.prepared_execution_plan = property(_prepared_execution_plan)
+OobleckParallelContext._generation_transition_pending = _generation_transition_pending
+OobleckParallelContext._wait_for_generation_barrier = _wait_for_generation_barrier
 OobleckParallelContext.mark_generation_active = _mark_generation_active
 OobleckParallelContext.step = _step_with_control_barrier
 OobleckParallelContext.recover_from_survivors = _recover_from_survivors

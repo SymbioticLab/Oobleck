@@ -125,9 +125,11 @@ python -m oobleck.cli inspect-membership-config \
   --master-host MASTER --master-port 29600
 ```
 
-Multi-node NCCL churn requires dedicated machines and remains a manual or
-dedicated-runner validation; the regular suite exercises multi-rank model and
-optimizer recovery on the single CUDA GPU over Gloo.
+Multi-node NCCL churn requires dedicated machines. Follow
+`docs/chaos_acceptance.md` for the opt-in manifest runner, simultaneous and
+cascading failure scenarios, long-running leak bounds, and machine-readable
+results. The regular suite exercises multi-rank model and optimizer recovery on
+the single CUDA GPU over Gloo.
 
 ## Drain, failure, replacement, and replay
 

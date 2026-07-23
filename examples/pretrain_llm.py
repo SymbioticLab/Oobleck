@@ -7,6 +7,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 import sys
+import time
 
 import torch
 
@@ -21,6 +22,7 @@ from examples.pretrain_llm_base import (
     configure_training,
     prepare_training,
 )
+from oobleck.acceptance import append_metric, resolve_metrics_path, runtime_metric
 from oobleck.elastic import LocalWorkerClient
 
 
@@ -34,6 +36,13 @@ class ExampleTrainingConfig:
     max_nodes: int = 16
     rendezvous_port: int = 29500
     distributed_backend: str = "auto"
+    steps: int = 1
+    step_delay_s: float = 0.0
+    metrics_output: Path | None = None
+
+    def __post_init__(self) -> None:
+        if self.steps < 1 or self.step_delay_s < 0:
+            raise ValueError("steps must be positive and step_delay_s must be non-negative")
 
 
 def _one_step(model, context, loader, selected: str, model_backend: str):
@@ -126,17 +135,53 @@ async def train_managed(config: ExampleTrainingConfig):
     context = await worker.activate_prepared(prepared, snapshot)
     model, context, loader = configure_training(model, context, dataset, device=selected)
 
+    metrics_path = (
+        None
+        if config.metrics_output is None
+        else resolve_metrics_path(config.metrics_output, node_id=node_id, worker_id=worker_id)
+    )
+
+    def record(event: str, result=None, *, step_seconds: float = 0.0) -> None:
+        if metrics_path is not None:
+            append_metric(
+                metrics_path,
+                runtime_metric(
+                    context,
+                    event=event,
+                    node_id=node_id,
+                    worker_id=worker_id,
+                    result=result,
+                    step_seconds=step_seconds,
+                ),
+            )
+
     async def prepare(snapshot) -> None:
         context.prepare_generation()
 
-    relay_task = asyncio.create_task(worker.run_context(context, on_snapshot=prepare))
+    async def activated(generation: int) -> None:
+        record("generation_active")
+
+    record("generation_active")
+    relay_task = asyncio.create_task(
+        worker.run_context(context, on_snapshot=prepare, on_active=activated)
+    )
     try:
-        return _one_step(model, context, loader, selected, config.model_backend)
+        result = None
+        for _ in range(config.steps):
+            started = time.perf_counter()
+            result = await asyncio.to_thread(
+                _one_step, model, context, loader, selected, config.model_backend
+            )
+            record("step", result, step_seconds=time.perf_counter() - started)
+            await asyncio.sleep(config.step_delay_s)
+        assert result is not None
+        return result
     finally:
         relay_task.cancel()
         await asyncio.gather(relay_task, return_exceptions=True)
         await worker.close()
         context.close()
+        record("closed")
 
 
 def main() -> None:
