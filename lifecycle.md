@@ -334,6 +334,86 @@ rank-local patches. If another event arrives while a generation is preparing or
 recovering, the newer complete snapshot supersedes the stale generation; that
 generation is torn down and never becomes active.
 
+#### 5-1. Add nodes and scale out
+
+A new node starts one CPU agent and its configured GPU workers. The agent
+registers a new stable node ID, incarnation, addresses, and GPU inventory with
+the master. Registration proposes a complete membership generation containing
+both the incumbent and joining nodes; it does not add ranks to the active WORLD
+in place.
+
+```mermaid
+sequenceDiagram
+    participant JA as Joining node CPU agent
+    participant JW as Joining node GPU workers
+    participant M as CPU master process
+    participant SA as Incumbent node agents
+    participant SW as Incumbent GPU workers
+
+    JA->>M: register(new stable ID, incarnation, addresses, GPU IDs)
+    M->>M: publish complete membership generation N+1
+    M-->>JA: snapshot N+1
+    M-->>SA: snapshot N+1
+    JA-->>JW: membership over local IPC
+    SA-->>SW: membership over local IPC
+    par Prepare without WORLD
+        SW->>SW: snapshot committed state, retire WORLD,<br/>compose join plan, compile ownership
+        JW->>JW: compose the same plan and compile ownership<br/>with no pre-generation state
+    end
+    JW-->>JA: worker_ack(prepared)
+    SW-->>SA: worker_ack(prepared)
+    JA-->>M: generation_prepared
+    SA-->>M: generation_prepared
+    M-->>JA: generation_rendezvous
+    M-->>SA: generation_rendezvous
+    par Replacement WORLD creation
+        JW->>SW: join torch.distributed rendezvous
+        SW->>JW: symmetric WORLD and mesh participation
+    end
+    SW-->>JW: transfer required committed state
+    Note over SW,JW: Missing parameter, buffer, optimizer, and training metadata<br/>move through the deterministic all-to-all schedule
+    JW-->>JA: worker_ack(ready)
+    SW-->>SA: worker_ack(ready)
+    JA-->>M: generation_ready
+    SA-->>M: generation_ready
+    M-->>JA: generation_active
+    M-->>SA: generation_active
+```
+
+When [`planning/reconfiguration.py`](oobleck/planning/reconfiguration.py) sees
+a node identity that was not in the previous execution plan, it calls the
+heterogeneous composer over the entire expanded membership, up to
+`max_nodes`, and records the strategy as `join`. The objective is still
+throughput first. If candidates have equal predicted iteration time, it
+maximizes retained state bytes, minimizes moved incumbent nodes, and finally
+uses stable identities as deterministic tie-breakers. Consequently, a join may
+create another pipeline replica, enlarge existing pipelines, or choose a
+different heterogeneous combination; it is not necessarily an append-only
+layout change.
+
+All workers derive a new stable rank map, so an incumbent numeric global rank
+may change when a lexicographically earlier node ID joins even though its stable
+node and pipeline identities remain retained. Each worker validates the fixed
+per-node TP width, compatibility digest, snapshot hash, and plan checksum before
+the master publishes rendezvous data.
+
+Incumbent workers capture the last committed state before destroying the old
+WORLD. For this bootstrap, joining workers must prepare with
+`recover_from_survivors=True`; after activation, `recover_from_survivors()` enters
+recovery without a local snapshot. They receive their assigned parameters,
+persistent buffers, optimizer slots, and committed training metadata from
+surviving sources in the replacement WORLD. State already owned by an
+incumbent may remain local; every missing logical bundle uses the same
+deterministic all-to-all transfer described in Section 6.
+Training resumes only after all incumbent and joining agents pass the ready
+barrier and the master broadcasts `generation_active`.
+
+If the expanded membership cannot form a supported template composition, exceeds
+`max_nodes`, has the wrong TP width, or disagrees on compatibility or plan
+checksums, the proposed generation cannot become active. A still newer join,
+failure, drain, or replacement snapshot supersedes this preparation in the same
+way as any other membership event.
+
 ### 6. Reconfigure workers and copy committed state
 
 The recovery methods layered onto `OobleckParallelContext` in
