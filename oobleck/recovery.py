@@ -39,6 +39,14 @@ def _gather_new_manifests(
     return tuple(item for item in gathered if item is not None)
 
 
+def _rank_to_node(context: Any) -> dict[int, str] | None:
+    execution_plan = getattr(context, "execution_plan", None)
+    rank_map = getattr(execution_plan, "rank_map", None)
+    if rank_map is None:
+        return None
+    return {rank: node_id for node_id, ranks in rank_map for rank in ranks}
+
+
 def restore_context_state(context: Any, snapshot: RecoverySnapshot | None) -> RecoveryReport:
     """Redistribute a committed snapshot into every rank of the active generation."""
 
@@ -97,6 +105,7 @@ def restore_context_state(context: Any, snapshot: RecoverySnapshot | None) -> Re
             context.config.state_transfer_chunk_bytes * world_size,
         ),
         alignment=context.config.transfer_alignment_bytes,
+        rank_to_node=_rank_to_node(context),
     )
     if dist is not None:
         hashes: list[str | None] = [None] * world_size

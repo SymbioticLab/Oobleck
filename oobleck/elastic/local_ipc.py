@@ -20,7 +20,7 @@ from oobleck.elastic.transport import (
     ProtocolError,
 )
 
-WorkerReadyCallback = Callable[[int, str], Awaitable[None]]
+WorkerReadyCallback = Callable[[int, str, str, str], Awaitable[None]]
 
 
 class LocalWorkerRelay:
@@ -46,7 +46,7 @@ class LocalWorkerRelay:
         self._workers: dict[str, ControlConnection] = {}
         self._latest_membership: MessageEnvelope | None = None
         self._latest_active: MessageEnvelope | None = None
-        self._acknowledged: set[str] = set()
+        self._acknowledged: dict[str, tuple[str, str, str]] = {}
         self._ready_notified_generation = -1
         self._lock = asyncio.Lock()
 
@@ -62,6 +62,14 @@ class LocalWorkerRelay:
             and len(self._workers) == self.expected_workers
             and len(self._acknowledged) == self.expected_workers
         )
+
+    def readiness_metadata(self, generation: int) -> tuple[str, str, str]:
+        if not self.generation_ready(generation):
+            raise RuntimeError("local generation is not ready")
+        values = set(self._acknowledged.values())
+        if len(values) != 1:
+            raise ProtocolError("local workers disagree on generation plan compatibility")
+        return next(iter(values))
 
     async def start(self) -> None:
         if self._server is not None:
@@ -112,33 +120,43 @@ class LocalWorkerRelay:
                 if (
                     message.agent_id != worker_id
                     or message.incarnation_id != registration.incarnation_id
-                    or message.payload != {"phase": "ready"}
                 ):
                     raise ProtocolError("invalid local worker readiness acknowledgement")
+                metadata = (
+                    str(message.payload["snapshot_hash"]),
+                    str(message.payload["plan_checksum"]),
+                    str(message.payload["compatibility_digest"]),
+                )
                 callback: WorkerReadyCallback | None = None
-                snapshot_hash = ""
                 async with self._lock:
                     latest = self._latest_membership
                     if latest is None or message.generation != latest.generation:
                         continue
-                    self._acknowledged.add(worker_id)
+                    if metadata[0] != latest.payload["snapshot_hash"]:
+                        raise ProtocolError("worker acknowledged a different membership snapshot")
+                    self._acknowledged[worker_id] = metadata
                     if (
                         self.generation_ready(message.generation)
                         and self._ready_notified_generation != message.generation
                     ):
+                        agreed = self.readiness_metadata(message.generation)
                         self._ready_notified_generation = message.generation
                         callback = self.on_generation_ready
-                        snapshot_hash = str(latest.payload["snapshot_hash"])
                 if callback is not None:
-                    await callback(message.generation, snapshot_hash)
-        except (asyncio.IncompleteReadError, ConnectionError, BrokenPipeError):
+                    await callback(message.generation, *agreed)
+        except (
+            asyncio.IncompleteReadError,
+            ConnectionError,
+            BrokenPipeError,
+            ProtocolError,
+        ):
             pass
         finally:
             if worker_id is not None:
                 async with self._lock:
                     if self._workers.get(worker_id) is connection:
                         self._workers.pop(worker_id, None)
-                        self._acknowledged.discard(worker_id)
+                        self._acknowledged.pop(worker_id, None)
             with contextlib.suppress(Exception):
                 await connection.close()
 
@@ -153,12 +171,17 @@ class LocalWorkerRelay:
                 self._ready_notified_generation = -1
             else:
                 latest = self._latest_membership
-                if (
-                    latest is None
-                    or message.generation != latest.generation
-                    or message.payload != {"snapshot_hash": latest.payload["snapshot_hash"]}
-                ):
+                if latest is None or message.generation != latest.generation:
                     raise ProtocolError("active generation does not match local membership")
+                snapshot_hash, plan_checksum, compatibility_digest = self.readiness_metadata(
+                    message.generation
+                )
+                if message.payload != {
+                    "snapshot_hash": snapshot_hash,
+                    "plan_checksum": plan_checksum,
+                    "compatibility_digest": compatibility_digest,
+                }:
+                    raise ProtocolError("active generation does not match local readiness")
                 self._latest_active = message
             workers = tuple(self._workers.items())
         results = await asyncio.gather(
@@ -174,7 +197,7 @@ class LocalWorkerRelay:
             async with self._lock:
                 for worker_id in failed:
                     self._workers.pop(worker_id, None)
-                    self._acknowledged.discard(worker_id)
+                    self._acknowledged.pop(worker_id, None)
 
     async def close(self) -> None:
         if self._server is not None:
@@ -263,6 +286,9 @@ class LocalWorkerClient:
             context.apply_membership(snapshot)
             if on_snapshot is not None:
                 await on_snapshot(snapshot)
+            execution_plan = getattr(context, "execution_plan", None)
+            plan_checksum = getattr(execution_plan, "plan_checksum", snapshot.snapshot_hash)
+            compatibility_digest = getattr(execution_plan, "compatibility_digest", None) or ""
             self.sequence += 1
             await self.connection.send(
                 MessageEnvelope(
@@ -272,7 +298,12 @@ class LocalWorkerClient:
                     self.incarnation_id,
                     self.sequence,
                     snapshot.generation,
-                    {"phase": "ready"},
+                    {
+                        "phase": "ready",
+                        "snapshot_hash": snapshot.snapshot_hash,
+                        "plan_checksum": plan_checksum,
+                        "compatibility_digest": compatibility_digest,
+                    },
                 )
             )
             while True:
@@ -285,7 +316,9 @@ class LocalWorkerClient:
                 if message.generation < snapshot.generation:
                     continue
                 if message.generation != snapshot.generation or message.payload != {
-                    "snapshot_hash": snapshot.snapshot_hash
+                    "snapshot_hash": snapshot.snapshot_hash,
+                    "plan_checksum": plan_checksum,
+                    "compatibility_digest": compatibility_digest,
                 }:
                     raise ProtocolError("active generation does not match prepared membership")
                 self.active_generation = message.generation

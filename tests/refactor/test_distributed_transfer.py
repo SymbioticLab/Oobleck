@@ -113,6 +113,7 @@ class TestDistributedStateTransfer(GlooDistributedTestBase):
             device=device,
             _optimizer_factory=optimizer_factory,
             _scheduler_factory=None,
+            execution_plan=SimpleNamespace(rank_map=(("one-node", (0, 1)),)),
         )
         snapshot = capture_context_state(context)
         source_weight = model.weight.detach().cpu().clone()
@@ -131,6 +132,8 @@ class TestDistributedStateTransfer(GlooDistributedTestBase):
         assert report.actual_source_bytes == report.source_bytes
         assert report.actual_destination_bytes == report.destination_bytes
         assert report.round_durations
+        assert report.link_class_bytes
+        assert {link for link, _ in report.link_class_bytes} == {"same-node"}
         torch.testing.assert_close(model.weight.cpu(), gathered_weights[1 - self.rank])
         torch.testing.assert_close(
             context.optimizer.state[model.weight]["exp_avg"].cpu(),

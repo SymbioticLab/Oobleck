@@ -99,6 +99,7 @@ async def run_agent_service(
         config.node_id,
         config.gpu_ids,
         heartbeat_interval_s=config.heartbeat_interval_s,
+        addresses=config.addresses,
         on_membership=on_membership,
         on_generation_active=on_generation_active,
         local_worker_socket=config.local_worker_socket,

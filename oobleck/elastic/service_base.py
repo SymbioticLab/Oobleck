@@ -42,7 +42,7 @@ class MasterControlService:
         self._lease_task: asyncio.Task[None] | None = None
         self._master_sequence = 0
         self._proposed_snapshot: MembershipSnapshot | None = None
-        self._ready_agents: set[str] = set()
+        self._ready_agents: dict[str, tuple[str, str]] = {}
         self.active_generation = 0
 
     async def start(self, host: str, port: int) -> asyncio.AbstractServer:
@@ -169,19 +169,27 @@ class MasterControlService:
                         if (
                             proposed is None
                             or message.generation != proposed.generation
-                            or message.payload != {"snapshot_hash": proposed.snapshot_hash}
+                            or message.payload["snapshot_hash"] != proposed.snapshot_hash
                         ):
                             continue
+                        metadata = (
+                            str(message.payload["plan_checksum"]),
+                            str(message.payload["compatibility_digest"]),
+                        )
+                        if self._ready_agents and metadata not in set(self._ready_agents.values()):
+                            raise ProtocolError(
+                                "agents disagree on execution plan or runtime compatibility"
+                            )
                         self.membership.acknowledge(
                             message.agent_id,
                             message.incarnation_id,
                             message.sequence_number,
                             message.generation,
                         )
-                        self._ready_agents.add(message.agent_id)
-                        if self._ready_agents == set(self.membership.agent_ids):
+                        self._ready_agents[message.agent_id] = metadata
+                        if set(self._ready_agents) == set(self.membership.agent_ids):
                             self.active_generation = proposed.generation
-                            active_message = self._generation_active_message(proposed)
+                            active_message = self._generation_active_message(proposed, *metadata)
                     elif message.message_type == "drain":
                         self.membership.drain(
                             message.agent_id,
@@ -200,7 +208,12 @@ class MasterControlService:
                     if snapshot is not None:
                         await self._broadcast(snapshot)
                     return
-        except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
+        except (
+            asyncio.IncompleteReadError,
+            ConnectionResetError,
+            BrokenPipeError,
+            ProtocolError,
+        ):
             pass
         finally:
             if identity is not None:
@@ -247,7 +260,12 @@ class MasterControlService:
             },
         )
 
-    def _generation_active_message(self, snapshot: MembershipSnapshot) -> MessageEnvelope:
+    def _generation_active_message(
+        self,
+        snapshot: MembershipSnapshot,
+        plan_checksum: str,
+        compatibility_digest: str,
+    ) -> MessageEnvelope:
         self._master_sequence += 1
         return MessageEnvelope(
             1,
@@ -256,7 +274,11 @@ class MasterControlService:
             "master",
             self._master_sequence,
             snapshot.generation,
-            {"snapshot_hash": snapshot.snapshot_hash},
+            {
+                "snapshot_hash": snapshot.snapshot_hash,
+                "plan_checksum": plan_checksum,
+                "compatibility_digest": compatibility_digest,
+            },
         )
 
 
