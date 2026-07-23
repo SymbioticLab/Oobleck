@@ -450,7 +450,7 @@ Add `examples/README.md` with:
 - expected logs for generation changes, WORLD teardown, state transfer, replay, and resume;
 - cleanup instructions, troubleshooting, and a warning that the failure helper is for disposable example jobs.
 
-Exercise the examples in CI at import/configuration level and add a subprocess smoke test for the one-node flow. Multi-node/NCCL execution remains an explicitly documented manual or dedicated-runner test.
+Exercise the examples through local import/configuration tests and add a subprocess smoke test for the one-node flow. Multi-node/NCCL execution remains an explicitly documented manual or dedicated-runner test.
 
 ## 17. Pull-request sequence
 
@@ -460,7 +460,7 @@ Exercise the examples in CI at import/configuration level and add a subprocess s
 - Add architecture decision records for scope, lifecycle, state identity, and replay semantics.
 - Remove or quarantine obsolete ColossalAI integration from the new package path.
 - Define dependency pinning to the Cornstarch PR head.
-- Establish formatting, type checking, and unit-test CI for the refactor path.
+- Establish documented local formatting, type-checking, and unit-test commands for the refactor path; keep validation developer-run and repository-local.
 - Copy Cornstarch's `tests/distributed/distributed_base.py:GlooDistributedTestBase` and `tests/distributed/gloo_utils.py` into the same paths in Oobleck, retaining source/license attribution and changing only package-local imports or necessary compatibility code.
 - Add a multi-rank smoke test proving that model execution is on CUDA while distributed communication uses Gloo.
 
