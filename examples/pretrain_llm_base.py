@@ -8,7 +8,11 @@ from typing import TYPE_CHECKING
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from oobleck import OobleckConfig, OobleckParallelizationPlan
+from oobleck import (
+    OobleckConfig,
+    OobleckParallelizationPlan,
+    build_runtime_compatibility,
+)
 from oobleck.types import stable_rank_map
 
 if TYPE_CHECKING:
@@ -21,6 +25,9 @@ class FakeTextDataset(Dataset):
     ) -> None:
         generator = torch.Generator().manual_seed(7)
         self.tokens = torch.randint(vocab_size, (samples, sequence_length), generator=generator)
+        self.oobleck_fingerprint = (
+            f"fake-text:v1:samples={samples}:sequence={sequence_length}:vocab={vocab_size}:seed=7"
+        )
 
     def __len__(self) -> int:
         return len(self.tokens)
@@ -139,24 +146,41 @@ def build_training(
             raise ValueError("local_tp_lane is outside the fixed TP width")
         if len(nodes) > max_nodes:
             raise ValueError("membership exceeds configured max_nodes")
+    seed = 42
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     rank_map = dict(stable_rank_map(nodes, tensor_parallel_size)) if nodes else {}
     rank = rank_map[local_node_id][local_tp_lane] if local_node_id is not None else 0
     world_size = max(1, len(nodes) * tensor_parallel_size)
     model, parallel_config, cornstarch_plan, vocab_size = _build_model(
         model_backend, tensor_parallel_size, world_size
     )
+    dataset = build_dataset(
+        dataset_name,
+        dataset_config,
+        split,
+        vocab_size=vocab_size,
+    )
+    compatibility = build_runtime_compatibility(
+        model,
+        dataset,
+        model_identity=f"{model_backend}:synthetic-v1:seed={seed}",
+        preprocessing_fingerprint="token-shift-v1",
+    )
     plan = OobleckParallelizationPlan(
         OobleckConfig(
             global_batch_size=8,
             microbatch_size=2,
             max_nodes=max_nodes,
-            seed=42,
+            seed=seed,
             rendezvous_port=rendezvous_port,
             distributed_backend=distributed_backend,
         ),
         node_ids=nodes,
         rank=rank,
         cornstarch_plan=cornstarch_plan,
+        compatibility=compatibility,
     )
     if membership_snapshot is not None:
         plan.set_membership(nodes, membership_snapshot.generation)
@@ -164,12 +188,6 @@ def build_training(
         plan.set_rendezvous_address(coordinator.addresses[0])
     plan.parallelize(model, parallel_config)
     context = plan.materialize(device, dtype=torch.float32)
-    dataset = build_dataset(
-        dataset_name,
-        dataset_config,
-        split,
-        vocab_size=vocab_size,
-    )
     sampler = context.create_batch_sampler(dataset, shuffle=True)
     dataloader = DataLoader(
         dataset,

@@ -30,6 +30,7 @@ class AgentConfig:
     master_host: str = "127.0.0.1"
     master_port: int = 0
     gpu_ids: tuple[str, ...] = ("0",)
+    addresses: tuple[str, ...] = ()
     local_worker_socket: Path | None = None
     worker_script: Path | None = None
     worker_args: tuple[str, ...] = ()
@@ -40,6 +41,10 @@ class AgentConfig:
             raise ValueError("agent identity and master address are required")
         if not self.gpu_ids or len(set(self.gpu_ids)) != len(self.gpu_ids):
             raise ValueError("gpu_ids must be non-empty and unique")
+        if len(set(self.addresses)) != len(self.addresses) or any(
+            not address for address in self.addresses
+        ):
+            raise ValueError("addresses must be unique non-empty strings")
         if self.heartbeat_interval_s <= 0:
             raise ValueError("heartbeat_interval_s must be positive")
         if self.worker_script is not None and self.local_worker_socket is None:

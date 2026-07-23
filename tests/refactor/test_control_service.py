@@ -134,3 +134,107 @@ def test_agent_relays_latest_membership_to_local_gpu_workers(tmp_path):
         assert not socket_path.exists()
 
     asyncio.run(check())
+
+
+def test_local_workers_must_agree_on_plan_and_compatibility(tmp_path):
+    import pytest
+
+    from oobleck.elastic import LocalWorkerRelay, MessageEnvelope, ProtocolError
+
+    relay = LocalWorkerRelay(tmp_path / "relay.sock", "node-a", expected_workers=2)
+    relay._latest_membership = MessageEnvelope(
+        1,
+        "membership",
+        "master",
+        "master",
+        1,
+        7,
+        {"nodes": [], "reasons": [], "snapshot_hash": "membership"},
+    )
+    relay._workers = {"gpu-0": object(), "gpu-1": object()}
+    relay._acknowledged = {
+        "gpu-0": ("membership", "plan-a", "compat"),
+        "gpu-1": ("membership", "plan-b", "compat"),
+    }
+    assert relay.generation_ready(7)
+    with pytest.raises(ProtocolError, match="disagree"):
+        relay.readiness_metadata(7)
+
+
+def test_master_rejects_cross_agent_plan_disagreement():
+    async def check():
+        from oobleck.elastic import AsyncioTcpControlTransport, MessageEnvelope
+
+        service = MasterControlService(lease_timeout_s=2, lease_check_interval_s=0.05)
+        server = await service.start("127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        transport = AsyncioTcpControlTransport()
+        first = await transport.connect("127.0.0.1", port)
+        second = await transport.connect("127.0.0.1", port)
+        await first.send(
+            MessageEnvelope(
+                1,
+                "register",
+                "node-a",
+                "a1",
+                0,
+                0,
+                {"addresses": ["127.0.0.1"], "gpu_ids": ["0"]},
+            )
+        )
+        assert (await first.receive()).generation == 1
+        await second.send(
+            MessageEnvelope(
+                1,
+                "register",
+                "node-b",
+                "b1",
+                0,
+                0,
+                {"addresses": ["127.0.0.1"], "gpu_ids": ["0"]},
+            )
+        )
+        first_proposal = await first.receive()
+        second_proposal = await second.receive()
+        assert first_proposal.generation == second_proposal.generation == 2
+        snapshot_hash = first_proposal.payload["snapshot_hash"]
+        await first.send(
+            MessageEnvelope(
+                1,
+                "generation_ready",
+                "node-a",
+                "a1",
+                1,
+                2,
+                {
+                    "snapshot_hash": snapshot_hash,
+                    "plan_checksum": "plan-a",
+                    "compatibility_digest": "compat",
+                },
+            )
+        )
+        await second.send(
+            MessageEnvelope(
+                1,
+                "generation_ready",
+                "node-b",
+                "b1",
+                1,
+                2,
+                {
+                    "snapshot_hash": snapshot_hash,
+                    "plan_checksum": "plan-b",
+                    "compatibility_digest": "compat",
+                },
+            )
+        )
+        replacement = await asyncio.wait_for(first.receive(), timeout=2)
+        assert replacement.message_type == "membership"
+        assert replacement.generation == 3
+        assert replacement.payload["reasons"] == ["disconnect:node-b"]
+        assert service.active_generation != 2
+        await first.close()
+        await second.close()
+        await service.close()
+
+    asyncio.run(check())

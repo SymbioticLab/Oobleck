@@ -28,8 +28,10 @@ def test_agent_worker_configuration_requires_local_ipc(tmp_path):
         master_port=29600,
         local_worker_socket=tmp_path / "agent.sock",
         worker_script=script,
+        addresses=("127.0.0.1",),
     )
     assert config.worker_script == script
+    assert config.addresses == ("127.0.0.1",)
 
 
 def test_one_node_master_agent_worker_subprocess_smoke():

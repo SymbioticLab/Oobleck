@@ -23,16 +23,16 @@ _FIELDS = {
 _PAYLOAD_FIELDS = {
     "register": {"addresses", "gpu_ids"},
     "heartbeat": set(),
-    "generation_ready": {"snapshot_hash"},
+    "generation_ready": {"snapshot_hash", "plan_checksum", "compatibility_digest"},
     "drain": set(),
     "membership": {"nodes", "reasons", "snapshot_hash"},
-    "generation_active": {"snapshot_hash"},
+    "generation_active": {"snapshot_hash", "plan_checksum", "compatibility_digest"},
     "inspect": set(),
     "request_drain": {"node_id"},
     "drain_command": {"node_id"},
     "drain_accepted": {"node_id"},
     "worker_register": {"node_id"},
-    "worker_ack": {"phase"},
+    "worker_ack": {"phase", "snapshot_hash", "plan_checksum", "compatibility_digest"},
 }
 
 
@@ -65,8 +65,11 @@ def _validate_payload(message_type: str, payload: Mapping[str, object]) -> None:
         if type(payload["snapshot_hash"]) is not str:
             raise ProtocolError("membership snapshot_hash must be a string")
     elif message_type in {"generation_ready", "generation_active"}:
-        if type(payload["snapshot_hash"]) is not str or not payload["snapshot_hash"]:
-            raise ProtocolError(f"{message_type} snapshot_hash must be a non-empty string")
+        for field in ("snapshot_hash", "plan_checksum"):
+            if type(payload[field]) is not str or not payload[field]:
+                raise ProtocolError(f"{message_type} {field} must be a non-empty string")
+        if type(payload["compatibility_digest"]) is not str:
+            raise ProtocolError(f"{message_type} compatibility_digest must be a string")
     elif message_type in {
         "request_drain",
         "drain_command",
@@ -75,8 +78,14 @@ def _validate_payload(message_type: str, payload: Mapping[str, object]) -> None:
     }:
         if type(payload["node_id"]) is not str or not payload["node_id"]:
             raise ProtocolError(f"{message_type} node_id must be a non-empty string")
-    elif message_type == "worker_ack" and payload["phase"] != "ready":
-        raise ProtocolError("worker_ack phase must be 'ready'")
+    elif message_type == "worker_ack":
+        if payload["phase"] != "ready":
+            raise ProtocolError("worker_ack phase must be 'ready'")
+        for field in ("snapshot_hash", "plan_checksum"):
+            if type(payload[field]) is not str or not payload[field]:
+                raise ProtocolError(f"worker_ack {field} must be a non-empty string")
+        if type(payload["compatibility_digest"]) is not str:
+            raise ProtocolError("worker_ack compatibility_digest must be a string")
 
 
 @dataclass(frozen=True, slots=True)

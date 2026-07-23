@@ -1,5 +1,10 @@
 """Oobleck heterogeneous elastic training API."""
 
+from oobleck.compatibility import (
+    build_runtime_compatibility,
+    dataset_fingerprint,
+    model_fingerprint,
+)
 from oobleck.data import OobleckBatch, OobleckBatchSampler
 from oobleck.runtime import (
     GenerationTransitionMetrics,
@@ -28,6 +33,9 @@ from oobleck.types import (
 
 __all__ = [
     "CompatibilityFingerprint",
+    "build_runtime_compatibility",
+    "dataset_fingerprint",
+    "model_fingerprint",
     "GenerationTransitionMetrics",
     "LogicalStateEntry",
     "OobleckBatch",

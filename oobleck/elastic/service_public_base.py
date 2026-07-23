@@ -32,6 +32,7 @@ class NodeAgentClient:
         *,
         transport: ControlTransport | None = None,
         heartbeat_interval_s: float = 1.0,
+        addresses: Sequence[str] = (),
         on_membership: Callable[[MessageEnvelope], Awaitable[None]] | None = None,
         on_generation_active: Callable[[MessageEnvelope], Awaitable[None]] | None = None,
         local_worker_socket: str | Path | None = None,
@@ -40,6 +41,15 @@ class NodeAgentClient:
             raise ValueError("node_id, gpu_ids, and a positive heartbeat interval are required")
         self.node_id = node_id
         self.gpu_ids = tuple(gpu_ids)
+        discovered = tuple(addresses) or tuple(
+            sorted(set(socket.gethostbyname_ex(socket.gethostname())[2]))
+        )
+        self.addresses = discovered or (socket.gethostbyname(socket.gethostname()),)
+        for address in self.addresses:
+            try:
+                socket.getaddrinfo(address, None)
+            except socket.gaierror as exc:
+                raise ValueError(f"agent address {address!r} is not resolvable") from exc
         self.transport = transport or AsyncioTcpControlTransport()
         self.heartbeat_interval_s = heartbeat_interval_s
         self.on_membership = on_membership
@@ -55,6 +65,7 @@ class NodeAgentClient:
         self._last_master_sequence = -1
         self._prepared_generation = -1
         self._ready_sent_generation = -1
+        self._ready_metadata: tuple[str, str] | None = None
         self._send_lock = asyncio.Lock()
         self._ready_lock = asyncio.Lock()
         self._stopping = False
@@ -91,13 +102,20 @@ class NodeAgentClient:
                 )
             )
 
-    async def _local_workers_ready(self, generation: int, snapshot_hash: str) -> None:
+    async def _local_workers_ready(
+        self,
+        generation: int,
+        snapshot_hash: str,
+        plan_checksum: str,
+        compatibility_digest: str,
+    ) -> None:
         snapshot = self.snapshot
         if (
             snapshot is not None
             and generation == snapshot.generation
             and snapshot_hash == snapshot.snapshot_hash
         ):
+            self._ready_metadata = (plan_checksum, compatibility_digest)
             await self._send_ready_if_possible(generation)
 
     async def _send_ready_if_possible(self, generation: int) -> None:
@@ -111,16 +129,24 @@ class NodeAgentClient:
                 or self._ready_sent_generation >= generation
             ):
                 return
-            if self.local_worker_relay is not None and not self.local_worker_relay.generation_ready(
-                generation
-            ):
-                return
+            if self.local_worker_relay is not None:
+                if not self.local_worker_relay.generation_ready(generation):
+                    return
+                if self._ready_metadata is None:
+                    return
+                plan_checksum, compatibility_digest = self._ready_metadata
+            else:
+                plan_checksum, compatibility_digest = snapshot.snapshot_hash, ""
             self._ready_sent_generation = generation
             try:
                 await self._send_agent_message(
                     "generation_ready",
                     generation,
-                    {"snapshot_hash": snapshot.snapshot_hash},
+                    {
+                        "snapshot_hash": snapshot.snapshot_hash,
+                        "plan_checksum": plan_checksum,
+                        "compatibility_digest": compatibility_digest,
+                    },
                 )
             except BaseException:
                 self._ready_sent_generation = -1
@@ -144,6 +170,7 @@ class NodeAgentClient:
         self.snapshot = snapshot
         self._prepared_generation = -1
         self._ready_sent_generation = -1
+        self._ready_metadata = None
         if self.local_worker_relay is not None:
             await self.local_worker_relay.publish(message)
         if self.on_membership is not None:
@@ -159,11 +186,14 @@ class NodeAgentClient:
         if message.generation < self.generation:
             return
         snapshot = self.snapshot
-        if (
-            snapshot is None
-            or message.generation != snapshot.generation
-            or message.payload != {"snapshot_hash": snapshot.snapshot_hash}
-        ):
+        if snapshot is None:
+            raise ValueError("master activated a generation before membership")
+        ready_metadata = self._ready_metadata or (snapshot.snapshot_hash, "")
+        if message.generation != snapshot.generation or message.payload != {
+            "snapshot_hash": snapshot.snapshot_hash,
+            "plan_checksum": ready_metadata[0],
+            "compatibility_digest": ready_metadata[1],
+        }:
             raise ValueError("master activated an unprepared generation")
         self.active_generation = message.generation
         if self.local_worker_relay is not None:
@@ -185,7 +215,7 @@ class NodeAgentClient:
                 self.sequence,
                 self.generation,
                 {
-                    "addresses": [socket.gethostbyname(socket.gethostname())],
+                    "addresses": list(self.addresses),
                     "gpu_ids": list(self.gpu_ids),
                 },
             )

@@ -82,13 +82,13 @@ python examples/run_master.py --host 0.0.0.0 --port 29600
 
 python examples/run_agent.py \
   --node-id node-a --master-host MASTER --master-port 29600 \
-  --gpu-ids 0 1 2 3 \
+  --gpu-ids 0 1 2 3 --addresses 10.0.0.11 \
   --local-worker-socket /tmp/oobleck-node-a.sock \
   --worker-script examples/pretrain_llm.py
 
 python examples/run_agent.py \
   --node-id node-b --master-host MASTER --master-port 29600 \
-  --gpu-ids 0 1 2 3 \
+  --gpu-ids 0 1 2 3 --addresses 10.0.0.12 \
   --local-worker-socket /tmp/oobleck-node-b.sock \
   --worker-script examples/pretrain_llm.py
 ```
