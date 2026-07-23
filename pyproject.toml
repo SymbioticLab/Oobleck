@@ -11,7 +11,7 @@ dependencies = [
     "datasets>=2.18.0",
     "tyro>=0.8.0",
     "loguru>=0.7.0",
-    "cornstarch",
+    "cornstarch @ git+https://github.com/cornstarch-org/Cornstarch.git@71cf4ad681cfefdbf4a5b61d524af9033bebd055",
 ]
 
 [project.optional-dependencies]
