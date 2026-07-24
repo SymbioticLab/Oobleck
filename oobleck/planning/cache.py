@@ -17,6 +17,8 @@ def save_templates(
     templates: Sequence[PipelineTemplate],
     fingerprint: CompatibilityFingerprint,
 ) -> None:
+    """Persist templates with the exact fingerprint that produced them."""
+
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -39,6 +41,8 @@ def save_templates(
 def load_templates(
     path: str | Path, fingerprint: CompatibilityFingerprint
 ) -> tuple[PipelineTemplate, ...]:
+    """Load a cache only when both its schema and runtime fingerprint match."""
+
     target = Path(path)
     try:
         payload = json.loads(target.read_text())

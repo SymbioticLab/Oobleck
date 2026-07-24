@@ -27,12 +27,21 @@ def plan_state_redistribution(
     bandwidth_bytes_per_s: Mapping[int, float] | None = None,
     link_classifier: Callable[[int, int], tuple[str, float]] | None = None,
 ) -> TransferSchedule:
-    """Plan transfers, balancing homogeneous links per source/destination pair."""
+    """Refine base transfer planning so homogeneous links stripe across source pairs.
+
+    Without an operator classifier, each source/destination pair receives an independent temporary
+    link bucket, with same-node pairs retaining their lower relative cost. This prevents aggregate
+    ``network`` load from collapsing otherwise equal source choices. After planning, pair-specific
+    labels are normalized back to public ``same-node``/``network`` classes and byte totals recomputed;
+    explicit operator classifiers pass through unchanged.
+    """
 
     normalize_default_links = link_classifier is None
     if link_classifier is None:
 
         def link_classifier(source: int, destination: int) -> tuple[str, float]:
+            """Give each homogeneous pair an independent scheduler load bucket."""
+
             if rank_to_node and rank_to_node.get(source) == rank_to_node.get(destination):
                 return f"same-node:{source}:{destination}", 0.25
             return f"network:{source}:{destination}", 1.0

@@ -23,6 +23,8 @@ from oobleck.types import OobleckExecutionPlan
 
 
 class MasterControlService:
+    """Serialize membership changes and two-phase generation activation."""
+
     def __init__(
         self,
         transport: ControlTransport | None = None,
@@ -32,6 +34,8 @@ class MasterControlService:
         max_nodes: int | None = None,
         gpu_ids_per_node: int | None = None,
     ) -> None:
+        """Create empty membership, consensus, connection, and lease state."""
+
         self.transport = transport or AsyncioTcpControlTransport()
         self.membership = MembershipStateMachine(
             lease_timeout_s=lease_timeout_s,
@@ -56,6 +60,8 @@ class MasterControlService:
         self.active_generation = 0
 
     async def start(self, host: str, port: int) -> asyncio.AbstractServer:
+        """Start accepting agent streams and monitoring their renewable leases."""
+
         if self._server is not None:
             raise RuntimeError("master service is already running")
         self._server = await self.transport.start_server(host, port, self._handle)
@@ -63,6 +69,8 @@ class MasterControlService:
         return self._server
 
     async def close(self) -> None:
+        """Stop lease monitoring, close listeners, then retire every agent stream."""
+
         if self._lease_task is not None:
             self._lease_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -79,12 +87,18 @@ class MasterControlService:
         self._server = None
 
     def _clear_accumulated_operations(self) -> None:
+        """Forget coalesced removals/additions after a generation becomes active."""
         self._accumulated_removed.clear()
         self._accumulated_added.clear()
         self._accumulated_detection_seconds = 0.0
 
     def _begin_generation(self, snapshot: MembershipSnapshot) -> MembershipSnapshot:
-        """Install a proposal and accumulate operations since last activation."""
+        """Install a proposal with all operations since the last activation.
+
+        A newer proposal supersedes barrier state but does not erase identities
+        removed or added by earlier unactivated proposals. The active execution
+        plan remains the common baseline until consensus activates a generation.
+        """
 
         for member in snapshot.removed_nodes:
             self._accumulated_removed[(member.agent_id, member.incarnation_id)] = member
@@ -123,6 +137,8 @@ class MasterControlService:
         return snapshot
 
     async def _expire_leases(self) -> None:
+        """Convert expired leases into coalesced membership proposals."""
+
         while True:
             await asyncio.sleep(self.lease_check_interval_s)
             async with self._lock:
@@ -136,6 +152,17 @@ class MasterControlService:
                 await self._broadcast(snapshot)
 
     async def _handle(self, connection: ControlConnection) -> None:
+        """Serve one operator request or one registered agent incarnation.
+
+        Operator inspection and drain requests are short-lived and never enter membership.
+        Agent streams must register first; their heartbeats, drains, and prepared/ready
+        acknowledgements are serialized under the membership lock. Prepared metadata must
+        agree across every live agent before rendezvous, and ready metadata must agree
+        again before activation. A newer membership proposal clears both barriers. EOF,
+        reset, malformed protocol, and lease expiry all converge on incarnation-aware
+        removal so closure of an old-incarnation socket cannot evict the new incarnation.
+        """
+
         identity: NodeIdentity | None = None
         try:
             first = await connection.receive()
@@ -345,10 +372,14 @@ class MasterControlService:
                     await self._broadcast(snapshot)
 
     async def _broadcast(self, snapshot: MembershipSnapshot) -> None:
+        """Encode and publish one immutable membership snapshot."""
+
         message = self._membership_message(snapshot)
         await self._broadcast_message(message)
 
     async def _broadcast_message(self, message: MessageEnvelope) -> None:
+        """Send a phase message concurrently without hiding task cancellation."""
+
         connections = [item[1] for item in self._connections.values()]
         results = await asyncio.gather(
             *(connection.send(message) for connection in connections),
@@ -359,6 +390,8 @@ class MasterControlService:
                 raise result
 
     def _membership_message(self, snapshot: MembershipSnapshot) -> MessageEnvelope:
+        """Create a sequenced membership envelope from a checksummed snapshot."""
+
         self._master_sequence += 1
         return MessageEnvelope(
             "membership",
@@ -381,6 +414,8 @@ class MasterControlService:
         )
 
     def _status_message(self, snapshot: MembershipSnapshot) -> MessageEnvelope:
+        """Expose proposed, prepared, ready, and active generation progress."""
+
         self._master_sequence += 1
         return MessageEnvelope(
             "status",
@@ -406,6 +441,8 @@ class MasterControlService:
         plan_checksum: str,
         compatibility_digest: str,
     ) -> MessageEnvelope:
+        """Authorize workers with matching preparation metadata to build WORLD."""
+
         self._master_sequence += 1
         return MessageEnvelope(
             "generation_rendezvous",
@@ -426,6 +463,8 @@ class MasterControlService:
         plan_checksum: str,
         compatibility_digest: str,
     ) -> MessageEnvelope:
+        """Publish activation after every live agent reports local readiness."""
+
         self._master_sequence += 1
         return MessageEnvelope(
             "generation_active",
@@ -442,6 +481,8 @@ class MasterControlService:
 
 
 class NodeAgentClient:
+    """Retained basic agent client for registration, leases, and graceful drain."""
+
     def __init__(
         self,
         node_id: str,
@@ -451,6 +492,8 @@ class NodeAgentClient:
         heartbeat_interval_s: float = 1.0,
         on_membership: Callable[[MessageEnvelope], Awaitable[None]] | None = None,
     ) -> None:
+        """Assign a fresh process incarnation and initialize stream counters."""
+
         if not node_id or not gpu_ids:
             raise ValueError("node_id and gpu_ids are required")
         self.node_id = node_id
@@ -464,6 +507,8 @@ class NodeAgentClient:
         self.connection: ControlConnection | None = None
 
     async def connect(self, host: str, port: int) -> MessageEnvelope:
+        """Register inventory on a new stream and receive its first membership."""
+
         self.connection = await self.transport.connect(host, port)
         await self.connection.send(
             MessageEnvelope(
@@ -483,6 +528,8 @@ class NodeAgentClient:
         return membership
 
     async def run(self) -> None:
+        """Renew the lease and opportunistically consume membership updates."""
+
         if self.connection is None:
             raise RuntimeError("connect() must be called before run()")
         while True:
@@ -506,6 +553,8 @@ class NodeAgentClient:
                         await self.on_membership(message)
 
     async def drain(self) -> None:
+        """Submit an incarnation-owned graceful removal to the master."""
+
         if self.connection is None:
             raise RuntimeError("agent is not connected")
         self.sequence += 1

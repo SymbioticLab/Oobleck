@@ -15,6 +15,8 @@ from oobleck.types import PipelineInstance, PipelineTemplate, RecoveryUnavailabl
 
 @dataclass(frozen=True, slots=True)
 class ReconfigurationResult:
+    """A complete survivor assignment plus recovery-strategy accounting."""
+
     instances: tuple[PipelineInstance, ...]
     strategies: tuple[str, ...]
     retained_nodes: int
@@ -25,6 +27,8 @@ class ReconfigurationResult:
 def _instance(
     identity: str, nodes: Iterable[str], templates: Sequence[PipelineTemplate]
 ) -> PipelineInstance | None:
+    """Create an ordered instance when its resource count is supported."""
+
     selected_nodes = tuple(sorted(nodes))
     template = template_for_resources(templates, len(selected_nodes))
     return None if template is None else PipelineInstance(identity, template, selected_nodes)
@@ -39,7 +43,15 @@ def reconfigure_pipelines(
     *,
     state_bytes_by_node: Mapping[str, int] | None = None,
 ) -> ReconfigurationResult:
-    """Apply simple, borrow, and merge with throughput/state-stable ties."""
+    """Reassign complete survivor membership using simple, borrow, or merge.
+
+    Changes containing added nodes use global composition because new resources may
+    change the throughput optimum. Removal-only changes first retain each surviving
+    pipeline identity, borrow low-state nodes from viable donors, and merge only
+    groups that still lack a supported template. The final allocation must satisfy
+    the replica threshold and assign every survivor exactly once; ties prefer
+    throughput, retained state, minimal movement, and stable identities.
+    """
 
     survivors = set(surviving_node_ids)
     weights = dict(state_bytes_by_node or {})
@@ -49,6 +61,8 @@ def reconfigure_pipelines(
     old_owner = {node: item.instance_id for item in previous for node in item.node_ids}
 
     def retained_bytes(identity: str, nodes: Iterable[str]) -> int:
+        """Score state that stays under the same logical pipeline identity."""
+
         return sum(weights.get(node, 1) for node in nodes if old_owner.get(node) == identity)
 
     if not survivors <= known:
@@ -136,6 +150,8 @@ def reconfigure_pipelines(
             )
 
         def partner_objective(partner: list) -> tuple[object, ...]:
+            """Rank merge partners by throughput, retained state, size, and ID."""
+
             combined = target[1] | partner[1]
             template = template_for_resources(templates, len(combined))
             predicted = float("inf") if template is None else template.iteration_time(1)

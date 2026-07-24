@@ -8,6 +8,8 @@ from pathlib import Path
 
 @dataclass(frozen=True, slots=True)
 class MasterServiceConfig:
+    """Serializable settings for the central membership/control service."""
+
     host: str = "127.0.0.1"
     port: int = 0
     heartbeat_interval_s: float = 1.0
@@ -16,6 +18,8 @@ class MasterServiceConfig:
     max_nodes: int = 16
 
     def __post_init__(self) -> None:
+        """Reject endpoints and timing bounds that cannot maintain valid leases."""
+
         if not self.host or not 0 <= self.port <= 65535:
             raise ValueError("master host/port is invalid")
         if self.heartbeat_interval_s <= 0 or self.lease_timeout_s <= self.heartbeat_interval_s:
@@ -26,6 +30,8 @@ class MasterServiceConfig:
 
 @dataclass(frozen=True, slots=True)
 class AgentConfig:
+    """Connection, inventory, and optional worker-launch settings for one node."""
+
     node_id: str
     master_host: str = "127.0.0.1"
     master_port: int = 0
@@ -37,6 +43,8 @@ class AgentConfig:
     heartbeat_interval_s: float = 1.0
 
     def __post_init__(self) -> None:
+        """Validate stable identity, GPU ownership, and worker IPC dependencies."""
+
         if not self.node_id or not self.master_host or not 1 <= self.master_port <= 65535:
             raise ValueError("agent identity and master address are required")
         if not self.gpu_ids or len(set(self.gpu_ids)) != len(self.gpu_ids):
@@ -53,6 +61,8 @@ class AgentConfig:
 
 @dataclass(frozen=True, slots=True)
 class TrainingLaunchConfig:
+    """Inputs for a local launch and optional SSH bootstrap of initial agents."""
+
     training_script: Path
     script_args: tuple[str, ...] = ()
     max_nodes: int = 1
@@ -66,6 +76,8 @@ class TrainingLaunchConfig:
     socket_directory: Path = Path("/tmp")
 
     def __post_init__(self) -> None:
+        """Require complete remote-bootstrap information when a hostfile is used."""
+
         if self.max_nodes < 1 or self.tensor_parallel_size < 1:
             raise ValueError("max_nodes and tensor_parallel_size must be positive")
         if self.initial_hostfile is not None and (
@@ -76,6 +88,8 @@ class TrainingLaunchConfig:
 
 @dataclass(frozen=True, slots=True)
 class ProfileCommandConfig:
+    """Offline profiling/template-generation inputs accepted by the CLI."""
+
     output: Path
     model: str
     profile: Path | None = None
@@ -92,6 +106,8 @@ class ProfileCommandConfig:
     device_memory_bytes: int | None = None
 
     def __post_init__(self) -> None:
+        """Keep measured and precomputed profile modes mutually consistent."""
+
         if not self.model or self.tensor_parallel_size < 1 or self.microbatch_size < 1:
             raise ValueError("profile model and parallel sizes are required")
         if not self.resource_counts or any(item < 1 for item in self.resource_counts):
@@ -106,31 +122,43 @@ class ProfileCommandConfig:
 
 @dataclass(frozen=True, slots=True)
 class DrainConfig:
+    """Identify the live node and master involved in a graceful drain."""
+
     node_id: str
     master_host: str = "127.0.0.1"
     master_port: int = 0
 
     def __post_init__(self) -> None:
+        """Require a routable master endpoint and non-empty stable node ID."""
+
         if not self.node_id or not self.master_host or not 1 <= self.master_port <= 65535:
             raise ValueError("drain requires a node identity and master address")
 
 
 @dataclass(frozen=True, slots=True)
 class InspectMembershipConfig:
+    """Address of the master whose current membership should be inspected."""
+
     master_host: str = "127.0.0.1"
     master_port: int = 0
 
     def __post_init__(self) -> None:
+        """Reject incomplete or non-routable inspection endpoints."""
+
         if not self.master_host or not 1 <= self.master_port <= 65535:
             raise ValueError("membership inspection requires a master address")
 
 
 @dataclass(frozen=True, slots=True)
 class ChaosConfig:
+    """Explicitly confirmed process target for the guarded failure helper."""
+
     target_node_id: str
     pid: int = 0
     confirmation: str = ""
 
     def __post_init__(self) -> None:
+        """Require the target-specific confirmation token before signaling a PID."""
+
         if self.pid < 1 or self.confirmation != f"FAIL:{self.target_node_id}":
             raise ValueError("pid must be positive and confirmation must be FAIL:<node-id>")

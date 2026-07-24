@@ -9,7 +9,7 @@ from typing import Iterable
 
 
 class ProcessGroupLayoutError(RuntimeError):
-    pass
+    """The installed PyTorch private c10d layout is outside the audited contract."""
 
 
 def initialize_process_group(
@@ -21,7 +21,13 @@ def initialize_process_group(
     world_size: int,
     timeout_s: float,
 ) -> None:
-    """Create one validated replacement WORLD from deterministic rendezvous data."""
+    """Create one replacement WORLD from deterministic generation metadata.
+
+    Initialization is forbidden while an older WORLD remains live. Endpoint, rank,
+    world size, and timeout are validated before constructing the TCP rendezvous URL;
+    afterward the observed rank map is checked against the plan. Any mismatch triggers
+    complete teardown so callers never continue with a partially valid universe.
+    """
 
     import torch.distributed as dist
 
@@ -61,13 +67,23 @@ _OPTIONAL = ("_pg_coalesce_state", "pg_default_device")
 
 
 def _shutdown(group: object) -> None:
+    """Best-effort stop one backend before global registry teardown."""
+
     shutdown = getattr(group, "_shutdown", None)
     if callable(shutdown):
         shutdown()
 
 
 def destroy_process_group_universe(extra_handles: Iterable[object] = ()) -> None:
-    """Concurrently stop all groups, destroy WORLD, and clear known registries."""
+    """Retire the complete process-group universe before generation replacement.
+
+    Oobleck audits the installed PyTorch version and private c10d registry layout before
+    touching them. Every known backend handle, including caller-supplied topology groups,
+    is shut down concurrently; default WORLD is destroyed and all audited registries are
+    cleared. Unknown layouts fail loudly because retaining a communicator across rank-map
+    changes is less safe than refusing recovery. The final initialized-state check makes
+    teardown completeness part of the generation invariant.
+    """
 
     import torch
     import torch.distributed as dist

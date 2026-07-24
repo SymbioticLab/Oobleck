@@ -9,11 +9,15 @@ from typing import Sequence
 
 @dataclass(frozen=True, slots=True)
 class InitialHost:
+    """Stable bootstrap node identity, SSH address, and fixed local GPU set."""
+
     node_id: str
     address: str
     gpu_ids: tuple[str, ...]
 
     def __post_init__(self) -> None:
+        """Require complete identity and unique GPU identifiers."""
+
         if not self.node_id or not self.address or not self.gpu_ids:
             raise ValueError("hostfile node_id, address, and gpu_ids are required")
         if len(self.gpu_ids) != len(set(self.gpu_ids)):
@@ -56,7 +60,13 @@ def ssh_agent_command(
     socket_directory: str | Path = "/tmp",
     ssh_command: str = "ssh",
 ) -> tuple[str, ...]:
-    """Build one explicit remote agent command without executing it."""
+    """Construct the complete SSH command for one bootstrap agent without side effects.
+
+    The command carries stable node identity, master endpoint, GPU inventory, local-worker socket,
+    worker entrypoint, and optional training arguments. Returning argv rather than a shell string
+    preserves quoting and lets the launcher supervise processes directly. This is intentionally
+    limited to initial bootstrap; membership controls later elastic additions.
+    """
 
     if not 1 <= master_port <= 65535:
         raise ValueError("master_port must be reachable and nonzero for SSH bootstrap")

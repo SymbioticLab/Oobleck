@@ -16,6 +16,8 @@ StateTensorKey = tuple[str, str, int]
 
 @dataclass(frozen=True, slots=True)
 class TransferExecutionMetrics:
+    """Observed byte accounting and collective duration for schedule execution."""
+
     actual_source_bytes: tuple[tuple[int, int], ...]
     actual_destination_bytes: tuple[tuple[int, int], ...]
     actual_link_class_bytes: tuple[tuple[str, int], ...]
@@ -23,6 +25,8 @@ class TransferExecutionMetrics:
 
 
 def _bytes(tensor: torch.Tensor) -> torch.Tensor:
+    """Expose contiguous tensor storage as a flat byte view, including scalars."""
+
     if not tensor.is_contiguous():
         raise ValueError("state transfer tensors must be contiguous")
     # ``view(dtype)`` rejects zero-dimensional tensors when element sizes
@@ -32,6 +36,8 @@ def _bytes(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def _transfer_identity(item) -> tuple[object, ...]:
+    """Key checksum metadata by every field that identifies a scheduled chunk."""
+
     return (
         item.round,
         item.source_rank,
@@ -46,10 +52,14 @@ def _transfer_identity(item) -> tuple[object, ...]:
 
 
 def _checksum(payload: torch.Tensor) -> str:
+    """Hash payload bytes on CPU so corruption is detected after transfer."""
+
     return hashlib.sha256(payload.detach().cpu().numpy().tobytes()).hexdigest()
 
 
 def _validate_dtype(tensor: torch.Tensor, expected: str, key: StateTensorKey) -> None:
+    """Prevent byte unpacking into a storage layout with a different dtype."""
+
     actual = str(tensor.dtype).removeprefix("torch.")
     if actual != expected.removeprefix("torch."):
         raise ValueError(
@@ -68,11 +78,15 @@ def execute_transfer_schedule(
     group=None,
     verify_checksums: bool = True,
 ) -> TransferExecutionMetrics:
-    """Pack, all-to-all, validate, and unpack every collective round.
+    """Execute every immutable schedule round through collective all-to-all.
 
-    Each rank calls this with the same schedule and participates with zero-sized
-    splits when it has no payload. Destination tensors are preallocated from the
-    new manifest, allowing unpacking directly into their storage.
+    Each rank selects outgoing/incoming chunks using the same stable ordering, validates
+    source dtype and bounds, and packs raw bytes by destination. Ranks with no payload still
+    participate using zero-sized splits. Optional pre-transfer checksums are exchanged as
+    objects and verified after bytes are copied directly into manifest-sized destination
+    storage. Round durations use the slowest rank, and planned traffic accounting is returned
+    for recovery diagnostics. Any missing tensor, byte mismatch, dtype mismatch, or checksum
+    failure aborts activation before recovered state can be committed.
     """
 
     if not 0 <= rank < world_size:

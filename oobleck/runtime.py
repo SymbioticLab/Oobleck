@@ -25,6 +25,13 @@ _base_close = OobleckParallelContext.close
 
 @dataclass(frozen=True, slots=True)
 class GenerationTransitionMetrics:
+    """Timing and membership facts recorded for one transition attempt.
+
+    Superseded attempts remain visible for diagnosis. ``graceful_cutover``
+    identifies pure additions, while ``cutover_committed_step`` records the
+    committed boundary after which the new cohort was allowed to prepare.
+    """
+
     generation: int
     snapshot_seconds: float
     teardown_seconds: float
@@ -48,6 +55,8 @@ class GenerationTransitionMetrics:
 
 @dataclass(slots=True)
 class _PreparedGenerationTransition:
+    """Resources and timings retained between prepare and activation barriers."""
+
     target: Any
     compiled: Any
     snapshot: Any
@@ -62,6 +71,14 @@ class _PreparedGenerationTransition:
 
 
 def _init_with_recovery(self: OobleckParallelContext, *args: Any, **kwargs: Any) -> None:
+    """Extend a context with recovery, transition, and cutover bookkeeping.
+
+    Optimizer factories are retained for rebuilding ownership, while condition
+    and commit state coordinate external generation barriers with training steps.
+    Separate pending, prepared, and deferred-addition slots make the transition
+    lifecycle explicit. Existing owners enable gradient synchronization at once;
+    added workers postpone it until survivor state has been restored.
+    """
     _base_init(self, *args, **kwargs)
     self._optimizer_factory: (
         Callable[[Iterable[torch.nn.Parameter]], torch.optim.Optimizer] | None
@@ -104,6 +121,7 @@ def _configure_optimization(
     scheduler_factory: Callable[[torch.optim.Optimizer], Any] | None = None,
     scaler: Any = None,
 ) -> None:
+    """Configure optimization and retain factories needed after repartitioning."""
     _base_configure_optimization(
         self,
         optimizer_factory=optimizer_factory,
@@ -115,6 +133,7 @@ def _configure_optimization(
 
 
 def _world_initialized() -> bool:
+    """Return whether torch.distributed has a live default process group."""
     try:
         import torch.distributed as dist
 
@@ -124,6 +143,7 @@ def _world_initialized() -> bool:
 
 
 def _retire_world(self: OobleckParallelContext) -> None:
+    """Close topology resources before destroying the current process-group universe."""
     if self._heterogeneous_gradient_sync is not None:
         self._heterogeneous_gradient_sync.close()
         self._heterogeneous_gradient_sync = None
@@ -140,6 +160,14 @@ def _record_superseded(
     activation_seconds: float = 0.0,
     recovery_seconds: float = 0.0,
 ) -> None:
+    """Append metrics once for a proposal superseded during preparation.
+
+    A proposal can become obsolete before WORLD creation, during activation, or
+    after recovery. Optional phase durations describe how far it progressed. Any
+    completed recovery report contributes redistribution timings, and transition
+    metadata preserves the coalesced removed/added identities and cutover boundary.
+    The per-transition guard prevents duplicate history entries across cleanup paths.
+    """
     if transition.superseded_recorded:
         return
     transition.superseded_recorded = True
@@ -179,11 +207,19 @@ def _transition_fields(
     bool,
     int | None,
 ]:
+    """Return removed/added identities and graceful-boundary metadata."""
     return self._transition_metadata.get(generation, ((), (), False, None))
 
 
 def _prepare_latest_generation(self: OobleckParallelContext) -> bool:
-    """Retire WORLD and compile the newest ownership without creating a new WORLD."""
+    """Snapshot committed state, retire WORLD, and compile the newest proposal.
+
+    The first proposal captures state and tears down the old world exactly once.
+    If newer complete membership arrives while compilation is underway, the
+    obsolete attempt is recorded and compilation restarts from the same committed
+    snapshot. No process groups for the target generation are created until the
+    external prepared/rendezvous barrier succeeds.
+    """
 
     existing = self._prepared_transition
     if self._pending_plan is None:
@@ -239,7 +275,14 @@ def _prepare_latest_generation(self: OobleckParallelContext) -> bool:
 
 
 def _activate_prepared_generation(self: OobleckParallelContext) -> bool:
-    """Create WORLD, activate ownership, and recover after rendezvous publication."""
+    """Create WORLD, activate ownership, and restore state after rendezvous.
+
+    Activation installs the compiled partition and execution plan, reconfigures
+    data loaders, restores the committed snapshot, then enables heterogeneous
+    gradient synchronization. A superseding generation aborts this attempt and
+    reuses the captured snapshot; only the newest successful activation is added
+    to recovery history as the live generation.
+    """
 
     transition = self._prepared_transition
     if transition is None:
@@ -334,11 +377,20 @@ def _activate_latest_generation(self: OobleckParallelContext) -> None:
 
 
 def _member_ids(nodes: tuple[Any, ...]) -> tuple[tuple[str, str], ...]:
+    """Project node identities into stable-ID/incarnation metric tuples."""
     return tuple((node.agent_id, node.incarnation_id) for node in nodes)
 
 
 def _apply_membership(self: OobleckParallelContext, snapshot: MembershipSnapshot) -> bool:
-    """Convert one complete snapshot into a hard or graceful pending generation."""
+    """Convert a complete membership snapshot into a pending execution plan.
+
+    The published previous plan is validated against local ownership before the
+    new complete cohort is planned. A proposal with additions and no removals is
+    graceful: if a step is running, it is deferred until that step commits, so
+    its gradients are not replayed. Any removal—including an old incarnation
+    removed when the same stable agent ID restarts—is a hard transition and is
+    made pending immediately. Newer proposals supersede older deferred plans.
+    """
 
     newest_generation = max(
         self.generation,
@@ -411,11 +463,13 @@ def _apply_membership(self: OobleckParallelContext, snapshot: MembershipSnapshot
 
 
 def _enable_control_plane_barrier(self: OobleckParallelContext) -> None:
+    """Require future generations to pass external prepare and active barriers."""
     self._control_plane_managed = True
     self._control_active_generation = self.generation
 
 
 def _prepare_generation(self: OobleckParallelContext) -> None:
+    """Compile the pending generation after the control plane admits preparation."""
     if not self._control_plane_managed:
         raise RuntimeError("enable the control-plane barrier before preparation")
     if not _prepare_latest_generation(self):
@@ -423,6 +477,7 @@ def _prepare_generation(self: OobleckParallelContext) -> None:
 
 
 def _activate_generation(self: OobleckParallelContext) -> None:
+    """Activate the prepared generation after the global rendezvous is published."""
     if not self._control_plane_managed:
         raise RuntimeError("enable the control-plane barrier before activation")
     if not _activate_prepared_generation(self):
@@ -430,11 +485,13 @@ def _activate_generation(self: OobleckParallelContext) -> None:
 
 
 def _prepared_execution_plan(self: OobleckParallelContext) -> Any:
+    """Expose the candidate plan used in prepared consensus, or the active plan."""
     transition = self._prepared_transition
     return self.execution_plan if transition is None else transition.target
 
 
 def _generation_transition_pending(self: OobleckParallelContext) -> bool:
+    """Return whether managed execution must remain behind a generation barrier."""
     return self._control_plane_managed and (
         self._pending_plan is not None
         or self._prepared_transition is not None
@@ -443,6 +500,7 @@ def _generation_transition_pending(self: OobleckParallelContext) -> bool:
 
 
 def _wait_for_generation_barrier(self: OobleckParallelContext) -> None:
+    """Block step admission until the prepared generation is globally active."""
     deadline = time.monotonic() + self.config.rendezvous_timeout_s
     with self._generation_condition:
         while _generation_transition_pending(self):
@@ -453,6 +511,7 @@ def _wait_for_generation_barrier(self: OobleckParallelContext) -> None:
 
 
 def _mark_generation_active(self: OobleckParallelContext, generation: int) -> None:
+    """Release waiting steps after validating the control plane's active generation."""
     if generation != self.generation:
         raise RuntimeError(
             f"cannot activate generation {generation}; prepared generation is {self.generation}"
@@ -463,7 +522,13 @@ def _mark_generation_active(self: OobleckParallelContext, generation: int) -> No
 
 
 def _wait_until_generation_preparable(self: OobleckParallelContext, generation: int) -> bool:
-    """Wait for a graceful step boundary; return false when superseded."""
+    """Wait until ``generation`` can be prepared without cutting through a step.
+
+    A pure-addition plan stays deferred while the current step commits. The step
+    epilogue promotes it to pending and wakes this waiter. The method returns
+    ``False`` instead of preparing when a newer generation supersedes the target
+    or the target is no longer known.
+    """
 
     deadline = time.monotonic() + self.config.rendezvous_timeout_s
     with self._generation_condition:
@@ -495,6 +560,14 @@ def _wait_until_generation_preparable(self: OobleckParallelContext, generation: 
 
 
 def _step_with_control_barrier(self: OobleckParallelContext, *args: Any, **kwargs: Any) -> Any:
+    """Run one optimizer step without crossing a generation transition.
+
+    Step admission waits for every managed generation to become active, then the
+    commit lock atomically marks the step in progress. Hard transitions can stop
+    subsequent work immediately. A pure addition received mid-step is promoted
+    only in the ``finally`` block after the base step has committed; that boundary
+    is recorded in transition metrics and no partial gradient replay is needed.
+    """
     while True:
         if _generation_transition_pending(self):
             _wait_for_generation_barrier(self)
@@ -541,6 +614,7 @@ def _recover_from_survivors(self: OobleckParallelContext) -> None:
 
 
 def _close_with_topology(self: OobleckParallelContext) -> None:
+    """Close gradient topology, context resources, and the distributed universe."""
     if self._heterogeneous_gradient_sync is not None:
         self._heterogeneous_gradient_sync.close()
         self._heterogeneous_gradient_sync = None

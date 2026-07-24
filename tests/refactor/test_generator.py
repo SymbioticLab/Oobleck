@@ -52,9 +52,7 @@ def test_rust_and_python_backends_match_the_paper_objective():
     latencies = (91, 45, 29, 75, 73, 66, 99, 81, 83, 83)
     layers = _profile(latencies)
     rust = create_pipeline_templates("counterexample", layers, [1, 2, 3, 4, 5, 6])
-    python = _create_python_templates(
-        "counterexample", layers, [1, 2, 3, 4, 5, 6], 1, None, None
-    )
+    python = _create_python_templates("counterexample", layers, [1, 2, 3, 4, 5, 6], 1, None, None)
 
     assert rust == python
     expected_time, expected_starts = _paper_oracle(latencies, 6)
@@ -67,9 +65,7 @@ def test_rust_and_python_backends_match_the_paper_objective():
 
 def test_memory_feasibility_is_part_of_partition_selection():
     layers = _profile((1, 5, 6), (8, 5, 1))
-    rust = create_pipeline_templates(
-        "memory", layers, [2], device_memory_bytes=10
-    )
+    rust = create_pipeline_templates("memory", layers, [2], device_memory_bytes=10)
     python = _create_python_templates("memory", layers, [2], 1, None, 10)
 
     assert rust == python

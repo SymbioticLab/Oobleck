@@ -26,6 +26,8 @@ class LocalWorkerSupervisor:
         gpu_ids: Sequence[str],
         socket_path: str | Path,
     ) -> None:
+        """Capture worker entrypoint, stable node identity, GPUs, and relay path."""
+
         self.script = Path(script)
         self.script_args = tuple(script_args)
         self.node_id = node_id
@@ -34,6 +36,8 @@ class LocalWorkerSupervisor:
         self.processes: list[asyncio.subprocess.Process] = []
 
     async def start(self) -> None:
+        """Spawn one isolated process per GPU with deterministic worker metadata."""
+
         if self.processes:
             raise RuntimeError("local workers are already running")
         if not self.script.is_file():
@@ -62,6 +66,8 @@ class LocalWorkerSupervisor:
             self.processes.append(process)
 
     async def wait(self) -> tuple[int, ...]:
+        """Wait for every worker and fail the node service if any exits nonzero."""
+
         if not self.processes:
             raise RuntimeError("local workers have not been started")
         codes = tuple(await asyncio.gather(*(item.wait() for item in self.processes)))
@@ -71,6 +77,8 @@ class LocalWorkerSupervisor:
         return codes
 
     async def close(self) -> None:
+        """Terminate workers, escalate to kill after a bound, and forget handles."""
+
         running = [item for item in self.processes if item.returncode is None]
         for process in running:
             process.terminate()
@@ -93,7 +101,14 @@ async def run_agent_service(
     on_membership: Callable[[MessageEnvelope], Awaitable[None]] | None = None,
     on_generation_active: Callable[[MessageEnvelope], Awaitable[None]] | None = None,
 ) -> None:
-    """Run an agent lease and, when configured, its local training workers."""
+    """Own the complete node-agent and optional GPU-worker process lifetime.
+
+    The agent registers before workers start so membership and local IPC are available. Without a
+    worker script it simply maintains the reconnecting lease. With workers, the agent stream and
+    process cohort run concurrently; unsuccessful workers fail the node, while clean worker completion
+    requests a graceful drain. The ``finally`` path always retires processes, closes transports, and
+    cancels the remaining agent task.
+    """
 
     client = NodeAgentClient(
         config.node_id,

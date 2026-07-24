@@ -12,6 +12,8 @@ from oobleck.types import OobleckExecutionPlan, PipelineStageSpec
 
 
 def _local_manifest(model: torch.nn.Module, rank: int, committed_step: int = 0) -> StateManifest:
+    """Describe every local parameter and buffer as replicated fallback state."""
+
     entries = []
     for kind, values in (
         ("parameter", model.named_parameters(recurse=True)),
@@ -52,6 +54,8 @@ class CompiledLocalPartition:
         *,
         mesh: Any = None,
     ) -> "ActivatedPartition":
+        """Materialize an external partition or initialize the fallback model."""
+
         if self.external_compiled is not None:
             external = self.external_compiled.activate(device=device, dtype=dtype, mesh=mesh)
             model = getattr(external, "model", self.root_model)
@@ -69,12 +73,16 @@ class CompiledLocalPartition:
 
 
 class ActivatedPartition:
+    """Lower-level materialized model wrapper retained for compatibility."""
+
     def __init__(
         self,
         compiled: CompiledLocalPartition,
         model: torch.nn.Module,
         external_context: Any = None,
     ) -> None:
+        """Bind compiled ownership to its model and optional external context."""
+
         self.compiled = compiled
         self.model = model
         self.external_context = external_context
@@ -82,9 +90,13 @@ class ActivatedPartition:
 
     @property
     def closed(self) -> bool:
+        """Report whether the materialized context has been retired."""
+
         return self._closed
 
     def close(self) -> None:
+        """Idempotently close an external context and mark this wrapper retired."""
+
         if self._closed:
             return
         if self.external_context is not None:

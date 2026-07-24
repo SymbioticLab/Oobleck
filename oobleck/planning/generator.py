@@ -11,6 +11,7 @@ from oobleck.types import CompatibilityFingerprint, PipelineTemplate
 
 
 def _effective_activation_memory(layer: LayerExecutionResult) -> int:
+    """Read split activation memory, falling back to legacy aggregate profiles."""
     if layer.activation_memory or layer.persistent_memory:
         return layer.activation_memory
     return layer.mem_required
@@ -26,6 +27,7 @@ def _sequential_sum(values: Sequence[float]) -> float:
 
 
 def _prefix(values: Sequence[float | int]) -> list[float | int]:
+    """Build checked prefix sums used for constant-time interval metrics."""
     result: list[float | int] = [0]
     for value in values:
         next_value = result[-1] + value
@@ -37,6 +39,8 @@ def _prefix(values: Sequence[float | int]) -> list[float | int]:
 
 @dataclass(frozen=True, slots=True)
 class _StageMetrics:
+    """Aggregate latency and memory for one contiguous pipeline stage."""
+
     forward: float
     backward: float
     activation: int
@@ -44,11 +48,14 @@ class _StageMetrics:
 
     @property
     def latency(self) -> float:
+        """Return the stage's forward-plus-backward compute time."""
         return self.forward + self.backward
 
 
 @dataclass(frozen=True, slots=True)
 class _BottleneckCandidate:
+    """A feasible rightmost bottleneck and bounds for stages around it."""
+
     start: int
     end: int
     latency: float
@@ -58,6 +65,8 @@ class _BottleneckCandidate:
 
 @dataclass(frozen=True, slots=True)
 class _PaperPlan:
+    """Internal representation of a partition and its paper objective terms."""
+
     ranges: tuple[tuple[int, int], ...]
     forward: float
     backward: float
@@ -70,6 +79,7 @@ class _PaperPlan:
 
     @property
     def planning_iteration_time(self) -> float:
+        """Evaluate the Section 4.1.2 iteration-time objective."""
         stages = len(self.ranges)
         return self.t1 + (3 * stages + self.kstar - 1) * (self.forward + self.backward) + self.t3
 
@@ -78,6 +88,7 @@ class _PaperWorkspace:
     """Shared Section 4.1.2 stage cache for all requested templates."""
 
     def __init__(self, layers: Sequence[LayerExecutionResult], device_memory_bytes: int | None):
+        """Cache profile prefixes shared by every requested stage count."""
         self.layers = layers
         self.device_memory_bytes = device_memory_bytes
         self.forward = _prefix([layer.forward for layer in layers])
@@ -86,6 +97,7 @@ class _PaperWorkspace:
         self.persistent = _prefix([layer.persistent_memory for layer in layers])
 
     def stage(self, start: int, end: int) -> _StageMetrics:
+        """Aggregate timing and memory for the half-open layer interval."""
         return _StageMetrics(
             float(self.forward[end] - self.forward[start]),
             float(self.backward[end] - self.backward[start]),
@@ -94,6 +106,7 @@ class _PaperWorkspace:
         )
 
     def allowed(self, start: int, end: int, threshold: float, *, inclusive: bool) -> bool:
+        """Test both device-memory feasibility and a bottleneck latency bound."""
         stage = self.stage(start, end)
         if (
             self.device_memory_bytes is not None
@@ -131,6 +144,13 @@ class _PaperWorkspace:
         *,
         inclusive: bool,
     ) -> tuple[int, ...] | None:
+        """Find the lexicographically earliest feasible contiguous partition.
+
+        Each next boundary is chosen as far left as possible while a greedy
+        minimum-segment check proves that the suffix can still use exactly the
+        remaining number of stages. This deterministic tie-break is shared with
+        the Rust backend and keeps equal-cost plans byte-for-byte reproducible.
+        """
         if count == 0:
             return () if start == end else None
         if count > end - start:
@@ -152,9 +172,7 @@ class _PaperWorkspace:
             for next_position in range(position + 1, latest + 1):
                 if not self.allowed(position, next_position, threshold, inclusive=inclusive):
                     break
-                minimum = self.min_segments(
-                    next_position, end, threshold, inclusive=inclusive
-                )
+                minimum = self.min_segments(next_position, end, threshold, inclusive=inclusive)
                 if minimum is not None and minimum <= remaining <= end - next_position:
                     chosen = next_position
                     break
@@ -164,6 +182,12 @@ class _PaperWorkspace:
         return None
 
     def bottleneck_candidates(self) -> tuple[_BottleneckCandidate, ...]:
+        """Enumerate feasible intervals that can be the rightmost bottleneck.
+
+        Prefix stages may tie the candidate latency, but suffix stages must be
+        strictly faster. This encodes the paper's ``k*`` convention and avoids
+        emitting duplicate interpretations of a partition with tied maxima.
+        """
         candidates = []
         layer_count = len(self.layers)
         for start in range(layer_count):
@@ -187,6 +211,13 @@ class _PaperWorkspace:
     def materialize(
         self, candidate: _BottleneckCandidate, prefix_stages: int, total_stages: int
     ) -> _PaperPlan | None:
+        """Construct and score a complete plan around one bottleneck.
+
+        Prefix and suffix partitions obey their respective inclusive/strict
+        latency bounds. The resulting plan records maximum per-stage memory,
+        the largest feasible microbatch count, and the T1/T3 objective terms
+        needed to compare it with other candidates.
+        """
         suffix_stages = total_stages - prefix_stages - 1
         prefix = self.lexicographic_partition(
             0,
@@ -307,12 +338,14 @@ def _partition(
     stages: int,
     device_memory_bytes: int | None = None,
 ) -> tuple[tuple[int, int], ...]:
+    """Return the paper planner's ranges for one stage count."""
     return _partitions(layers, (stages,), device_memory_bytes)[stages]
 
 
 def _max_microbatches(
     stage_memory: Sequence[tuple[int, int]], device_memory_bytes: int | None
 ) -> int | None:
+    """Compute the tightest per-stage activation capacity after persistent state."""
     if device_memory_bytes is None:
         return None
     capacities = []
@@ -333,10 +366,9 @@ def _create_python_templates(
     fingerprint: CompatibilityFingerprint | None,
     device_memory_bytes: int | None,
 ) -> dict[int, PipelineTemplate]:
+    """Materialize public templates from the pure-Python paper planner."""
     results = {}
-    for stages, plan in _paper_plans(
-        profile_data, resource_counts, device_memory_bytes
-    ).items():
+    for stages, plan in _paper_plans(profile_data, resource_counts, device_memory_bytes).items():
         results[stages] = PipelineTemplate(
             f"{model_name}-stages-{stages}",
             plan.ranges,
@@ -363,7 +395,18 @@ def create_pipeline_templates(
     fingerprint: CompatibilityFingerprint | None = None,
     device_memory_bytes: int | None = None,
 ) -> dict[int, PipelineTemplate]:
-    """Create one paper-modeled, fixed-TP pipeline template per node count."""
+    """Create a paper-modeled fixed-TP template for every requested node count.
+
+    Inputs are validated once, including contiguous global layer indices and
+    optional device capacity. The native Rust backend is preferred when the
+    extension is installed; the Python implementation is the behavioral
+    fallback. Both enumerate the Section 4.1.2 bottleneck candidates, apply the
+    same deterministic tie-breaking, and expose identical T1/T3/k* metadata.
+
+    The fixed tensor-parallel width makes each logical node one pipeline stage.
+    Infeasible memory constraints are normalized to ``ValueError`` so callers do
+    not depend on the selected backend's internal error type.
+    """
 
     if not model_name or not profile_data or not num_nodes:
         raise ValueError("model_name, profile_data, and num_nodes must be non-empty")

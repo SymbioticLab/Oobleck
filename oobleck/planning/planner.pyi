@@ -2,7 +2,6 @@ from typing import Any
 
 from oobleck.planning.profiler import LayerExecutionResult
 
-
 def create_pipeline_templates(
     model_name: str,
     profile_data: list[LayerExecutionResult],

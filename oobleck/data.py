@@ -16,6 +16,8 @@ from oobleck.data_base import prepare_dataloader as _prepare_dataloader
 
 
 def prepare_dataloader(dataloader: DataLoader) -> PreparedDataLoader:
+    """Attach replay semantics only when sampler and loader share one dataset."""
+
     sampler = getattr(dataloader, "batch_sampler", None)
     if isinstance(sampler, OobleckBatchSampler) and sampler.dataset is not dataloader.dataset:
         raise ValueError(

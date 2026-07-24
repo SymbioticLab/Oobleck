@@ -19,6 +19,8 @@ PROFILE_SCHEMA_VERSION = 2
 
 @dataclass(frozen=True, slots=True)
 class LayerExecutionResult:
+    """Timing and memory measurements for one globally indexed model layer."""
+
     layer_index: int
     layer_name: str
     forward: float
@@ -28,6 +30,8 @@ class LayerExecutionResult:
     persistent_memory: int = 0
 
     def __post_init__(self) -> None:
+        """Require a valid global identity and non-negative measurements."""
+
         if self.layer_index < 0 or not self.layer_name:
             raise ValueError("layer identity is invalid")
         if (
@@ -44,7 +48,11 @@ class LayerExecutionResult:
 
 
 class JsonEncoder(json.JSONEncoder):
+    """Encode profile value objects through their dataclass representation."""
+
     def default(self, obj: object) -> object:
+        """Delegate unknown objects after handling profile dataclasses."""
+
         if isinstance(obj, (LayerExecutionResult, CompatibilityFingerprint)):
             return asdict(obj)
         return super().default(obj)
@@ -52,12 +60,16 @@ class JsonEncoder(json.JSONEncoder):
 
 @dataclass(frozen=True, slots=True)
 class ModelProfile:
+    """Versioned, compatibility-bound collection of per-layer measurements."""
+
     fingerprint: CompatibilityFingerprint
     microbatch_size: int
     layers: tuple[LayerExecutionResult, ...]
     schema_version: int = PROFILE_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
+        """Reject stale schemas and profiles without contiguous layer identities."""
+
         if self.schema_version != PROFILE_SCHEMA_VERSION:
             raise ValueError(f"unsupported profile schema {self.schema_version}")
         if self.microbatch_size < 1 or not self.layers:
@@ -66,6 +78,8 @@ class ModelProfile:
             raise ValueError("profile layers must have contiguous global indices")
 
     def save(self, path: str | Path) -> None:
+        """Write a deterministic JSON profile, creating parent directories."""
+
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(
@@ -76,6 +90,8 @@ class ModelProfile:
     def load(
         cls, path: str | Path, expected: CompatibilityFingerprint | None = None
     ) -> "ModelProfile":
+        """Decode a profile and optionally enforce an exact fingerprint match."""
+
         target = Path(path)
         try:
             value = json.loads(target.read_text())
@@ -114,6 +130,8 @@ class ProfilingWorkload:
     loss_factory: ProfileLossFactory | None = None
 
     def __post_init__(self) -> None:
+        """Require at least one layer and callable input/loss factories."""
+
         if not self.layers or not callable(self.input_factory):
             raise ValueError("a profiling workload requires layers and an input factory")
         if self.loss_factory is not None and not callable(self.loss_factory):
@@ -131,6 +149,8 @@ class ModelProfiler:
         base_dir: str | Path = ".",
         **legacy: Any,
     ) -> None:
+        """Bind cache layout and optional compatibility identity for this run."""
+
         self.tag = tag
         self.fingerprint = fingerprint
         self.profile_dir = Path(base_dir) / tag / "profile"
@@ -140,6 +160,8 @@ class ModelProfiler:
     def get_profile_path(
         profile_dir: Path, tp_size: int, microbatch_size: int, precision: str
     ) -> Path:
+        """Return the legacy cache path keyed by TP, batch size, and precision."""
+
         profile_dir.mkdir(parents=True, exist_ok=True)
         return profile_dir / f"profile_tp{tp_size}_mb{microbatch_size}_{precision}.json"
 
@@ -149,6 +171,8 @@ class ModelProfiler:
         microbatch_size: int,
         layers: Sequence[LayerExecutionResult],
     ) -> ModelProfile:
+        """Validate, persist, and return a newly measured profile."""
+
         if self.fingerprint is None:
             raise ValueError("a compatibility fingerprint is required to record profiles")
         profile = ModelProfile(self.fingerprint, microbatch_size, tuple(layers))
@@ -156,10 +180,14 @@ class ModelProfiler:
         return profile
 
     def load(self, path: str | Path) -> ModelProfile:
+        """Load a profile under this profiler's compatibility requirement."""
+
         return ModelProfile.load(path, self.fingerprint)
 
     @staticmethod
     def _arguments(value: object) -> tuple[tuple[object, ...], dict[str, object]]:
+        """Normalize flexible input-factory results into call args and kwargs."""
+
         if (
             isinstance(value, tuple)
             and len(value) == 2
@@ -175,9 +203,13 @@ class ModelProfiler:
 
     @staticmethod
     def _default_loss(output: object) -> torch.Tensor:
+        """Sum every differentiable floating output into a synthetic scalar loss."""
+
         tensors: list[torch.Tensor] = []
 
         def collect(value: object) -> None:
+            """Recursively find floating tensor leaves in common containers."""
+
             if isinstance(value, torch.Tensor) and value.is_floating_point():
                 tensors.append(value)
             elif isinstance(value, dict):
@@ -199,6 +231,8 @@ class ModelProfiler:
 
     @staticmethod
     def _persistent_bytes(layer: torch.nn.Module) -> int:
+        """Count parameter and buffer storage owned by a materialized layer."""
+
         state = tuple(layer.parameters(recurse=True)) + tuple(layer.buffers(recurse=True))
         return sum(item.numel() * item.element_size() for item in state)
 
@@ -287,6 +321,8 @@ class ModelProfiler:
         warmup_steps: int = 2,
         measurement_steps: int = 5,
     ) -> ModelProfile:
+        """Measure a workload and atomically feed the results into profile storage."""
+
         return self.record(
             path,
             microbatch_size,
@@ -298,6 +334,8 @@ class ModelProfiler:
         )
 
     def load_profile(self, microbatch_size: int) -> list[LayerExecutionResult]:
+        """Load layers from the retained legacy cache naming convention."""
+
         precision = str(self.legacy.get("precision", "unknown"))
         tp_size = int(self.legacy.get("tp_size", 1))
         path = self.get_profile_path(self.profile_dir, tp_size, microbatch_size, precision)

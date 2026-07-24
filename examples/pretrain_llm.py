@@ -135,9 +135,7 @@ async def train_managed(config: ExampleTrainingConfig):
     configured: dict[str, object] = {}
 
     def configure_before_ready(context):
-        _, _, loader = configure_training(
-            model, context, dataset, device=selected
-        )
+        _, _, loader = configure_training(model, context, dataset, device=selected)
         configured["loader"] = loader
 
     context = await worker.activate_prepared(
@@ -169,9 +167,7 @@ async def train_managed(config: ExampleTrainingConfig):
         record("generation_active")
 
     record("generation_active")
-    relay_task = asyncio.create_task(
-        worker.run_context(context, on_active=activated)
-    )
+    relay_task = asyncio.create_task(worker.run_context(context, on_active=activated))
     try:
         result = None
         for _ in range(config.steps):

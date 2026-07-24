@@ -16,6 +16,8 @@ class OptimizerSchemaError(TypeError):
 
 @dataclass(frozen=True, slots=True)
 class OptimizerStateSchema:
+    """Portable optimizer metadata and versioned logical tensor entries."""
+
     optimizer_class: str
     parameter_groups: tuple[dict[str, Any], ...]
     scalar_slots: tuple[tuple[str, str, Any], ...]
@@ -24,6 +26,8 @@ class OptimizerStateSchema:
 
 
 def _local_tensor(value: torch.Tensor) -> torch.Tensor:
+    """Extract detached rank-local storage from a Tensor or DTensor slot."""
+
     local = value.to_local() if hasattr(value, "to_local") else value
     return local.detach()
 
@@ -110,7 +114,14 @@ def optimizer_schema_for_partition(
     owner_rank: int,
     committed_step: int,
 ) -> OptimizerStateSchema:
-    """Merge replica schemas and retain state belonging to one new partition."""
+    """Derive optimizer metadata and slots owned by one replacement partition.
+
+    Surviving schemas must agree on optimizer class, schema version, parameter-group count,
+    group metadata, and each parameter's group assignment. The new model manifest selects
+    only locally owned parameters and matching TP-lane tensor slots; scalar slots are copied
+    by logical parameter key. Owners and committed versions are rewritten for the new rank,
+    producing a schema that can be planned alongside model state without unstable object IDs.
+    """
 
     if not schemas:
         raise OptimizerSchemaError("no surviving optimizer schema is available")
@@ -176,6 +187,8 @@ def _restore_tensor_for_parameter(
     tensor: torch.Tensor,
     parameter: torch.nn.Parameter,
 ) -> torch.Tensor:
+    """Restore local storage and rewrap it as DTensor when the parameter is sharded."""
+
     local = tensor.to(parameter.device).clone()
     if not hasattr(parameter, "device_mesh") or tuple(local.shape) != tuple(
         getattr(parameter, "_local_tensor", local).shape
@@ -202,6 +215,15 @@ def restore_optimizer_state(
     tensors: Mapping[str, torch.Tensor],
     named_parameters: Mapping[str, torch.nn.Parameter],
 ) -> None:
+    """Rebuild optimizer groups and state using stable logical parameter identities.
+
+    Class/schema and group-count checks prevent recovery into a semantically different
+    optimizer. Parameter lists are rebound to the replacement model, group options and scalar
+    slots are restored, and every declared tensor slot must be present. Sharded parameters
+    rewrap matching local storage as DTensor when possible; ordinary slots remain local tensors
+    on the parameter device.
+    """
+
     actual = f"{optimizer.__class__.__module__}.{optimizer.__class__.__qualname__}"
     if schema.schema_version != 1 or actual != schema.optimizer_class:
         raise OptimizerSchemaError(

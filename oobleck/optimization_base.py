@@ -11,11 +11,13 @@ from oobleck.state import LogicalStateEntry
 
 
 class OptimizerSchemaError(TypeError):
-    pass
+    """An optimizer cannot be represented by the retained logical-key schema."""
 
 
 @dataclass(frozen=True, slots=True)
 class OptimizerStateSchema:
+    """Optimizer class, parameter groups, scalar slots, and tensor manifests."""
+
     optimizer_class: str
     parameter_groups: tuple[dict[str, Any], ...]
     scalar_slots: tuple[tuple[str, str, Any], ...]
@@ -30,6 +32,14 @@ def serialize_optimizer_state(
     owner_rank: int,
     committed_step: int,
 ) -> tuple[OptimizerStateSchema, dict[str, torch.Tensor]]:
+    """Serialize the retained homogeneous optimizer schema using logical model keys.
+
+    Parameter groups preserve options but replace object identities with stable names. Per-parameter
+    state is split into primitive scalar slots and tensor slots represented by versioned manifest
+    entries at the committed step. Parameters or slot types that lack a portable representation fail
+    explicitly rather than producing recovery data tied to transient Python IDs.
+    """
+
     by_identity = {id(parameter): name for name, parameter in named_parameters.items()}
     groups = []
     for group in optimizer.param_groups:
@@ -91,6 +101,8 @@ def restore_optimizer_state(
     tensors: Mapping[str, torch.Tensor],
     named_parameters: Mapping[str, torch.nn.Parameter],
 ) -> None:
+    """Reconstruct parameter groups and slots into a compatible optimizer."""
+
     actual = f"{optimizer.__class__.__module__}.{optimizer.__class__.__qualname__}"
     if schema.schema_version != 1 or actual != schema.optimizer_class:
         raise OptimizerSchemaError(

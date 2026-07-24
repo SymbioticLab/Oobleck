@@ -35,6 +35,8 @@ from oobleck.types import (
 
 @dataclass(frozen=True, slots=True)
 class OobleckStepResult:
+    """Outcome of one logical batch, including retries across generations."""
+
     committed: bool
     committed_step: int
     generation: int
@@ -56,6 +58,8 @@ class OobleckPreparedContext:
     _activated: bool = False
 
     def activate(self) -> "OobleckParallelContext":
+        """Initialize WORLD, materialize local state, and consume this preparation once."""
+
         if self._activated:
             raise RuntimeError("prepared context has already been activated")
         if self.owner_plan.world_initializer is not None:
@@ -88,6 +92,8 @@ class OobleckParallelizationPlan:
         world_initializer: Callable[[OobleckExecutionPlan], None] | None = None,
         compatibility: RuntimeCompatibility | None = None,
     ) -> None:
+        """Record planning inputs without touching the distributed data plane."""
+
         self.config = config
         self.templates = tuple(templates)
         self.node_ids = tuple(node_ids)
@@ -106,6 +112,8 @@ class OobleckParallelizationPlan:
         self._rendezvous_address: str | None = None
 
     def parallelize(self, model: torch.nn.Module, parallel_config: object) -> None:
+        """Register the reusable model blueprint and validate Oobleck-owned dimensions."""
+
         if self.model is not None:
             raise RuntimeError("parallelize() may be called only once in the first release")
         required = {
@@ -136,11 +144,15 @@ class OobleckParallelizationPlan:
                 register(model, parallel_config)
 
     def set_templates(self, templates: Sequence[PipelineTemplate]) -> None:
+        """Replace the candidate template catalog used for future generations."""
+
         if not templates:
             raise ValueError("templates must not be empty")
         self.templates = tuple(templates)
 
     def set_membership(self, node_ids: Sequence[str], generation: int | None = None) -> None:
+        """Install a sorted membership and monotonically advance its generation."""
+
         if len(node_ids) != len(set(node_ids)):
             raise ValueError("node IDs must be unique")
         if len(node_ids) > self.config.max_nodes:
@@ -156,6 +168,8 @@ class OobleckParallelizationPlan:
             self._generation += 1
 
     def set_rendezvous_address(self, address: str) -> None:
+        """Select the coordinator address used when creating replacement WORLDs."""
+
         if not address:
             raise ValueError("rendezvous address must not be empty")
         self._rendezvous_address = address
@@ -184,6 +198,8 @@ class OobleckParallelizationPlan:
         )
 
     def _default_template(self) -> PipelineTemplate:
+        """Build a local single-stage fallback when no profiled templates were supplied."""
+
         assert self.model is not None and self.parallel_config is not None
         layer_count = 1
         repeated_layers = getattr(self.model, "_repeated_layers", None)
@@ -205,6 +221,16 @@ class OobleckParallelizationPlan:
         )
 
     def build_execution_plan(self) -> OobleckExecutionPlan:
+        """Derive the immutable execution plan for the current membership generation.
+
+        Initial generations compose profiled templates globally; later generations run
+        the survivor-aware reconfiguration planner with estimated retained-state bytes.
+        The method then assigns stable per-node TP rank blocks, records generation
+        ancestry and compatibility, and caches the plan used to score the next change.
+        No process group is created here, so every worker can independently checksum
+        the same ownership before entering rendezvous.
+        """
+
         if self.model is None or self.parallel_config is None:
             raise RuntimeError("call parallelize() before building or materializing a plan")
         tp = int(getattr(self.parallel_config, "tensor_parallel_size"))
@@ -278,6 +304,8 @@ class OobleckParallelizationPlan:
         return result
 
     def rank_for_plan(self, execution_plan: OobleckExecutionPlan) -> int:
+        """Preserve this worker's node and TP-lane identity across rank remapping."""
+
         if self._local_node_id is None:
             return self.rank
         for node_id, ranks in execution_plan.rank_map:
@@ -292,6 +320,14 @@ class OobleckParallelizationPlan:
         )
 
     def compile(self, execution_plan: OobleckExecutionPlan | None = None) -> CompiledLocalPartition:
+        """Compile this worker's rank-local ownership without creating WORLD.
+
+        The plan compatibility digest is checked before rank remapping. Stable node and
+        TP-lane identity select the worker's new global rank, after which Cornstarch
+        receives only the local stage override and global plan metadata. Materialization
+        and real tensor allocation remain deferred until the activation barrier.
+        """
+
         if self.model is None or self.parallel_config is None:
             raise RuntimeError("call parallelize() before compile()")
         plan = execution_plan or self.build_execution_plan()
@@ -320,6 +356,8 @@ class OobleckParallelizationPlan:
         *,
         recover_from_survivors: bool = False,
     ) -> "OobleckParallelContext":
+        """Compatibility wrapper that prepares and immediately activates a partition."""
+
         return self.prepare(
             device,
             dtype,
@@ -348,6 +386,8 @@ class OobleckParallelizationPlan:
 
 
 class OobleckParallelContext:
+    """Active generation plus transactional training and reconfiguration state."""
+
     def __init__(
         self,
         *,
@@ -360,6 +400,8 @@ class OobleckParallelContext:
         dtype: torch.dtype | None,
         needs_survivor_recovery: bool = False,
     ) -> None:
+        """Bind an activated local partition to one immutable execution plan."""
+
         self.config = config
         self.owner_plan = owner_plan
         self.execution_plan = execution_plan
@@ -379,10 +421,14 @@ class OobleckParallelContext:
 
     @property
     def model(self) -> torch.nn.Module:
+        """Return the currently active rank-local model view."""
+
         return self.partition.model
 
     @property
     def generation(self) -> int:
+        """Return the active membership generation."""
+
         return self.execution_plan.generation
 
     def create_batch_sampler(
@@ -392,6 +438,8 @@ class OobleckParallelContext:
         shuffle: bool,
         drop_last: bool = True,
     ) -> OobleckBatchSampler:
+        """Create a commit-aware sampler using this generation's allocation."""
+
         return OobleckBatchSampler(
             dataset,
             global_batch_size=self.config.global_batch_size,
@@ -403,6 +451,8 @@ class OobleckParallelContext:
         )
 
     def prepare_dataloader(self, dataloader: DataLoader) -> PreparedDataLoader:
+        """Attach a validated loader so reconfiguration can invalidate its prefetch."""
+
         loader = prepare_dataloader(dataloader)
         self._loaders.append(loader)
         return loader
@@ -414,6 +464,8 @@ class OobleckParallelContext:
         scheduler_factory: Callable[[torch.optim.Optimizer], Any] | None = None,
         scaler: Any = None,
     ) -> None:
+        """Construct optimization state only after local parameters are materialized."""
+
         if self.optimizer is not None:
             raise RuntimeError("optimization is already configured")
         self.optimizer = optimizer_factory(self.model.parameters())
@@ -421,6 +473,8 @@ class OobleckParallelContext:
         self.scaler = scaler
 
     def announce_generation(self, plan: OobleckExecutionPlan) -> bool:
+        """Queue only the newest future plan under the optimizer commit lock."""
+
         with self._commit_lock:
             if plan.generation <= self.generation:
                 return False
@@ -429,6 +483,14 @@ class OobleckParallelContext:
             return True
 
     def _activate_latest_generation(self) -> None:
+        """Synchronously replace the active generation for unmanaged callers.
+
+        Prefetched batches are invalidated before the partition and every process group
+        are retired. Ownership is recompiled without WORLD, replacement WORLD is then
+        initialized, and only afterward is local storage materialized. The loop consumes
+        newer pending plans so an older generation is never left active accidentally.
+        """
+
         while self._pending_plan is not None:
             target = self._pending_plan
             self._pending_plan = None
@@ -451,11 +513,15 @@ class OobleckParallelContext:
             self.execution_plan = target
 
     def _call_model(self, microbatch: Any) -> Any:
+        """Dispatch mapping batches as keyword arguments and other batches positionally."""
+
         if isinstance(microbatch, Mapping):
             return self.model(**microbatch)
         return self.model(microbatch)
 
     def _local_microbatches(self, batch: OobleckBatch) -> tuple[tuple[int, Any], ...]:
+        """Select this pipeline's global microbatch IDs from the logical batch."""
+
         pipeline_id = self.execution_plan.rank_local_stage(self.owner_plan.rank).pipeline_id
         cursor = 0
         selected: tuple[int, ...] | None = None
@@ -480,6 +546,15 @@ class OobleckParallelContext:
         output_reference: Any,
         criterion: Callable[..., torch.Tensor] | None,
     ) -> tuple[torch.Tensor | None, Any]:
+        """Execute local microbatches without committing any training state.
+
+        A native schedule may own the complete attempt; otherwise each local microbatch
+        runs under a seed derived from logical epoch, committed step, and global
+        microbatch ID. Losses are normalized before backward so replay on a different
+        pipeline layout preserves stochastic behavior and global-batch scaling.
+        Optimizer, scheduler, scaler, and sampler state are deliberately untouched.
+        """
+
         assert self.optimizer is not None
         local_microbatches = self._local_microbatches(batch)
         if hasattr(execution, "step") and callable(execution.step):
@@ -526,6 +601,20 @@ class OobleckParallelContext:
         output: Any = None,
         criterion: Callable[..., torch.Tensor] | None = None,
     ) -> OobleckStepResult:
+        """Execute and atomically commit one logical batch across generation changes.
+
+        Each attempt starts with clean gradients, executes deterministically, and
+        completes both Cornstarch and heterogeneous replica synchronization. Under the
+        commit lock, a final generation/barrier check decides whether the attempt may
+        update optimizer, scheduler, scaler, committed step, and sampler cursor together.
+
+        A hard transition containing any removal invalidates an overlapping attempt,
+        discards its partial gradients, and retries the same descriptor. A pure addition
+        is instead deferred by the control-plane wrapper until this commit completes, so
+        the batch is not replayed. Execution exceptions are retried only when a concurrent
+        hard transition explains them; otherwise the original error is propagated.
+        """
+
         if self._closed:
             raise RuntimeError("context is closed")
         if self.optimizer is None:
@@ -535,9 +624,13 @@ class OobleckParallelContext:
         wait_for_generation = getattr(self, "_wait_for_generation_barrier", None)
 
         def managed_transition_pending() -> bool:
+            """Consult the optional control-plane barrier installed by runtime.py."""
+
             return callable(transition_pending) and bool(transition_pending())
 
         def wait_if_managed() -> None:
+            """Block commits while the master coordinates a two-phase transition."""
+
             if managed_transition_pending():
                 if not callable(wait_for_generation):
                     raise RuntimeError("managed generation has no control-plane waiter")
@@ -607,6 +700,8 @@ class OobleckParallelContext:
             )
 
     def close(self) -> None:
+        """Idempotently retire the local partition and attached loader references."""
+
         if self._closed:
             return
         self.partition.close()
@@ -614,7 +709,11 @@ class OobleckParallelContext:
         self._closed = True
 
     def __enter__(self) -> "OobleckParallelContext":
+        """Return the active context for managed use."""
+
         return self
 
     def __exit__(self, *exc_info: object) -> None:
+        """Retire resources regardless of how the managed block exits."""
+
         self.close()
