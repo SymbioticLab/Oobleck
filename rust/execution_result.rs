@@ -93,20 +93,52 @@ impl StageExecutionResult {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PipelineExecutionResult {
     pub stages: Vec<StageExecutionResult>,
+    /// Section 4.1.2, Equation 1: one forward and backward pass for every stage.
+    pub t1: f64,
+    /// Section 4.1.2, Equation 3: work from the bottleneck through the last stage.
+    pub t3: f64,
+    /// Zero-based index of the rightmost stage with maximum forward + backward time.
+    pub kstar: usize,
 }
 
 impl PipelineExecutionResult {
+    /// Section 4.1.2, Equation 4 (conquer): evaluate one stage.
+    pub fn from_stage(stage: StageExecutionResult) -> Self {
+        let latency = stage.latency();
+        Self {
+            stages: vec![stage],
+            t1: latency,
+            t3: latency,
+            kstar: 0,
+        }
+    }
+
+    /// Section 4.1.2, Equations 1 and 3 (combine two subproblems).
+    ///
+    /// T2 is evaluated from the combined rightmost bottleneck by
+    /// `iteration_time`, because its coefficient depends on the concrete Nb.
+    pub fn combine(left: &Self, right: &Self) -> Self {
+        let mut stages = left.stages.clone();
+        stages.extend(right.stages.clone());
+        let right_wins = right
+            .bottleneck_latency()
+            .total_cmp(&left.bottleneck_latency())
+            != std::cmp::Ordering::Less;
+        let (kstar, t3) = if right_wins {
+            (left.stages.len() + right.kstar, right.t3)
+        } else {
+            (left.kstar, left.t3 + right.t1)
+        };
+        Self {
+            stages,
+            t1: left.t1 + right.t1,
+            t3,
+            kstar,
+        }
+    }
+
     pub fn bottleneck_stage(&self) -> &StageExecutionResult {
-        self.stages
-            .iter()
-            .enumerate()
-            .max_by(|(left_index, left), (right_index, right)| {
-                left.latency()
-                    .total_cmp(&right.latency())
-                    .then_with(|| left_index.cmp(right_index))
-            })
-            .map(|(_, stage)| stage)
-            .expect("a planned pipeline always has at least one stage")
+        &self.stages[self.kstar]
     }
 
     pub fn bottleneck_latency(&self) -> f64 {
@@ -135,6 +167,20 @@ impl PipelineExecutionResult {
             .map(|stage| stage.persistent_memory)
             .max()
             .unwrap_or(0)
+    }
+
+    /// Evaluate Section 4.1.2's T1 + T2 + T3 model.
+    pub fn iteration_time(&self, num_microbatches: u32) -> f64 {
+        // Equation 2: T2 = (Nb - S + k* - 1) * (F_k* + B_k*).
+        let t2_coefficient = num_microbatches as i64 - self.stages.len() as i64
+            + self.kstar as i64
+            - 1;
+        self.t1 + t2_coefficient as f64 * self.bottleneck_latency() + self.t3
+    }
+
+    /// The paper selects a template using the temporary planning value Nb = 4S.
+    pub fn planning_iteration_time(&self) -> f64 {
+        self.iteration_time((4 * self.stages.len()) as u32)
     }
 
     pub fn max_microbatches(&self, device_memory_bytes: Option<u64>) -> Option<u64> {

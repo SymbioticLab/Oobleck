@@ -1,8 +1,9 @@
-"""Narrow Python planner API with equivalent Rust and Python backends."""
+"""Paper-traceable Python planner API with equivalent Rust and Python backends."""
 
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import Sequence
 
 from oobleck.planning.profiler import LayerExecutionResult
@@ -15,6 +16,15 @@ def _effective_activation_memory(layer: LayerExecutionResult) -> int:
     return layer.mem_required
 
 
+def _sequential_sum(values: Sequence[float]) -> float:
+    """Match Rust's left-associated f64 accumulation (Python 3.12 sum is compensated)."""
+
+    result = 0.0
+    for value in values:
+        result += value
+    return result
+
+
 def _prefix(values: Sequence[float | int]) -> list[float | int]:
     result: list[float | int] = [0]
     for value in values:
@@ -25,66 +35,271 @@ def _prefix(values: Sequence[float | int]) -> list[float | int]:
     return result
 
 
+@dataclass(frozen=True, slots=True)
+class _StageMetrics:
+    forward: float
+    backward: float
+    activation: int
+    persistent: int
+
+    @property
+    def latency(self) -> float:
+        return self.forward + self.backward
+
+
+@dataclass(frozen=True, slots=True)
+class _BottleneckCandidate:
+    start: int
+    end: int
+    latency: float
+    min_prefix_stages: int
+    min_suffix_stages: int
+
+
+@dataclass(frozen=True, slots=True)
+class _PaperPlan:
+    ranges: tuple[tuple[int, int], ...]
+    forward: float
+    backward: float
+    activation: int
+    persistent: int
+    capacity: int | None
+    t1: float
+    t3: float
+    kstar: int
+
+    @property
+    def planning_iteration_time(self) -> float:
+        stages = len(self.ranges)
+        return self.t1 + (3 * stages + self.kstar - 1) * (self.forward + self.backward) + self.t3
+
+
+class _PaperWorkspace:
+    """Shared Section 4.1.2 stage cache for all requested templates."""
+
+    def __init__(self, layers: Sequence[LayerExecutionResult], device_memory_bytes: int | None):
+        self.layers = layers
+        self.device_memory_bytes = device_memory_bytes
+        self.forward = _prefix([layer.forward for layer in layers])
+        self.backward = _prefix([layer.backward for layer in layers])
+        self.activation = _prefix([_effective_activation_memory(layer) for layer in layers])
+        self.persistent = _prefix([layer.persistent_memory for layer in layers])
+
+    def stage(self, start: int, end: int) -> _StageMetrics:
+        return _StageMetrics(
+            float(self.forward[end] - self.forward[start]),
+            float(self.backward[end] - self.backward[start]),
+            int(self.activation[end] - self.activation[start]),
+            int(self.persistent[end] - self.persistent[start]),
+        )
+
+    def allowed(self, start: int, end: int, threshold: float, *, inclusive: bool) -> bool:
+        stage = self.stage(start, end)
+        if (
+            self.device_memory_bytes is not None
+            and stage.activation + stage.persistent > self.device_memory_bytes
+        ):
+            return False
+        return stage.latency <= threshold if inclusive else stage.latency < threshold
+
+    def min_segments(
+        self, start: int, end: int, threshold: float, *, inclusive: bool
+    ) -> int | None:
+        """Greedily conquer an interval with the fewest bounded stages."""
+
+        position = start
+        count = 0
+        while position < end:
+            farthest = None
+            for next_position in range(position + 1, end + 1):
+                if self.allowed(position, next_position, threshold, inclusive=inclusive):
+                    farthest = next_position
+                else:
+                    break
+            if farthest is None:
+                return None
+            position = farthest
+            count += 1
+        return count
+
+    def lexicographic_partition(
+        self,
+        start: int,
+        end: int,
+        count: int,
+        threshold: float,
+        *,
+        inclusive: bool,
+    ) -> tuple[int, ...] | None:
+        if count == 0:
+            return () if start == end else None
+        if count > end - start:
+            return None
+
+        starts: list[int] = []
+        position = start
+        for stage_index in range(count):
+            starts.append(position)
+            remaining = count - stage_index - 1
+            if remaining == 0:
+                return (
+                    tuple(starts)
+                    if self.allowed(position, end, threshold, inclusive=inclusive)
+                    else None
+                )
+            latest = end - remaining
+            chosen = None
+            for next_position in range(position + 1, latest + 1):
+                if not self.allowed(position, next_position, threshold, inclusive=inclusive):
+                    break
+                minimum = self.min_segments(
+                    next_position, end, threshold, inclusive=inclusive
+                )
+                if minimum is not None and minimum <= remaining <= end - next_position:
+                    chosen = next_position
+                    break
+            if chosen is None:
+                return None
+            position = chosen
+        return None
+
+    def bottleneck_candidates(self) -> tuple[_BottleneckCandidate, ...]:
+        candidates = []
+        layer_count = len(self.layers)
+        for start in range(layer_count):
+            for end in range(start + 1, layer_count + 1):
+                stage = self.stage(start, end)
+                if (
+                    self.device_memory_bytes is not None
+                    and stage.activation + stage.persistent > self.device_memory_bytes
+                ):
+                    continue
+                prefix = self.min_segments(0, start, stage.latency, inclusive=True)
+                # k* is the rightmost bottleneck: following stages must be
+                # strictly faster, while preceding stages may tie it.
+                suffix = self.min_segments(end, layer_count, stage.latency, inclusive=False)
+                if prefix is not None and suffix is not None:
+                    candidates.append(
+                        _BottleneckCandidate(start, end, stage.latency, prefix, suffix)
+                    )
+        return tuple(candidates)
+
+    def materialize(
+        self, candidate: _BottleneckCandidate, prefix_stages: int, total_stages: int
+    ) -> _PaperPlan | None:
+        suffix_stages = total_stages - prefix_stages - 1
+        prefix = self.lexicographic_partition(
+            0,
+            candidate.start,
+            prefix_stages,
+            candidate.latency,
+            inclusive=True,
+        )
+        suffix = self.lexicographic_partition(
+            candidate.end,
+            len(self.layers),
+            suffix_stages,
+            candidate.latency,
+            inclusive=False,
+        )
+        if prefix is None or suffix is None:
+            return None
+        starts = (*prefix, candidate.start, *suffix)
+        ends = (*starts[1:], len(self.layers))
+        ranges = tuple(zip(starts, ends))
+        metrics = tuple(self.stage(start, end) for start, end in ranges)
+        bottleneck = metrics[prefix_stages]
+        stage_memory = tuple((item.activation, item.persistent) for item in metrics)
+        return _PaperPlan(
+            ranges,
+            bottleneck.forward,
+            bottleneck.backward,
+            max(item.activation for item in metrics),
+            max(item.persistent for item in metrics),
+            _max_microbatches(stage_memory, self.device_memory_bytes),
+            _sequential_sum(tuple(item.latency for item in metrics)),
+            _sequential_sum(tuple(item.latency for item in metrics[prefix_stages:])),
+            prefix_stages,
+        )
+
+
+def _paper_plans(
+    layers: Sequence[LayerExecutionResult],
+    resource_counts: Sequence[int],
+    device_memory_bytes: int | None = None,
+) -> dict[int, _PaperPlan]:
+    """Apply Section 4.1.2 Equations 1--4 for fixed-TP logical nodes.
+
+    The refactored runtime assigns one complete fixed-TP node to each stage, so
+    the paper state T(S, u, v, d) has S=d and no within-node GPU split m. The
+    shared bottleneck cache is equivalent to evaluating every feasible divide
+    and conquer result, but retains enough state to avoid the artifact's unsafe
+    single-locally-best-subproblem assumption.
+    """
+
+    requested = sorted(set(resource_counts))
+    if not requested or requested[0] < 1 or requested[-1] > len(layers):
+        raise ValueError("stage count must be between one and the number of layers")
+    workspace = _PaperWorkspace(layers, device_memory_bytes)
+    candidates = workspace.bottleneck_candidates()
+    results: dict[int, _PaperPlan] = {}
+
+    for stages in requested:
+        best: _PaperPlan | None = None
+        for candidate in candidates:
+            prefix_lower = max(
+                candidate.min_prefix_stages,
+                stages - 1 - (len(layers) - candidate.end),
+                0,
+            )
+            prefix_upper = min(
+                candidate.start,
+                stages - 1 - candidate.min_suffix_stages,
+            )
+            if prefix_lower > prefix_upper or prefix_lower >= stages:
+                continue
+            prefix_counts = (
+                range(prefix_lower, prefix_upper + 1)
+                if candidate.latency == 0.0
+                else (prefix_lower,)
+            )
+            for prefix_stages in prefix_counts:
+                predicted = (
+                    workspace.stage(0, len(layers)).latency
+                    + (3 * stages + prefix_stages - 1) * candidate.latency
+                    + workspace.stage(candidate.start, len(layers)).latency
+                )
+                if best is not None and predicted > best.planning_iteration_time:
+                    continue
+                plan = workspace.materialize(candidate, prefix_stages, stages)
+                if plan is not None and (
+                    best is None
+                    or (plan.planning_iteration_time, tuple(start for start, _ in plan.ranges))
+                    < (
+                        best.planning_iteration_time,
+                        tuple(start for start, _ in best.ranges),
+                    )
+                ):
+                    best = plan
+        if best is None:
+            raise ValueError(
+                f"pipeline template for resource count {stages} cannot fit one microbatch in device memory"
+            )
+        results[stages] = best
+    return results
+
+
 def _partitions(
     layers: Sequence[LayerExecutionResult],
     resource_counts: Sequence[int],
     device_memory_bytes: int | None = None,
 ) -> dict[int, tuple[tuple[int, int], ...]]:
-    """Return exact deterministic minimax partitions from one dynamic program."""
+    """Compatibility helper returning only the paper planner's layer ranges."""
 
-    requested = sorted(set(resource_counts))
-    if not requested or requested[0] < 1 or requested[-1] > len(layers):
-        raise ValueError("stage count must be between one and the number of layers")
-    forward = _prefix([layer.forward for layer in layers])
-    backward = _prefix([layer.backward for layer in layers])
-    activation = _prefix([_effective_activation_memory(layer) for layer in layers])
-    persistent = _prefix([layer.persistent_memory for layer in layers])
-
-    # dp[k][j] = (maximum stage work, stage start positions) for k stages
-    # covering the first j layers. Keeping the lexicographically smallest
-    # starts gives a stable answer when several partitions have equal cost.
-    max_stages = requested[-1]
-    dp: list[list[tuple[float, tuple[int, ...]] | None]] = [
-        [None] * (len(layers) + 1) for _ in range(max_stages + 1)
-    ]
-    dp[0][0] = (0.0, ())
-    for count in range(1, max_stages + 1):
-        for end in range(count, len(layers) + 1):
-            candidates = []
-            for start in range(count - 1, end):
-                previous = dp[count - 1][start]
-                if previous is None:
-                    continue
-                stage_activation = int(activation[end] - activation[start])
-                stage_persistent = int(persistent[end] - persistent[start])
-                if (
-                    device_memory_bytes is not None
-                    and stage_activation + stage_persistent > device_memory_bytes
-                ):
-                    continue
-                stage_work = float(
-                    forward[end] - forward[start] + backward[end] - backward[start]
-                )
-                candidates.append(
-                    (max(previous[0], stage_work), (*previous[1], start))
-                )
-            if candidates:
-                dp[count][end] = min(candidates)
-
-    results = {}
-    for stages in requested:
-        result = dp[stages][len(layers)]
-        if result is None:
-            raise ValueError(
-                f"pipeline template for resource count {stages} cannot fit one microbatch in device memory"
-            )
-        starts = result[1]
-        ends = (*starts[1:], len(layers))
-        results[stages] = tuple(
-            (layers[start].layer_index, layers[end - 1].layer_index + 1)
-            for start, end in zip(starts, ends)
-        )
-    return results
+    return {
+        stages: plan.ranges
+        for stages, plan in _paper_plans(layers, resource_counts, device_memory_bytes).items()
+    }
 
 
 def _partition(
@@ -92,8 +307,6 @@ def _partition(
     stages: int,
     device_memory_bytes: int | None = None,
 ) -> tuple[tuple[int, int], ...]:
-    """Return one partition; retained as the small Python oracle entry point."""
-
     return _partitions(layers, (stages,), device_memory_bytes)[stages]
 
 
@@ -112,37 +325,6 @@ def _max_microbatches(
     return min(capacities) if capacities else None
 
 
-def _summarize_partition(
-    layers: Sequence[LayerExecutionResult],
-    ranges: Sequence[tuple[int, int]],
-    device_memory_bytes: int | None,
-) -> tuple[float, float, int, int, int | None]:
-    forward_prefix = _prefix([layer.forward for layer in layers])
-    backward_prefix = _prefix([layer.backward for layer in layers])
-    activation_prefix = _prefix([_effective_activation_memory(layer) for layer in layers])
-    persistent_prefix = _prefix([layer.persistent_memory for layer in layers])
-    stage_metrics = [
-        (
-            float(forward_prefix[end] - forward_prefix[start]),
-            float(backward_prefix[end] - backward_prefix[start]),
-            int(activation_prefix[end] - activation_prefix[start]),
-            int(persistent_prefix[end] - persistent_prefix[start]),
-        )
-        for start, end in ranges
-    ]
-    bottleneck = max(
-        range(len(stage_metrics)),
-        key=lambda index: (stage_metrics[index][0] + stage_metrics[index][1], index),
-    )
-    forward, backward, _, _ = stage_metrics[bottleneck]
-    activation_memory = max(item[2] for item in stage_metrics)
-    persistent_memory = max(item[3] for item in stage_metrics)
-    max_microbatches = _max_microbatches(
-        [(item[2], item[3]) for item in stage_metrics], device_memory_bytes
-    )
-    return forward, backward, activation_memory, persistent_memory, max_microbatches
-
-
 def _create_python_templates(
     model_name: str,
     profile_data: Sequence[LayerExecutionResult],
@@ -152,21 +334,22 @@ def _create_python_templates(
     device_memory_bytes: int | None,
 ) -> dict[int, PipelineTemplate]:
     results = {}
-    partitions = _partitions(profile_data, resource_counts, device_memory_bytes)
-    for stages, ranges in partitions.items():
-        forward, backward, activation, persistent, capacity = _summarize_partition(
-            profile_data, ranges, device_memory_bytes
-        )
+    for stages, plan in _paper_plans(
+        profile_data, resource_counts, device_memory_bytes
+    ).items():
         results[stages] = PipelineTemplate(
             f"{model_name}-stages-{stages}",
-            ranges,
+            plan.ranges,
             tensor_parallel_size,
-            forward,
-            backward,
-            activation_memory=activation,
-            persistent_memory=persistent,
-            max_microbatches=capacity,
+            plan.forward,
+            plan.backward,
+            activation_memory=plan.activation,
+            persistent_memory=plan.persistent,
+            max_microbatches=plan.capacity,
             fingerprint=fingerprint,
+            paper_t1=plan.t1,
+            paper_t3=plan.t3,
+            paper_bottleneck_stage=plan.kstar,
         )
     return results
 
@@ -180,7 +363,7 @@ def create_pipeline_templates(
     fingerprint: CompatibilityFingerprint | None = None,
     device_memory_bytes: int | None = None,
 ) -> dict[int, PipelineTemplate]:
-    """Create one fixed-TP, one-stage-per-resource template for each count."""
+    """Create one paper-modeled, fixed-TP pipeline template per node count."""
 
     if not model_name or not profile_data or not num_nodes:
         raise ValueError("model_name, profile_data, and num_nodes must be non-empty")
@@ -231,6 +414,9 @@ def create_pipeline_templates(
             None if value["max_microbatches"] is None else int(value["max_microbatches"]),
             fingerprint,
             int(value["schema_version"]),
+            float(value["paper_t1"]),
+            float(value["paper_t3"]),
+            int(value["paper_bottleneck_stage"]),
         )
         for stages, value in raw.items()
     }

@@ -88,7 +88,7 @@ active intermediate layer, `state_public_base.py`.
 | --- | --- |
 | [`__init__.py`](oobleck/planning/__init__.py) | Re-exports the supported profiling, template, composition, and reconfiguration API. |
 | [`profiler.py`](oobleck/planning/profiler.py) | Measures model layers with a model-agnostic workload and records versioned execution/memory profiles. |
-| [`generator.py`](oobleck/planning/generator.py) | Narrow binding around the exact Rust minimax template generator with an equivalent deterministic Python fallback; see [`docs/pipeline_planner.md`](docs/pipeline_planner.md). |
+| [`generator.py`](oobleck/planning/generator.py) | Narrow binding around the Rust implementation of the Section 4.1.2 T1/T2/T3 template planner with an equivalent deterministic Python fallback; see [`docs/pipeline_planner.md`](docs/pipeline_planner.md). |
 | [`planner.pyi`](oobleck/planning/planner.pyi) | Type stub for the compiled Rust `create_pipeline_templates` extension. |
 | [`cache.py`](oobleck/planning/cache.py) | Saves and loads versioned templates while validating schema and compatibility fingerprints. |
 | [`composer.py`](oobleck/planning/composer.py) | Selects a deterministic heterogeneous template composition, maps it to nodes, allocates global microbatches, and computes gradient sample weights. |

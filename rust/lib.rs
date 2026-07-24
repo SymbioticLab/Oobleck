@@ -100,6 +100,9 @@ fn create_pipeline_templates(
         template.set_item("forward_time", result.forward_time())?;
         template.set_item("backward_time", result.backward_time())?;
         template.set_item("communication_time", 0.0)?;
+        template.set_item("paper_t1", result.t1)?;
+        template.set_item("paper_t3", result.t3)?;
+        template.set_item("paper_bottleneck_stage", result.kstar)?;
         template.set_item("activation_memory", result.activation_memory())?;
         template.set_item("persistent_memory", result.persistent_memory())?;
         template.set_item(

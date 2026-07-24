@@ -1,3 +1,6 @@
+from itertools import combinations
+import math
+
 import pytest
 
 from oobleck.planning import LayerExecutionResult, create_pipeline_templates
@@ -14,6 +17,23 @@ def _profile(
     ]
 
 
+def _paper_oracle(latencies: tuple[float, ...], stages: int) -> tuple[float, tuple[int, ...]]:
+    best: tuple[float, tuple[int, ...]] | None = None
+    for cuts in combinations(range(1, len(latencies)), stages - 1):
+        starts = (0, *cuts)
+        ends = (*cuts, len(latencies))
+        work = tuple(sum(latencies[start:end]) for start, end in zip(starts, ends))
+        kstar = max(range(stages), key=lambda index: (work[index], index))
+        t1 = sum(work)
+        t2 = (3 * stages + kstar - 1) * work[kstar]
+        t3 = sum(work[kstar:])
+        candidate = (t1 + t2 + t3, starts)
+        if best is None or candidate < best:
+            best = candidate
+    assert best is not None
+    return best
+
+
 def test_template_generator_covers_uneven_global_ranges():
     layers = [
         LayerExecutionResult(index, f"layer.{index}", index + 1, index + 1, 10)
@@ -28,21 +48,21 @@ def test_template_generator_covers_uneven_global_ranges():
     assert templates[2].layer_ranges == ((0, 4), (4, 6))
 
 
-def test_rust_and_python_backends_return_identical_templates():
-    layers = _profile((91, 45, 29, 75, 73, 66, 99, 81, 83, 83))
+def test_rust_and_python_backends_match_the_paper_objective():
+    latencies = (91, 45, 29, 75, 73, 66, 99, 81, 83, 83)
+    layers = _profile(latencies)
     rust = create_pipeline_templates("counterexample", layers, [1, 2, 3, 4, 5, 6])
-    python = _create_python_templates("counterexample", layers, [1, 2, 3, 4, 5, 6], 1, None, None)
+    python = _create_python_templates(
+        "counterexample", layers, [1, 2, 3, 4, 5, 6], 1, None, None
+    )
 
     assert rust == python
-    assert rust[6].layer_ranges == (
-        (0, 2),
-        (2, 4),
-        (4, 6),
-        (6, 7),
-        (7, 9),
-        (9, 10),
-    )
-    assert rust[6].forward_time + rust[6].backward_time == 164
+    expected_time, expected_starts = _paper_oracle(latencies, 6)
+    assert tuple(start for start, _ in rust[6].layer_ranges) == expected_starts
+    assert rust[6].planning_iteration_time == expected_time
+    assert rust[6].paper_t1 == sum(latencies)
+    assert rust[6].paper_t3 is not None
+    assert rust[6].paper_bottleneck_stage is not None
 
 
 def test_memory_feasibility_is_part_of_partition_selection():
@@ -55,6 +75,7 @@ def test_memory_feasibility_is_part_of_partition_selection():
     assert rust == python
     assert rust[2].layer_ranges == ((0, 1), (1, 3))
     assert rust[2].max_microbatches == 1
+    assert math.isfinite(rust[2].planning_iteration_time)
 
 
 def test_memory_infeasibility_reports_requested_resource_count():
