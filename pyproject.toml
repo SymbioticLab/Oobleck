@@ -27,7 +27,6 @@ oobleck = "oobleck.cli:main"
 
 [tool.ruff]
 line-length = 100
-exclude = ["legacy"]
 
 [tool.ruff.lint]
 ignore = ["E501"]
@@ -50,7 +49,6 @@ include = [
     "oobleck/elastic/transport.py",
     "benchmarks",
 ]
-exclude = ["legacy"]
 pythonVersion = "3.12"
 typeCheckingMode = "basic"
 reportMissingImports = false
