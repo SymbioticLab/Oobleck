@@ -32,7 +32,13 @@ def serialize_optimizer_state(
     owner_rank: int,
     committed_step: int,
 ) -> tuple[OptimizerStateSchema, dict[str, torch.Tensor]]:
-    """Replace unstable parameter IDs with logical keys and versioned slot tensors."""
+    """Serialize the retained homogeneous optimizer schema using logical model keys.
+
+    Parameter groups preserve options but replace object identities with stable names. Per-parameter
+    state is split into primitive scalar slots and tensor slots represented by versioned manifest
+    entries at the committed step. Parameters or slot types that lack a portable representation fail
+    explicitly rather than producing recovery data tied to transient Python IDs.
+    """
 
     by_identity = {id(parameter): name for name, parameter in named_parameters.items()}
     groups = []

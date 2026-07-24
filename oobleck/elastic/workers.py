@@ -101,7 +101,14 @@ async def run_agent_service(
     on_membership: Callable[[MessageEnvelope], Awaitable[None]] | None = None,
     on_generation_active: Callable[[MessageEnvelope], Awaitable[None]] | None = None,
 ) -> None:
-    """Run an agent lease and, when configured, its local training workers."""
+    """Own the complete node-agent and optional GPU-worker process lifetime.
+
+    The agent registers before workers start so membership and local IPC are available. Without a
+    worker script it simply maintains the reconnecting lease. With workers, the agent stream and
+    process cohort run concurrently; unsuccessful workers fail the node, while clean worker completion
+    requests a graceful drain. The ``finally`` path always retires processes, closes transports, and
+    cancels the remaining agent task.
+    """
 
     client = NodeAgentClient(
         config.node_id,

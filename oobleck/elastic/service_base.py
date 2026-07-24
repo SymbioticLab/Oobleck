@@ -106,9 +106,13 @@ class MasterControlService:
     async def _handle(self, connection: ControlConnection) -> None:
         """Serve one operator request or one registered agent incarnation.
 
-        Registration installs the stream under a stable node ID. Subsequent
-        heartbeats and phase acknowledgements are serialized with membership;
-        stream loss feeds the same removal path as lease expiration.
+        Operator inspection and drain requests are short-lived and never join membership.
+        Agent streams must register first; their heartbeats, drains, and prepared/ready
+        acknowledgements are serialized under the membership lock. Prepared metadata must
+        agree across every live agent before rendezvous, and ready metadata must agree
+        again before activation. A newer membership proposal clears both barriers. EOF,
+        reset, malformed protocol, and lease expiry all converge on incarnation-aware
+        removal so closure of a superseded socket cannot evict its replacement.
         """
 
         identity: NodeIdentity | None = None

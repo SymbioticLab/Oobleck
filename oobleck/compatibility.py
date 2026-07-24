@@ -138,7 +138,13 @@ def build_runtime_compatibility(
     oobleck_revision: str | None = None,
     cornstarch_revision: str | None = None,
 ) -> RuntimeCompatibility:
-    """Assemble the checksummed contract workers compare before activation."""
+    """Assemble the exact software, model, dataset, and hardware generation contract.
+
+    Package revisions prefer source commits, while Torch/CUDA/NCCL and datasets versions describe
+    the executable environment. Model structure, stable dataset/preprocessing identity, schema
+    versions, and local hardware are fingerprinted independently. The resulting immutable digest
+    is embedded in execution plans and must agree across workers before rendezvous.
+    """
 
     cuda_version = torch.version.cuda
     nccl_version = None

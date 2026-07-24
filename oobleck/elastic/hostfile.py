@@ -60,7 +60,13 @@ def ssh_agent_command(
     socket_directory: str | Path = "/tmp",
     ssh_command: str = "ssh",
 ) -> tuple[str, ...]:
-    """Build one explicit remote agent command without executing it."""
+    """Construct the complete SSH command for one bootstrap agent without side effects.
+
+    The command carries stable node identity, master endpoint, GPU inventory, local-worker socket,
+    worker entrypoint, and optional training arguments. Returning argv rather than a shell string
+    preserves quoting and lets the launcher supervise processes directly. This is intentionally
+    limited to initial bootstrap; membership controls later joins.
+    """
 
     if not 1 <= master_port <= 65535:
         raise ValueError("master_port must be reachable and nonzero for SSH bootstrap")

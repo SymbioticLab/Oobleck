@@ -13,7 +13,14 @@ from oobleck.types import PipelineInstance, PipelineTemplate, RecoveryUnavailabl
 def allocate_microbatches(
     instances: Sequence[PipelineInstance], total_microbatches: int
 ) -> tuple[PipelineInstance, ...]:
-    """Minimize the predicted maximum iteration time with integer allocations."""
+    """Allocate integer microbatches to minimize predicted iteration makespan.
+
+    The search first finds the smallest feasible iteration-time threshold under
+    each template's memory capacity. Every replica receives one microbatch, then
+    remaining work is assigned greedily by its next completion time with stable
+    instance-ID tie breaks. The returned allocation always consumes the complete
+    fixed global batch without silently disabling a pipeline.
+    """
 
     if not instances:
         raise RecoveryUnavailable("cannot allocate a batch without a pipeline")
@@ -105,7 +112,14 @@ def _assign_composition(
     previous: Sequence[PipelineInstance],
     state_bytes: Mapping[str, int],
 ) -> tuple[tuple[PipelineInstance, ...], int, int]:
-    """Assign identities/nodes to a composition with maximum in-place state."""
+    """Map a template composition to nodes while preserving maximum local state.
+
+    A dynamic-programming match pairs new composition slots with surviving old
+    pipeline identities using retained-state bytes as the primary score. Reserved
+    survivors stay with the winning identity; remaining nodes fill deficits in
+    stable order. The result also reports retained bytes and survivor movement so
+    higher-level composition can apply deterministic recovery tie breaks.
+    """
 
     surviving = set(nodes)
     old = tuple(
@@ -207,7 +221,14 @@ def compose_templates(
     previous_instances: Sequence[PipelineInstance] = (),
     state_bytes_by_node: Mapping[str, int] | None = None,
 ) -> tuple[PipelineInstance, ...]:
-    """Choose throughput first, then retained state, movement, and stable IDs."""
+    """Choose a complete heterogeneous composition with deterministic objectives.
+
+    Every multiset of templates that exactly consumes membership and satisfies the
+    replica threshold is considered. Feasible candidates receive an integer batch
+    allocation, then compare by predicted makespan, retained state, moved nodes,
+    template IDs, and concrete ownership. This ordering lets all workers derive an
+    identical plan while preferring throughput before recovery convenience.
+    """
 
     if not templates:
         raise RecoveryUnavailable("no pipeline templates are available")

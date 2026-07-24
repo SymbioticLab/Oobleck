@@ -43,7 +43,15 @@ def reconfigure_pipelines(
     *,
     state_bytes_by_node: Mapping[str, int] | None = None,
 ) -> ReconfigurationResult:
-    """Apply simple, borrow, and merge with throughput/state-stable ties."""
+    """Reassign complete survivor membership using simple, borrow, or merge.
+
+    Pure joins/replacements use global composition because new resources may change
+    the throughput optimum. Failure-only changes first retain each surviving
+    pipeline identity, borrow low-state nodes from viable donors, and merge only
+    groups that still lack a supported template. The final allocation must satisfy
+    the replica threshold and assign every survivor exactly once; ties prefer
+    throughput, retained state, minimal movement, and stable identities.
+    """
 
     survivors = set(surviving_node_ids)
     weights = dict(state_bytes_by_node or {})

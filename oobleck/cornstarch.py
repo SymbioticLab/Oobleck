@@ -81,8 +81,12 @@ class CompiledLocalPartition:
     ) -> "ActivatedPartition":
         """Materialize local storage only after replacement WORLD exists.
 
-        External Cornstarch partitions receive the rank-local heterogeneous mesh;
-        the fallback path initializes meta tensors or moves an ordinary model.
+        External Cornstarch partitions receive the rank-local heterogeneous mesh,
+        which every rank creates in identical pipeline order to avoid collective
+        mismatches. The fallback path either allocates meta parameters and invokes the
+        checkpoint initializer or moves an ordinary model to the target device/dtype.
+        The resulting manifest is the authoritative ownership description for state
+        recovery and heterogeneous gradient-group construction.
         """
 
         if self.external_compiled is not None:
@@ -161,7 +165,14 @@ def compile_local_partition(
     *,
     cornstarch_plan: object | None = None,
 ) -> CompiledLocalPartition:
-    """Compile ownership without touching ``torch.distributed`` or real storage."""
+    """Compile rank-local ownership without touching distributed state or storage.
+
+    The execution plan selects one global stage for ``rank`` and supplies its total
+    world size to the pinned Cornstarch compiler. When Cornstarch exposes a local
+    manifest, it is normalized into Oobleck's logical recovery schema; otherwise a
+    replicated fallback manifest is built from the model blueprint. The returned
+    object is safe to exchange and validate before replacement WORLD exists.
+    """
 
     stage = execution_plan.rank_local_stage(rank)
     external = None

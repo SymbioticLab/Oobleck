@@ -78,11 +78,15 @@ def execute_transfer_schedule(
     group=None,
     verify_checksums: bool = True,
 ) -> TransferExecutionMetrics:
-    """Pack, all-to-all, validate, and unpack every collective round.
+    """Execute every immutable schedule round through collective all-to-all.
 
-    Each rank calls this with the same schedule and participates with zero-sized
-    splits when it has no payload. Destination tensors are preallocated from the
-    new manifest, allowing unpacking directly into their storage.
+    Each rank selects outgoing/incoming chunks using the same stable ordering, validates
+    source dtype and bounds, and packs raw bytes by destination. Ranks with no payload still
+    participate using zero-sized splits. Optional pre-transfer checksums are exchanged as
+    objects and verified after bytes are copied directly into manifest-sized destination
+    storage. Round durations use the slowest rank, and planned traffic accounting is returned
+    for recovery diagnostics. Any missing tensor, byte mismatch, dtype mismatch, or checksum
+    failure aborts activation before recovered state can be committed.
     """
 
     if not 0 <= rank < world_size:

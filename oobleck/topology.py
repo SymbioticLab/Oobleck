@@ -175,7 +175,14 @@ def activate_gradient_synchronizer(
     *,
     microbatch_size: int,
 ) -> HeterogeneousGradientSynchronizer | None:
-    """Gather ownership, create every logical group, and bind local parameters."""
+    """Build generation-local gradient synchronization from logical ownership.
+
+    Every rank gathers state manifests, groups parameter replicas by logical/shared key, TP lane,
+    and placement, and derives sample weights from each pipeline's microbatch allocation. Process
+    groups are created in identical global order, including on non-members, before local parameters
+    are bound through shared-state aliases. The returned synchronizer reduces only groups containing
+    this rank and must be retired with the generation's process-group universe.
+    """
 
     import torch.distributed as dist
 

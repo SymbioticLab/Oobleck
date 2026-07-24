@@ -114,7 +114,14 @@ def optimizer_schema_for_partition(
     owner_rank: int,
     committed_step: int,
 ) -> OptimizerStateSchema:
-    """Merge replica schemas and retain state belonging to one new partition."""
+    """Derive optimizer metadata and slots owned by one replacement partition.
+
+    Surviving schemas must agree on optimizer class, schema version, parameter-group count,
+    group metadata, and each parameter's group assignment. The new model manifest selects
+    only locally owned parameters and matching TP-lane tensor slots; scalar slots are copied
+    by logical parameter key. Owners and committed versions are rewritten for the new rank,
+    producing a schema that can be planned alongside model state without unstable object IDs.
+    """
 
     if not schemas:
         raise OptimizerSchemaError("no surviving optimizer schema is available")
@@ -208,7 +215,14 @@ def restore_optimizer_state(
     tensors: Mapping[str, torch.Tensor],
     named_parameters: Mapping[str, torch.nn.Parameter],
 ) -> None:
-    """Rebuild a compatible optimizer from logical parameter and slot identities."""
+    """Rebuild optimizer groups and state using stable logical parameter identities.
+
+    Class/schema and group-count checks prevent recovery into a semantically different
+    optimizer. Parameter lists are rebound to the replacement model, group options and scalar
+    slots are restored, and every declared tensor slot must be present. Sharded parameters
+    rewrap matching local storage as DTensor when possible; ordinary slots remain local tensors
+    on the parameter device.
+    """
 
     actual = f"{optimizer.__class__.__module__}.{optimizer.__class__.__qualname__}"
     if schema.schema_version != 1 or actual != schema.optimizer_class:

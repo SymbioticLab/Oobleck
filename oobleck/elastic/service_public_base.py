@@ -62,7 +62,14 @@ class NodeAgentClient:
         on_generation_active: Callable[[MessageEnvelope], Awaitable[None]] | None = None,
         local_worker_socket: str | Path | None = None,
     ) -> None:
-        """Validate advertised resources and initialize per-incarnation phase state."""
+        """Initialize one reconnectable node incarnation and its generation state machine.
+
+        Advertised GPU inventory and heartbeat cadence are validated, while addresses are either
+        supplied explicitly or discovered and checked for resolvability. Independent cursors track
+        master sequencing, membership, preparation, rendezvous, readiness, and activation. Optional
+        local IPC aggregates exactly one worker per GPU before node-level acknowledgements, and send
+        locks preserve the incarnation sequence across heartbeat and phase tasks.
+        """
 
         if not node_id or not gpu_ids or heartbeat_interval_s <= 0:
             raise ValueError("node_id, gpu_ids, and a positive heartbeat interval are required")
@@ -172,7 +179,13 @@ class NodeAgentClient:
             await self._send_ready_if_possible(generation)
 
     async def _send_prepared_if_possible(self, generation: int) -> None:
-        """Acknowledge preparation once per generation after every local worker."""
+        """Send node-level preparation exactly once when all prerequisites agree.
+
+        The current connection, snapshot, local preparation cursor, and generation must match. With
+        local workers, unanimous snapshot/plan/compatibility metadata is required; without them, the
+        snapshot hash supplies the compatibility fallback. The sent cursor is rolled back if writing
+        fails so a reconnected incarnation may safely acknowledge again.
+        """
 
         async with self._ready_lock:
             snapshot = self.snapshot
@@ -209,7 +222,12 @@ class NodeAgentClient:
                 raise
 
     async def _send_ready_if_possible(self, generation: int) -> None:
-        """Acknowledge readiness once local workers match master rendezvous."""
+        """Send node-level readiness exactly once after matching rendezvous and local WORLD.
+
+        Readiness is gated by the current snapshot, the rendezvous cursor, retained preparation
+        metadata, and unanimous local-worker ready state. As with preparation, failure resets the sent
+        marker so reconnect can retry without treating a dropped frame as consensus.
+        """
 
         async with self._ready_lock:
             snapshot = self.snapshot
@@ -252,7 +270,13 @@ class NodeAgentClient:
         self._last_master_sequence = message.sequence_number
 
     async def _consume_membership(self, message: MessageEnvelope) -> MembershipSnapshot:
-        """Install a newer snapshot and invalidate all phase work derived before it."""
+        """Install membership and invalidate every phase derived from its predecessor.
+
+        Master sequence and snapshot checksum are validated before local state changes.
+        Preparation/rendezvous/readiness cursors and compatibility metadata reset together,
+        then the complete snapshot is relayed to GPU workers and optional callbacks. The
+        agent acknowledges preparation only after every configured local worker agrees.
+        """
 
         if message.message_type != "membership":
             raise ValueError("expected a membership message from the master")
@@ -276,7 +300,12 @@ class NodeAgentClient:
         return snapshot
 
     async def _consume_rendezvous(self, message: MessageEnvelope) -> None:
-        """Accept rendezvous only when it exactly matches local preparation."""
+        """Accept rendezvous only for the locally prepared generation and metadata.
+
+        Stale rendezvous is harmlessly ignored; a future or mismatched checksum, plan, or
+        compatibility digest is a protocol error. Matching rendezvous is relayed to local
+        workers, and the agent reports ready only after their second barrier completes.
+        """
 
         if message.message_type != "generation_rendezvous":
             raise ValueError("expected a generation_rendezvous message")
@@ -298,7 +327,12 @@ class NodeAgentClient:
         await self._send_ready_if_possible(message.generation)
 
     async def _consume_active(self, message: MessageEnvelope) -> None:
-        """Mark and relay activation only for the locally readied generation."""
+        """Complete activation only for the generation this node prepared and readied.
+
+        The master sequence, membership hash, plan checksum, and compatibility digest must
+        all match local phase state. Once accepted, activation is broadcast to GPU workers
+        before the optional application callback observes the new active generation.
+        """
 
         if message.message_type != "generation_active":
             raise ValueError("expected a generation_active message")
@@ -390,7 +424,12 @@ class NodeAgentClient:
             task.result()
 
     async def run_reconnecting(self, *, retry_delay_s: float = 0.1) -> None:
-        """Maintain one incarnation at a time and reconnect after stream loss."""
+        """Reconnect after transport loss without reusing incarnation ordering state.
+
+        Ordinary protocol/application errors still escape. Recoverable stream errors close the old
+        connection, allocate a fresh incarnation ID, reset sequence numbering, wait the configured
+        retry delay, and register again. A graceful stop suppresses reconnection entirely.
+        """
 
         if self._host is None or self._port is None:
             raise RuntimeError("connect() must be called before run_reconnecting()")

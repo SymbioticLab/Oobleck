@@ -137,7 +137,13 @@ def _record_superseded(
     activation_seconds: float = 0.0,
     recovery_seconds: float = 0.0,
 ) -> None:
-    """Record an abandoned attempt exactly once with all completed phase metrics."""
+    """Record one superseded generation attempt without double-counting recovery work.
+
+    The transition remembers whether it was already emitted because supersession can be observed at
+    compile, activation, or post-recovery boundaries. Completed phase durations and any available state
+    transfer metrics are preserved, while the record is marked superseded so acceptance analysis can
+    distinguish abandoned work from the generation that ultimately became active.
+    """
 
     if transition.superseded_recorded:
         return
@@ -167,7 +173,15 @@ def _record_superseded(
 
 
 def _prepare_latest_generation(self: OobleckParallelContext) -> bool:
-    """Retire WORLD and compile the newest ownership without creating a new WORLD."""
+    """Perform the first generation barrier: snapshot, teardown, and compile.
+
+    The first pending proposal clones the last committed state, invalidates loader
+    prefetch, and completely retires the old process-group universe. Superseding
+    proposals reuse that same committed snapshot rather than snapshotting partial
+    recovery state, record the abandoned attempt, and compile only the newest plan.
+    The resulting transition is process-group-free and safe to checksum before the
+    master publishes rendezvous.
+    """
 
     existing = self._prepared_transition
     if self._pending_plan is None:
@@ -223,7 +237,15 @@ def _prepare_latest_generation(self: OobleckParallelContext) -> bool:
 
 
 def _activate_prepared_generation(self: OobleckParallelContext) -> bool:
-    """Create WORLD, activate ownership, and recover after rendezvous publication."""
+    """Perform the second generation barrier: rendezvous, activation, and recovery.
+
+    Replacement WORLD is initialized before Cornstarch materializes local ownership.
+    All ranks then redistribute the shared committed snapshot, rebuild heterogeneous
+    gradient groups, and reconfigure attached DataLoaders. A newer proposal at any
+    point retires partially initialized resources and returns to preparation using
+    the original committed snapshot; only an unsuperseded transition enters recovery
+    history as the active generation.
+    """
 
     transition = self._prepared_transition
     if transition is None:
@@ -314,7 +336,15 @@ def _activate_latest_generation(self: OobleckParallelContext) -> None:
 
 
 def _apply_membership(self: OobleckParallelContext, snapshot: MembershipSnapshot) -> bool:
-    """Convert one complete control-plane snapshot into a pending generation."""
+    """Validate and plan from one complete membership snapshot.
+
+    Stale snapshots are ignored, while every node must preserve the fixed per-node
+    tensor-parallel width. The lowest stable node ID supplies rendezvous, the owner
+    plan recomputes topology from the entire membership rather than an incremental
+    failure, and detection/configuration timings are retained for acceptance metrics.
+    Announcing the plan only queues it; transaction commit and activation barriers
+    decide when it can replace the running generation.
+    """
 
     newest_generation = max(
         self.generation,

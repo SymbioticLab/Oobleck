@@ -130,7 +130,15 @@ class LocalWorkerRelay:
         self._server = await asyncio.start_unix_server(accept, path=self.path)
 
     async def _handle(self, connection: ControlConnection) -> None:
-        """Register one worker incarnation and aggregate its phase acknowledgements."""
+        """Register one local worker incarnation and aggregate generation consensus.
+
+        A reconnecting stable worker replaces its prior Unix stream and receives the latest
+        membership/rendezvous/active phases in order. Acknowledgements must belong to that
+        incarnation and current snapshot. Preparation records checksum/plan/compatibility;
+        readiness additionally requires a matching relayed rendezvous. Callbacks fire once
+        only after all configured GPU workers report identical metadata, while disconnects
+        remove that worker from both phase counts.
+        """
 
         worker_id: str | None = None
         try:
@@ -229,7 +237,13 @@ class LocalWorkerRelay:
                 await connection.close()
 
     async def publish(self, message: MessageEnvelope) -> None:
-        """Validate, retain, and fan out a master generation phase locally."""
+        """Validate, retain, and fan out one master generation phase to GPU workers.
+
+        New membership clears all preparation/readiness state. Rendezvous is accepted only
+        after unanimous local preparation, and active only after unanimous readiness for
+        the same identities. Messages are sent concurrently; failed worker streams are
+        removed from consensus instead of blocking the node indefinitely.
+        """
 
         allowed = {"membership", "generation_rendezvous", "generation_active"}
         if message.message_type not in allowed:
@@ -437,7 +451,14 @@ class LocalWorkerClient:
         )
 
     async def activate_prepared(self, prepared: Any, snapshot: MembershipSnapshot) -> Any:
-        """Activate initial ownership only after both CPU control-plane barriers."""
+        """Activate initial ownership through prepared, rendezvous, ready, and active.
+
+        The worker recompiles if its prepared plan predates the latest membership, then
+        acknowledges plan and compatibility metadata. A superseding snapshot before
+        rendezvous restarts preparation; one arriving after local WORLD creation closes the
+        partial context and starts over. Only matching master activation enables transaction
+        barriers and returns the context to application code.
+        """
 
         if self.connection is None:
             raise RuntimeError("local worker is not connected")
@@ -483,7 +504,14 @@ class LocalWorkerClient:
         on_snapshot: Callable[[MembershipSnapshot], Awaitable[None]] | None = None,
         on_active: Callable[[int], Awaitable[None]] | None = None,
     ) -> None:
-        """Drive reconfiguration barriers, restarting whenever membership supersedes."""
+        """Drive the active context through every future generation barrier.
+
+        Complete snapshots are applied to plan replacement ownership, after which local
+        preparation metadata is acknowledged. Rendezvous authorizes WORLD activation and
+        local readiness; master activation releases transactional steps. Membership at
+        either nested phase supersedes the attempt and restarts from the newest snapshot,
+        ensuring workers never combine topology or state from different generations.
+        """
 
         if self.connection is None:
             raise RuntimeError("local worker is not connected")

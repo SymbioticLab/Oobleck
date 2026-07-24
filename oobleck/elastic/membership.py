@@ -76,7 +76,13 @@ class MembershipSnapshot:
 def membership_snapshot_from_payload(
     generation: int, payload: Mapping[str, object]
 ) -> MembershipSnapshot:
-    """Strictly reconstruct a checksummed snapshot from a control payload."""
+    """Reconstruct a membership snapshot only from the exact wire representation.
+
+    The decoder rejects unknown/missing fields, invalid container types, malformed identities,
+    empty resource inventories, and non-string values before creating ``NodeIdentity`` objects.
+    ``MembershipSnapshot`` then recomputes and verifies the supplied hash, so downstream planning
+    consumes a complete, typed, checksummed generation rather than partially trusted JSON.
+    """
 
     if set(payload) != {"nodes", "reasons", "snapshot_hash"}:
         raise ValueError("membership payload fields are invalid")
@@ -175,8 +181,12 @@ class MembershipStateMachine:
     def register(self, identity: NodeIdentity, sequence_number: int) -> None:
         """Add, refresh, or replace a node while enforcing fixed TP width.
 
-        A new incarnation for an existing stable ID supersedes the old one and
-        contributes a replacement event to the next coalesced generation.
+        Registration is scoped to a stable agent ID plus a process incarnation. A
+        repeated live incarnation must advance its sequence and only renews its lease;
+        a fresh incarnation atomically supersedes the old connection. New nodes respect
+        ``max_nodes`` and all nodes contribute the same GPU count required by fixed TP.
+        Join/replacement reasons are queued but do not advance generation until publish,
+        allowing concurrent membership events to coalesce into one complete snapshot.
         """
 
         if sequence_number < 0:
@@ -284,7 +294,13 @@ class MembershipStateMachine:
         return expired
 
     def publish(self) -> MembershipSnapshot | None:
-        """Coalesce pending events into one monotonically newer snapshot."""
+        """Publish all queued membership events as one immutable generation.
+
+        Generation advances once regardless of how many joins, disconnects, drains, or
+        lease expirations accumulated. Nodes and reasons are sorted before checksumming,
+        so master and workers share a deterministic full-membership identity. Consuming
+        the pending reasons ensures a later event produces a strictly newer proposal.
+        """
 
         if not self._pending_reasons:
             return None

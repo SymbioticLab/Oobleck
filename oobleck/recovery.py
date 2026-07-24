@@ -52,7 +52,16 @@ def _rank_to_node(context: Any) -> dict[int, str] | None:
 
 
 def restore_context_state(context: Any, snapshot: RecoverySnapshot | None) -> RecoveryReport:
-    """Redistribute a committed snapshot into every rank of the active generation."""
+    """Restore one agreed committed transaction into the entire replacement generation.
+
+    Surviving ranks exchange tensor-free source metadata, agree on one committed step, and build
+    model/optimizer destination manifests for every new rank—including joining workers with no
+    snapshot. All ranks derive and checksum one global redistribution schedule before retained
+    local shards are copied and remote chunks execute collectively. Completeness is verified for
+    every destination, then optimizer groups/slots, scheduler, scaler, and committed step are
+    reconstructed. A final WORLD barrier prevents any rank from training on partially restored
+    state; phase and load metrics describe the completed recovery.
+    """
 
     started = time.perf_counter()
     dist, rank, world_size = _distributed_identity(context.owner_plan.rank)

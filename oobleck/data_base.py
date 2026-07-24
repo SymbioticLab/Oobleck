@@ -74,7 +74,13 @@ class OobleckBatchSampler(BatchSampler):
         shuffle: bool,
         drop_last: bool = True,
     ) -> None:
-        """Validate the replay contract and initialize an uncommitted cursor."""
+        """Validate the deterministic replay contract and initialize its cursor.
+
+        A logical global batch is independent of physical rank assignment. The
+        sampler therefore stores the pipeline allocation separately, derives sample
+        order only from ``seed`` and ``epoch``, and advances progress exclusively
+        through :meth:`commit` rather than DataLoader iteration or prefetch.
+        """
 
         _validate_dataset(dataset)
         if global_batch_size < 1 or microbatch_size < 1:
@@ -128,7 +134,13 @@ class OobleckBatchSampler(BatchSampler):
         return torch.randperm(size, generator=generator).tolist()
 
     def descriptor_at(self, batch_index: int) -> OobleckBatchDescriptor:
-        """Build and cache the deterministic routing descriptor for an index."""
+        """Build the replay-stable sample and pipeline routing for one batch.
+
+        Global microbatch IDs are assigned before physical pipeline routing, so the
+        same descriptor can be retried after reconfiguration. Issued descriptors are
+        cached to make an eventual commit validate the exact batch that was exposed
+        to the training loop, even when DataLoader prefetched later batches.
+        """
 
         if batch_index < 0 or batch_index >= len(self):
             raise IndexError(batch_index)
@@ -184,7 +196,13 @@ class OobleckBatchSampler(BatchSampler):
         return (size + self.global_batch_size - 1) // self.global_batch_size
 
     def commit(self, descriptor: OobleckBatchDescriptor) -> None:
-        """Advance exactly one position after validating an in-order successful step."""
+        """Atomically advance the logical cursor after one successful transaction.
+
+        Commits must match the active epoch, the next cursor position, and the exact
+        previously issued descriptor. This prevents duplicate, skipped, or stale
+        batches from advancing sample progress; uncommitted prefetched descriptors
+        remain replayable if the generation changes before optimizer commit.
+        """
 
         if descriptor.epoch != self.epoch:
             raise RuntimeError("cannot commit a batch from a stale epoch")
@@ -298,7 +316,12 @@ class PreparedDataLoader:
         self.sampler.reconfigure(instances)
 
     def __iter__(self) -> Iterator[OobleckBatch]:
-        """Pair each collated result with the still-uncommitted logical descriptor."""
+        """Pair DataLoader output with descriptors beginning at committed progress.
+
+        Enumeration starts from the sampler cursor rather than from prefetched state.
+        Invalidation stops the iterator immediately, allowing a replacement iterator
+        to reproduce the same uncommitted batch under a new pipeline allocation.
+        """
 
         self._invalidated = False
         start = self.sampler.committed_cursor

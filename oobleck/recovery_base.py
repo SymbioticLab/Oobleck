@@ -129,7 +129,14 @@ def logical_state_bindings(
     model: torch.nn.Module,
     manifest: StateManifest,
 ) -> tuple[dict[str, torch.nn.Parameter], dict[StateTensorKey, torch.Tensor]]:
-    """Bind stable manifest identities to the active partition's local tensors."""
+    """Bind manifest identities to concrete tensors in the activated partition.
+
+    Local module names are expanded through Cornstarch global-key converters so partitioned
+    modules still match generation-independent logical names. Each binding must agree with
+    manifest shape and dtype, shared parameters may appear under aliases, and every declared
+    parameter/buffer shard must resolve. The result separates optimizer-facing Parameter
+    objects from raw local tensor storage used by transfer.
+    """
 
     parameters: dict[str, torch.nn.Parameter] = {}
     states: dict[StateTensorKey, torch.Tensor] = {}
@@ -179,7 +186,14 @@ def _combined_manifest(
 
 
 def capture_context_state(context: Any) -> RecoverySnapshot:
-    """Clone the last committed rank-local state before retiring a generation."""
+    """Capture an immutable rank-local snapshot at the committed transaction boundary.
+
+    Model manifest entries are stamped with ``committed_step`` and all bound local tensors are
+    cloned contiguously before WORLD teardown. Optimizer state is serialized by logical key and
+    merged into the same transfer manifest; scheduler and scaler dictionaries are deep-copied as
+    replicated metadata. No uncommitted gradients or DataLoader progress enter the snapshot, so
+    it remains valid through multiple superseded recovery attempts.
+    """
 
     model_manifest = version_manifest(context.partition.manifest, context.committed_step)
     named_parameters, model_tensors = logical_state_bindings(context.model, model_manifest)
@@ -321,7 +335,14 @@ def _copy_retained(
 
 
 def restore_context_state(context: Any, snapshot: RecoverySnapshot) -> RecoveryReport:
-    """Redistribute a committed snapshot into the context's active generation."""
+    """Restore committed state through the retained single-destination recovery path.
+
+    Surviving metadata must agree on committed step and WORLD size. The local replacement manifest
+    binds model tensors, derives optimizer destinations, and plans transfers from all source manifests.
+    Ranks checksum the schedule, copy locally retained shards, execute collective transfers, and verify
+    every destination was initialized before rebuilding optimizer, scheduler, and scaler state. The
+    public recovery layer extends this algorithm by planning all destination manifests together.
+    """
 
     dist, rank, world_size = _distributed_identity(context.owner_plan.rank)
     if context.compiled.world_size != world_size:

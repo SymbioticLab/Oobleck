@@ -92,7 +92,13 @@ async def _agent(config: AgentConfig) -> None:
 
 
 def _launch(config: TrainingLaunchConfig) -> int:
-    """Run locally or bootstrap initial remote agents and supervise their exits."""
+    """Launch training locally or bootstrap the initial cluster over explicit SSH.
+
+    Local mode directly returns the training process exit code. Hostfile mode validates node and
+    fixed-TP capacity, constructs one explicit agent command per host, and supervises them as a
+    cohort. The first nonzero exit terminates remaining agents; normal completion requires all
+    agents to exit successfully. Later elastic joins bypass this bootstrap-only hostfile path.
+    """
 
     if not config.training_script.is_file():
         raise FileNotFoundError(f"training script does not exist: {config.training_script}")
@@ -150,7 +156,13 @@ def _launch(config: TrainingLaunchConfig) -> int:
 
 
 def _profile(config: ProfileCommandConfig) -> None:
-    """Measure or load a profile, validate compatibility, and save templates."""
+    """Produce a versioned template cache from measured or precomputed layer profiles.
+
+    Measurement mode loads a user factory, derives hardware/Cornstarch identity, profiles warmup
+    and timed steps, and persists the raw profile. Cached mode decodes an existing profile. Both
+    paths require exact model, dtype, TP width, and microbatch compatibility before the planner
+    generates every requested resource-count template under the device-memory budget.
+    """
 
     if config.profile is None and config.measurement_factory is None:
         raise ValueError(

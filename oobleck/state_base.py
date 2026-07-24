@@ -218,7 +218,17 @@ def plan_state_redistribution(
     bandwidth_bytes_per_s: Mapping[int, float] | None = None,
     link_classifier: Callable[[int, int], tuple[str, float]] | None = None,
 ) -> TransferSchedule:
-    """Assign largest chunks to candidates by projected byte makespan."""
+    """Plan deterministic, balanced redistribution of one committed state version.
+
+    Old manifests are indexed by full shard identity. For every destination parameter,
+    buffer, and optimizer slot, the planner first requires a surviving rank that owns the
+    complete parameter bundle; a locally complete bundle is retained without transfer.
+    Remaining tensors are split into aligned chunks and scheduled largest-first to the
+    source minimizing projected source egress, destination ingress, and link-class load,
+    adjusted by optional measured bandwidth/locality. Per-round byte caps bound collective
+    memory. Stable sort keys and the final schedule hash let every rank independently derive
+    and verify the identical all-to-all program.
+    """
 
     if chunk_bytes < 1 or alignment < 1:
         raise ValueError("chunk_bytes and alignment must be positive")

@@ -65,7 +65,14 @@ def runtime_metric(
     result: Any = None,
     step_seconds: float = 0.0,
 ) -> dict[str, object]:
-    """Snapshot transaction, recovery, CUDA, and process-group health as JSON data."""
+    """Build one machine-readable observation of runtime and recovery health.
+
+    The record binds worker identity to generation, committed transaction progress, plan and
+    compatibility checksums, retry count, CUDA allocation, and live process-group count. When
+    the current generation has transition metrics, its detection, planning, transfer, activation,
+    and balancing measurements are nested into the same record. The function only snapshots
+    state; durable JSONL ordering and flushing belong to :func:`append_metric`.
+    """
 
     if not event or step_seconds < 0:
         raise ValueError("metric event and non-negative step duration are required")
@@ -154,7 +161,14 @@ def verify_churn_metrics(
     max_cuda_reserved_growth_bytes: int = 256 * 1024 * 1024,
     max_process_group_growth: int = 16,
 ) -> dict[str, object]:
-    """Verify monotonic generations/steps, replay, strategy, and leak bounds."""
+    """Validate a multi-worker churn run against transactional and resource invariants.
+
+    Records are grouped by stable worker identity and ordered by timestamp. Each worker must
+    observe nondecreasing generations and strictly consecutive committed steps, while retries
+    prove interrupted-batch replay when required. Recovery-strategy coverage, CUDA-reserved
+    growth, process-group growth, step latency, and optional clean shutdown are checked against
+    caller bounds. The returned summary is suitable for CI artifacts and benchmark comparison.
+    """
 
     if not records:
         raise ValueError("at least one worker metric is required")

@@ -221,7 +221,15 @@ class OobleckParallelizationPlan:
         )
 
     def build_execution_plan(self) -> OobleckExecutionPlan:
-        """Compose or reconfigure pipelines and assign deterministic concrete ranks."""
+        """Derive the immutable execution plan for the current membership generation.
+
+        Initial generations compose profiled templates globally; later generations run
+        the survivor-aware reconfiguration planner with estimated retained-state bytes.
+        The method then assigns stable per-node TP rank blocks, records generation
+        ancestry and compatibility, and caches the plan used to score the next change.
+        No process group is created here, so every worker can independently checksum
+        the same ownership before entering rendezvous.
+        """
 
         if self.model is None or self.parallel_config is None:
             raise RuntimeError("call parallelize() before building or materializing a plan")
@@ -312,7 +320,13 @@ class OobleckParallelizationPlan:
         )
 
     def compile(self, execution_plan: OobleckExecutionPlan | None = None) -> CompiledLocalPartition:
-        """Compile rank-local ownership before WORLD, after compatibility validation."""
+        """Compile this worker's rank-local ownership without creating WORLD.
+
+        The plan compatibility digest is checked before rank remapping. Stable node and
+        TP-lane identity select the worker's new global rank, after which Cornstarch
+        receives only the local stage override and global plan metadata. Materialization
+        and real tensor allocation remain deferred until the activation barrier.
+        """
 
         if self.model is None or self.parallel_config is None:
             raise RuntimeError("call parallelize() before compile()")
@@ -469,7 +483,13 @@ class OobleckParallelContext:
             return True
 
     def _activate_latest_generation(self) -> None:
-        """Retire WORLD completely and activate the newest queued generation."""
+        """Synchronously replace the active generation for unmanaged callers.
+
+        Prefetched batches are invalidated before the partition and every process group
+        are retired. Ownership is recompiled without WORLD, replacement WORLD is then
+        initialized, and only afterward is local storage materialized. The loop consumes
+        newer pending plans so an older generation is never left active accidentally.
+        """
 
         while self._pending_plan is not None:
             target = self._pending_plan
@@ -526,7 +546,14 @@ class OobleckParallelContext:
         output_reference: Any,
         criterion: Callable[..., torch.Tensor] | None,
     ) -> tuple[torch.Tensor | None, Any]:
-        """Run one forward/backward attempt with replay-stable stochastic seeds."""
+        """Execute local microbatches without committing any training state.
+
+        A native schedule may own the complete attempt; otherwise each local microbatch
+        runs under a seed derived from logical epoch, committed step, and global
+        microbatch ID. Losses are normalized before backward so replay on a different
+        pipeline layout preserves stochastic behavior and global-batch scaling.
+        Optimizer, scheduler, scaler, and sampler state are deliberately untouched.
+        """
 
         assert self.optimizer is not None
         local_microbatches = self._local_microbatches(batch)
@@ -576,8 +603,13 @@ class OobleckParallelContext:
     ) -> OobleckStepResult:
         """Execute and atomically commit a logical batch, replaying on generation change.
 
-        Optimizer, scheduler, scaler, step, and sampler cursors advance together
-        only after gradient synchronization and a final membership check.
+        Each attempt starts with clean gradients, executes deterministically, and
+        completes both Cornstarch and heterogeneous replica synchronization. Under the
+        commit lock, a final generation/barrier check decides whether the attempt may
+        update optimizer, scheduler, scaler, committed step, and sampler cursor together.
+        A membership event discards partial gradients and retries the same descriptor;
+        execution exceptions are replayed only when a concurrent transition explains
+        them, otherwise the original error is propagated.
         """
 
         if self._closed:

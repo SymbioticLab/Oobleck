@@ -56,7 +56,13 @@ class FrameTooLarge(ProtocolError):
 
 
 def _validate_payload(message_type: str, payload: Mapping[str, object]) -> None:
-    """Enforce the exact payload schema for a versioned message type."""
+    """Enforce the exact field set and runtime types for each protocol message.
+
+    Validation is intentionally closed-world: unknown message types, extra fields, bools
+    masquerading as integers, malformed node inventories, or invalid phase metadata are
+    rejected before service state machines see them. This keeps transport decoding from
+    smuggling partially interpreted control state across generation boundaries.
+    """
 
     expected = _PAYLOAD_FIELDS.get(message_type)
     if expected is None:
@@ -235,7 +241,13 @@ class SerializedWriter:
         await future
 
     async def _run(self) -> None:
-        """Serialize writes and propagate the first failure to every queued sender."""
+        """Own the stream writer, preserving frame order and bounded backpressure.
+
+        Exactly one task dequeues frames and awaits ``drain()``, preventing concurrent
+        coroutines from interleaving bytes. A close sentinel flushes preceding messages.
+        Any write failure is copied to its sender and every still-queued completion before
+        the task terminates, so callers cannot mistake dropped control messages for success.
+        """
 
         try:
             while True:
