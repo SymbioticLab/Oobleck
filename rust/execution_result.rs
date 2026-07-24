@@ -1,26 +1,14 @@
+use crate::PlannerError;
 use pyo3::conversion::FromPyObject;
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
-use serde::{Deserialize, Serialize};
-use std::cmp::{Ordering, PartialEq};
-use std::sync::Arc;
 
-#[derive(Serialize, Deserialize)]
-pub struct ProfileResult {
-    model_name: String,
-    microbatch_size: u32,
-    tp_size: u32,
-    precision: String,
-    layers: Vec<LayerExecutionResult>,
-}
-
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct LayerExecutionResult {
     pub layer_index: u32,
     pub layer_name: String,
     pub forward: f64,
     pub backward: f64,
-    pub mem_required: u64,
     pub activation_memory: u64,
     pub persistent_memory: u64,
 }
@@ -46,127 +34,166 @@ impl<'py> FromPyObject<'py> for LayerExecutionResult {
             layer_name: ob.getattr("layer_name")?.extract()?,
             forward: ob.getattr("forward")?.extract()?,
             backward: ob.getattr("backward")?.extract()?,
-            mem_required,
             activation_memory,
             persistent_memory,
         })
     }
 }
 
+impl LayerExecutionResult {
+    pub fn validate(&self, expected_index: usize) -> Result<(), PlannerError> {
+        if self.layer_index as usize != expected_index {
+            return Err(PlannerError::invalid_input(format!(
+                "profile_data must have contiguous layer indices; expected {expected_index}, got {}",
+                self.layer_index
+            )));
+        }
+        if self.layer_name.is_empty() {
+            return Err(PlannerError::invalid_input(format!(
+                "layer {expected_index} must have a non-empty name"
+            )));
+        }
+        if !self.forward.is_finite()
+            || !self.backward.is_finite()
+            || !(self.forward + self.backward).is_finite()
+            || self.forward < 0.0
+            || self.backward < 0.0
+        {
+            return Err(PlannerError::invalid_input(format!(
+                "layer {expected_index} timings must be finite and non-negative"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct StageExecutionResult {
     pub layers: (u32, u32),
-    forward: f64,
-    backward: f64,
-    mem_required: u64,
-    activation_memory: u64,
-    persistent_memory: u64,
+    pub forward: f64,
+    pub backward: f64,
+    pub activation_memory: u64,
+    pub persistent_memory: u64,
 }
 
 impl StageExecutionResult {
-    pub fn new(layers: &[LayerExecutionResult]) -> Self {
-        Self {
-            layers: (layers[0].layer_index, layers[layers.len() - 1].layer_index + 1),
-            forward: layers.iter().map(|layer| layer.forward).sum(),
-            backward: layers.iter().map(|layer| layer.backward).sum(),
-            mem_required: layers.iter().map(|layer| layer.mem_required).sum(),
-            activation_memory: layers.iter().map(|layer| layer.activation_memory).sum(),
-            persistent_memory: layers.iter().map(|layer| layer.persistent_memory).sum(),
-        }
-    }
-
     pub fn latency(&self) -> f64 {
         self.forward + self.backward
     }
+
+    pub fn fits_one_microbatch(&self, device_memory_bytes: Option<u64>) -> bool {
+        device_memory_bytes.map_or(true, |device_memory| {
+            self.persistent_memory
+                .checked_add(self.activation_memory)
+                .is_some_and(|required| required <= device_memory)
+        })
+    }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PipelineExecutionResult {
-    pub stages: Vec<Arc<StageExecutionResult>>,
+    pub stages: Vec<StageExecutionResult>,
+    /// Section 4.1.2, Equation 1: one forward and backward pass for every stage.
     pub t1: f64,
-    pub t2: f64,
+    /// Section 4.1.2, Equation 3: work from the bottleneck through the last stage.
     pub t3: f64,
+    /// Zero-based index of the rightmost stage with maximum forward + backward time.
     pub kstar: usize,
 }
 
 impl PipelineExecutionResult {
-    pub fn new(left: &Self, right: &Self) -> Self {
-        let mut stages = left.stages.clone();
-        stages.extend(right.stages.clone());
-        let t1 = left.t1 + right.t1;
-        let kstar = if left.stages[left.kstar].latency() > right.stages[right.kstar].latency() {
-            left.kstar
-        } else {
-            left.stages.len() + right.kstar
-        };
-        let num_microbatches = 4 * stages.len();
-        let t2 = (num_microbatches - stages.len() + kstar - 1) as f64 * stages[kstar].latency();
-        let t3 = if kstar == left.kstar { left.t3 + right.t1 } else { right.t3 };
-        Self {
-            stages,
-            t1,
-            t2,
-            t3,
-            kstar,
-        }
-    }
-
-    pub fn make_base_result(stage: Arc<StageExecutionResult>) -> Self {
+    /// Section 4.1.2, Equation 4 (conquer): evaluate one stage.
+    pub fn from_stage(stage: StageExecutionResult) -> Self {
         let latency = stage.latency();
         Self {
             stages: vec![stage],
             t1: latency,
-            t2: 2.0 * latency,
             t3: latency,
             kstar: 0,
         }
     }
 
-    pub fn latency_with_mb(&self, mb: u32) -> f64 {
-        self.t1 + self.t2 + self.t3
-            + ((mb as i32 - 4 * self.stages.len() as i32) as f64)
-                * self.stages[self.kstar].latency()
+    /// Section 4.1.2, Equations 1 and 3 (combine two subproblems).
+    ///
+    /// T2 is evaluated from the combined rightmost bottleneck by
+    /// `iteration_time`, because its coefficient depends on the concrete Nb.
+    pub fn combine(left: &Self, right: &Self) -> Self {
+        let mut stages = left.stages.clone();
+        stages.extend(right.stages.clone());
+        let right_wins = right
+            .bottleneck_latency()
+            .total_cmp(&left.bottleneck_latency())
+            != std::cmp::Ordering::Less;
+        let (kstar, t3) = if right_wins {
+            (left.stages.len() + right.kstar, right.t3)
+        } else {
+            (left.kstar, left.t3 + right.t1)
+        };
+        Self {
+            stages,
+            t1: left.t1 + right.t1,
+            t3,
+            kstar,
+        }
     }
-    pub fn latency(&self) -> f64 {
-        self.t1 + self.t2 + self.t3
+
+    pub fn bottleneck_stage(&self) -> &StageExecutionResult {
+        &self.stages[self.kstar]
     }
+
+    pub fn bottleneck_latency(&self) -> f64 {
+        self.bottleneck_stage().latency()
+    }
+
     pub fn forward_time(&self) -> f64 {
-        self.stages.iter().map(|stage| stage.forward).fold(0.0, f64::max)
+        self.bottleneck_stage().forward
     }
+
     pub fn backward_time(&self) -> f64 {
-        self.stages.iter().map(|stage| stage.backward).fold(0.0, f64::max)
+        self.bottleneck_stage().backward
     }
-    pub fn mem_required(&self) -> u64 {
+
+    pub fn activation_memory(&self) -> u64 {
         self.stages
             .iter()
-            .map(|stage| stage.mem_required)
+            .map(|stage| stage.activation_memory)
             .max()
             .unwrap_or(0)
     }
-    pub fn activation_memory(&self) -> u64 {
-        self.stages.iter().map(|stage| stage.activation_memory).max().unwrap_or(0)
-    }
-    pub fn persistent_memory(&self) -> u64 {
-        self.stages.iter().map(|stage| stage.persistent_memory).max().unwrap_or(0)
-    }
-}
 
-impl PartialEq for PipelineExecutionResult {
-    fn eq(&self, other: &Self) -> bool {
-        self.latency_with_mb(128) == other.latency_with_mb(128)
-            && self.mem_required() == other.mem_required()
+    pub fn persistent_memory(&self) -> u64 {
+        self.stages
+            .iter()
+            .map(|stage| stage.persistent_memory)
+            .max()
+            .unwrap_or(0)
     }
-}
-impl Eq for PipelineExecutionResult {}
-impl Ord for PipelineExecutionResult {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.latency_with_mb(128)
-            .partial_cmp(&other.latency_with_mb(128))
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| self.mem_required().cmp(&other.mem_required()))
+
+    /// Evaluate Section 4.1.2's T1 + T2 + T3 model.
+    pub fn iteration_time(&self, num_microbatches: u32) -> f64 {
+        // Equation 2: T2 = (Nb - S + k* - 1) * (F_k* + B_k*).
+        let t2_coefficient = num_microbatches as i64 - self.stages.len() as i64
+            + self.kstar as i64
+            - 1;
+        self.t1 + t2_coefficient as f64 * self.bottleneck_latency() + self.t3
     }
-}
-impl PartialOrd for PipelineExecutionResult {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+
+    /// The paper selects a template using the temporary planning value Nb = 4S.
+    pub fn planning_iteration_time(&self) -> f64 {
+        self.iteration_time((4 * self.stages.len()) as u32)
+    }
+
+    pub fn max_microbatches(&self, device_memory_bytes: Option<u64>) -> Option<u64> {
+        let device_memory = device_memory_bytes?;
+        self.stages
+            .iter()
+            .filter(|stage| stage.activation_memory > 0)
+            .map(|stage| {
+                device_memory
+                    .checked_sub(stage.persistent_memory)
+                    .map(|available| available / stage.activation_memory)
+                    .unwrap_or(0)
+            })
+            .min()
     }
 }

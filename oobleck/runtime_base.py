@@ -601,15 +601,18 @@ class OobleckParallelContext:
         output: Any = None,
         criterion: Callable[..., torch.Tensor] | None = None,
     ) -> OobleckStepResult:
-        """Execute and atomically commit a logical batch, replaying on generation change.
+        """Execute and atomically commit one logical batch across generation changes.
 
         Each attempt starts with clean gradients, executes deterministically, and
         completes both Cornstarch and heterogeneous replica synchronization. Under the
         commit lock, a final generation/barrier check decides whether the attempt may
         update optimizer, scheduler, scaler, committed step, and sampler cursor together.
-        A membership event discards partial gradients and retries the same descriptor;
-        execution exceptions are replayed only when a concurrent transition explains
-        them, otherwise the original error is propagated.
+
+        A hard transition containing any removal invalidates an overlapping attempt,
+        discards its partial gradients, and retries the same descriptor. A pure addition
+        is instead deferred by the control-plane wrapper until this commit completes, so
+        the batch is not replayed. Execution exceptions are retried only when a concurrent
+        hard transition explains them; otherwise the original error is propagated.
         """
 
         if self._closed:

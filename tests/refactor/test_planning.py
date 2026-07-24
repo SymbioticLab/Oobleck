@@ -71,6 +71,31 @@ def test_profiler_measures_and_records_materialized_layers(tmp_path):
     assert all(item.activation_memory >= 0 for item in templates.values())
 
 
+def test_generated_template_serializes_the_section_4_timing_model():
+    layers = (
+        LayerExecutionResult(0, "l0", 2.0, 0.0, 1),
+        LayerExecutionResult(1, "l1", 3.0, 0.0, 1),
+        LayerExecutionResult(2, "l2", 4.0, 0.0, 1),
+    )
+    item = create_pipeline_templates("paper", layers, (2,))[2]
+    assert item.paper_t1 == 9.0
+    assert item.paper_t3 is not None
+    assert item.paper_bottleneck_stage is not None
+    stage_work = item.forward_time + item.backward_time
+    expected = (
+        item.paper_t1
+        + (8 - item.num_stages + item.paper_bottleneck_stage - 1) * stage_work
+        + item.paper_t3
+    )
+    assert item.planning_iteration_time == expected
+    assert PipelineTemplate.from_dict(item.to_dict()) == item
+
+
+def test_hand_written_template_keeps_legacy_iteration_estimate():
+    item = PipelineTemplate("legacy", ((0, 1), (1, 2)), 1, 2.0, 1.0)
+    assert item.iteration_time(4) == 15.0
+
+
 def test_template_capacity_uses_device_memory_budget():
     layers = (
         LayerExecutionResult(0, "l0", 1.0, 1.0, 300, 100, 200),
@@ -147,11 +172,11 @@ def test_execution_plan_tracks_stable_node_when_join_reorders_global_ranks():
     assert plan._local_node_id == "node-b"
 
     plan.set_membership(("node-a", "node-b", "node-c"))
-    joined = plan.build_execution_plan()
-    assert joined.generation == 1
-    assert joined.previous_generation == 0
-    assert plan.rank_for_plan(joined) == 1
-    assert plan.last_reconfiguration.strategies == ("join",)
+    expanded = plan.build_execution_plan()
+    assert expanded.generation == 1
+    assert expanded.previous_generation == 0
+    assert plan.rank_for_plan(expanded) == 1
+    assert plan.last_reconfiguration.strategies == ("addition",)
 
     # Re-reading a generation is deterministic and keeps a valid predecessor.
     repeated = plan.build_execution_plan()

@@ -45,8 +45,8 @@ def reconfigure_pipelines(
 ) -> ReconfigurationResult:
     """Reassign complete survivor membership using simple, borrow, or merge.
 
-    Pure joins/replacements use global composition because new resources may change
-    the throughput optimum. Failure-only changes first retain each surviving
+    Changes containing added nodes use global composition because new resources may
+    change the throughput optimum. Removal-only changes first retain each surviving
     pipeline identity, borrow low-state nodes from viable donors, and merge only
     groups that still lack a supported template. The final allocation must satisfy
     the replica threshold and assign every survivor exactly once; ties prefer
@@ -84,7 +84,7 @@ def reconfigure_pipelines(
         known_survivors = survivors.intersection(known)
         return ReconfigurationResult(
             instances,
-            ("join",),
+            ("addition",),
             retained,
             len(known_survivors) - retained,
             retained_state,

@@ -61,9 +61,9 @@ def test_reconfiguration_keeps_indices_and_reallocates_uncommitted_microbatches(
         shuffle=True,
     )
     before = sampler.descriptor_at(0)
-    replacement = (PipelineInstance("joined", template, ("c",), microbatches=2),)
-    sampler.reconfigure(replacement)
+    reconfigured = (PipelineInstance("added", template, ("c",), microbatches=2),)
+    sampler.reconfigure(reconfigured)
     after = sampler.descriptor_at(0)
     assert after.sample_indices == before.sample_indices
-    assert [item.pipeline_id for item in after.assignments] == ["joined"]
+    assert [item.pipeline_id for item in after.assignments] == ["added"]
     assert after.assignments[0].global_microbatch_ids == (0, 1)

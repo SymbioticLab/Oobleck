@@ -21,7 +21,7 @@ flowchart TD
     AB --> S["Run transactional training steps"]
     S --> F{"Membership changed?"}
     F -- "No" --> S
-    F -- "Failure, drain, join, replacement" --> NM["Receive newer complete membership snapshot"]
+    F -- "Removal or addition" --> NM["Receive newer complete membership snapshot"]
     NM --> RP["Reconfigure with simple / borrow / merge"]
     RP --> X["Capture committed state and invalidate prefetch"]
     X --> D["Close schedules/meshes and destroy all process groups"]
@@ -160,8 +160,7 @@ separately in
 The master and node agents communicate only through the CPU control plane in
 [`elastic/`](oobleck/elastic/). An agent registers its stable node ID,
 incarnation, reachable addresses, and GPU IDs, then maintains a heartbeat lease.
-The master publishes every join, replacement, drain, disconnect, or lease
-expiry as a complete, monotonically newer `MembershipSnapshot`.
+The master normalizes registrations into additions and disconnects, lease expiry, and drains into removals, then publishes a complete, monotonically newer `MembershipSnapshot`.
 
 ```mermaid
 sequenceDiagram
@@ -286,11 +285,13 @@ discards the attempt's gradients and does not advance any of those objects.
 
 ### 5. Handle membership changes
 
-Failures, joins, graceful drains, and replacements all enter the same generation
-protocol. The master converts each event into a complete, monotonically newer
-`MembershipSnapshot`; it never sends rank-local membership patches. Workers
-first agree on that snapshot and a deterministic execution plan, then replace
-the distributed generation through the common path in Section 5.3.
+Every membership removal or addition enters the same generation protocol. The master converts each event into a complete, monotonically newer
+`MembershipSnapshot`; it never sends rank-local membership patches. The control
+protocol binds the previous active execution plan into the snapshot hash, and
+prepared acknowledgements carry the complete checksummed target plan. The master
+stores that plan only after the generation becomes active.
+
+The cutover boundary is derived only from accumulated membership operations. A snapshot with additions and no removals is graceful: it cuts over immediately when idle, or lets exactly the running step commit under the old generation before blocking the next step. Any snapshot containing a removal becomes hard-pending immediately and makes the active attempt uncommittable.
 
 If another event arrives while a generation is being prepared or activated, the
 newer complete snapshot supersedes the stale generation. Workers abandon the
@@ -324,7 +325,7 @@ sequenceDiagram
     SA-->>SW: snapshot N+1 over local IPC
     SW->>SW: apply_membership and announce pending recovery plan
     Note over SW: An in-flight step cannot commit after the pending generation is visible
-    opt Another failure, join, drain, or replacement arrives
+    opt Another removal or addition arrives
         M->>M: publish generation N+2
         M-->>SA: newer complete snapshot N+2
         SA-->>SW: N+2 supersedes prepared or activating N+1
@@ -345,7 +346,7 @@ master membership state machine
 A failed worker may be required by the current pipeline schedule or collective,
 so the in-flight logical batch generally cannot finish. Once the reduced
 membership becomes pending, surviving workers preserve the last committed
-cursor and enter the shared replacement path in Section 5.3. Any uncommitted
+cursor and enter the shared reconfiguration path in Section 5.3. Any uncommitted
 attempt is replayed after the new generation becomes active.
 
 #### 5.2. Register added nodes and publish expanded membership
@@ -353,71 +354,84 @@ attempt is replayed after the new generation becomes active.
 A new node starts one CPU agent and its configured GPU workers. The agent
 registers a new stable node ID, incarnation, addresses, and GPU inventory with
 the master. Registration proposes a complete membership generation containing
-both incumbent and joining nodes; it does not add ranks to the active WORLD in
+both incumbent and added nodes; it does not add ranks to the active WORLD in
 place.
 
 ```mermaid
 sequenceDiagram
-    participant JA as Joining node CPU agent
-    participant JW as Joining node GPU workers
+    participant JA as Added node CPU agent
+    participant JW as Added node GPU workers
     participant M as CPU master process
     participant IA as Incumbent node agents
     participant IW as Incumbent GPU workers
 
     JA->>M: register(new stable ID, incarnation, addresses, GPU IDs)
-    M->>M: validate registration and publish generation N+1
-    M-->>JA: complete expanded membership snapshot N+1
-    M-->>IA: complete expanded membership snapshot N+1
+    M->>M: validate pure stable-ID addition
+    M->>M: bind previous active plan into snapshot N+1
+    M-->>JA: expanded snapshot N+1 plus previous active plan
+    M-->>IA: expanded snapshot N+1 plus previous active plan
     JA-->>JW: snapshot N+1 over local IPC
     IA-->>IW: snapshot N+1 over local IPC
     par Build the expanded plan
-        IW->>IW: apply_membership and compose the join plan
-        JW->>JW: validate snapshot and compose the same plan
+        JW->>JW: seed previous plan and compile target ownership early
+        IW->>IW: compose the same plan; defer while current step runs
     end
-    Note over JW,IW: Continue through the shared generation replacement in Section 5.3
+    IW->>IW: commit current step once under generation N
+    IW->>IW: promote deferred plan and block the next step
+    IW-->>IA: prepared(plan N+1) after safe boundary
+    JW-->>JA: prepared(same plan N+1)
+    Note over M: Rendezvous waits for every incumbent and added worker
+    Note over JW,IW: Continue through WORLD recreation and recovery in Section 5.3
 ```
 
 When [`planning/reconfiguration.py`](oobleck/planning/reconfiguration.py) sees
 a node identity that was not in the previous execution plan, it calls the
 heterogeneous composer over the entire expanded membership, up to
-`max_nodes`, and records the strategy as `join`. The objective remains
+`max_nodes`, and records the strategy as `addition`. The objective remains
 throughput first. If candidates have equal predicted iteration time, it
 maximizes retained state bytes, minimizes moved incumbent nodes, and finally
-uses stable identities as deterministic tie-breakers. Consequently, a join may
+uses stable identities as deterministic tie-breakers. Consequently, an addition may
 create another pipeline replica, enlarge existing pipelines, or choose a
 different heterogeneous combination; it is not necessarily an append-only
 layout change.
 
 All workers derive a new stable rank map, so an incumbent numeric global rank
-may change when a lexicographically earlier node ID joins even though stable
+may change when a lexicographically earlier node ID is added even though stable
 node and pipeline identities remain retained. Each worker validates the fixed
 per-node TP width, compatibility digest, snapshot hash, and plan checksum before
 the master publishes rendezvous data.
 
-The current runtime uses the same pending-generation commit guard for joins and
-failures. If an expanded membership becomes visible before the atomic step
-commit, that attempt does not commit and is replayed after Section 5.3. If the
-step commits first, its new state and sampler cursor become the recovery source,
-and training resumes from the following logical batch.
+For a pure addition, `runtime.py` holds the newest additive plan separately while a
+step is active. That step commits exactly once with the old generation and
+`attempts=1`; its optimizer, scheduler, scaler, committed step, sampler epoch,
+and sampler cursor become the recovery source. The deferred plan is then
+promoted, so the following `step()` waits for `generation_active` and consumes
+the next logical batch without replay. Several additive snapshots coalesce to
+the newest generation. Any snapshot containing a removal supersedes the deferred addition, makes the active attempt uncommittable, and
+restores the hard replay behavior described in Section 5.1.
 
 If the expanded membership cannot form a supported template composition,
 exceeds `max_nodes`, has the wrong TP width, or disagrees on compatibility or
-plan checksums, the proposed generation cannot become active. A still newer
-join, failure, drain, or replacement snapshot supersedes the proposal in the
+plan checksums, the proposed generation cannot become active. A still newer removal/addition snapshot supersedes the proposal in the
 same way as any other membership event.
 
 #### 5.3. Replace the generation and transfer committed state
 
-The generation-replacement methods layered onto `OobleckParallelContext` in
+The generation-reconfiguration methods layered onto `OobleckParallelContext` in
 [`runtime.py`](oobleck/runtime.py) perform a common prepare phase followed by an
 activate-and-recover phase. `apply_membership()` first updates the stable
 membership and rank map and builds a pending execution plan. Removed nodes use
-the simple, borrow, or merge planner; added nodes use the `join` composition
+the simple, borrow, or merge planner; added nodes use the `addition` composition
 path. In both cases, the next plan is chosen before the active WORLD is retired.
 
 ```mermaid
 flowchart TD
-    EVENT["Receive complete membership snapshot"] --> PLAN["Build deterministic failure, drain,<br/>replacement, or join plan"]
+    EVENT["Receive complete membership snapshot"] --> CLASSIFY{"Pure incarnation addition?"}
+    CLASSIFY -- "Yes; step active" --> FINISH["Commit current step once;<br/>then block next step"]
+    CLASSIFY -- "Yes; idle" --> PLAN["Build target plan"]
+    CLASSIFY -- "No" --> HARD["Mark active attempt uncommittable"]
+    FINISH --> PLAN
+    HARD --> PLAN
     PLAN --> ISNAP
     PLAN --> JCOMPILE
 
@@ -429,7 +443,7 @@ flowchart TD
         ISNAP --> ICLOSE --> IDESTROY --> ICOMPILE
     end
 
-    subgraph joiners["On joining GPU workers, if any"]
+    subgraph added_workers["On added GPU workers, if any"]
         JCOMPILE["Compile target ownership without WORLD;<br/>no pre-generation state is available"]
     end
 
@@ -450,10 +464,12 @@ flowchart TD
 
 1. On incumbent workers, [`recovery_base.py`](oobleck/recovery_base.py) captures
    the last committed parameter, persistent-buffer, optimizer, scheduler,
-   scaler, and step state. Joining workers have no pre-generation snapshot.
+   scaler, step, sampler epoch, and sampler cursor state. Added workers have
+   no pre-generation snapshot, but use the previous active plan from the
+   membership snapshot to derive the identical retained-state composition.
 2. Incumbent DataLoaders invalidate prefetched but uncommitted batches.
 3. Incumbents close the active Cornstarch partition, schedules, meshes, and
-   heterogeneous gradient groups. Joining workers have no old partition to
+   heterogeneous gradient groups. Added workers have no old partition to
    retire.
 4. [`distributed/lifecycle.py`](oobleck/distributed/lifecycle.py) concurrently
    shuts down every known backend on incumbents, destroys the old WORLD, clears
@@ -464,23 +480,26 @@ flowchart TD
 
 **Activate and recover after rendezvous:**
 
-1. Incumbent and joining workers create the replacement WORLD and activate their
-   compiled local partitions.
+1. Incumbent and added workers create the replacement WORLD and activate their
+   compiled local partitions. Before collective recovery, each added worker
+   configures its DataLoader, optimizer, scheduler, and scaler through the
+   activation hook.
 2. [`state_base.py`](oobleck/state_base.py) matches old and new state through
    stable logical keys, TP lanes, placements, and committed versions.
 3. [`state.py`](oobleck/state.py) plans retained shards and missing transfers. It
    chunks complete parameter and optimizer bundles and balances source,
    destination, round, and link load across available committed replicas.
 4. [`state_transfer.py`](oobleck/state_transfer.py) executes the immutable,
-   checksummed schedule with variable-split `all_to_all_single` rounds. Joining
+   checksummed schedule with variable-split `all_to_all_single` rounds. Added
    workers enter as destinations without a local snapshot; incumbents may be
    sources, destinations, or both under the new layout.
 5. [`recovery.py`](oobleck/recovery.py) restores parameters, buffers, optimizer
-   slots and groups, scheduler, scaler, and committed-step metadata, then
+   slots and groups, scheduler, scaler, committed-step, sampler epoch, and sampler
+   cursor metadata, then
    rebuilds heterogeneous gradient synchronization.
 
 After every participating worker reports ready, the master activates the
-replacement generation. An interrupted logical batch is fetched again from the
-unchanged committed cursor and can commit exactly once. If the previous batch
-committed before the membership transition became pending, execution instead
-continues from the next logical batch.
+new generation. Hard transitions fetch an interrupted logical batch
+again from the unchanged committed cursor. Pure additions instead recover from the
+step committed at the graceful boundary and continue with the next logical
+batch; they do not replay that committed batch.

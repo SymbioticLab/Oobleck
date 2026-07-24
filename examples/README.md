@@ -93,9 +93,10 @@ python examples/run_agent.py \
   --worker-script examples/pretrain_llm.py
 ```
 
-Node IDs remain stable across replacements; each agent process creates a fresh
-incarnation. A membership proposal supersedes any older preparation, local
-workers recover and acknowledge it, all agents acknowledge readiness, and only
+Node IDs remain stable across agent restarts; each agent process creates a fresh
+incarnation. Membership proposals carry the previous active plan, and every
+prepared worker acknowledges the same complete checksummed target plan. A newer
+proposal supersedes older preparation, all agents acknowledge readiness, and only
 then does the master publish `generation_active`.
 
 For bootstrap only, an optional hostfile may start the initial agents over SSH:
@@ -115,8 +116,10 @@ python -m oobleck.cli training-launch-config \
   --max-nodes 16 --tensor-parallel-size 4
 ```
 
-The hostfile is not consulted for later joins. New or replacement agents simply
-run the normal agent command and self-register.
+The hostfile is not consulted for later additions. New or restarted agents simply
+run the normal agent command and self-register. A pure addition may compile
+early, but the master withholds rendezvous until incumbents finish their current
+step, report prepared, and block the next step.
 
 Inspect the full checksummed membership snapshot with:
 
@@ -131,7 +134,7 @@ cascading failure scenarios, long-running leak bounds, and machine-readable
 results. The regular suite exercises multi-rank model and optimizer recovery on
 the single CUDA GPU over Gloo.
 
-## Drain, failure, replacement, and replay
+## Removal, addition, and replay
 
 A graceful drain is a complete generation boundary:
 
@@ -149,15 +152,19 @@ python examples/fail_agent.py \
 ```
 
 Invoke it for two validated agents in the same detection window to demonstrate
-a simultaneous failure. A replacement uses the same stable node ID in a fresh
-agent process; a join uses a new ID. Both paths create a new WORLD rather than
-editing groups in place.
+a simultaneous failure. A restarted agent removes the old incarnation and adds the new incarnation; a new ID is an ordinary addition. Both paths create a new WORLD rather than
+editing groups in place. Any accumulated operation set containing a removal is a hard transition that replays an interrupted batch. A pure addition lets the current
+step commit once under the old generation, blocks the next step, restores the
+new worker from that committed state and sampler cursor, and resumes with the
+next batch without replay.
 
-Expected logs show the proposal generation and reason set, full WORLD teardown,
+Expected logs show the proposal generation, removed and added member sets, full WORLD teardown,
 compiled ownership, all-worker `prepared` consensus, coordinator rendezvous
 publication, transfer schedule hash and source/destination byte balance, final
-worker readiness, `generation_active`, replay of the uncommitted logical batch,
-and exactly one commit. A cascading failure should show the partial
+worker readiness and `generation_active`. Hard-transition logs then show replay
+of the uncommitted logical batch and exactly one commit; pure-addition logs instead
+show `attempts=1`, the old-generation cutover commit, and the next logical batch
+under the expanded generation. A cascading failure should show the partial
 recovery marked superseded before the newest snapshot is prepared.
 
 ## Cleanup and troubleshooting
@@ -167,7 +174,7 @@ socket; remove a stale `/tmp/oobleck-*.sock` only after confirming no matching
 agent is running. The failure helper sends `SIGKILL`, so use it only in a
 disposable deployment.
 
-If a node cannot join or activate, check TCP reachability, unique stable IDs,
+If a node cannot be added or activate, check TCP reachability, unique stable IDs,
 identical GPU counts/TP width, worker-script paths on every host, writable Unix
 socket directories, profile/template/runtime fingerprints, stable dataset
 length/fingerprint, and that no stale master owns the rendezvous port. A profile

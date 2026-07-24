@@ -149,7 +149,12 @@ class PipelineStageSpec:
 
 @dataclass(frozen=True, slots=True)
 class PipelineTemplate:
-    """A profiled pipeline layout independent of concrete nodes and ranks."""
+    """A profiled pipeline layout independent of concrete nodes and ranks.
+
+    Generated templates store Section 4.1.2's T1, T3, and rightmost
+    bottleneck-stage metadata. Manually constructed legacy templates may omit
+    those optional fields and retain the earlier steady-state estimate.
+    """
 
     template_id: str
     layer_ranges: tuple[tuple[int, int], ...]
@@ -162,9 +167,19 @@ class PipelineTemplate:
     max_microbatches: int | None = None
     fingerprint: CompatibilityFingerprint | None = None
     schema_version: int = 1
+    paper_t1: float | None = None
+    paper_t3: float | None = None
+    paper_bottleneck_stage: int | None = None
 
     def __post_init__(self) -> None:
-        """Validate that the template is a contiguous, feasible stage partition."""
+        """Validate structural, timing, memory, and paper-metadata invariants.
+
+        Layer ranges must be non-empty, ordered, and contiguous; TP width and
+        microbatch capacity must be positive. All timing and memory values are
+        finite and non-negative. The optional T1, T3, and bottleneck index form
+        one atomic group so a template cannot claim a partially specified paper
+        objective, and the bottleneck must identify an existing stage.
+        """
 
         if not self.template_id:
             raise ValueError("template_id must not be empty")
@@ -190,6 +205,22 @@ class PipelineTemplate:
             raise ValueError("memory requirements must be non-negative")
         if self.max_microbatches is not None and self.max_microbatches < 1:
             raise ValueError("max_microbatches must be >= 1 when supplied")
+        paper_fields = (self.paper_t1, self.paper_t3, self.paper_bottleneck_stage)
+        if any(value is not None for value in paper_fields) and not all(
+            value is not None for value in paper_fields
+        ):
+            raise ValueError("paper timing fields must be supplied together")
+        if self.paper_t1 is not None:
+            assert self.paper_t3 is not None and self.paper_bottleneck_stage is not None
+            if (
+                not math.isfinite(self.paper_t1)
+                or not math.isfinite(self.paper_t3)
+                or self.paper_t1 < 0
+                or self.paper_t3 < 0
+            ):
+                raise ValueError("paper T1 and T3 must be finite and non-negative")
+            if not 0 <= self.paper_bottleneck_stage < self.num_stages:
+                raise ValueError("paper bottleneck stage is outside the pipeline")
 
     @property
     def num_stages(self) -> int:
@@ -216,11 +247,32 @@ class PipelineTemplate:
             return math.inf
         if microbatches == 0:
             return 0.0
-        # Flush time plus steady-state work.  This deliberately uses only the
-        # serialized profile and is deterministic across workers.
         stage_work = self.forward_time + self.backward_time
+        if self.paper_t1 is not None:
+            assert self.paper_t3 is not None and self.paper_bottleneck_stage is not None
+            # Oobleck Section 4.1.2, Equation 2:
+            # T2 = (Nb - S + k* - 1) * (F_k* + B_k*).
+            t2 = (microbatches - self.num_stages + self.paper_bottleneck_stage - 1) * stage_work
+            return self.paper_t1 + t2 + self.paper_t3 + self.communication_time
+        # Compatibility path for hand-written/schema-v1 templates without the
+        # paper timing summary.
         bubble = max(0, self.num_stages - 1) * stage_work
         return bubble + microbatches * stage_work + self.communication_time
+
+    @property
+    def planning_iteration_time(self) -> float:
+        """Return the Section 4.1.2 objective with its temporary Nb = 4S.
+
+        This is the offline comparison value, not a runnable allocation, so the
+        concrete ``max_microbatches`` guard used by composition does not apply.
+        """
+
+        if self.paper_t1 is None:
+            return self.iteration_time(4 * self.num_stages)
+        assert self.paper_t3 is not None and self.paper_bottleneck_stage is not None
+        stage_work = self.forward_time + self.backward_time
+        t2 = (3 * self.num_stages + self.paper_bottleneck_stage - 1) * stage_work
+        return self.paper_t1 + t2 + self.paper_t3 + self.communication_time
 
     def assert_compatible(self, fingerprint: CompatibilityFingerprint) -> None:
         """Reject cache entries produced for a different model or runtime."""
@@ -303,6 +355,8 @@ class PipelineInstance:
 class OobleckExecutionPlan:
     """Checksummed, immutable topology for one membership generation."""
 
+    SERIALIZATION_VERSION = 1
+
     generation: int
     instances: tuple[PipelineInstance, ...]
     rank_map: tuple[tuple[str, tuple[int, ...]], ...]
@@ -350,6 +404,63 @@ class OobleckExecutionPlan:
                 for item in self.instances
             ],
         }
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the complete, checksummed plan for control-plane consensus."""
+
+        return {
+            "schema_version": self.SERIALIZATION_VERSION,
+            **self._unsigned_dict(),
+            "plan_checksum": self.plan_checksum,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "OobleckExecutionPlan":
+        """Strictly reconstruct a plan and verify its embedded checksum.
+
+        The wire object must contain exactly the current schema fields. Nested
+        templates and instances are converted back to immutable value objects,
+        with rank collections normalized to tuples. Construction then re-runs all
+        plan invariants and recomputes the checksum, rejecting malformed or
+        tampered consensus data before it can drive generation activation.
+        """
+
+        expected = {
+            "schema_version",
+            "generation",
+            "previous_generation",
+            "compatibility_digest",
+            "rank_map",
+            "instances",
+            "plan_checksum",
+        }
+        if set(value) != expected:
+            raise ValueError("execution plan fields are invalid")
+        if value["schema_version"] != cls.SERIALIZATION_VERSION:
+            schema_version = value["schema_version"]
+            raise ValueError(f"unsupported execution plan schema {schema_version!r}")
+        instances_value = value["instances"]
+        rank_map_value = value["rank_map"]
+        if not isinstance(instances_value, list) or not isinstance(rank_map_value, list):
+            raise ValueError("execution plan instances and rank_map must be lists")
+        instances = []
+        for item in instances_value:
+            if not isinstance(item, Mapping):
+                raise ValueError("execution plan instance must be an object")
+            data = dict(item)
+            data["template"] = PipelineTemplate.from_dict(data["template"])
+            data["node_ids"] = tuple(data["node_ids"])
+            data["ranks"] = tuple(tuple(group) for group in data["ranks"])
+            instances.append(PipelineInstance(**data))
+        rank_map = tuple((str(node_id), tuple(ranks)) for node_id, ranks in rank_map_value)
+        return cls(
+            generation=value["generation"],
+            instances=tuple(instances),
+            rank_map=rank_map,
+            previous_generation=value["previous_generation"],
+            compatibility_digest=value["compatibility_digest"],
+            plan_checksum=value["plan_checksum"],
+        )
 
     def rank_local_stage(self, rank: int) -> PipelineStageSpec:
         """Find the single pipeline stage owned by a global rank."""

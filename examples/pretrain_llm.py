@@ -132,8 +132,16 @@ async def train_managed(config: ExampleTrainingConfig):
         rendezvous_port=config.rendezvous_port,
         distributed_backend=config.distributed_backend,
     )
-    context = await worker.activate_prepared(prepared, snapshot)
-    model, context, loader = configure_training(model, context, dataset, device=selected)
+    configured: dict[str, object] = {}
+
+    def configure_before_ready(context):
+        _, _, loader = configure_training(model, context, dataset, device=selected)
+        configured["loader"] = loader
+
+    context = await worker.activate_prepared(
+        prepared, snapshot, on_activated=configure_before_ready
+    )
+    loader = configured["loader"]
 
     metrics_path = (
         None
@@ -155,16 +163,11 @@ async def train_managed(config: ExampleTrainingConfig):
                 ),
             )
 
-    async def prepare(snapshot) -> None:
-        context.prepare_generation()
-
     async def activated(generation: int) -> None:
         record("generation_active")
 
     record("generation_active")
-    relay_task = asyncio.create_task(
-        worker.run_context(context, on_snapshot=prepare, on_active=activated)
-    )
+    relay_task = asyncio.create_task(worker.run_context(context, on_active=activated))
     try:
         result = None
         for _ in range(config.steps):

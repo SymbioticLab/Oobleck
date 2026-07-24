@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -34,7 +35,10 @@ class LayerExecutionResult:
         if self.layer_index < 0 or not self.layer_name:
             raise ValueError("layer identity is invalid")
         if (
-            self.forward < 0
+            not math.isfinite(self.forward)
+            or not math.isfinite(self.backward)
+            or not math.isfinite(self.forward + self.backward)
+            or self.forward < 0
             or self.backward < 0
             or self.mem_required < 0
             or self.activation_memory < 0

@@ -81,7 +81,8 @@ async def _agent(config: AgentConfig) -> None:
                 {
                     "generation": message.generation,
                     "nodes": [item["agent_id"] for item in message.payload["nodes"]],
-                    "reasons": message.payload["reasons"],
+                    "removed_nodes": message.payload["removed_nodes"],
+                    "added_nodes": message.payload["added_nodes"],
                 },
                 sort_keys=True,
             ),
@@ -97,7 +98,7 @@ def _launch(config: TrainingLaunchConfig) -> int:
     Local mode directly returns the training process exit code. Hostfile mode validates node and
     fixed-TP capacity, constructs one explicit agent command per host, and supervises them as a
     cohort. The first nonzero exit terminates remaining agents; normal completion requires all
-    agents to exit successfully. Later elastic joins bypass this bootstrap-only hostfile path.
+    agents to exit successfully. Later elastic additions bypass this bootstrap-only hostfile path.
     """
 
     if not config.training_script.is_file():

@@ -9,10 +9,8 @@ from dataclasses import asdict, dataclass
 from typing import Awaitable, Callable, Mapping, Protocol
 
 
-PROTOCOL_VERSION = 1
 DEFAULT_MAX_FRAME_BYTES = 1 << 20
 _FIELDS = {
-    "protocol_version",
     "message_type",
     "agent_id",
     "incarnation_id",
@@ -23,17 +21,31 @@ _FIELDS = {
 _PAYLOAD_FIELDS = {
     "register": {"addresses", "gpu_ids"},
     "heartbeat": set(),
-    "generation_prepared": {"snapshot_hash", "plan_checksum", "compatibility_digest"},
+    "generation_prepared": {
+        "snapshot_hash",
+        "plan_checksum",
+        "compatibility_digest",
+        "execution_plan",
+    },
     "generation_ready": {"snapshot_hash", "plan_checksum", "compatibility_digest"},
     "drain": set(),
-    "membership": {"nodes", "reasons", "snapshot_hash"},
+    "membership": {
+        "nodes",
+        "removed_nodes",
+        "added_nodes",
+        "detection_seconds",
+        "snapshot_hash",
+        "previous_execution_plan",
+    },
     "generation_rendezvous": {"snapshot_hash", "plan_checksum", "compatibility_digest"},
     "generation_active": {"snapshot_hash", "plan_checksum", "compatibility_digest"},
     "inspect": set(),
     "inspect_status": set(),
     "status": {
         "nodes",
-        "reasons",
+        "removed_nodes",
+        "added_nodes",
+        "detection_seconds",
         "snapshot_hash",
         "active_generation",
         "prepared_agents",
@@ -43,12 +55,18 @@ _PAYLOAD_FIELDS = {
     "drain_command": {"node_id"},
     "drain_accepted": {"node_id"},
     "worker_register": {"node_id"},
-    "worker_ack": {"phase", "snapshot_hash", "plan_checksum", "compatibility_digest"},
+    "worker_ack": {
+        "phase",
+        "snapshot_hash",
+        "plan_checksum",
+        "compatibility_digest",
+        "execution_plan",
+    },
 }
 
 
 class ProtocolError(ValueError):
-    """A frame or envelope violates the versioned control protocol."""
+    """A frame or envelope violates the closed versioned control protocol."""
 
 
 class FrameTooLarge(ProtocolError):
@@ -56,12 +74,12 @@ class FrameTooLarge(ProtocolError):
 
 
 def _validate_payload(message_type: str, payload: Mapping[str, object]) -> None:
-    """Enforce the exact field set and runtime types for each protocol message.
+    """Validate the exact fields and runtime types for one control message.
 
-    Validation is intentionally closed-world: unknown message types, extra fields, bools
-    masquerading as integers, malformed node inventories, or invalid phase metadata are
-    rejected before service state machines see them. This keeps transport decoding from
-    smuggling partially interpreted control state across generation boundaries.
+    The schema is deliberately closed-world so malformed identity sets, transition
+    timing, plan ancestry, phase metadata, or operator commands never reach membership
+    state. Prepared acknowledgements additionally carry a serialized execution plan whose
+    embedded checksum must match the advertised plan; ready acknowledgements must not.
     """
 
     expected = _PAYLOAD_FIELDS.get(message_type)
@@ -79,10 +97,22 @@ def _validate_payload(message_type: str, payload: Mapping[str, object]) -> None:
             ):
                 raise ProtocolError(f"register {field} must be a non-empty list of strings")
     elif message_type in {"membership", "status"}:
-        if type(payload["nodes"]) is not list or type(payload["reasons"]) is not list:
-            raise ProtocolError(f"{message_type} nodes and reasons must be lists")
+        for field in ("nodes", "removed_nodes", "added_nodes"):
+            if type(payload[field]) is not list:
+                raise ProtocolError(f"{message_type} {field} must be a list")
+        detection_seconds = payload["detection_seconds"]
+        if (
+            not isinstance(detection_seconds, (int, float))
+            or isinstance(detection_seconds, bool)
+            or detection_seconds < 0
+        ):
+            raise ProtocolError(f"{message_type} detection_seconds must be non-negative")
         if type(payload["snapshot_hash"]) is not str:
             raise ProtocolError(f"{message_type} snapshot_hash must be a string")
+        if message_type == "membership":
+            plan = payload["previous_execution_plan"]
+            if plan is not None and not isinstance(plan, dict):
+                raise ProtocolError("membership previous_execution_plan must be an object or null")
         if message_type == "status":
             if type(payload["active_generation"]) is not int or payload["active_generation"] < 0:
                 raise ProtocolError("status active_generation must be non-negative")
@@ -101,6 +131,10 @@ def _validate_payload(message_type: str, payload: Mapping[str, object]) -> None:
                 raise ProtocolError(f"{message_type} {field} must be a non-empty string")
         if type(payload["compatibility_digest"]) is not str:
             raise ProtocolError(f"{message_type} compatibility_digest must be a string")
+        if message_type == "generation_prepared":
+            plan = payload["execution_plan"]
+            if not isinstance(plan, dict) or plan.get("plan_checksum") != payload["plan_checksum"]:
+                raise ProtocolError("generation_prepared execution_plan is invalid")
     elif message_type in {
         "request_drain",
         "drain_command",
@@ -117,13 +151,18 @@ def _validate_payload(message_type: str, payload: Mapping[str, object]) -> None:
                 raise ProtocolError(f"worker_ack {field} must be a non-empty string")
         if type(payload["compatibility_digest"]) is not str:
             raise ProtocolError("worker_ack compatibility_digest must be a string")
+        plan = payload["execution_plan"]
+        if payload["phase"] == "prepared":
+            if not isinstance(plan, dict) or plan.get("plan_checksum") != payload["plan_checksum"]:
+                raise ProtocolError("prepared worker_ack execution_plan is invalid")
+        elif plan is not None:
+            raise ProtocolError("ready worker_ack execution_plan must be null")
 
 
 @dataclass(frozen=True, slots=True)
 class MessageEnvelope:
-    """Strictly validated metadata and payload for one control-plane message."""
+    """Strictly validated routing, ordering, generation, and payload metadata."""
 
-    protocol_version: int
     message_type: str
     agent_id: str
     incarnation_id: str
@@ -132,12 +171,8 @@ class MessageEnvelope:
     payload: Mapping[str, object]
 
     def __post_init__(self) -> None:
-        """Reject unknown versions, missing identities, and malformed payloads."""
+        """Reject empty identities, negative cursors, and malformed payloads."""
 
-        if self.protocol_version != PROTOCOL_VERSION:
-            raise ProtocolError(
-                f"unsupported protocol version {self.protocol_version}; expected {PROTOCOL_VERSION}"
-            )
         if not self.message_type or not self.agent_id or not self.incarnation_id:
             raise ProtocolError("message_type, agent_id, and incarnation_id are required")
         if self.sequence_number < 0 or self.generation < 0:
@@ -148,7 +183,7 @@ class MessageEnvelope:
 
     @classmethod
     def from_dict(cls, value: object) -> "MessageEnvelope":
-        """Decode only an exact envelope shape; unknown fields are protocol errors."""
+        """Decode only the exact envelope shape and primitive JSON field types."""
 
         if not isinstance(value, dict):
             raise ProtocolError("control envelope must be a JSON object")
@@ -157,7 +192,6 @@ class MessageEnvelope:
             extra = sorted(set(value) - _FIELDS)
             raise ProtocolError(f"invalid envelope fields; missing={missing}, extra={extra}")
         expected_types = {
-            "protocol_version": int,
             "message_type": str,
             "agent_id": str,
             "incarnation_id": str,
@@ -185,7 +219,7 @@ def encode_frame(message: MessageEnvelope, max_frame_bytes: int = DEFAULT_MAX_FR
 async def read_frame(
     reader: asyncio.StreamReader, max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES
 ) -> MessageEnvelope:
-    """Read exactly one frame, preserving fragmentation and coalescing semantics."""
+    """Read one complete frame while preserving fragmentation/coalescing semantics."""
 
     header = await reader.readexactly(4)
     size = struct.unpack(">I", header)[0]
@@ -206,7 +240,7 @@ async def write_frame(
     message: MessageEnvelope,
     max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
 ) -> None:
-    """Write one complete frame and wait for stream backpressure."""
+    """Write one encoded frame and wait for transport backpressure."""
 
     writer.write(encode_frame(message, max_frame_bytes))
     await writer.drain()
@@ -222,7 +256,7 @@ class SerializedWriter:
         max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
         queue_size: int = 64,
     ) -> None:
-        """Start the sole writer task for this stream and bound queued sends."""
+        """Start the sole stream-writer task with bounded queued sends."""
 
         self._writer = writer
         self._max_frame_bytes = max_frame_bytes
@@ -232,7 +266,7 @@ class SerializedWriter:
         self._task = asyncio.create_task(self._run())
 
     async def send(self, message: MessageEnvelope) -> None:
-        """Queue a message and return only after it has drained to the stream."""
+        """Queue one message and return only after it drains or fails."""
 
         if self._task.done():
             await self._task
@@ -241,12 +275,12 @@ class SerializedWriter:
         await future
 
     async def _run(self) -> None:
-        """Own the stream writer, preserving frame order and bounded backpressure.
+        """Preserve frame order and propagate the first failure to every sender.
 
-        Exactly one task dequeues frames and awaits ``drain()``, preventing concurrent
-        coroutines from interleaving bytes. A close sentinel flushes preceding messages.
-        Any write failure is copied to its sender and every still-queued completion before
-        the task terminates, so callers cannot mistake dropped control messages for success.
+        A single task owns ``write``/``drain`` so concurrent control coroutines cannot
+        interleave bytes. The close sentinel flushes preceding frames. Any stream failure
+        completes both the active and all queued futures exceptionally, preventing callers
+        from treating an untransmitted membership or barrier message as successful.
         """
 
         try:
@@ -283,7 +317,7 @@ class SerializedWriter:
 
 
 class ControlConnection:
-    """Bidirectional framed connection with one serialized writer."""
+    """Bidirectional framed connection with one serialized bounded writer."""
 
     def __init__(
         self,
@@ -293,7 +327,7 @@ class ControlConnection:
         max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
         writer_queue_size: int = 64,
     ) -> None:
-        """Wrap the stream pair with shared frame and queue limits."""
+        """Wrap a stream pair with shared frame and queue limits."""
 
         self.reader = reader
         self.writer = SerializedWriter(
@@ -304,26 +338,26 @@ class ControlConnection:
         self.max_frame_bytes = max_frame_bytes
 
     async def receive(self) -> MessageEnvelope:
-        """Receive the next validated envelope from the peer."""
+        """Receive and validate the next envelope from the peer."""
 
         return await read_frame(self.reader, self.max_frame_bytes)
 
     async def send(self, message: MessageEnvelope) -> None:
-        """Send through the connection's ordered, backpressured queue."""
+        """Send through the ordered, backpressured writer queue."""
 
         await self.writer.send(message)
 
     async def close(self) -> None:
-        """Close the serialized writer and its underlying stream."""
+        """Close the serialized writer and underlying stream."""
 
         await self.writer.close()
 
 
 class ControlTransport(Protocol):
-    """Transport boundary consumed by membership services and local IPC."""
+    """Backend boundary consumed by membership services and local IPC."""
 
     async def connect(self, host: str, port: int) -> ControlConnection:
-        """Open one persistent client connection using the transport backend."""
+        """Open one persistent client connection."""
 
         ...
 
@@ -339,7 +373,7 @@ class ControlTransport(Protocol):
 
 
 class AsyncioTcpControlTransport:
-    """Asyncio stream implementation of the control transport contract."""
+    """Asyncio TCP implementation of the control transport contract."""
 
     def __init__(
         self,
@@ -357,7 +391,7 @@ class AsyncioTcpControlTransport:
     def _connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> ControlConnection:
-        """Apply this transport's limits to a newly opened stream pair."""
+        """Apply transport limits to a newly opened stream pair."""
 
         return ControlConnection(
             reader,
@@ -367,7 +401,7 @@ class AsyncioTcpControlTransport:
         )
 
     async def connect(self, host: str, port: int) -> ControlConnection:
-        """Open a persistent full-duplex TCP control connection."""
+        """Open one persistent full-duplex TCP control stream."""
 
         reader, writer = await asyncio.open_connection(host, port)
         return self._connection(reader, writer)
@@ -378,7 +412,7 @@ class AsyncioTcpControlTransport:
         port: int,
         handler: Callable[[ControlConnection], Awaitable[None]],
     ) -> asyncio.AbstractServer:
-        """Start a server that always closes each accepted connection after handling."""
+        """Start a server that retires every accepted stream after handling."""
 
         async def accept(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
             """Adapt an asyncio stream pair and guarantee connection retirement."""

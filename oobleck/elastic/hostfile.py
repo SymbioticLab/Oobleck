@@ -65,7 +65,7 @@ def ssh_agent_command(
     The command carries stable node identity, master endpoint, GPU inventory, local-worker socket,
     worker entrypoint, and optional training arguments. Returning argv rather than a shell string
     preserves quoting and lets the launcher supervise processes directly. This is intentionally
-    limited to initial bootstrap; membership controls later joins.
+    limited to initial bootstrap; membership controls later elastic additions.
     """
 
     if not 1 <= master_port <= 65535:
