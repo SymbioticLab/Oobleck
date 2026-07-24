@@ -9,6 +9,8 @@ from oobleck.types import CompatibilityFingerprint, PipelineTemplate
 
 
 def _partition(layers: Sequence[LayerExecutionResult], stages: int) -> tuple[tuple[int, int], ...]:
+    """Minimax-partition contiguous layers with deterministic cut-position ties."""
+
     if stages < 1 or stages > len(layers):
         raise ValueError("stage count must be between one and the number of layers")
     prefix = [0.0]
@@ -41,6 +43,8 @@ def _partition(layers: Sequence[LayerExecutionResult], stages: int) -> tuple[tup
 def _max_microbatches(
     activation_memory: int, persistent_memory: int, device_memory_bytes: int | None
 ) -> int | None:
+    """Convert a device-memory budget into a pipeline activation capacity."""
+
     if device_memory_bytes is None:
         return None
     available = device_memory_bytes - persistent_memory
@@ -60,6 +64,13 @@ def create_pipeline_templates(
     fingerprint: CompatibilityFingerprint | None = None,
     device_memory_bytes: int | None = None,
 ) -> dict[int, PipelineTemplate]:
+    """Generate templates via the Rust planner or deterministic Python fallback.
+
+    Profiles use global contiguous layer IDs. Each requested node count becomes
+    a stage count; optional memory capacity lets composition reject globally
+    infeasible microbatch allocations.
+    """
+
     if not model_name or not profile_data or not num_nodes:
         raise ValueError("model_name, profile_data, and num_nodes must be non-empty")
     if tensor_parallel_size < 1:

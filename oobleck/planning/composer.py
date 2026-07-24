@@ -78,11 +78,15 @@ def allocate_microbatches(
 def _resource_compositions(
     templates: Sequence[PipelineTemplate], resources: int, minimum_replicas: int
 ) -> Iterable[tuple[PipelineTemplate, ...]]:
+    """Enumerate stable template multisets that consume every available node."""
+
     ordered = sorted(templates, key=lambda item: (item.resource_count, item.template_id))
 
     def visit(
         start: int, remaining: int, selected: tuple[PipelineTemplate, ...]
     ) -> Iterable[tuple[PipelineTemplate, ...]]:
+        """Backtrack through nondecreasing templates to avoid duplicates."""
+
         if remaining == 0:
             if len(selected) >= minimum_replicas:
                 yield selected
@@ -131,6 +135,8 @@ def _assign_composition(
 
     @lru_cache(maxsize=None)
     def choose(slot: int, used: int) -> tuple[int, tuple[int, ...]]:
+        """Match old identities to new slots while maximizing retained state."""
+
         if slot == len(composition):
             return 0, ()
         options: list[tuple[int, tuple[int, ...]]] = []

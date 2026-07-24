@@ -16,6 +16,8 @@ class OptimizerSchemaError(TypeError):
 
 @dataclass(frozen=True, slots=True)
 class OptimizerStateSchema:
+    """Portable optimizer metadata and versioned logical tensor entries."""
+
     optimizer_class: str
     parameter_groups: tuple[dict[str, Any], ...]
     scalar_slots: tuple[tuple[str, str, Any], ...]
@@ -24,6 +26,8 @@ class OptimizerStateSchema:
 
 
 def _local_tensor(value: torch.Tensor) -> torch.Tensor:
+    """Extract detached rank-local storage from a Tensor or DTensor slot."""
+
     local = value.to_local() if hasattr(value, "to_local") else value
     return local.detach()
 
@@ -176,6 +180,8 @@ def _restore_tensor_for_parameter(
     tensor: torch.Tensor,
     parameter: torch.nn.Parameter,
 ) -> torch.Tensor:
+    """Restore local storage and rewrap it as DTensor when the parameter is sharded."""
+
     local = tensor.to(parameter.device).clone()
     if not hasattr(parameter, "device_mesh") or tuple(local.shape) != tuple(
         getattr(parameter, "_local_tensor", local).shape
@@ -202,6 +208,8 @@ def restore_optimizer_state(
     tensors: Mapping[str, torch.Tensor],
     named_parameters: Mapping[str, torch.nn.Parameter],
 ) -> None:
+    """Rebuild a compatible optimizer from logical parameter and slot identities."""
+
     actual = f"{optimizer.__class__.__module__}.{optimizer.__class__.__qualname__}"
     if schema.schema_version != 1 or actual != schema.optimizer_class:
         raise OptimizerSchemaError(

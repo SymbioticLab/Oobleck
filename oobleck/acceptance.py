@@ -16,6 +16,8 @@ _METRIC_LOCK = threading.Lock()
 
 
 def _metric_int(record: Mapping[str, object], field: str) -> int:
+    """Read an integer metric without accepting bool's integer subclass."""
+
     value = record[field]
     if not isinstance(value, int) or isinstance(value, bool):
         raise ValueError(f"metric {field} must be an integer")
@@ -23,6 +25,8 @@ def _metric_int(record: Mapping[str, object], field: str) -> int:
 
 
 def _metric_float(record: Mapping[str, object], field: str) -> float:
+    """Read a numeric metric and normalize it for aggregation."""
+
     value = record[field]
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise ValueError(f"metric {field} must be a number")
@@ -30,6 +34,8 @@ def _metric_float(record: Mapping[str, object], field: str) -> float:
 
 
 def resolve_metrics_path(template: str | Path, *, node_id: str, worker_id: str) -> Path:
+    """Expand worker/node/PID placeholders into a collision-resistant output path."""
+
     value = str(template).format(
         node_id=node_id,
         worker_id=worker_id.replace(":", "-"),
@@ -39,6 +45,8 @@ def resolve_metrics_path(template: str | Path, *, node_id: str, worker_id: str) 
 
 
 def _process_group_count() -> int:
+    """Best-effort count live private c10d handles for leak detection."""
+
     try:
         from torch.distributed import distributed_c10d as c10d
 
@@ -57,6 +65,8 @@ def runtime_metric(
     result: Any = None,
     step_seconds: float = 0.0,
 ) -> dict[str, object]:
+    """Snapshot transaction, recovery, CUDA, and process-group health as JSON data."""
+
     if not event or step_seconds < 0:
         raise ValueError("metric event and non-negative step duration are required")
     device = getattr(context, "device", torch.device("cpu"))
@@ -107,6 +117,8 @@ def runtime_metric(
 
 
 def append_metric(path: str | Path, metric: Mapping[str, object]) -> None:
+    """Append and flush one canonical JSONL record under a process-local lock."""
+
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(dict(metric), sort_keys=True, separators=(",", ":")) + "\n"
@@ -117,6 +129,8 @@ def append_metric(path: str | Path, metric: Mapping[str, object]) -> None:
 
 
 def load_metrics(paths: Iterable[str | Path]) -> list[dict[str, object]]:
+    """Load JSONL records from every worker output with source-aware validation."""
+
     records: list[dict[str, object]] = []
     for path in paths:
         source = Path(path)
@@ -140,6 +154,8 @@ def verify_churn_metrics(
     max_cuda_reserved_growth_bytes: int = 256 * 1024 * 1024,
     max_process_group_growth: int = 16,
 ) -> dict[str, object]:
+    """Verify monotonic generations/steps, replay, strategy, and leak bounds."""
+
     if not records:
         raise ValueError("at least one worker metric is required")
     if max_cuda_reserved_growth_bytes < 0 or max_process_group_growth < 0:

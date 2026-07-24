@@ -27,6 +27,8 @@ from oobleck.elastic.transport import (
 
 @dataclass(frozen=True, slots=True)
 class ControlStatus:
+    """Operator view of proposal membership and activation barrier progress."""
+
     snapshot: MembershipSnapshot
     active_generation: int
     prepared_agents: tuple[str, ...]
@@ -34,14 +36,20 @@ class ControlStatus:
 
     @property
     def generation(self) -> int:
+        """Return the newest proposed membership generation."""
+
         return self.snapshot.generation
 
     @property
     def active(self) -> bool:
+        """Report whether the proposal has completed both activation barriers."""
+
         return self.active_generation == self.snapshot.generation
 
 
 class NodeAgentClient:
+    """Reconnectable node stream plus local GPU-worker barrier aggregation."""
+
     def __init__(
         self,
         node_id: str,
@@ -54,6 +62,8 @@ class NodeAgentClient:
         on_generation_active: Callable[[MessageEnvelope], Awaitable[None]] | None = None,
         local_worker_socket: str | Path | None = None,
     ) -> None:
+        """Validate advertised resources and initialize per-incarnation phase state."""
+
         if not node_id or not gpu_ids or heartbeat_interval_s <= 0:
             raise ValueError("node_id, gpu_ids, and a positive heartbeat interval are required")
         self.node_id = node_id
@@ -106,6 +116,8 @@ class NodeAgentClient:
         generation: int,
         payload: Mapping[str, object],
     ) -> None:
+        """Serialize one sequenced agent message on the current incarnation."""
+
         if self.connection is None:
             raise RuntimeError("agent is not connected")
         async with self._send_lock:
@@ -129,6 +141,8 @@ class NodeAgentClient:
         plan_checksum: str,
         compatibility_digest: str,
     ) -> None:
+        """Record unanimous local preparation and attempt the master acknowledgement."""
+
         snapshot = self.snapshot
         if (
             snapshot is not None
@@ -145,6 +159,8 @@ class NodeAgentClient:
         plan_checksum: str,
         compatibility_digest: str,
     ) -> None:
+        """Forward unanimous local readiness only when it matches preparation."""
+
         snapshot = self.snapshot
         if (
             snapshot is not None
@@ -156,6 +172,8 @@ class NodeAgentClient:
             await self._send_ready_if_possible(generation)
 
     async def _send_prepared_if_possible(self, generation: int) -> None:
+        """Acknowledge preparation once per generation after every local worker."""
+
         async with self._ready_lock:
             snapshot = self.snapshot
             if (
@@ -191,6 +209,8 @@ class NodeAgentClient:
                 raise
 
     async def _send_ready_if_possible(self, generation: int) -> None:
+        """Acknowledge readiness once local workers match master rendezvous."""
+
         async with self._ready_lock:
             snapshot = self.snapshot
             if (
@@ -223,6 +243,8 @@ class NodeAgentClient:
                 raise
 
     def _validate_master_sequence(self, message: MessageEnvelope) -> None:
+        """Reject messages not owned by the master or replayed out of order."""
+
         if message.agent_id != "master":
             raise ValueError("expected a control message from the master")
         if message.sequence_number <= self._last_master_sequence:
@@ -230,6 +252,8 @@ class NodeAgentClient:
         self._last_master_sequence = message.sequence_number
 
     async def _consume_membership(self, message: MessageEnvelope) -> MembershipSnapshot:
+        """Install a newer snapshot and invalidate all phase work derived before it."""
+
         if message.message_type != "membership":
             raise ValueError("expected a membership message from the master")
         self._validate_master_sequence(message)
@@ -252,6 +276,8 @@ class NodeAgentClient:
         return snapshot
 
     async def _consume_rendezvous(self, message: MessageEnvelope) -> None:
+        """Accept rendezvous only when it exactly matches local preparation."""
+
         if message.message_type != "generation_rendezvous":
             raise ValueError("expected a generation_rendezvous message")
         self._validate_master_sequence(message)
@@ -272,6 +298,8 @@ class NodeAgentClient:
         await self._send_ready_if_possible(message.generation)
 
     async def _consume_active(self, message: MessageEnvelope) -> None:
+        """Mark and relay activation only for the locally readied generation."""
+
         if message.message_type != "generation_active":
             raise ValueError("expected a generation_active message")
         self._validate_master_sequence(message)
@@ -294,6 +322,8 @@ class NodeAgentClient:
             await self.on_generation_active(message)
 
     async def connect(self, host: str, port: int) -> MessageEnvelope:
+        """Start local IPC, register this incarnation, and consume membership."""
+
         self._host, self._port = host, port
         if self.local_worker_relay is not None and self.local_worker_relay._server is None:
             await self.local_worker_relay.start()
@@ -317,11 +347,15 @@ class NodeAgentClient:
         return membership
 
     async def _heartbeat_loop(self) -> None:
+        """Renew the master lease on an independent send cadence."""
+
         while True:
             await asyncio.sleep(self.heartbeat_interval_s)
             await self._send_agent_message("heartbeat", self.generation, {})
 
     async def _receive_loop(self) -> None:
+        """Continuously dispatch master phases and targeted drain commands."""
+
         assert self.connection is not None
         while True:
             message = await self.connection.receive()
@@ -340,6 +374,8 @@ class NodeAgentClient:
                 raise ValueError(f"unsupported master message {message.message_type!r}")
 
     async def run(self) -> None:
+        """Run heartbeat and receive loops until either stream task fails."""
+
         if self.connection is None:
             raise RuntimeError("connect() must be called before run()")
         tasks = {
@@ -376,12 +412,16 @@ class NodeAgentClient:
                 await self.connect(self._host, self._port)
 
     async def drain(self) -> None:
+        """Stop reconnecting and request graceful incarnation removal."""
+
         if self.connection is None:
             raise RuntimeError("agent is not connected")
         self._stopping = True
         await self._send_agent_message("drain", self.generation, {})
 
     async def close(self, *, graceful: bool = False) -> None:
+        """Optionally drain, then close master and local-worker transports."""
+
         self._stopping = True
         if self.connection is not None:
             if graceful:
@@ -398,6 +438,8 @@ async def inspect_membership(
     *,
     transport: ControlTransport | None = None,
 ) -> MembershipSnapshot:
+    """Fetch one immutable membership snapshot over a short-lived operator stream."""
+
     selected = transport or AsyncioTcpControlTransport()
     connection = await selected.connect(host, port)
     try:
@@ -416,6 +458,8 @@ async def inspect_status(
     *,
     transport: ControlTransport | None = None,
 ) -> ControlStatus:
+    """Fetch membership together with prepared/ready/active barrier progress."""
+
     selected = transport or AsyncioTcpControlTransport()
     connection = await selected.connect(host, port)
     try:

@@ -33,6 +33,8 @@ def plan_state_redistribution(
     if link_classifier is None:
 
         def link_classifier(source: int, destination: int) -> tuple[str, float]:
+            """Give each homogeneous pair an independent scheduler load bucket."""
+
             if rank_to_node and rank_to_node.get(source) == rank_to_node.get(destination):
                 return f"same-node:{source}:{destination}", 0.25
             return f"network:{source}:{destination}", 1.0

@@ -23,6 +23,8 @@ def logical_seed(seed: int, *keys: object) -> int:
 
 @dataclass(frozen=True, slots=True)
 class PipelineBatchAssignment:
+    """The samples and global microbatch IDs routed to one pipeline."""
+
     pipeline_id: str
     sample_indices: tuple[int, ...]
     global_microbatch_ids: tuple[int, ...]
@@ -30,6 +32,8 @@ class PipelineBatchAssignment:
 
 @dataclass(frozen=True, slots=True)
 class OobleckBatchDescriptor:
+    """Replay-stable logical identity and routing for one global batch."""
+
     epoch: int
     logical_batch_id: int
     sample_indices: tuple[int, ...]
@@ -38,15 +42,21 @@ class OobleckBatchDescriptor:
 
 @dataclass(frozen=True, slots=True)
 class OobleckBatch:
+    """Collated microbatches paired with the descriptor used for commit/replay."""
+
     descriptor: OobleckBatchDescriptor
     microbatches: tuple[Any, ...]
 
     @property
     def sample_indices(self) -> tuple[int, ...]:
+        """Return dataset indices in deterministic global-batch order."""
+
         return self.descriptor.sample_indices
 
     @property
     def logical_batch_id(self) -> int:
+        """Return the commit cursor position represented by this batch."""
+
         return self.descriptor.logical_batch_id
 
 
@@ -64,6 +74,8 @@ class OobleckBatchSampler(BatchSampler):
         shuffle: bool,
         drop_last: bool = True,
     ) -> None:
+        """Validate the replay contract and initialize an uncommitted cursor."""
+
         _validate_dataset(dataset)
         if global_batch_size < 1 or microbatch_size < 1:
             raise ValueError("batch sizes must be positive")
@@ -90,9 +102,13 @@ class OobleckBatchSampler(BatchSampler):
 
     @property
     def committed_cursor(self) -> int:
+        """Return the next logical batch that may be committed."""
+
         return self._committed_cursor
 
     def set_epoch(self, epoch: int) -> None:
+        """Reset deterministic ordering, refusing to abandon consumed progress."""
+
         if epoch < 0:
             raise ValueError("epoch must be non-negative")
         if self._committed_cursor and epoch != self.epoch:
@@ -102,6 +118,8 @@ class OobleckBatchSampler(BatchSampler):
         self._issued.clear()
 
     def _permutation(self) -> list[int]:
+        """Derive the epoch sample order without consulting physical rank state."""
+
         size = len(self.dataset)  # type: ignore[arg-type]
         if not self.shuffle:
             return list(range(size))
@@ -110,6 +128,8 @@ class OobleckBatchSampler(BatchSampler):
         return torch.randperm(size, generator=generator).tolist()
 
     def descriptor_at(self, batch_index: int) -> OobleckBatchDescriptor:
+        """Build and cache the deterministic routing descriptor for an index."""
+
         if batch_index < 0 or batch_index >= len(self):
             raise IndexError(batch_index)
         logical_id = batch_index
@@ -148,18 +168,24 @@ class OobleckBatchSampler(BatchSampler):
         return descriptor
 
     def __iter__(self) -> Iterator[list[int]]:
+        """Issue batches from the committed cursor without advancing it."""
+
         # Prefetch may advance this iterator arbitrarily far.  The committed
         # cursor is deliberately untouched and a fresh iterator starts there.
         for index in range(self._committed_cursor, len(self)):
             yield list(self.descriptor_at(index).sample_indices)
 
     def __len__(self) -> int:
+        """Return complete batches, or include the final partial batch when requested."""
+
         size = len(self.dataset)  # type: ignore[arg-type]
         if self.drop_last:
             return size // self.global_batch_size
         return (size + self.global_batch_size - 1) // self.global_batch_size
 
     def commit(self, descriptor: OobleckBatchDescriptor) -> None:
+        """Advance exactly one position after validating an in-order successful step."""
+
         if descriptor.epoch != self.epoch:
             raise RuntimeError("cannot commit a batch from a stale epoch")
         if descriptor.logical_batch_id != self._committed_cursor:
@@ -174,11 +200,15 @@ class OobleckBatchSampler(BatchSampler):
         self._issued.pop(descriptor.logical_batch_id, None)
 
     def rewind_uncommitted(self) -> None:
+        """Forget descriptors produced only by DataLoader prefetch."""
+
         self._issued = {
             key: value for key, value in self._issued.items() if key < self._committed_cursor
         }
 
     def reconfigure(self, instances: Sequence[PipelineInstance]) -> None:
+        """Replace physical routing while preserving the logical commit cursor."""
+
         selected = tuple(instances)
         allocated = sum(item.microbatches for item in selected)
         expected = self.global_batch_size // self.microbatch_size
@@ -191,6 +221,8 @@ class OobleckBatchSampler(BatchSampler):
 
 
 def _validate_dataset(dataset: object) -> None:
+    """Enforce the stable indexed-dataset requirement needed for replay."""
+
     if isinstance(dataset, IterableDataset):
         raise TypeError(
             "Oobleck requires a stable map-style Dataset; streaming and other "
@@ -210,6 +242,8 @@ def _validate_dataset(dataset: object) -> None:
 
 
 def _slice_collated(value: Any, start: int, end: int, total: int) -> Any:
+    """Slice batch-shaped leaves while retaining shared metadata unchanged."""
+
     if isinstance(value, Mapping):
         return {key: _slice_collated(item, start, end, total) for key, item in value.items()}
     if isinstance(value, tuple) and len(value) == total:
@@ -224,6 +258,8 @@ def _slice_collated(value: Any, start: int, end: int, total: int) -> Any:
 def _normalize_microbatches(
     collated: Any, descriptor: OobleckBatchDescriptor, microbatch_size: int
 ) -> tuple[Any, ...]:
+    """Accept pre-split input or split a collated global batch into microbatches."""
+
     count = sum(len(item.global_microbatch_ids) for item in descriptor.assignments)
     if isinstance(collated, list) and len(collated) == count:
         return tuple(collated)
@@ -243,19 +279,27 @@ class PreparedDataLoader:
     """Ordered adapter that pairs DataLoader results with logical descriptors."""
 
     def __init__(self, dataloader: DataLoader, sampler: OobleckBatchSampler) -> None:
+        """Bind DataLoader output order to the sampler's logical descriptors."""
+
         self.dataloader = dataloader
         self.sampler = sampler
         self._invalidated = False
 
     def invalidate_prefetch(self) -> None:
+        """Stop the active iterator and discard work fetched beyond commit."""
+
         self._invalidated = True
         self.sampler.rewind_uncommitted()
 
     def reconfigure(self, instances: Sequence[PipelineInstance]) -> None:
+        """Invalidate prefetched data before changing pipeline assignments."""
+
         self.invalidate_prefetch()
         self.sampler.reconfigure(instances)
 
     def __iter__(self) -> Iterator[OobleckBatch]:
+        """Pair each collated result with the still-uncommitted logical descriptor."""
+
         self._invalidated = False
         start = self.sampler.committed_cursor
         for offset, collated in enumerate(iter(self.dataloader)):
@@ -268,10 +312,14 @@ class PreparedDataLoader:
             )
 
     def __len__(self) -> int:
+        """Return the number of logical batches remaining after commit."""
+
         return max(0, len(self.sampler) - self.sampler.committed_cursor)
 
 
 def prepare_dataloader(dataloader: DataLoader) -> PreparedDataLoader:
+    """Validate and seed a standard DataLoader for deterministic replay."""
+
     if not isinstance(dataloader, DataLoader):
         raise TypeError("prepare_dataloader expects torch.utils.data.DataLoader")
     _validate_dataset(dataloader.dataset)

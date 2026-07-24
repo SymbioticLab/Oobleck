@@ -27,6 +27,13 @@ def plan_state_redistribution(
     bandwidth_bytes_per_s: Mapping[int, float] | None = None,
     link_classifier: Callable[[int, int], tuple[str, float]] | None = None,
 ) -> TransferSchedule:
+    """Plan public redistribution without inventing destination bottlenecks.
+
+    When no measured bandwidth is supplied, destination ingress is common to
+    every source candidate. Treating it as unbounded preserves source-egress
+    load balancing while the lower layers still account for transferred bytes.
+    """
+
     # In the topology-free model destination ingress is identical for every
     # candidate and must not erase the source-egress tie-break.  Infinite
     # destination bandwidth removes only that common term; measured bandwidth

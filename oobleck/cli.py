@@ -54,6 +54,8 @@ Command = Union[
 
 
 async def _master(config: MasterServiceConfig) -> None:
+    """Run the membership master until cancellation, then close every stream."""
+
     service = MasterControlService(
         AsyncioTcpControlTransport(max_frame_bytes=config.max_frame_bytes),
         lease_timeout_s=config.lease_timeout_s,
@@ -69,7 +71,11 @@ async def _master(config: MasterServiceConfig) -> None:
 
 
 async def _agent(config: AgentConfig) -> None:
+    """Run a node agent and emit machine-readable membership changes."""
+
     async def announce(message: MessageEnvelope) -> None:
+        """Print a compact generation notice for operators and launch scripts."""
+
         print(
             json.dumps(
                 {
@@ -86,6 +92,8 @@ async def _agent(config: AgentConfig) -> None:
 
 
 def _launch(config: TrainingLaunchConfig) -> int:
+    """Run locally or bootstrap initial remote agents and supervise their exits."""
+
     if not config.training_script.is_file():
         raise FileNotFoundError(f"training script does not exist: {config.training_script}")
     if config.initial_hostfile is None:
@@ -142,6 +150,8 @@ def _launch(config: TrainingLaunchConfig) -> int:
 
 
 def _profile(config: ProfileCommandConfig) -> None:
+    """Measure or load a profile, validate compatibility, and save templates."""
+
     if config.profile is None and config.measurement_factory is None:
         raise ValueError(
             "provide --profile with a versioned ModelProfile JSON or "
@@ -225,16 +235,22 @@ def _profile(config: ProfileCommandConfig) -> None:
 
 
 async def _inspect(config: InspectMembershipConfig) -> None:
+    """Print the master's current checksummed membership as JSON."""
+
     snapshot = await inspect_membership(config.master_host, config.master_port)
     print(json.dumps(asdict(snapshot), sort_keys=True))
 
 
 async def _drain(config: DrainConfig) -> None:
+    """Request graceful removal of a live stable node identity."""
+
     generation = await request_drain(config.master_host, config.master_port, config.node_id)
     print(f"drain accepted at generation {generation}")
 
 
 def _chaos(config: ChaosConfig) -> None:
+    """Kill only a PID proven to be the confirmed disposable example agent."""
+
     path = f"/proc/{config.pid}/cmdline"
     try:
         command = open(path, "rb").read().decode(errors="replace")
@@ -246,6 +262,8 @@ def _chaos(config: ChaosConfig) -> None:
 
 
 def dispatch(command: Command) -> object:
+    """Route a validated Tyro dataclass to its synchronous or async handler."""
+
     if isinstance(command, MasterServiceConfig):
         return asyncio.run(_master(command))
     if isinstance(command, AgentConfig):
@@ -264,6 +282,8 @@ def dispatch(command: Command) -> object:
 
 
 def main() -> object:
+    """Parse the command union with Tyro and dispatch the selected operation."""
+
     import tyro
 
     return dispatch(tyro.cli(Command))

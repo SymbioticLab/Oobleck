@@ -15,6 +15,8 @@ from oobleck.types import PipelineInstance, PipelineTemplate, RecoveryUnavailabl
 
 @dataclass(frozen=True, slots=True)
 class ReconfigurationResult:
+    """A complete survivor assignment plus recovery-strategy accounting."""
+
     instances: tuple[PipelineInstance, ...]
     strategies: tuple[str, ...]
     retained_nodes: int
@@ -25,6 +27,8 @@ class ReconfigurationResult:
 def _instance(
     identity: str, nodes: Iterable[str], templates: Sequence[PipelineTemplate]
 ) -> PipelineInstance | None:
+    """Create an ordered instance when its resource count is supported."""
+
     selected_nodes = tuple(sorted(nodes))
     template = template_for_resources(templates, len(selected_nodes))
     return None if template is None else PipelineInstance(identity, template, selected_nodes)
@@ -49,6 +53,8 @@ def reconfigure_pipelines(
     old_owner = {node: item.instance_id for item in previous for node in item.node_ids}
 
     def retained_bytes(identity: str, nodes: Iterable[str]) -> int:
+        """Score state that stays under the same logical pipeline identity."""
+
         return sum(weights.get(node, 1) for node in nodes if old_owner.get(node) == identity)
 
     if not survivors <= known:
@@ -136,6 +142,8 @@ def reconfigure_pipelines(
             )
 
         def partner_objective(partner: list) -> tuple[object, ...]:
+            """Rank merge partners by throughput, retained state, size, and ID."""
+
             combined = target[1] | partner[1]
             template = template_for_resources(templates, len(combined))
             predicted = float("inf") if template is None else template.iteration_time(1)

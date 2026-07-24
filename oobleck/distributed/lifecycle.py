@@ -9,7 +9,7 @@ from typing import Iterable
 
 
 class ProcessGroupLayoutError(RuntimeError):
-    pass
+    """The installed PyTorch private c10d layout is outside the audited contract."""
 
 
 def initialize_process_group(
@@ -61,6 +61,8 @@ _OPTIONAL = ("_pg_coalesce_state", "pg_default_device")
 
 
 def _shutdown(group: object) -> None:
+    """Best-effort stop one backend before global registry teardown."""
+
     shutdown = getattr(group, "_shutdown", None)
     if callable(shutdown):
         shutdown()

@@ -10,25 +10,29 @@ from typing import Callable, Mapping
 
 
 class StaleGeneration(RuntimeError):
-    pass
+    """A control message refers to a generation that is no longer active."""
 
 
 class StaleSequence(RuntimeError):
-    pass
+    """An incarnation repeated or reordered a control-plane message."""
 
 
 class IncarnationMismatch(RuntimeError):
-    pass
+    """A connection no longer owns the live incarnation for its stable node ID."""
 
 
 @dataclass(frozen=True, slots=True)
 class NodeIdentity:
+    """Stable node identity plus one process incarnation and its resources."""
+
     agent_id: str
     incarnation_id: str
     addresses: tuple[str, ...]
     gpu_ids: tuple[str, ...]
 
     def __post_init__(self) -> None:
+        """Require routable identity and at least one GPU contribution."""
+
         if not self.agent_id or not self.incarnation_id:
             raise ValueError("agent_id and incarnation_id are required")
         if not self.addresses or not self.gpu_ids:
@@ -37,6 +41,8 @@ class NodeIdentity:
 
 @dataclass(slots=True)
 class _LiveNode:
+    """Mutable lease and sequence state for the currently authorized incarnation."""
+
     identity: NodeIdentity
     last_sequence: int
     lease_deadline: float
@@ -44,12 +50,16 @@ class _LiveNode:
 
 @dataclass(frozen=True, slots=True)
 class MembershipSnapshot:
+    """Immutable, checksummed membership view published as one generation."""
+
     generation: int
     nodes: tuple[NodeIdentity, ...]
     reasons: tuple[str, ...]
     snapshot_hash: str = field(default="", compare=False)
 
     def __post_init__(self) -> None:
+        """Compute or verify the hash used for worker consensus."""
+
         payload = {
             "generation": self.generation,
             "nodes": [asdict(item) for item in self.nodes],
@@ -126,6 +136,8 @@ class MembershipStateMachine:
         gpu_ids_per_node: int | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        """Initialize an empty membership with injectable time for lease tests."""
+
         if lease_timeout_s <= 0:
             raise ValueError("lease_timeout_s must be positive")
         self.lease_timeout_s = lease_timeout_s
@@ -142,19 +154,31 @@ class MembershipStateMachine:
 
     @property
     def agent_ids(self) -> tuple[str, ...]:
+        """Return live stable identities in deterministic order."""
+
         return tuple(sorted(self._nodes))
 
     @property
     def has_pending_generation(self) -> bool:
+        """Report whether coalesced events still need to be published."""
+
         return bool(self._pending_reasons)
 
     def _check_generation(self, generation: int) -> None:
+        """Prevent commands from mixing membership generations."""
+
         if generation != self.generation:
             raise StaleGeneration(
                 f"message generation {generation} does not match active {self.generation}"
             )
 
     def register(self, identity: NodeIdentity, sequence_number: int) -> None:
+        """Add, refresh, or replace a node while enforcing fixed TP width.
+
+        A new incarnation for an existing stable ID supersedes the old one and
+        contributes a replacement event to the next coalesced generation.
+        """
+
         if sequence_number < 0:
             raise ValueError("sequence_number must be non-negative")
         existing = self._nodes.get(identity.agent_id)
@@ -202,6 +226,8 @@ class MembershipStateMachine:
         sequence_number: int,
         generation: int,
     ) -> None:
+        """Renew the live incarnation lease after generation and sequence checks."""
+
         self._check_generation(generation)
         node = self._require_incarnation(agent_id, incarnation_id)
         if sequence_number <= node.last_sequence:
@@ -210,12 +236,16 @@ class MembershipStateMachine:
         node.lease_deadline = self.clock() + self.lease_timeout_s
 
     def _require_incarnation(self, agent_id: str, incarnation_id: str) -> _LiveNode:
+        """Resolve only the connection currently authorized for a stable node ID."""
+
         node = self._nodes.get(agent_id)
         if node is None or node.identity.incarnation_id != incarnation_id:
             raise IncarnationMismatch(f"connection does not own active incarnation for {agent_id}")
         return node
 
     def disconnect(self, agent_id: str, incarnation_id: str) -> bool:
+        """Remove the matching incarnation; ignore closure of superseded sockets."""
+
         node = self._nodes.get(agent_id)
         if node is None or node.identity.incarnation_id != incarnation_id:
             return False
@@ -230,6 +260,8 @@ class MembershipStateMachine:
         sequence_number: int,
         generation: int,
     ) -> None:
+        """Remove a node gracefully and queue a drain membership event."""
+
         self._check_generation(generation)
         node = self._require_incarnation(agent_id, incarnation_id)
         if sequence_number <= node.last_sequence:
@@ -238,6 +270,8 @@ class MembershipStateMachine:
         self._pending_reasons.add(f"drain:{agent_id}")
 
     def expire_leases(self, now: float | None = None) -> tuple[str, ...]:
+        """Remove all expired nodes atomically and return their stable IDs."""
+
         current = self.clock() if now is None else now
         expired = tuple(
             sorted(
@@ -250,6 +284,8 @@ class MembershipStateMachine:
         return expired
 
     def publish(self) -> MembershipSnapshot | None:
+        """Coalesce pending events into one monotonically newer snapshot."""
+
         if not self._pending_reasons:
             return None
         self.generation += 1
@@ -262,6 +298,8 @@ class MembershipStateMachine:
         return snapshot
 
     def snapshot(self) -> MembershipSnapshot:
+        """Return the current live view without consuming or advancing events."""
+
         return MembershipSnapshot(
             self.generation,
             tuple(self._nodes[agent_id].identity for agent_id in sorted(self._nodes)),

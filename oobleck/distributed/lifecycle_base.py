@@ -7,7 +7,7 @@ from typing import Iterable
 
 
 class ProcessGroupLayoutError(RuntimeError):
-    pass
+    """The retained teardown path cannot recognize private c10d registries."""
 
 
 _WORLD_REGISTRIES = (
@@ -23,6 +23,8 @@ _WORLD_REGISTRIES = (
 
 
 def _shutdown_backend(group: object) -> None:
+    """Ask one backend handle to stop without assuming a concrete backend type."""
+
     shutdown = getattr(group, "_shutdown", None)
     if callable(shutdown):
         shutdown()

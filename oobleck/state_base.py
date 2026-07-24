@@ -31,11 +31,15 @@ _DTYPE_BYTES = {
 
 
 def _dtype_name(value: str) -> str:
+    """Normalize torch-qualified dtype names for stable manifests and grouping."""
+
     return value.removeprefix("torch.")
 
 
 @dataclass(frozen=True, slots=True)
 class LogicalStateEntry:
+    """Versioned ownership metadata for one logical parameter, buffer, or slot."""
+
     logical_key: str
     global_shape: tuple[int, ...]
     local_shape: tuple[int, ...]
@@ -50,6 +54,8 @@ class LogicalStateEntry:
     byte_count: int | None = None
 
     def __post_init__(self) -> None:
+        """Validate shard identity and ensure its storage size is computable."""
+
         if not self.logical_key:
             raise ValueError("logical_key must not be empty")
         if any(size < 0 for size in (*self.global_shape, *self.local_shape)):
@@ -63,6 +69,8 @@ class LogicalStateEntry:
 
     @property
     def nbytes(self) -> int:
+        """Return explicit storage bytes or derive them from local shape and dtype."""
+
         if self.byte_count is not None:
             return self.byte_count
         elements = reduce(mul, self.local_shape, 1)
@@ -70,6 +78,8 @@ class LogicalStateEntry:
 
     @property
     def shard_identity(self) -> tuple[object, ...]:
+        """Return the fields that must match for a committed shard to be reused."""
+
         return (
             self.logical_key,
             self.tp_lane,
@@ -82,12 +92,16 @@ class LogicalStateEntry:
 
 @dataclass(frozen=True, slots=True)
 class StateManifest:
+    """Checksummed committed-state inventory owned by one rank."""
+
     rank: int
     entries: tuple[LogicalStateEntry, ...]
     committed_step: int
     manifest_hash: str = field(default="", compare=False)
 
     def __post_init__(self) -> None:
+        """Validate ownership uniqueness and compute the consensus hash."""
+
         if self.rank < 0 or self.committed_step < 0:
             raise ValueError("rank and committed_step must be non-negative")
         if any(entry.owner_rank != self.rank for entry in self.entries):
@@ -110,6 +124,8 @@ class StateManifest:
 
 @dataclass(frozen=True, slots=True)
 class Transfer:
+    """One byte range assigned to a source, destination, dtype, and round."""
+
     source_rank: int
     destination_rank: int
     logical_key: str
@@ -124,11 +140,15 @@ class Transfer:
 
     @property
     def byte_count(self) -> int:
+        """Return the half-open chunk length in bytes."""
+
         return self.chunk_end - self.chunk_start
 
 
 @dataclass(frozen=True, slots=True)
 class TransferSchedule:
+    """Immutable redistribution plan with deterministic load accounting."""
+
     transfers: tuple[Transfer, ...]
     retained: tuple[tuple[int, str, int], ...]
     per_source_bytes: tuple[tuple[int, int], ...]
@@ -137,6 +157,8 @@ class TransferSchedule:
     schedule_hash: str = field(default="", compare=False)
 
     def __post_init__(self) -> None:
+        """Compute or verify the schedule hash exchanged by all ranks."""
+
         payload = {
             "transfers": [asdict(item) for item in self.transfers],
             "retained": self.retained,
@@ -151,6 +173,8 @@ class TransferSchedule:
     def split_sizes(
         self, rank: int, world_size: int, *, round: int = 0, dtype: str | None = None
     ) -> tuple[list[int], list[int]]:
+        """Build all-to-all input/output byte splits for one rank and round."""
+
         inputs = [0] * world_size
         outputs = [0] * world_size
         for item in self.transfers:
@@ -164,6 +188,8 @@ class TransferSchedule:
 
 
 def _chunks(size: int, chunk_bytes: int, alignment: int) -> Iterable[tuple[int, int]]:
+    """Yield aligned half-open byte ranges without padding the final chunk."""
+
     if size == 0:
         return
     effective = max(alignment, (chunk_bytes // alignment) * alignment)
@@ -175,6 +201,8 @@ def _chunks(size: int, chunk_bytes: int, alignment: int) -> Iterable[tuple[int, 
 
 
 def _bundle_key(entry: LogicalStateEntry) -> tuple[str, int, int]:
+    """Keep a parameter and all of its optimizer slots on one complete source."""
+
     parameter_key = entry.logical_key.split("::optimizer::", 1)[0]
     return parameter_key, entry.tp_lane, entry.version
 
@@ -276,6 +304,8 @@ def plan_state_redistribution(
     round_destination_loads: list[dict[int, int]] = []
 
     def locality(source: int, destination: int) -> tuple[str, float]:
+        """Classify a candidate link and return its relative transfer cost."""
+
         if link_classifier is not None:
             return link_classifier(source, destination)
         if rank_to_node and rank_to_node.get(source) == rank_to_node.get(destination):

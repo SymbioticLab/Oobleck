@@ -48,14 +48,16 @@ _PAYLOAD_FIELDS = {
 
 
 class ProtocolError(ValueError):
-    pass
+    """A frame or envelope violates the versioned control protocol."""
 
 
 class FrameTooLarge(ProtocolError):
-    pass
+    """A peer declared or encoded a frame beyond the configured bound."""
 
 
 def _validate_payload(message_type: str, payload: Mapping[str, object]) -> None:
+    """Enforce the exact payload schema for a versioned message type."""
+
     expected = _PAYLOAD_FIELDS.get(message_type)
     if expected is None:
         raise ProtocolError(f"unsupported message_type {message_type!r}")
@@ -113,6 +115,8 @@ def _validate_payload(message_type: str, payload: Mapping[str, object]) -> None:
 
 @dataclass(frozen=True, slots=True)
 class MessageEnvelope:
+    """Strictly validated metadata and payload for one control-plane message."""
+
     protocol_version: int
     message_type: str
     agent_id: str
@@ -122,6 +126,8 @@ class MessageEnvelope:
     payload: Mapping[str, object]
 
     def __post_init__(self) -> None:
+        """Reject unknown versions, missing identities, and malformed payloads."""
+
         if self.protocol_version != PROTOCOL_VERSION:
             raise ProtocolError(
                 f"unsupported protocol version {self.protocol_version}; expected {PROTOCOL_VERSION}"
@@ -136,6 +142,8 @@ class MessageEnvelope:
 
     @classmethod
     def from_dict(cls, value: object) -> "MessageEnvelope":
+        """Decode only an exact envelope shape; unknown fields are protocol errors."""
+
         if not isinstance(value, dict):
             raise ProtocolError("control envelope must be a JSON object")
         if set(value) != _FIELDS:
@@ -158,6 +166,8 @@ class MessageEnvelope:
 
 
 def encode_frame(message: MessageEnvelope, max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES) -> bytes:
+    """Serialize an envelope as bounded big-endian-length-prefixed JSON."""
+
     body = json.dumps(
         asdict(message), sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode("utf-8")
@@ -169,6 +179,8 @@ def encode_frame(message: MessageEnvelope, max_frame_bytes: int = DEFAULT_MAX_FR
 async def read_frame(
     reader: asyncio.StreamReader, max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES
 ) -> MessageEnvelope:
+    """Read exactly one frame, preserving fragmentation and coalescing semantics."""
+
     header = await reader.readexactly(4)
     size = struct.unpack(">I", header)[0]
     if size == 0:
@@ -188,6 +200,8 @@ async def write_frame(
     message: MessageEnvelope,
     max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
 ) -> None:
+    """Write one complete frame and wait for stream backpressure."""
+
     writer.write(encode_frame(message, max_frame_bytes))
     await writer.drain()
 
@@ -202,6 +216,8 @@ class SerializedWriter:
         max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
         queue_size: int = 64,
     ) -> None:
+        """Start the sole writer task for this stream and bound queued sends."""
+
         self._writer = writer
         self._max_frame_bytes = max_frame_bytes
         self._queue: asyncio.Queue[tuple[MessageEnvelope | None, asyncio.Future[None]]] = (
@@ -210,6 +226,8 @@ class SerializedWriter:
         self._task = asyncio.create_task(self._run())
 
     async def send(self, message: MessageEnvelope) -> None:
+        """Queue a message and return only after it has drained to the stream."""
+
         if self._task.done():
             await self._task
         future = asyncio.get_running_loop().create_future()
@@ -217,6 +235,8 @@ class SerializedWriter:
         await future
 
     async def _run(self) -> None:
+        """Serialize writes and propagate the first failure to every queued sender."""
+
         try:
             while True:
                 message, completion = await self._queue.get()
@@ -239,6 +259,8 @@ class SerializedWriter:
             raise
 
     async def close(self) -> None:
+        """Flush queued frames, stop the writer task, and close the stream."""
+
         if not self._task.done():
             completion = asyncio.get_running_loop().create_future()
             await self._queue.put((None, completion))
@@ -249,6 +271,8 @@ class SerializedWriter:
 
 
 class ControlConnection:
+    """Bidirectional framed connection with one serialized writer."""
+
     def __init__(
         self,
         reader: asyncio.StreamReader,
@@ -257,6 +281,8 @@ class ControlConnection:
         max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
         writer_queue_size: int = 64,
     ) -> None:
+        """Wrap the stream pair with shared frame and queue limits."""
+
         self.reader = reader
         self.writer = SerializedWriter(
             writer,
@@ -266,33 +292,51 @@ class ControlConnection:
         self.max_frame_bytes = max_frame_bytes
 
     async def receive(self) -> MessageEnvelope:
+        """Receive the next validated envelope from the peer."""
+
         return await read_frame(self.reader, self.max_frame_bytes)
 
     async def send(self, message: MessageEnvelope) -> None:
+        """Send through the connection's ordered, backpressured queue."""
+
         await self.writer.send(message)
 
     async def close(self) -> None:
+        """Close the serialized writer and its underlying stream."""
+
         await self.writer.close()
 
 
 class ControlTransport(Protocol):
-    async def connect(self, host: str, port: int) -> ControlConnection: ...
+    """Transport boundary consumed by membership services and local IPC."""
+
+    async def connect(self, host: str, port: int) -> ControlConnection:
+        """Open one persistent client connection using the transport backend."""
+
+        ...
 
     async def start_server(
         self,
         host: str,
         port: int,
         handler: Callable[[ControlConnection], Awaitable[None]],
-    ) -> asyncio.AbstractServer: ...
+    ) -> asyncio.AbstractServer:
+        """Listen for framed connections and dispatch each to ``handler``."""
+
+        ...
 
 
 class AsyncioTcpControlTransport:
+    """Asyncio stream implementation of the control transport contract."""
+
     def __init__(
         self,
         *,
         max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
         writer_queue_size: int = 64,
     ) -> None:
+        """Configure identical frame and writer bounds for clients and servers."""
+
         if max_frame_bytes < 256 or writer_queue_size < 1:
             raise ValueError("invalid control transport limits")
         self.max_frame_bytes = max_frame_bytes
@@ -301,6 +345,8 @@ class AsyncioTcpControlTransport:
     def _connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> ControlConnection:
+        """Apply this transport's limits to a newly opened stream pair."""
+
         return ControlConnection(
             reader,
             writer,
@@ -309,6 +355,8 @@ class AsyncioTcpControlTransport:
         )
 
     async def connect(self, host: str, port: int) -> ControlConnection:
+        """Open a persistent full-duplex TCP control connection."""
+
         reader, writer = await asyncio.open_connection(host, port)
         return self._connection(reader, writer)
 
@@ -318,7 +366,11 @@ class AsyncioTcpControlTransport:
         port: int,
         handler: Callable[[ControlConnection], Awaitable[None]],
     ) -> asyncio.AbstractServer:
+        """Start a server that always closes each accepted connection after handling."""
+
         async def accept(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            """Adapt an asyncio stream pair and guarantee connection retirement."""
+
             connection = self._connection(reader, writer)
             try:
                 await handler(connection)

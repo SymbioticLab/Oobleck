@@ -16,7 +16,11 @@ from oobleck.elastic.transport import MessageEnvelope
 
 
 class MasterControlService(_MasterControlService):
+    """Master variant that bounds broadcasts to failed or stalled peers."""
+
     async def _broadcast_message(self, message: MessageEnvelope) -> None:
+        """Treat a stalled writer as failure detection, never a recovery barrier."""
+
         # A peer can close during a proposal or activation broadcast. That
         # failed writer is a detection input, not permission to stall the
         # membership state machine indefinitely.

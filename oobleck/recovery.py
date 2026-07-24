@@ -30,6 +30,8 @@ import torch
 def _gather_new_manifests(
     manifest: StateManifest, *, dist: Any, world_size: int
 ) -> tuple[StateManifest, ...]:
+    """Exchange every destination manifest before deriving a global schedule."""
+
     if dist is None:
         return (manifest,)
     gathered: list[StateManifest | None] = [None] * world_size
@@ -40,6 +42,8 @@ def _gather_new_manifests(
 
 
 def _rank_to_node(context: Any) -> dict[int, str] | None:
+    """Project the active execution rank map into transfer-locality metadata."""
+
     execution_plan = getattr(context, "execution_plan", None)
     rank_map = getattr(execution_plan, "rank_map", None)
     if rank_map is None:

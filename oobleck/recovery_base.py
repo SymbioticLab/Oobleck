@@ -20,6 +20,8 @@ from oobleck.state_transfer import StateTensorKey, execute_transfer_schedule
 
 @dataclass(slots=True)
 class RecoverySnapshot:
+    """Cloned rank-local state retained across process-group replacement."""
+
     manifest: StateManifest
     tensors: dict[StateTensorKey, torch.Tensor]
     optimizer_schema: OptimizerStateSchema | None
@@ -30,6 +32,8 @@ class RecoverySnapshot:
 
 @dataclass(frozen=True, slots=True)
 class RecoveryMetadata:
+    """Tensor-free recovery description exchanged among surviving/new ranks."""
+
     manifest: StateManifest
     optimizer_schema: OptimizerStateSchema | None
     scheduler_state: Mapping[str, Any] | None
@@ -39,6 +43,8 @@ class RecoveryMetadata:
 
 @dataclass(frozen=True, slots=True)
 class RecoveryReport:
+    """Planned versus observed recovery load and phase timing."""
+
     schedule: TransferSchedule
     source_bytes: tuple[tuple[int, int], ...]
     destination_bytes: tuple[tuple[int, int], ...]
@@ -55,14 +61,20 @@ class RecoveryReport:
 
     @property
     def maximum_source_bytes(self) -> int:
+        """Return the largest planned source egress load."""
+
         return max((value for _, value in self.source_bytes), default=0)
 
     @property
     def maximum_destination_bytes(self) -> int:
+        """Return the largest planned destination ingress load."""
+
         return max((value for _, value in self.destination_bytes), default=0)
 
     @property
     def source_scheduling_error_bytes(self) -> int:
+        """Return the worst absolute deviation from planned source traffic."""
+
         planned = dict(self.source_bytes)
         actual = dict(self.actual_source_bytes)
         ranks = set(planned) | set(actual)
@@ -70,10 +82,14 @@ class RecoveryReport:
 
     @property
     def straggler_round_seconds(self) -> float:
+        """Return the longest globally observed transfer round."""
+
         return max((duration for _, _, duration in self.round_durations), default=0.0)
 
 
 def version_manifest(manifest: StateManifest, committed_step: int) -> StateManifest:
+    """Stamp every logical shard with the transaction version being captured."""
+
     return StateManifest(
         manifest.rank,
         tuple(replace(entry, version=committed_step) for entry in manifest.entries),
@@ -82,10 +98,14 @@ def version_manifest(manifest: StateManifest, committed_step: int) -> StateManif
 
 
 def _local_tensor(value: torch.Tensor) -> torch.Tensor:
+    """Resolve DTensor wrappers to the local storage described by a manifest."""
+
     return value.to_local() if hasattr(value, "to_local") else value
 
 
 def _logical_candidates(root: torch.nn.Module, local_name: str) -> tuple[str, ...]:
+    """Translate local Cornstarch names back to candidate global logical keys."""
+
     candidates = [local_name]
     modules = sorted(root.named_modules(), key=lambda item: len(item[0]), reverse=True)
     for prefix, module in modules:
@@ -150,6 +170,8 @@ def _combined_manifest(
     model_manifest: StateManifest,
     optimizer_schema: OptimizerStateSchema | None,
 ) -> StateManifest:
+    """Combine model state and tensor optimizer slots into one transfer manifest."""
+
     entries = list(model_manifest.entries)
     if optimizer_schema is not None:
         entries.extend(optimizer_schema.tensor_entries)
@@ -205,6 +227,8 @@ def capture_context_state(context: Any) -> RecoverySnapshot:
 
 
 def _distributed_identity(fallback_rank: int) -> tuple[Any, int, int]:
+    """Return active WORLD identity or a deterministic single-process fallback."""
+
     try:
         import torch.distributed as dist
 
@@ -216,6 +240,8 @@ def _distributed_identity(fallback_rank: int) -> tuple[Any, int, int]:
 
 
 def _reown_manifest(manifest: StateManifest, rank: int) -> StateManifest:
+    """Rewrite ownership when gathered metadata moves into a replacement WORLD."""
+
     return StateManifest(
         rank,
         tuple(replace(entry, owner_rank=rank) for entry in manifest.entries),
@@ -224,6 +250,8 @@ def _reown_manifest(manifest: StateManifest, rank: int) -> StateManifest:
 
 
 def _reown_schema(schema: OptimizerStateSchema | None, rank: int) -> OptimizerStateSchema | None:
+    """Rewrite optimizer tensor owners alongside their model manifest."""
+
     if schema is None:
         return None
     return replace(
@@ -239,6 +267,8 @@ def _gather_metadata(
     dist: Any,
     world_size: int,
 ) -> tuple[RecoveryMetadata, ...]:
+    """Exchange tensor-free snapshots; ranks without surviving state send None."""
+
     local = (
         None
         if snapshot is None
@@ -258,6 +288,8 @@ def _gather_metadata(
 
 
 def _dtype(value: str) -> torch.dtype:
+    """Resolve a manifest dtype name to a concrete torch dtype."""
+
     name = value.removeprefix("torch.")
     dtype = getattr(torch, name, None)
     if not isinstance(dtype, torch.dtype):
@@ -271,6 +303,8 @@ def _copy_retained(
     sources: Mapping[StateTensorKey, torch.Tensor],
     destinations: MutableMapping[StateTensorKey, torch.Tensor],
 ) -> set[StateTensorKey]:
+    """Copy shards retained locally and report which destinations are initialized."""
+
     old_entries = {
         (entry.logical_key, entry.state_kind, entry.tp_lane): entry
         for entry in old_manifest.entries

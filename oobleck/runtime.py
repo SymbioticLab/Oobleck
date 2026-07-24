@@ -25,6 +25,8 @@ _base_close = OobleckParallelContext.close
 
 @dataclass(frozen=True, slots=True)
 class GenerationTransitionMetrics:
+    """Per-phase latency, balancing, and supersession data for one generation."""
+
     generation: int
     snapshot_seconds: float
     teardown_seconds: float
@@ -44,6 +46,8 @@ class GenerationTransitionMetrics:
 
 @dataclass(slots=True)
 class _PreparedGenerationTransition:
+    """Snapshot and compiled ownership held between control-plane barriers."""
+
     target: Any
     compiled: Any
     snapshot: Any
@@ -58,6 +62,8 @@ class _PreparedGenerationTransition:
 
 
 def _init_with_recovery(self: OobleckParallelContext, *args: Any, **kwargs: Any) -> None:
+    """Extend the base context with recovery factories, barriers, and topology."""
+
     _base_init(self, *args, **kwargs)
     self._optimizer_factory: (
         Callable[[Iterable[torch.nn.Parameter]], torch.optim.Optimizer] | None
@@ -89,6 +95,8 @@ def _configure_optimization(
     scheduler_factory: Callable[[torch.optim.Optimizer], Any] | None = None,
     scaler: Any = None,
 ) -> None:
+    """Retain optimizer factories so replacement partitions can rebuild state."""
+
     _base_configure_optimization(
         self,
         optimizer_factory=optimizer_factory,
@@ -100,6 +108,8 @@ def _configure_optimization(
 
 
 def _world_initialized() -> bool:
+    """Safely query WORLD without requiring distributed support to be importable."""
+
     try:
         import torch.distributed as dist
 
@@ -109,6 +119,8 @@ def _world_initialized() -> bool:
 
 
 def _retire_world(self: OobleckParallelContext) -> None:
+    """Close logical topology and partition before destroying every process group."""
+
     if self._heterogeneous_gradient_sync is not None:
         self._heterogeneous_gradient_sync.close()
         self._heterogeneous_gradient_sync = None
@@ -125,6 +137,8 @@ def _record_superseded(
     activation_seconds: float = 0.0,
     recovery_seconds: float = 0.0,
 ) -> None:
+    """Record an abandoned attempt exactly once with all completed phase metrics."""
+
     if transition.superseded_recorded:
         return
     transition.superseded_recorded = True
@@ -342,11 +356,15 @@ def _apply_membership(self: OobleckParallelContext, snapshot: MembershipSnapshot
 
 
 def _enable_control_plane_barrier(self: OobleckParallelContext) -> None:
+    """Require future steps to wait for master-published generation activation."""
+
     self._control_plane_managed = True
     self._control_active_generation = self.generation
 
 
 def _prepare_generation(self: OobleckParallelContext) -> None:
+    """Run snapshot, teardown, and compile after local preparation consensus."""
+
     if not self._control_plane_managed:
         raise RuntimeError("enable the control-plane barrier before preparation")
     if not _prepare_latest_generation(self):
@@ -354,6 +372,8 @@ def _prepare_generation(self: OobleckParallelContext) -> None:
 
 
 def _activate_generation(self: OobleckParallelContext) -> None:
+    """Build WORLD, materialize, and recover after rendezvous publication."""
+
     if not self._control_plane_managed:
         raise RuntimeError("enable the control-plane barrier before activation")
     if not _activate_prepared_generation(self):
@@ -361,11 +381,15 @@ def _activate_generation(self: OobleckParallelContext) -> None:
 
 
 def _prepared_execution_plan(self: OobleckParallelContext) -> Any:
+    """Expose the target plan whose checksum local workers must acknowledge."""
+
     transition = self._prepared_transition
     return self.execution_plan if transition is None else transition.target
 
 
 def _generation_transition_pending(self: OobleckParallelContext) -> bool:
+    """Report whether transactional commit is blocked on generation activation."""
+
     return self._control_plane_managed and (
         self._pending_plan is not None
         or self._prepared_transition is not None
@@ -374,6 +398,8 @@ def _generation_transition_pending(self: OobleckParallelContext) -> bool:
 
 
 def _wait_for_generation_barrier(self: OobleckParallelContext) -> None:
+    """Block the training thread until activation or the rendezvous timeout."""
+
     deadline = time.monotonic() + self.config.rendezvous_timeout_s
     with self._generation_condition:
         while _generation_transition_pending(self):
@@ -384,6 +410,8 @@ def _wait_for_generation_barrier(self: OobleckParallelContext) -> None:
 
 
 def _mark_generation_active(self: OobleckParallelContext, generation: int) -> None:
+    """Publish matching master activation to every waiting local step."""
+
     if generation != self.generation:
         raise RuntimeError(
             f"cannot activate generation {generation}; prepared generation is {self.generation}"
@@ -394,6 +422,8 @@ def _mark_generation_active(self: OobleckParallelContext, generation: int) -> No
 
 
 def _step_with_control_barrier(self: OobleckParallelContext, *args: Any, **kwargs: Any) -> Any:
+    """Prevent a new transaction attempt from entering an inactive generation."""
+
     if _generation_transition_pending(self):
         _wait_for_generation_barrier(self)
     return _base_step(self, *args, **kwargs)
@@ -415,6 +445,8 @@ def _recover_from_survivors(self: OobleckParallelContext) -> None:
 
 
 def _close_with_topology(self: OobleckParallelContext) -> None:
+    """Retire synchronization topology, partition state, and the entire WORLD."""
+
     if self._heterogeneous_gradient_sync is not None:
         self._heterogeneous_gradient_sync.close()
         self._heterogeneous_gradient_sync = None

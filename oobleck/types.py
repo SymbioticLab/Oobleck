@@ -19,6 +19,8 @@ class RecoveryUnavailable(RuntimeError):
 
 
 def _canonical_json(value: Any) -> bytes:
+    """Encode a JSON value identically on every worker for checksumming."""
+
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode(
         "utf-8"
     )
@@ -32,6 +34,8 @@ def checksum(value: Any) -> str:
 
 @dataclass(frozen=True, slots=True)
 class CompatibilityFingerprint:
+    """Offline template-cache identity for model, TP width, and hardware."""
+
     model: str
     dtype: str
     tensor_parallel_size: int
@@ -40,6 +44,8 @@ class CompatibilityFingerprint:
     schema_version: int = 1
 
     def __post_init__(self) -> None:
+        """Reject fingerprints that cannot describe the current cache schema."""
+
         if self.tensor_parallel_size < 1:
             raise ValueError("tensor_parallel_size must be >= 1")
         if self.schema_version != 1:
@@ -49,6 +55,8 @@ class CompatibilityFingerprint:
 
     @property
     def digest(self) -> str:
+        """Return the worker-independent identity used by template caches."""
+
         return checksum(asdict(self))
 
 
@@ -70,6 +78,8 @@ class RuntimeCompatibility:
     schema_version: int = 1
 
     def __post_init__(self) -> None:
+        """Validate fields required for exact cross-worker compatibility."""
+
         required = (
             self.oobleck_commit,
             self.cornstarch_commit,
@@ -88,9 +98,13 @@ class RuntimeCompatibility:
 
     @property
     def digest(self) -> str:
+        """Return the compatibility identity embedded in generation plans."""
+
         return checksum(asdict(self))
 
     def assert_matches(self, other: "RuntimeCompatibility") -> None:
+        """Raise with the differing fields when two workers cannot share a generation."""
+
         if self != other:
             left = asdict(self)
             right = asdict(other)
@@ -119,6 +133,8 @@ class PipelineStageSpec:
     tied_parameter_owner: str | None = None
 
     def __post_init__(self) -> None:
+        """Validate a non-empty global layer range and its ordered TP lanes."""
+
         if not self.pipeline_id:
             raise ValueError("pipeline_id must not be empty")
         if self.stage_id < 0:
@@ -148,6 +164,8 @@ class PipelineTemplate:
     schema_version: int = 1
 
     def __post_init__(self) -> None:
+        """Validate that the template is a contiguous, feasible stage partition."""
+
         if not self.template_id:
             raise ValueError("template_id must not be empty")
         if self.schema_version != 1:
@@ -175,6 +193,8 @@ class PipelineTemplate:
 
     @property
     def num_stages(self) -> int:
+        """Return the pipeline depth encoded by the ordered layer ranges."""
+
         return len(self.layer_ranges)
 
     @property
@@ -184,6 +204,12 @@ class PipelineTemplate:
         return self.num_stages
 
     def iteration_time(self, microbatches: int) -> float:
+        """Estimate flush plus steady-state time for a microbatch allocation.
+
+        Returning infinity for allocations beyond ``max_microbatches`` lets the
+        composer treat memory-infeasible choices like any other bad candidate.
+        """
+
         if microbatches < 0:
             raise ValueError("microbatches must be non-negative")
         if self.max_microbatches is not None and microbatches > self.max_microbatches:
@@ -197,6 +223,8 @@ class PipelineTemplate:
         return bubble + microbatches * stage_work + self.communication_time
 
     def assert_compatible(self, fingerprint: CompatibilityFingerprint) -> None:
+        """Reject cache entries produced for a different model or runtime."""
+
         if self.fingerprint is None:
             raise ValueError(f"Template {self.template_id!r} has no compatibility fingerprint")
         if self.fingerprint != fingerprint:
@@ -207,12 +235,16 @@ class PipelineTemplate:
             )
 
     def to_dict(self) -> dict[str, Any]:
+        """Convert the immutable template into its JSON-compatible cache form."""
+
         result = asdict(self)
         result["layer_ranges"] = [list(item) for item in self.layer_ranges]
         return result
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "PipelineTemplate":
+        """Reconstruct a validated template from its serialized cache form."""
+
         data = dict(value)
         data["layer_ranges"] = tuple(tuple(item) for item in data["layer_ranges"])
         fingerprint = data.get("fingerprint")
@@ -223,6 +255,8 @@ class PipelineTemplate:
 
 @dataclass(frozen=True, slots=True)
 class PipelineInstance:
+    """A template assigned to concrete nodes, ranks, and logical microbatches."""
+
     instance_id: str
     template: PipelineTemplate
     node_ids: tuple[str, ...]
@@ -230,6 +264,8 @@ class PipelineInstance:
     microbatches: int = 0
 
     def __post_init__(self) -> None:
+        """Ensure concrete ownership has exactly the template's shape."""
+
         if not self.instance_id:
             raise ValueError("instance_id must not be empty")
         if len(self.node_ids) != self.template.num_stages:
@@ -245,6 +281,8 @@ class PipelineInstance:
 
     @property
     def stage_specs(self) -> tuple[PipelineStageSpec, ...]:
+        """Expand concrete rank groups into Cornstarch-compatible stage ownership."""
+
         if not self.ranks:
             return ()
         return tuple(
@@ -273,6 +311,8 @@ class OobleckExecutionPlan:
     plan_checksum: str = field(default="", compare=False)
 
     def __post_init__(self) -> None:
+        """Validate complete ownership and seal the plan with a content checksum."""
+
         if self.generation < 0:
             raise ValueError("generation must be non-negative")
         if self.previous_generation is not None and self.previous_generation >= self.generation:
@@ -292,6 +332,8 @@ class OobleckExecutionPlan:
         object.__setattr__(self, "plan_checksum", expected)
 
     def _unsigned_dict(self) -> dict[str, Any]:
+        """Return the canonical payload covered by ``plan_checksum``."""
+
         return {
             "generation": self.generation,
             "previous_generation": self.previous_generation,
@@ -310,6 +352,8 @@ class OobleckExecutionPlan:
         }
 
     def rank_local_stage(self, rank: int) -> PipelineStageSpec:
+        """Find the single pipeline stage owned by a global rank."""
+
         for instance in self.instances:
             for spec in instance.stage_specs:
                 if rank in spec.ranks:
@@ -319,6 +363,8 @@ class OobleckExecutionPlan:
 
 @dataclass(frozen=True, slots=True)
 class OobleckConfig:
+    """Training, elasticity, control-plane, and transfer limits for one job."""
+
     global_batch_size: int
     microbatch_size: int
     fault_tolerance_threshold: int = 0
@@ -335,6 +381,8 @@ class OobleckConfig:
     transfer_alignment_bytes: int = 256
 
     def __post_init__(self) -> None:
+        """Reject settings that would break batching or generation invariants."""
+
         if self.global_batch_size < 1 or self.microbatch_size < 1:
             raise ValueError("global_batch_size and microbatch_size must be >= 1")
         if self.global_batch_size % self.microbatch_size:
@@ -366,12 +414,20 @@ class OobleckConfig:
 
     @property
     def global_num_microbatches(self) -> int:
+        """Return the fixed number of logical microbatches committed per step."""
+
         return self.global_batch_size // self.microbatch_size
 
 
 def stable_rank_map(
     node_ids: Sequence[str], tensor_parallel_size: int
 ) -> tuple[tuple[str, tuple[int, ...]], ...]:
+    """Assign contiguous rank blocks to sorted node IDs deterministically.
+
+    The control plane and every worker can call this independently before
+    process-group initialization and still derive the same WORLD rank order.
+    """
+
     if tensor_parallel_size < 1:
         raise ValueError("tensor_parallel_size must be >= 1")
     if len(set(node_ids)) != len(node_ids):

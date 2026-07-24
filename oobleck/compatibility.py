@@ -17,6 +17,8 @@ from oobleck.types import RuntimeCompatibility, checksum
 
 
 def _package_revision(distribution: str, module_name: str) -> str:
+    """Find the strongest available package identity: VCS commit, then version."""
+
     try:
         direct_url = importlib.metadata.distribution(distribution).read_text("direct_url.json")
         if direct_url:
@@ -45,6 +47,8 @@ def _package_revision(distribution: str, module_name: str) -> str:
 
 
 def model_fingerprint(model: torch.nn.Module, *, model_identity: str = "structure-only") -> str:
+    """Hash model type and state layout without reading mutable tensor contents."""
+
     if not model_identity:
         raise ValueError("model_identity must not be empty")
     state = [
@@ -70,6 +74,13 @@ def dataset_fingerprint(
     explicit: str | None = None,
     preprocessing: str = "identity",
 ) -> str:
+    """Hash a stable indexed dataset identity together with preprocessing semantics.
+
+    The fingerprint deliberately rejects iterable datasets and anonymous
+    map-style datasets: generation consensus must not equate workers whose
+    sample ordering or preprocessing may differ.
+    """
+
     if isinstance(dataset, IterableDataset) or not (
         hasattr(dataset, "__len__") and hasattr(dataset, "__getitem__")
     ):
@@ -97,6 +108,8 @@ def dataset_fingerprint(
 
 
 def _hardware_fingerprint() -> str:
+    """Hash the local accelerator model or CPU platform used for this worker."""
+
     if torch.cuda.is_available():
         device = torch.cuda.current_device()
         properties = torch.cuda.get_device_properties(device)
@@ -125,6 +138,8 @@ def build_runtime_compatibility(
     oobleck_revision: str | None = None,
     cornstarch_revision: str | None = None,
 ) -> RuntimeCompatibility:
+    """Assemble the checksummed contract workers compare before activation."""
+
     cuda_version = torch.version.cuda
     nccl_version = None
     if torch.cuda.is_available() and torch.distributed.is_nccl_available():

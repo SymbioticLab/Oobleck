@@ -9,11 +9,15 @@ from typing import Sequence
 
 @dataclass(frozen=True, slots=True)
 class InitialHost:
+    """Stable bootstrap node identity, SSH address, and fixed local GPU set."""
+
     node_id: str
     address: str
     gpu_ids: tuple[str, ...]
 
     def __post_init__(self) -> None:
+        """Require complete identity and unique GPU identifiers."""
+
         if not self.node_id or not self.address or not self.gpu_ids:
             raise ValueError("hostfile node_id, address, and gpu_ids are required")
         if len(self.gpu_ids) != len(set(self.gpu_ids)):

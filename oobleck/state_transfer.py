@@ -16,6 +16,8 @@ StateTensorKey = tuple[str, str, int]
 
 @dataclass(frozen=True, slots=True)
 class TransferExecutionMetrics:
+    """Observed byte accounting and collective duration for schedule execution."""
+
     actual_source_bytes: tuple[tuple[int, int], ...]
     actual_destination_bytes: tuple[tuple[int, int], ...]
     actual_link_class_bytes: tuple[tuple[str, int], ...]
@@ -23,6 +25,8 @@ class TransferExecutionMetrics:
 
 
 def _bytes(tensor: torch.Tensor) -> torch.Tensor:
+    """Expose contiguous tensor storage as a flat byte view, including scalars."""
+
     if not tensor.is_contiguous():
         raise ValueError("state transfer tensors must be contiguous")
     # ``view(dtype)`` rejects zero-dimensional tensors when element sizes
@@ -32,6 +36,8 @@ def _bytes(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def _transfer_identity(item) -> tuple[object, ...]:
+    """Key checksum metadata by every field that identifies a scheduled chunk."""
+
     return (
         item.round,
         item.source_rank,
@@ -46,10 +52,14 @@ def _transfer_identity(item) -> tuple[object, ...]:
 
 
 def _checksum(payload: torch.Tensor) -> str:
+    """Hash payload bytes on CPU so corruption is detected after transfer."""
+
     return hashlib.sha256(payload.detach().cpu().numpy().tobytes()).hexdigest()
 
 
 def _validate_dtype(tensor: torch.Tensor, expected: str, key: StateTensorKey) -> None:
+    """Prevent byte unpacking into a storage layout with a different dtype."""
+
     actual = str(tensor.dtype).removeprefix("torch.")
     if actual != expected.removeprefix("torch."):
         raise ValueError(

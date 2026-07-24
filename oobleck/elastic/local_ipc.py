@@ -36,6 +36,8 @@ class LocalWorkerRelay:
         on_generation_ready: WorkerPhaseCallback | None = None,
         max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
     ) -> None:
+        """Initialize the Unix listener and per-generation local consensus state."""
+
         if expected_workers < 1:
             raise ValueError("expected_workers must be positive")
         self.path = Path(path)
@@ -57,9 +59,13 @@ class LocalWorkerRelay:
 
     @property
     def worker_ids(self) -> tuple[str, ...]:
+        """Return registered stable worker identities in deterministic order."""
+
         return tuple(sorted(self._workers))
 
     def _phase_complete(self, generation: int, values: dict[str, tuple[str, str, str]]) -> bool:
+        """Require every configured worker to report against current membership."""
+
         latest = self._latest_membership
         return (
             latest is not None
@@ -69,9 +75,13 @@ class LocalWorkerRelay:
         )
 
     def generation_prepared(self, generation: int) -> bool:
+        """Report whether all local workers compiled the proposed generation."""
+
         return self._phase_complete(generation, self._prepared)
 
     def generation_ready(self, generation: int) -> bool:
+        """Report whether all local workers initialized replacement WORLD."""
+
         return self._phase_complete(generation, self._acknowledged)
 
     def _phase_metadata(
@@ -80,6 +90,8 @@ class LocalWorkerRelay:
         values: dict[str, tuple[str, str, str]],
         phase: str,
     ) -> tuple[str, str, str]:
+        """Return unanimous snapshot, plan, and compatibility identities."""
+
         if not self._phase_complete(generation, values):
             raise RuntimeError(f"local generation is not {phase}")
         agreed = set(values.values())
@@ -88,12 +100,18 @@ class LocalWorkerRelay:
         return next(iter(agreed))
 
     def preparation_metadata(self, generation: int) -> tuple[str, str, str]:
+        """Return agreed metadata for completed local preparation."""
+
         return self._phase_metadata(generation, self._prepared, "prepared")
 
     def readiness_metadata(self, generation: int) -> tuple[str, str, str]:
+        """Return agreed metadata for completed local readiness."""
+
         return self._phase_metadata(generation, self._acknowledged, "ready")
 
     async def start(self) -> None:
+        """Safely replace a stale socket and begin accepting local workers."""
+
         if self._server is not None:
             raise RuntimeError("local worker relay is already running")
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -104,12 +122,16 @@ class LocalWorkerRelay:
             self.path.unlink()
 
         async def accept(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            """Wrap one Unix stream in the same framed control protocol."""
+
             connection = ControlConnection(reader, writer, max_frame_bytes=self.max_frame_bytes)
             await self._handle(connection)
 
         self._server = await asyncio.start_unix_server(accept, path=self.path)
 
     async def _handle(self, connection: ControlConnection) -> None:
+        """Register one worker incarnation and aggregate its phase acknowledgements."""
+
         worker_id: str | None = None
         try:
             registration = await connection.receive()
@@ -207,6 +229,8 @@ class LocalWorkerRelay:
                 await connection.close()
 
     async def publish(self, message: MessageEnvelope) -> None:
+        """Validate, retain, and fan out a master generation phase locally."""
+
         allowed = {"membership", "generation_rendezvous", "generation_active"}
         if message.message_type not in allowed:
             raise ValueError(f"local relay accepts only {sorted(allowed)} messages")
@@ -262,6 +286,8 @@ class LocalWorkerRelay:
                     self._acknowledged.pop(worker_id, None)
 
     async def close(self) -> None:
+        """Close workers and listener, then remove only the owned socket path."""
+
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
@@ -280,6 +306,8 @@ class LocalWorkerClient:
     """Execute the prepared/rendezvous/ready/active generation protocol."""
 
     def __init__(self, path: str | Path, node_id: str, worker_id: str) -> None:
+        """Assign a fresh local incarnation and initialize phase cursors."""
+
         if not node_id or not worker_id:
             raise ValueError("node_id and worker_id are required")
         self.path = Path(path)
@@ -292,6 +320,8 @@ class LocalWorkerClient:
         self.sequence = 0
 
     async def connect(self) -> None:
+        """Open the Unix stream and register the stable worker identity."""
+
         reader, writer = await asyncio.open_unix_connection(self.path)
         self.connection = ControlConnection(reader, writer)
         await self.connection.send(
@@ -307,6 +337,8 @@ class LocalWorkerClient:
         )
 
     def _parse_membership(self, message: MessageEnvelope) -> MembershipSnapshot:
+        """Verify and install a strictly newer checksummed membership."""
+
         if message.message_type != "membership":
             raise ProtocolError("local agent sent a non-membership message")
         snapshot = membership_snapshot_from_payload(message.generation, message.payload)
@@ -316,6 +348,8 @@ class LocalWorkerClient:
         return snapshot
 
     async def receive(self) -> MembershipSnapshot:
+        """Wait for membership while consuming informational phase messages."""
+
         if self.connection is None:
             raise RuntimeError("local worker is not connected")
         while True:
@@ -330,6 +364,8 @@ class LocalWorkerClient:
 
     @staticmethod
     def _metadata(execution_plan: Any, snapshot: MembershipSnapshot) -> tuple[str, str, str]:
+        """Bind phase acknowledgements to membership, plan, and compatibility."""
+
         return (
             snapshot.snapshot_hash,
             str(getattr(execution_plan, "plan_checksum", snapshot.snapshot_hash)),
@@ -342,6 +378,8 @@ class LocalWorkerClient:
         snapshot: MembershipSnapshot,
         metadata: tuple[str, str, str],
     ) -> None:
+        """Send one sequenced worker phase acknowledgement to the local relay."""
+
         assert self.connection is not None
         self.sequence += 1
         await self.connection.send(
@@ -368,6 +406,8 @@ class LocalWorkerClient:
         snapshot: MembershipSnapshot,
         metadata: tuple[str, str, str],
     ) -> None:
+        """Require the expected phase and exact locally prepared identities."""
+
         if message.message_type != expected_type:
             raise ProtocolError(
                 f"local agent sent {message.message_type!r}; expected {expected_type}"
@@ -381,6 +421,8 @@ class LocalWorkerClient:
 
     @staticmethod
     def _reprepare(prepared: Any, snapshot: MembershipSnapshot) -> Any:
+        """Recompile ownership from a superseding snapshot without building WORLD."""
+
         owner = prepared.owner_plan
         tp = int(getattr(owner.parallel_config, "tensor_parallel_size"))
         if any(len(node.gpu_ids) != tp for node in snapshot.nodes):
@@ -441,6 +483,8 @@ class LocalWorkerClient:
         on_snapshot: Callable[[MembershipSnapshot], Awaitable[None]] | None = None,
         on_active: Callable[[int], Awaitable[None]] | None = None,
     ) -> None:
+        """Drive reconfiguration barriers, restarting whenever membership supersedes."""
+
         if self.connection is None:
             raise RuntimeError("local worker is not connected")
         enable_barrier = getattr(context, "enable_control_plane_barrier", None)
@@ -486,6 +530,8 @@ class LocalWorkerClient:
                 break
 
     async def close(self) -> None:
+        """Close the worker-to-agent stream idempotently."""
+
         if self.connection is not None:
             await self.connection.close()
             self.connection = None

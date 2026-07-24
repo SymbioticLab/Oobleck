@@ -13,6 +13,8 @@ from oobleck.types import OobleckExecutionPlan, PipelineStageSpec
 
 
 def _fallback_manifest(model: torch.nn.Module, rank: int, committed_step: int = 0) -> StateManifest:
+    """Describe an unsharded local model when Cornstarch provides no manifest."""
+
     entries = []
     for kind, values in (
         ("parameter", model.named_parameters(recurse=True)),
@@ -36,6 +38,8 @@ def _fallback_manifest(model: torch.nn.Module, rank: int, committed_step: int = 
 
 
 def _external_manifest(value: Any, rank: int, committed_step: int = 0) -> StateManifest:
+    """Normalize a Cornstarch manifest into Oobleck's versioned state schema."""
+
     entries = []
     for item in value.entries:
         entries.append(
@@ -58,6 +62,8 @@ def _external_manifest(value: Any, rank: int, committed_step: int = 0) -> StateM
 
 @dataclass(frozen=True, slots=True)
 class CompiledLocalPartition:
+    """Process-group-free ownership plus the execution plan needed at activation."""
+
     root_model: torch.nn.Module
     rank: int
     world_size: int
@@ -73,6 +79,12 @@ class CompiledLocalPartition:
         *,
         mesh: Any = None,
     ) -> "ActivatedPartition":
+        """Materialize local storage only after replacement WORLD exists.
+
+        External Cornstarch partitions receive the rank-local heterogeneous mesh;
+        the fallback path initializes meta tensors or moves an ordinary model.
+        """
+
         if self.external_compiled is not None:
             all_meshes = None
             if mesh is None and self.world_size > 1:
@@ -102,6 +114,8 @@ class CompiledLocalPartition:
 
 
 class ActivatedPartition:
+    """Materialized rank-local model and external resources for one generation."""
+
     def __init__(
         self,
         compiled: CompiledLocalPartition,
@@ -110,6 +124,8 @@ class ActivatedPartition:
         manifest: StateManifest | None = None,
         all_meshes: dict[str, Any] | None = None,
     ) -> None:
+        """Retain the compiled identity, materialized model, manifest, and meshes."""
+
         self.compiled = compiled
         self.model = model
         self.external_context = external_context
@@ -119,9 +135,13 @@ class ActivatedPartition:
 
     @property
     def closed(self) -> bool:
+        """Report whether generation-local external resources were retired."""
+
         return self._closed
 
     def close(self) -> None:
+        """Idempotently release the external context and mesh references."""
+
         if self._closed:
             return
         if self.external_context is not None:

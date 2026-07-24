@@ -26,6 +26,8 @@ class LocalWorkerSupervisor:
         gpu_ids: Sequence[str],
         socket_path: str | Path,
     ) -> None:
+        """Capture worker entrypoint, stable node identity, GPUs, and relay path."""
+
         self.script = Path(script)
         self.script_args = tuple(script_args)
         self.node_id = node_id
@@ -34,6 +36,8 @@ class LocalWorkerSupervisor:
         self.processes: list[asyncio.subprocess.Process] = []
 
     async def start(self) -> None:
+        """Spawn one isolated process per GPU with deterministic worker metadata."""
+
         if self.processes:
             raise RuntimeError("local workers are already running")
         if not self.script.is_file():
@@ -62,6 +66,8 @@ class LocalWorkerSupervisor:
             self.processes.append(process)
 
     async def wait(self) -> tuple[int, ...]:
+        """Wait for every worker and fail the node service if any exits nonzero."""
+
         if not self.processes:
             raise RuntimeError("local workers have not been started")
         codes = tuple(await asyncio.gather(*(item.wait() for item in self.processes)))
@@ -71,6 +77,8 @@ class LocalWorkerSupervisor:
         return codes
 
     async def close(self) -> None:
+        """Terminate workers, escalate to kill after a bound, and forget handles."""
+
         running = [item for item in self.processes if item.returncode is None]
         for process in running:
             process.terminate()

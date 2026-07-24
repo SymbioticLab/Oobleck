@@ -14,6 +14,8 @@ from oobleck.types import OobleckExecutionPlan
 
 @dataclass(frozen=True, slots=True)
 class GradientSyncGroup:
+    """Replica ranks and sample weights for one logical parameter shard."""
+
     logical_key: str
     tp_lane: int
     placements: tuple[str, ...]
@@ -21,6 +23,8 @@ class GradientSyncGroup:
     sample_weights: tuple[float, ...]
 
     def __post_init__(self) -> None:
+        """Require deterministic membership and a normalized weighted reduction."""
+
         if len(self.ranks) != len(self.sample_weights) or not self.ranks:
             raise ValueError("gradient group ranks and sample weights must align")
         if tuple(sorted(self.ranks)) != self.ranks or len(set(self.ranks)) != len(self.ranks):
@@ -34,6 +38,12 @@ def build_gradient_sync_groups(
     rank_to_pipeline: Mapping[int, str],
     pipeline_sample_counts: Mapping[str, int],
 ) -> tuple[GradientSyncGroup, ...]:
+    """Group parameter owners by logical identity, TP lane, and placement.
+
+    Each pipeline contributes in proportion to the number of samples it processed,
+    which preserves global-batch gradient semantics under heterogeneous allocation.
+    """
+
     owners: dict[tuple[str, int, tuple[str, ...]], set[int]] = {}
     for manifest in manifests:
         for entry in manifest.entries:
@@ -99,11 +109,19 @@ class HeterogeneousGradientSynchronizer:
     """Sample-weighted logical-parameter reduction across pipeline replicas."""
 
     def __init__(self, bindings, process_groups) -> None:
+        """Capture local parameters and the deterministically created groups."""
+
         self._bindings = tuple(bindings)
         self._process_groups = process_groups
         self._closed = False
 
     def sync(self) -> None:
+        """Sample-weight and all-reduce every present logical gradient.
+
+        A presence collective distinguishes an unused parameter from a missing
+        local gradient; Gloo reductions stage CUDA payloads through CPU storage.
+        """
+
         if self._closed:
             raise RuntimeError("gradient synchronizer is closed")
         import torch.distributed as dist
@@ -143,6 +161,8 @@ class HeterogeneousGradientSynchronizer:
             local_gradient.copy_(payload.to(local_gradient.device))
 
     def close(self) -> None:
+        """Drop generation-local parameter and process-group references."""
+
         self._bindings = ()
         self._process_groups = {}
         self._closed = True
