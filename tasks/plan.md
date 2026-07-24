@@ -9,8 +9,10 @@ Rebuild Oobleck on Cornstarch's `refactor` branch while preserving Oobleck's def
 - detect node failures through a dedicated CPU control plane rather than waiting for NCCL timeouts;
 - completely destroy and recreate the distributed world for every membership generation;
 - reconfigure with the simple, rank-borrowing, and pipeline-merge strategies from Section 5.1 of the Oobleck paper;
-- transfer missing model and optimizer state efficiently, then replay the interrupted logical global batch;
-- support initial deployment, one or multiple simultaneous abrupt failures, graceful drains, and joining or replacement nodes.
+- transfer missing model, optimizer, scheduler, scaler, and sampler state
+  efficiently; replay interrupted hard-transition batches while pure additions resume
+  from the newly committed cutover batch;
+- support initial deployment, one or multiple simultaneous abrupt failures, graceful drains, and added nodes and same-ID restarts.
 
 The first implementation supports LLM training with data, pipeline, and tensor parallelism. Tensor parallel size is fixed per node. Context parallelism, expert parallelism, multimodal models, and elastic changes to tensor-parallel width are deferred.
 
@@ -273,7 +275,7 @@ Use Cornstarch's pipeline schedule within each pipeline, initially 1F1B. Validat
 
 Retain a dedicated CPU agent per node and a master membership service, but do not require gRPC. The recommended simpler first implementation is a small `AsyncioTcpControlTransport` built on Python's `asyncio` streams. It needs no broker, RPC runtime, or generated client/server stubs and directly exposes the TCP-close signal Oobleck uses for failure detection. Keep membership and recovery logic behind a `ControlTransport` interface so transport mechanics cannot leak into the membership state machine. Replace Click with Tyro for all new CLI surfaces.
 
-Use one persistent full-duplex TCP connection from each agent to the master. Encode each message as a four-byte big-endian length followed by a UTF-8 JSON envelope containing protocol version, message type, agent ID, incarnation ID, sequence number, membership generation, and a type-specific payload. Enforce a small maximum frame size and strict field/type validation. The master uses `asyncio.start_server()`; agents use `asyncio.open_connection()`; readers use `readexactly()` for the header and body; and each connection has one serialized writer queue that calls `drain()` for backpressure. EOF, reset, or an incomplete frame closes the incarnation and feeds the same lease/membership logic as heartbeat expiry.
+Use one persistent full-duplex TCP connection from each agent to the master. Encode each message as a four-byte big-endian length followed by a UTF-8 JSON envelope. The control protocol carries complete execution plans in prepared acknowledgements and the previous active plan in later membership snapshots. Each envelope contains message type, agent ID, incarnation ID, sequence number, membership generation, and a type-specific payload. Enforce a small maximum frame size and strict field/type validation. The master uses `asyncio.start_server()`; agents use `asyncio.open_connection()`; readers use `readexactly()` for the header and body; and each connection has one serialized writer queue that calls `drain()` for backpressure. EOF, reset, or an incomplete frame closes the incarnation and feeds the same lease/membership logic as heartbeat expiry.
 
 The transport must define reconnect and duplicate-message semantics explicitly: a new incarnation replaces an old connection only through the membership state machine, sequence numbers reject duplicate/out-of-order messages, and generation numbers reject stale commands. Unit tests must fragment and coalesce frames, block writers to exercise backpressure, send oversized/malformed messages, reconnect an incarnation, and close several sockets concurrently. The old gRPC implementation may remain temporarily as a behavior reference during PR 5, but remove its runtime, generated files, and test dependencies after the asyncio transport reaches parity. TLS and authentication remain a separately scoped production-hardening concern.
 
@@ -284,9 +286,9 @@ Each agent:
 - sends heartbeats (default every 1 second) under a renewable lease (default 5 seconds);
 - treats TCP stream closure as an immediate failure signal;
 - relays membership-generation notices to local GPU workers over a local IPC channel;
-- supports an optional initial SSH hostfile, without requiring one for later joins.
+- supports an optional initial SSH hostfile, without requiring one for later additions.
 
-The master maintains monotonically increasing membership generations. Abrupt failure, graceful drain, join, and replacement all produce a proposed generation. Workers reject stale messages and never combine rank maps from different generations.
+The master maintains monotonically increasing membership generations. Registrations produce additions; abrupt failure, graceful drain, disconnect, and lease expiry produce removals. The master retains a consensus plan only after its generation becomes active and binds that plan into subsequent snapshot hashes. Workers reject stale messages and never combine rank maps from different generations. A proposal is graceful only when its accumulated operations contain additions and no removals; every snapshot containing a removal is hard.
 
 Failure handling must operate on a set of failed node or agent identities, never assume exactly one failure. The master serializes concurrent disconnect/lease events against the live membership snapshot and coalesces events observed before a generation is published. If another agent fails while a generation is being prepared, torn down, or activated, the newer full-membership snapshot supersedes the in-progress generation. Workers abort the stale recovery attempt, tear down any partially initialized WORLD, and plan again from all currently surviving nodes. This covers simultaneous failures as well as cascading failures during recovery.
 
@@ -304,7 +306,9 @@ Treat each logical global batch as a transaction:
 4. Check that no newer membership generation was announced.
 5. Atomically commit optimizer step, scheduler step, scaler update, and `committed_step`.
 
-If a membership event is received before commit, ranks finish or unwind to the nearest safe schedule boundary, but must not update model parameters. Clear partial gradients, retire the generation, reconfigure from the newest complete membership snapshot, and replay the same `OobleckBatch`. Do not advance the optimizer, scheduler, scaler growth tracker, sampler cursor, epoch cursor, or global step. Multiple membership changes during the same attempt still cause only one replay after a viable generation becomes active.
+For a hard membership event received before commit, ranks finish or unwind to the nearest safe schedule boundary but must not update model parameters. Clear partial gradients, retire the generation, reconfigure from the newest complete membership snapshot, and replay the same `OobleckBatch`. Do not advance the optimizer, scheduler, scaler growth tracker, sampler cursor, epoch cursor, or global step. Multiple hard membership changes during the same attempt still cause only one replay after a viable generation becomes active.
+
+A pure addition is the exception: if idle, promote it immediately; if a step is running, allow exactly that step to commit under the old generation, coalesce additive proposals to the newest plan, promote it after commit, and block the next step. A removal supersedes a deferred addition and restores the replay rule. Added workers may compile early, but rendezvous waits for every incumbent to reach the boundary. The completed old-generation step reports `attempts=1`; recovery restores its sampler cursor and the expanded generation processes the next logical batch without duplication.
 
 Deterministic sample order must be represented by explicit indices, not by relying on a live iterator that cannot rewind. Derive stochastic model behavior from logical keys such as:
 
@@ -341,7 +345,7 @@ For an abrupt failure:
 7. Verify that no stale Cornstarch meshes, schedules, or Oobleck subgroup handles remain.
 8. Compile the next local ownership before initializing the next WORLD.
 
-Graceful drain and join use the same generation boundary and complete teardown; they are not in-place group edits. Add explicit PyTorch-version guards and fail fast if internal registry layout changes, because silently retaining an old communicator is unsafe.
+Graceful drain remains a hard boundary. A pure addition uses a deferred commit boundary, but after that boundary it performs the same complete teardown and WORLD replacement; neither path edits groups in place. Add explicit PyTorch-version guards and fail fast if internal registry layout changes, because silently retaining an old communicator is unsafe.
 
 ## 13. Reconfiguration and pipeline merge
 
@@ -355,7 +359,7 @@ Reimplement Section 5.1 and Figure 8(c) as a deterministic, pure planner. The pl
 
 Tie-breaking must be stable. Primary objective: minimize predicted iteration time. Secondary objective: maximize bytes of state retained in place. Further tie-breakers: minimize moved nodes, then choose lexicographically by stable node identity.
 
-For joins and replacements, re-enumerate candidate template compositions up to `max_nodes`. Move to a faster valid composition only at a generation boundary. The same retained-state objective prevents gratuitous reshuffling when throughput estimates are equal.
+For additions and removals, re-enumerate candidate template compositions up to `max_nodes`. Move to a faster valid composition only at a generation boundary. The same retained-state objective prevents gratuitous reshuffling when throughput estimates are equal.
 
 ## 14. All-to-all state redistribution
 
@@ -368,9 +372,12 @@ Replace the legacy tensor-by-tensor `send`/`recv` implementation with a determin
 - optimizer slots associated with each parameter;
 - optimizer parameter-group metadata needed for faithful reconstruction;
 - AMP/gradient-scaler state;
-- scheduler state and committed-step metadata.
+- scheduler state and committed-step metadata;
+- versioned DataLoader sampler epoch and committed-cursor state.
 
-Gradients are not transferred because an interrupted attempt is discarded and replayed.
+Gradients are not transferred: hard-transition gradients are discarded before
+replay, while a pure-addition boundary commits its optimizer update before the
+recovery snapshot is captured.
 
 ### Candidate discovery and transfer units
 
@@ -446,7 +453,7 @@ Add `examples/README.md` with:
 - exact start order and commands for master, initial agents, and training;
 - a one-node single-GPU walkthrough;
 - a multi-node launch walkthrough with addresses and stable node IDs;
-- commands for simultaneous failure injection, graceful drain, and joining/replacement agents;
+- commands for simultaneous failure injection, graceful drain, and removed and added agents;
 - expected logs for generation changes, WORLD teardown, state transfer, replay, and resume;
 - cleanup instructions, troubleshooting, and a warning that the failure helper is for disposable example jobs.
 
@@ -490,14 +497,14 @@ Exercise the examples through local import/configuration tests and add a subproc
 ### PR 4 — Pure reconfiguration planner
 
 - Implement set-based failure filtering, simple re-instantiation, borrowing, and merge for single and simultaneous failures.
-- Add join, replacement, and graceful-drain planning.
+- Add removal, addition, and graceful-drain planning.
 - Add deterministic throughput/state-retention objectives and exhaustive planner tests.
 
 ### PR 5 — Elastic control plane
 
 - Refactor the master/agent protocol around complete membership snapshots and set-based generations.
 - Define `ControlTransport` and implement the recommended length-prefixed `AsyncioTcpControlTransport`.
-- Add self-registration, heartbeats, leases, TCP-close detection, reconnect/sequence semantics, local worker notifications, and drain/join operations.
+- Add self-registration, heartbeats, leases, TCP-close detection, reconnect/sequence semantics, local worker notifications, and drain and addition operations.
 - Keep gRPC only as a temporary parity reference, then remove `grpcio`, generated stubs, and gRPC-specific test dependencies.
 - Replace Click-based commands with Tyro.
 - Unit-test framing, partial reads, backpressure, malformed frames, reconnects, concurrent disconnects, and the transport-independent membership state machine.
@@ -523,7 +530,7 @@ Exercise the examples through local import/configuration tests and add a subproc
 - Implement manifest diffing, candidate discovery, chunking, and deterministic makespan-aware source assignment.
 - Stripe large state bundles across surviving replicas and optionally use cost-model-approved relay rounds.
 - Transfer parameters, buffers, optimizer, scaler, scheduler, and committed-step state through balanced all-to-all rounds.
-- Integrate single/simultaneous failure, failure-during-recovery, drain, join, and replacement recovery end to end.
+- Integrate single/simultaneous failure, failure-during-recovery, drain, removal, and addition recovery end to end.
 - Add metrics for source/destination/link utilization, scheduling error, straggler round, detection, planning, teardown, transfer, activation, and total recovery latency.
 
 ### PR 9 — End-to-end examples and operator walkthrough
@@ -576,6 +583,8 @@ Use this GPU-over-Gloo base for distributed unit tests in every relevant PR, inc
 - model and optimizer state movement after merge/split;
 - standard DataLoader execution over a Hugging Face `datasets.Dataset`, with heterogeneous sample assignment and no duplicate committed indices;
 - abort before commit and exact replay of sample IDs with `num_workers=0` and a positive worker count;
+- pure-addition commit with `attempts=1`, next-step blocking, additive coalescing,
+  failure supersession, and a mandatory two-to-three-rank Gloo WORLD expansion;
 - repeated WORLD teardown/recreation;
 - simultaneous rank-loss plans and a failure that supersedes recovery;
 - CUDA numerical equivalence against a local reference.
@@ -584,7 +593,7 @@ After teardown, assert that PyTorch's relevant process-group registries are empt
 
 ### CPU control-plane tests
 
-Master/agent protocol tests that do not execute training may run on CPU. Cover concurrent stream closure, lease expiry, event coalescing, stale generation rejection, join, replacement, and graceful drain without requiring CUDA collectives.
+Master/agent protocol tests that do not execute training may run on CPU. Cover concurrent stream closure, lease expiry, event coalescing, stale generation rejection, removal, addition, and graceful drain without requiring CUDA collectives.
 
 ### GPU tests
 
@@ -605,7 +614,10 @@ The single-CUDA-GPU, multi-rank Gloo suite is the mandatory distributed validati
 
 - Steady-state updates match a reference run within the chosen numerical tolerance.
 - A failure before commit never advances logical training state.
-- The interrupted global batch is replayed exactly once after recovery.
+- A hard-interrupted global batch is replayed exactly once after recovery.
+- A pure addition commits the current old-generation batch once, recovers the added
+  worker from that committed state and sampler cursor, and starts the next batch
+  without replay.
 - A Hugging Face `datasets.Dataset` selected by `load_dataset(..., split=...)` runs through a standard `torch.utils.data.DataLoader`, and recovery neither skips nor duplicates committed sample indices.
 - Simple, borrow, and merge paths are all observed in end-to-end tests.
 - Several agents can fail in the same detection window or during recovery without committing a partial step or activating a stale generation.
@@ -623,12 +635,12 @@ Roll out in this order:
 1. single pipeline, no failure, DP/PP/TP correctness;
 2. multiple homogeneous replicas;
 3. heterogeneous templates and cross-replica synchronization;
-4. graceful generation replacement;
+4. graceful generation reconfiguration;
 5. abrupt failure with simple recovery;
 6. borrow recovery;
 7. merge recovery;
 8. simultaneous and cascading failures;
-9. joins/replacements and repeated churn.
+9. removals/additions and repeated churn.
 
 ## 20. Explicit assumptions and non-goals
 
@@ -643,4 +655,4 @@ Roll out in this order:
 
 ## 21. Definition of done
 
-The refactor is complete when an Oobleck job based on the pinned Cornstarch `refactor-oobleck` commit can start from meta model ownership without WORLD, run heterogeneous pipeline replicas, detect one or multiple simultaneous node losses through the CPU control plane, abort the uncommitted step, fully destroy WORLD, choose a configuration using simple/borrow/merge, recreate WORLD, redistribute all missing training state using all-to-all, replay the same logical global batch, and continue training with numerically correct updates. A newer failure during recovery must safely supersede the in-progress generation. The same generation mechanism must also handle graceful drains and joining or replacement nodes, with distributed unit tests on the single CUDA GPU over Gloo and documented end-to-end examples for each path. Multi-GPU and multi-node NCCL runs are optional environment-specific validation and are not required for this definition of done.
+The refactor is complete when an Oobleck job based on the pinned Cornstarch `refactor-oobleck` commit can start from meta model ownership without WORLD, run heterogeneous pipeline replicas, detect one or multiple simultaneous node losses through the CPU control plane, abort the uncommitted step, fully destroy WORLD, choose a configuration using simple/borrow/merge, recreate WORLD, redistribute all missing training state using all-to-all, replay the same logical global batch, and continue training with numerically correct updates. A newer failure during recovery must safely supersede the in-progress generation. The same generation mechanism must also handle graceful drains and added nodes and same-ID restarts, with distributed unit tests on the single CUDA GPU over Gloo and documented end-to-end examples for each path. Multi-GPU and multi-node NCCL runs are optional environment-specific validation and are not required for this definition of done.

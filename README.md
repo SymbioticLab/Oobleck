@@ -43,7 +43,10 @@ with committed-state transfer.
 See the [runtime lifecycle guide](lifecycle.md) for the complete walkthrough,
 architecture diagrams showing where the master, node agents, and GPU workers
 run, their communication paths, the template-cache format, and the relationship
-between heterogeneous composition and the paper algorithm.
+between heterogeneous composition and the paper algorithm. Pure additions
+finish one already-running step under the old generation, block the next step,
+and resume without replay after the expanded WORLD recovers; all other
+membership changes retain immediate hard-transition replay semantics.
 
 ## Package directory guide
 
@@ -64,12 +67,12 @@ active intermediate layer, `state_public_base.py`.
 | [`cli.py`](oobleck/cli.py) | Tyro command dispatcher for the master, agent, training launch, profiling, membership inspection, drain, and guarded chaos helper. |
 | [`compatibility.py`](oobleck/compatibility.py) | Builds model, dataset/preprocessing, package revision, CUDA/NCCL, and hardware fingerprints used for cross-worker generation consensus. |
 | [`config.py`](oobleck/config.py) | Serializable command configurations for master/agent services, launch, profiling, drain, inspection, and chaos injection. The training runtime's `OobleckConfig` lives in `types.py`. |
-| [`types.py`](oobleck/types.py) | Immutable public value types: templates, stage specs, pipeline instances, execution plans, runtime compatibility, checksums, rank maps, and runtime configuration. |
+| [`types.py`](oobleck/types.py) | Immutable public value types: templates, stage specs, pipeline instances, execution plans with versioned control-plane serialization, runtime compatibility, checksums, rank maps, and runtime configuration. |
 | [`runtime_base.py`](oobleck/runtime_base.py) | Core `OobleckParallelizationPlan`, prepared/context objects, initial plan compilation/materialization, DataLoader attachment, and logical step transaction. |
-| [`runtime.py`](oobleck/runtime.py) | Public runtime layer that extends the base context with membership application, two-phase generation replacement, supersession, state recovery, generation barriers, transition metrics, and complete topology-aware close. |
+| [`runtime.py`](oobleck/runtime.py) | Public runtime layer that extends the base context with membership application, two-phase generation reconfiguration, supersession, state recovery, generation barriers, transition metrics, and complete topology-aware close. |
 | [`cornstarch_base.py`](oobleck/cornstarch_base.py) | Retained minimal compile/activate adapter and fallback local-manifest reference for the pinned Cornstarch lifecycle. The active runtime imports `cornstarch.py`. |
 | [`cornstarch.py`](oobleck/cornstarch.py) | Current Cornstarch boundary used by the runtime; preserves the execution plan through compilation, imports Cornstarch manifests, creates heterogeneous meshes on activation, and retires external contexts idempotently. |
-| [`data_base.py`](oobleck/data_base.py) | Deterministic logical batch descriptors, committed-cursor sampler, microbatch slicing, prefetch invalidation, replay, and the prepared DataLoader adapter. |
+| [`data_base.py`](oobleck/data_base.py) | Deterministic logical batch descriptors, committed-cursor sampler with recovery state, microbatch slicing, prefetch invalidation, replay, and the prepared DataLoader adapter. |
 | [`data.py`](oobleck/data.py) | Public DataLoader facade; re-exports the base types and adds strict validation that sampler and DataLoader use the exact same dataset object. |
 | [`meshes.py`](oobleck/meshes.py) | Creates deterministic per-pipeline Cornstarch `DeviceMesh` objects from an execution plan's heterogeneous stage/rank layout. |
 | [`topology.py`](oobleck/topology.py) | Derives cross-pipeline gradient groups from logical parameter identity and TP lane, creates the process groups, applies sample-weighted synchronization, and closes the groups. |
@@ -92,7 +95,7 @@ active intermediate layer, `state_public_base.py`.
 | [`planner.pyi`](oobleck/planning/planner.pyi) | Type stub for the compiled Rust `create_pipeline_templates` extension. |
 | [`cache.py`](oobleck/planning/cache.py) | Saves and loads versioned templates while validating schema and compatibility fingerprints. |
 | [`composer.py`](oobleck/planning/composer.py) | Selects a deterministic heterogeneous template composition, maps it to nodes, allocates global microbatches, and computes gradient sample weights. |
-| [`reconfiguration.py`](oobleck/planning/reconfiguration.py) | Pure membership replanner implementing simple re-instantiation, node borrowing, pipeline merge, joins/replacements, and deterministic state-retention/throughput objectives. |
+| [`reconfiguration.py`](oobleck/planning/reconfiguration.py) | Pure membership replanner implementing simple re-instantiation, node borrowing, pipeline merge, removals and additions, and deterministic state-retention/throughput objectives. |
 
 ### `oobleck/distributed/`
 
@@ -112,9 +115,9 @@ active intermediate layer, `state_public_base.py`.
 | [`service_base.py`](oobleck/elastic/service_base.py) | Master generation protocol and base agent stream: registration, heartbeat/lease processing, membership proposals, prepared-plan consensus, rendezvous publication, ready consensus, activation, drain, and inspection. |
 | [`service_public_base.py`](oobleck/elastic/service_public_base.py) | Current reconnecting `NodeAgentClient`, local-worker phase aggregation, master sequence validation, TCP-close handling, and public inspect/status/drain helpers. |
 | [`service.py`](oobleck/elastic/service.py) | Public service facade; combines the current client/helpers with the master and bounds broadcasts so a failed writer becomes a membership event instead of stalling recovery. |
-| [`local_ipc.py`](oobleck/elastic/local_ipc.py) | Unix-domain relay between one CPU agent and its GPU workers. Aggregates every local worker's prepared/ready metadata and enforces membership, rendezvous, and active phase ordering. |
+| [`local_ipc.py`](oobleck/elastic/local_ipc.py) | Unix-domain relay between one CPU agent and its GPU workers. Aggregates every local worker's complete-plan prepared/ready metadata, owns responsive generation preparation, and enforces membership, rendezvous, and active phase ordering. |
 | [`workers.py`](oobleck/elastic/workers.py) | Agent-owned process supervisor that launches one training worker per configured GPU, assigns stable environment identity/rank data, and retires workers on completion or failure. |
-| [`hostfile.py`](oobleck/elastic/hostfile.py) | Parses an optional bootstrap-only host inventory and constructs explicit SSH agent commands; later joins do not depend on the hostfile. |
+| [`hostfile.py`](oobleck/elastic/hostfile.py) | Parses an optional bootstrap-only host inventory and constructs explicit SSH agent commands; later additions do not depend on the hostfile. |
 
 ## Suggested reading paths
 

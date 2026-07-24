@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import socket
 import uuid
 from dataclasses import asdict
@@ -17,6 +18,8 @@ from oobleck.elastic.transport import (
     MessageEnvelope,
     ProtocolError,
 )
+
+from oobleck.types import OobleckExecutionPlan
 
 
 class MasterControlService:
@@ -42,8 +45,13 @@ class MasterControlService:
         self._lease_task: asyncio.Task[None] | None = None
         self._master_sequence = 0
         self._proposed_snapshot: MembershipSnapshot | None = None
-        self._prepared_agents: dict[str, tuple[str, str]] = {}
+        self._prepared_agents: dict[str, tuple[str, str, str]] = {}
         self._rendezvous_metadata: tuple[str, str] | None = None
+        self._proposed_execution_plan: OobleckExecutionPlan | None = None
+        self.active_execution_plan: OobleckExecutionPlan | None = None
+        self._accumulated_removed: dict[tuple[str, str], NodeIdentity] = {}
+        self._accumulated_added: dict[tuple[str, str], NodeIdentity] = {}
+        self._accumulated_detection_seconds = 0.0
         self._ready_agents: dict[str, tuple[str, str]] = {}
         self.active_generation = 0
 
@@ -70,15 +78,49 @@ class MasterControlService:
         )
         self._server = None
 
-    def _begin_generation(self, snapshot: MembershipSnapshot) -> None:
-        """Install a proposal and invalidate every older readiness result."""
+    def _clear_accumulated_operations(self) -> None:
+        self._accumulated_removed.clear()
+        self._accumulated_added.clear()
+        self._accumulated_detection_seconds = 0.0
 
+    def _begin_generation(self, snapshot: MembershipSnapshot) -> MembershipSnapshot:
+        """Install a proposal and accumulate operations since last activation."""
+
+        for member in snapshot.removed_nodes:
+            self._accumulated_removed[(member.agent_id, member.incarnation_id)] = member
+        for member in snapshot.added_nodes:
+            self._accumulated_added[(member.agent_id, member.incarnation_id)] = member
+        self._accumulated_detection_seconds = max(
+            self._accumulated_detection_seconds, snapshot.detection_seconds
+        )
+        snapshot = MembershipSnapshot(
+            snapshot.generation,
+            snapshot.nodes,
+            tuple(
+                sorted(
+                    self._accumulated_removed.values(),
+                    key=lambda member: (member.agent_id, member.incarnation_id),
+                )
+            ),
+            tuple(
+                sorted(
+                    self._accumulated_added.values(),
+                    key=lambda member: (member.agent_id, member.incarnation_id),
+                )
+            ),
+            previous_execution_plan=self.active_execution_plan,
+            detection_seconds=self._accumulated_detection_seconds,
+        )
         self._proposed_snapshot = snapshot
         self._prepared_agents.clear()
         self._ready_agents.clear()
         self._rendezvous_metadata = None
+        self._proposed_execution_plan = None
         if not snapshot.nodes:
             self.active_generation = snapshot.generation
+            self.active_execution_plan = None
+            self._clear_accumulated_operations()
+        return snapshot
 
     async def _expire_leases(self) -> None:
         while True:
@@ -89,7 +131,7 @@ class MasterControlService:
                     self._connections.pop(agent_id, None)
                 snapshot = self.membership.publish()
                 if snapshot is not None:
-                    self._begin_generation(snapshot)
+                    snapshot = self._begin_generation(snapshot)
             if snapshot is not None:
                 await self._broadcast(snapshot)
 
@@ -100,7 +142,7 @@ class MasterControlService:
             if first.message_type in {"inspect", "inspect_status"}:
                 if first.payload:
                     raise ProtocolError(f"{first.message_type} payload must be empty")
-                snapshot = self.membership.snapshot()
+                snapshot = self._proposed_snapshot or self.membership.snapshot()
                 reply = (
                     self._membership_message(snapshot)
                     if first.message_type == "inspect"
@@ -118,7 +160,6 @@ class MasterControlService:
                         raise ProtocolError(f"node {node_id!r} is not active")
                     self._master_sequence += 1
                     command = MessageEnvelope(
-                        1,
                         "drain_command",
                         "master",
                         "master",
@@ -129,7 +170,6 @@ class MasterControlService:
                     await active[1].send(command)
                 await connection.send(
                     MessageEnvelope(
-                        1,
                         "drain_accepted",
                         "master",
                         "master",
@@ -158,7 +198,7 @@ class MasterControlService:
                 )
                 snapshot = self.membership.publish()
                 if snapshot is not None:
-                    self._begin_generation(snapshot)
+                    snapshot = self._begin_generation(snapshot)
             if snapshot is not None:
                 await self._broadcast(snapshot)
 
@@ -183,9 +223,29 @@ class MasterControlService:
                             or message.payload["snapshot_hash"] != proposed.snapshot_hash
                         ):
                             continue
+                        try:
+                            execution_plan = OobleckExecutionPlan.from_dict(
+                                message.payload["execution_plan"]
+                            )
+                        except (TypeError, ValueError) as exc:
+                            raise ProtocolError(
+                                "agent submitted an invalid execution plan"
+                            ) from exc
+                        if (
+                            execution_plan.generation != proposed.generation
+                            or execution_plan.plan_checksum != message.payload["plan_checksum"]
+                            or (execution_plan.compatibility_digest or "")
+                            != message.payload["compatibility_digest"]
+                        ):
+                            raise ProtocolError("prepared execution plan metadata is inconsistent")
                         metadata = (
-                            str(message.payload["plan_checksum"]),
-                            str(message.payload["compatibility_digest"]),
+                            execution_plan.plan_checksum,
+                            execution_plan.compatibility_digest or "",
+                            json.dumps(
+                                execution_plan.to_dict(),
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
                         )
                         self.membership.acknowledge(
                             message.agent_id,
@@ -201,9 +261,10 @@ class MasterControlService:
                             )
                         self._prepared_agents[message.agent_id] = metadata
                         if set(self._prepared_agents) == set(self.membership.agent_ids):
-                            self._rendezvous_metadata = metadata
+                            self._proposed_execution_plan = execution_plan
+                            self._rendezvous_metadata = metadata[:2]
                             rendezvous_message = self._generation_rendezvous_message(
-                                proposed, *metadata
+                                proposed, *metadata[:2]
                             )
                     elif message.message_type == "generation_ready":
                         proposed = self._proposed_snapshot
@@ -235,7 +296,11 @@ class MasterControlService:
                         )
                         self._ready_agents[message.agent_id] = metadata
                         if set(self._ready_agents) == set(self.membership.agent_ids):
+                            if self._proposed_execution_plan is None:
+                                raise ProtocolError("active generation has no consensus plan")
                             self.active_generation = proposed.generation
+                            self.active_execution_plan = self._proposed_execution_plan
+                            self._clear_accumulated_operations()
                             active_message = self._generation_active_message(proposed, *metadata)
                     elif message.message_type == "drain":
                         self.membership.drain(
@@ -246,7 +311,7 @@ class MasterControlService:
                         )
                         snapshot = self.membership.publish()
                         if snapshot is not None:
-                            self._begin_generation(snapshot)
+                            snapshot = self._begin_generation(snapshot)
                     else:
                         raise ProtocolError(f"unsupported agent message {message.message_type!r}")
                 if rendezvous_message is not None:
@@ -273,7 +338,7 @@ class MasterControlService:
                         self.membership.disconnect(identity.agent_id, identity.incarnation_id)
                         snapshot = self.membership.publish()
                         if snapshot is not None:
-                            self._begin_generation(snapshot)
+                            snapshot = self._begin_generation(snapshot)
                     else:
                         snapshot = None
                 if snapshot is not None:
@@ -296,7 +361,6 @@ class MasterControlService:
     def _membership_message(self, snapshot: MembershipSnapshot) -> MessageEnvelope:
         self._master_sequence += 1
         return MessageEnvelope(
-            1,
             "membership",
             "master",
             "master",
@@ -304,15 +368,21 @@ class MasterControlService:
             snapshot.generation,
             {
                 "nodes": [asdict(node) for node in snapshot.nodes],
-                "reasons": list(snapshot.reasons),
+                "removed_nodes": [asdict(node) for node in snapshot.removed_nodes],
+                "added_nodes": [asdict(node) for node in snapshot.added_nodes],
+                "detection_seconds": snapshot.detection_seconds,
                 "snapshot_hash": snapshot.snapshot_hash,
+                "previous_execution_plan": (
+                    snapshot.previous_execution_plan.to_dict()
+                    if snapshot.previous_execution_plan is not None
+                    else None
+                ),
             },
         )
 
     def _status_message(self, snapshot: MembershipSnapshot) -> MessageEnvelope:
         self._master_sequence += 1
         return MessageEnvelope(
-            1,
             "status",
             "master",
             "master",
@@ -320,7 +390,9 @@ class MasterControlService:
             snapshot.generation,
             {
                 "nodes": [asdict(node) for node in snapshot.nodes],
-                "reasons": list(snapshot.reasons),
+                "removed_nodes": [asdict(node) for node in snapshot.removed_nodes],
+                "added_nodes": [asdict(node) for node in snapshot.added_nodes],
+                "detection_seconds": snapshot.detection_seconds,
                 "snapshot_hash": snapshot.snapshot_hash,
                 "active_generation": self.active_generation,
                 "prepared_agents": sorted(self._prepared_agents),
@@ -336,7 +408,6 @@ class MasterControlService:
     ) -> MessageEnvelope:
         self._master_sequence += 1
         return MessageEnvelope(
-            1,
             "generation_rendezvous",
             "master",
             "master",
@@ -357,7 +428,6 @@ class MasterControlService:
     ) -> MessageEnvelope:
         self._master_sequence += 1
         return MessageEnvelope(
-            1,
             "generation_active",
             "master",
             "master",
@@ -397,7 +467,6 @@ class NodeAgentClient:
         self.connection = await self.transport.connect(host, port)
         await self.connection.send(
             MessageEnvelope(
-                1,
                 "register",
                 self.node_id,
                 self.incarnation_id,
@@ -421,7 +490,6 @@ class NodeAgentClient:
             self.sequence += 1
             await self.connection.send(
                 MessageEnvelope(
-                    1,
                     "heartbeat",
                     self.node_id,
                     self.incarnation_id,
@@ -443,6 +511,11 @@ class NodeAgentClient:
         self.sequence += 1
         await self.connection.send(
             MessageEnvelope(
-                1, "drain", self.node_id, self.incarnation_id, self.sequence, self.generation, {}
+                "drain",
+                self.node_id,
+                self.incarnation_id,
+                self.sequence,
+                self.generation,
+                {},
             )
         )

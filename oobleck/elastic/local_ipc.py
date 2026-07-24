@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import inspect
 import stat
 import uuid
 from pathlib import Path
@@ -19,8 +21,42 @@ from oobleck.elastic.transport import (
     MessageEnvelope,
     ProtocolError,
 )
+from oobleck.types import (
+    OobleckExecutionPlan,
+    PipelineInstance,
+    PipelineTemplate,
+    stable_rank_map,
+)
 
-WorkerPhaseCallback = Callable[[int, str, str, str], Awaitable[None]]
+
+def _control_only_plan(snapshot: MembershipSnapshot) -> OobleckExecutionPlan:
+    node_ids = tuple(node.agent_id for node in snapshot.nodes)
+    tp = len(snapshot.nodes[0].gpu_ids)
+    rank_map = stable_rank_map(node_ids, tp)
+    template = PipelineTemplate(
+        "control-only",
+        tuple((index, index + 1) for index in range(len(node_ids))),
+        tp,
+        0.0,
+        0.0,
+    )
+    instance = PipelineInstance(
+        "control-only",
+        template,
+        node_ids,
+        tuple(dict(rank_map)[node_id] for node_id in node_ids),
+        0,
+    )
+    previous = (
+        snapshot.previous_execution_plan.generation
+        if snapshot.previous_execution_plan is not None
+        else (snapshot.generation - 1 if snapshot.generation else None)
+    )
+    return OobleckExecutionPlan(snapshot.generation, (instance,), rank_map, previous)
+
+
+PreparedWorkerCallback = Callable[[int, str, str, str, dict[str, Any]], Awaitable[None]]
+ReadyWorkerCallback = Callable[[int, str, str, str], Awaitable[None]]
 
 
 class LocalWorkerRelay:
@@ -32,8 +68,8 @@ class LocalWorkerRelay:
         node_id: str,
         *,
         expected_workers: int = 1,
-        on_generation_prepared: WorkerPhaseCallback | None = None,
-        on_generation_ready: WorkerPhaseCallback | None = None,
+        on_generation_prepared: PreparedWorkerCallback | None = None,
+        on_generation_ready: ReadyWorkerCallback | None = None,
         max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
     ) -> None:
         if expected_workers < 1:
@@ -49,7 +85,7 @@ class LocalWorkerRelay:
         self._latest_membership: MessageEnvelope | None = None
         self._latest_rendezvous: MessageEnvelope | None = None
         self._latest_active: MessageEnvelope | None = None
-        self._prepared: dict[str, tuple[str, str, str]] = {}
+        self._prepared: dict[str, tuple[str, str, str, str]] = {}
         self._acknowledged: dict[str, tuple[str, str, str]] = {}
         self._prepared_notified_generation = -1
         self._ready_notified_generation = -1
@@ -59,7 +95,7 @@ class LocalWorkerRelay:
     def worker_ids(self) -> tuple[str, ...]:
         return tuple(sorted(self._workers))
 
-    def _phase_complete(self, generation: int, values: dict[str, tuple[str, str, str]]) -> bool:
+    def _phase_complete(self, generation: int, values: dict[str, tuple[str, ...]]) -> bool:
         latest = self._latest_membership
         return (
             latest is not None
@@ -77,9 +113,9 @@ class LocalWorkerRelay:
     def _phase_metadata(
         self,
         generation: int,
-        values: dict[str, tuple[str, str, str]],
+        values: dict[str, tuple[str, ...]],
         phase: str,
-    ) -> tuple[str, str, str]:
+    ) -> tuple[str, ...]:
         if not self._phase_complete(generation, values):
             raise RuntimeError(f"local generation is not {phase}")
         agreed = set(values.values())
@@ -87,7 +123,7 @@ class LocalWorkerRelay:
             raise ProtocolError(f"local workers disagree on {phase} generation plan compatibility")
         return next(iter(agreed))
 
-    def preparation_metadata(self, generation: int) -> tuple[str, str, str]:
+    def preparation_metadata(self, generation: int) -> tuple[str, str, str, str]:
         return self._phase_metadata(generation, self._prepared, "prepared")
 
     def readiness_metadata(self, generation: int) -> tuple[str, str, str]:
@@ -148,7 +184,7 @@ class LocalWorkerRelay:
                     str(message.payload["compatibility_digest"]),
                 )
                 phase_name = str(message.payload["phase"])
-                callback: WorkerPhaseCallback | None = None
+                callback: PreparedWorkerCallback | ReadyWorkerCallback | None = None
                 async with self._lock:
                     latest = self._latest_membership
                     if latest is None or message.generation != latest.generation:
@@ -156,8 +192,14 @@ class LocalWorkerRelay:
                     if metadata[0] != latest.payload["snapshot_hash"]:
                         raise ProtocolError("worker acknowledged a different membership snapshot")
                     if phase_name == "prepared":
+                        execution_plan = OobleckExecutionPlan.from_dict(
+                            message.payload["execution_plan"]
+                        )
+                        plan_json = json.dumps(
+                            execution_plan.to_dict(), sort_keys=True, separators=(",", ":")
+                        )
                         values = self._prepared
-                        values[worker_id] = metadata
+                        values[worker_id] = (*metadata, plan_json)
                         if (
                             self.generation_prepared(message.generation)
                             and self._prepared_notified_generation != message.generation
@@ -188,7 +230,16 @@ class LocalWorkerRelay:
                             self._ready_notified_generation = message.generation
                             callback = self.on_generation_ready
                 if callback is not None:
-                    await callback(message.generation, *agreed)
+                    if phase_name == "prepared":
+                        await callback(
+                            message.generation,
+                            agreed[0],
+                            agreed[1],
+                            agreed[2],
+                            json.loads(agreed[3]),
+                        )
+                    else:
+                        await callback(message.generation, *agreed)
         except (
             asyncio.IncompleteReadError,
             ConnectionError,
@@ -296,7 +347,6 @@ class LocalWorkerClient:
         self.connection = ControlConnection(reader, writer)
         await self.connection.send(
             MessageEnvelope(
-                1,
                 "worker_register",
                 self.worker_id,
                 self.incarnation_id,
@@ -341,12 +391,12 @@ class LocalWorkerClient:
         phase: str,
         snapshot: MembershipSnapshot,
         metadata: tuple[str, str, str],
+        execution_plan: Any | None = None,
     ) -> None:
         assert self.connection is not None
         self.sequence += 1
         await self.connection.send(
             MessageEnvelope(
-                1,
                 "worker_ack",
                 self.worker_id,
                 self.incarnation_id,
@@ -357,6 +407,7 @@ class LocalWorkerClient:
                     "snapshot_hash": metadata[0],
                     "plan_checksum": metadata[1],
                     "compatibility_digest": metadata[2],
+                    "execution_plan": (execution_plan.to_dict() if phase == "prepared" else None),
                 },
             )
         )
@@ -379,9 +430,19 @@ class LocalWorkerClient:
         }:
             raise ProtocolError(f"{expected_type} does not match prepared membership")
 
-    @staticmethod
-    def _reprepare(prepared: Any, snapshot: MembershipSnapshot) -> Any:
+    def _reprepare(self, prepared: Any, snapshot: MembershipSnapshot) -> Any:
         owner = prepared.owner_plan
+        previous = snapshot.previous_execution_plan
+        if previous is not None:
+            owner._last_execution_plan = previous
+        local_identity = next(
+            (node for node in snapshot.nodes if node.agent_id == self.node_id), None
+        )
+        added_worker = (
+            previous is not None
+            and local_identity is not None
+            and local_identity in snapshot.added_nodes
+        )
         tp = int(getattr(owner.parallel_config, "tensor_parallel_size"))
         if any(len(node.gpu_ids) != tp for node in snapshot.nodes):
             raise ValueError("membership does not match the fixed tensor-parallel width")
@@ -391,10 +452,16 @@ class LocalWorkerClient:
         return owner.prepare(
             prepared.device,
             prepared.dtype,
-            recover_from_survivors=prepared.recover_from_survivors,
+            recover_from_survivors=(prepared.recover_from_survivors or added_worker),
         )
 
-    async def activate_prepared(self, prepared: Any, snapshot: MembershipSnapshot) -> Any:
+    async def activate_prepared(
+        self,
+        prepared: Any,
+        snapshot: MembershipSnapshot,
+        *,
+        on_activated: Callable[[Any], Any] | None = None,
+    ) -> Any:
         """Activate initial ownership only after both CPU control-plane barriers."""
 
         if self.connection is None:
@@ -405,7 +472,7 @@ class LocalWorkerClient:
             if prepared.execution_plan.generation != snapshot.generation:
                 prepared = self._reprepare(prepared, snapshot)
             metadata = self._metadata(prepared.execution_plan, snapshot)
-            await self._acknowledge("prepared", snapshot, metadata)
+            await self._acknowledge("prepared", snapshot, metadata, prepared.execution_plan)
             while True:
                 message = await self.connection.receive()
                 if message.message_type == "membership":
@@ -414,6 +481,13 @@ class LocalWorkerClient:
                     break
                 self._validate_phase(message, "generation_rendezvous", snapshot, metadata)
                 context = prepared.activate()
+                if on_activated is not None:
+                    hook_result = on_activated(context)
+                    if inspect.isawaitable(hook_result):
+                        await hook_result
+                recover = getattr(context, "recover_from_survivors", None)
+                if getattr(context, "_needs_survivor_recovery", False) and callable(recover):
+                    await asyncio.to_thread(recover)
                 await self._acknowledge("ready", snapshot, metadata)
                 while True:
                     message = await self.connection.receive()
@@ -432,6 +506,64 @@ class LocalWorkerClient:
                         mark(message.generation)
                     return context
                 break
+
+    async def _prepare_context_responsively(
+        self,
+        context: Any,
+        snapshot: MembershipSnapshot,
+        on_snapshot: Callable[[MembershipSnapshot], Awaitable[None]] | None,
+    ) -> tuple[MembershipSnapshot, Any]:
+        """Prepare while continuing to consume superseding membership messages."""
+
+        assert self.connection is not None
+
+        async def apply(value: MembershipSnapshot) -> None:
+            context.apply_membership(value)
+            if on_snapshot is not None:
+                await on_snapshot(value)
+
+        async def prepare(generation: int) -> Any | None:
+            wait = getattr(context, "wait_until_generation_preparable", None)
+            if callable(wait) and not await asyncio.to_thread(wait, generation):
+                return None
+            prepare_generation = getattr(context, "prepare_generation", None)
+            if callable(prepare_generation):
+                await asyncio.to_thread(prepare_generation)
+            candidate = getattr(context, "prepared_execution_plan", None)
+            return candidate if candidate is not None else _control_only_plan(snapshot)
+
+        await apply(snapshot)
+        preparation = asyncio.create_task(prepare(snapshot.generation))
+        receive = asyncio.create_task(self.connection.receive())
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    {preparation, receive}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if receive in done:
+                    message = receive.result()
+                    if message.message_type != "membership":
+                        raise ProtocolError(
+                            f"local agent sent {message.message_type!r} before preparation"
+                        )
+                    snapshot = self._parse_membership(message)
+                    await apply(snapshot)
+                    receive = asyncio.create_task(self.connection.receive())
+                if preparation in done:
+                    prepared_plan = preparation.result()
+                    if (
+                        prepared_plan is not None
+                        and getattr(prepared_plan, "generation", -1) == snapshot.generation
+                    ):
+                        receive.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await receive
+                        return snapshot, prepared_plan
+                    preparation = asyncio.create_task(prepare(snapshot.generation))
+        finally:
+            for task in (preparation, receive):
+                if not task.done():
+                    task.cancel()
 
     async def run_context(
         self,
@@ -452,14 +584,11 @@ class LocalWorkerClient:
         while True:
             snapshot = pending or await self.receive()
             pending = None
-            context.apply_membership(snapshot)
-            if on_snapshot is not None:
-                await on_snapshot(snapshot)
-            prepared_plan = getattr(context, "prepared_execution_plan", None)
-            if prepared_plan is None:
-                prepared_plan = getattr(context, "execution_plan", snapshot)
+            snapshot, prepared_plan = await self._prepare_context_responsively(
+                context, snapshot, on_snapshot
+            )
             metadata = self._metadata(prepared_plan, snapshot)
-            await self._acknowledge("prepared", snapshot, metadata)
+            await self._acknowledge("prepared", snapshot, metadata, prepared_plan)
             while True:
                 message = await self.connection.receive()
                 if message.message_type == "membership":
@@ -468,7 +597,7 @@ class LocalWorkerClient:
                 self._validate_phase(message, "generation_rendezvous", snapshot, metadata)
                 activate = getattr(context, "activate_generation", None)
                 if callable(activate):
-                    activate()
+                    await asyncio.to_thread(activate)
                 await self._acknowledge("ready", snapshot, metadata)
                 while True:
                     message = await self.connection.receive()

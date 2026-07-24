@@ -147,11 +147,11 @@ def test_execution_plan_tracks_stable_node_when_join_reorders_global_ranks():
     assert plan._local_node_id == "node-b"
 
     plan.set_membership(("node-a", "node-b", "node-c"))
-    joined = plan.build_execution_plan()
-    assert joined.generation == 1
-    assert joined.previous_generation == 0
-    assert plan.rank_for_plan(joined) == 1
-    assert plan.last_reconfiguration.strategies == ("join",)
+    expanded = plan.build_execution_plan()
+    assert expanded.generation == 1
+    assert expanded.previous_generation == 0
+    assert plan.rank_for_plan(expanded) == 1
+    assert plan.last_reconfiguration.strategies == ("addition",)
 
     # Re-reading a generation is deterministic and keeps a valid predecessor.
     repeated = plan.build_execution_plan()

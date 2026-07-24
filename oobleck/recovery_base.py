@@ -26,6 +26,7 @@ class RecoverySnapshot:
     scheduler_state: Mapping[str, Any] | None
     scaler_state: Mapping[str, Any] | None
     committed_step: int
+    sampler_states: tuple[Mapping[str, Any], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +36,7 @@ class RecoveryMetadata:
     scheduler_state: Mapping[str, Any] | None
     scaler_state: Mapping[str, Any] | None
     committed_step: int
+    sampler_states: tuple[Mapping[str, Any], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +203,10 @@ def capture_context_state(context: Any) -> RecoverySnapshot:
         scheduler_state,
         scaler_state,
         context.committed_step,
+        tuple(
+            copy.deepcopy(loader.sampler.state_dict())
+            for loader in getattr(context, "_loaders", ())
+        ),
     )
 
 
@@ -248,6 +254,7 @@ def _gather_metadata(
             snapshot.scheduler_state,
             snapshot.scaler_state,
             snapshot.committed_step,
+            tuple(copy.deepcopy(state) for state in snapshot.sampler_states),
         )
     )
     if dist is None:

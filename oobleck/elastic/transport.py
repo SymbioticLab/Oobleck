@@ -9,10 +9,8 @@ from dataclasses import asdict, dataclass
 from typing import Awaitable, Callable, Mapping, Protocol
 
 
-PROTOCOL_VERSION = 1
 DEFAULT_MAX_FRAME_BYTES = 1 << 20
 _FIELDS = {
-    "protocol_version",
     "message_type",
     "agent_id",
     "incarnation_id",
@@ -23,17 +21,31 @@ _FIELDS = {
 _PAYLOAD_FIELDS = {
     "register": {"addresses", "gpu_ids"},
     "heartbeat": set(),
-    "generation_prepared": {"snapshot_hash", "plan_checksum", "compatibility_digest"},
+    "generation_prepared": {
+        "snapshot_hash",
+        "plan_checksum",
+        "compatibility_digest",
+        "execution_plan",
+    },
     "generation_ready": {"snapshot_hash", "plan_checksum", "compatibility_digest"},
     "drain": set(),
-    "membership": {"nodes", "reasons", "snapshot_hash"},
+    "membership": {
+        "nodes",
+        "removed_nodes",
+        "added_nodes",
+        "detection_seconds",
+        "snapshot_hash",
+        "previous_execution_plan",
+    },
     "generation_rendezvous": {"snapshot_hash", "plan_checksum", "compatibility_digest"},
     "generation_active": {"snapshot_hash", "plan_checksum", "compatibility_digest"},
     "inspect": set(),
     "inspect_status": set(),
     "status": {
         "nodes",
-        "reasons",
+        "removed_nodes",
+        "added_nodes",
+        "detection_seconds",
         "snapshot_hash",
         "active_generation",
         "prepared_agents",
@@ -43,7 +55,13 @@ _PAYLOAD_FIELDS = {
     "drain_command": {"node_id"},
     "drain_accepted": {"node_id"},
     "worker_register": {"node_id"},
-    "worker_ack": {"phase", "snapshot_hash", "plan_checksum", "compatibility_digest"},
+    "worker_ack": {
+        "phase",
+        "snapshot_hash",
+        "plan_checksum",
+        "compatibility_digest",
+        "execution_plan",
+    },
 }
 
 
@@ -71,10 +89,22 @@ def _validate_payload(message_type: str, payload: Mapping[str, object]) -> None:
             ):
                 raise ProtocolError(f"register {field} must be a non-empty list of strings")
     elif message_type in {"membership", "status"}:
-        if type(payload["nodes"]) is not list or type(payload["reasons"]) is not list:
-            raise ProtocolError(f"{message_type} nodes and reasons must be lists")
+        for field in ("nodes", "removed_nodes", "added_nodes"):
+            if type(payload[field]) is not list:
+                raise ProtocolError(f"{message_type} {field} must be a list")
+        detection_seconds = payload["detection_seconds"]
+        if (
+            not isinstance(detection_seconds, (int, float))
+            or isinstance(detection_seconds, bool)
+            or detection_seconds < 0
+        ):
+            raise ProtocolError(f"{message_type} detection_seconds must be non-negative")
         if type(payload["snapshot_hash"]) is not str:
             raise ProtocolError(f"{message_type} snapshot_hash must be a string")
+        if message_type == "membership":
+            plan = payload["previous_execution_plan"]
+            if plan is not None and not isinstance(plan, dict):
+                raise ProtocolError("membership previous_execution_plan must be an object or null")
         if message_type == "status":
             if type(payload["active_generation"]) is not int or payload["active_generation"] < 0:
                 raise ProtocolError("status active_generation must be non-negative")
@@ -93,6 +123,10 @@ def _validate_payload(message_type: str, payload: Mapping[str, object]) -> None:
                 raise ProtocolError(f"{message_type} {field} must be a non-empty string")
         if type(payload["compatibility_digest"]) is not str:
             raise ProtocolError(f"{message_type} compatibility_digest must be a string")
+        if message_type == "generation_prepared":
+            plan = payload["execution_plan"]
+            if not isinstance(plan, dict) or plan.get("plan_checksum") != payload["plan_checksum"]:
+                raise ProtocolError("generation_prepared execution_plan is invalid")
     elif message_type in {
         "request_drain",
         "drain_command",
@@ -109,11 +143,16 @@ def _validate_payload(message_type: str, payload: Mapping[str, object]) -> None:
                 raise ProtocolError(f"worker_ack {field} must be a non-empty string")
         if type(payload["compatibility_digest"]) is not str:
             raise ProtocolError("worker_ack compatibility_digest must be a string")
+        plan = payload["execution_plan"]
+        if payload["phase"] == "prepared":
+            if not isinstance(plan, dict) or plan.get("plan_checksum") != payload["plan_checksum"]:
+                raise ProtocolError("prepared worker_ack execution_plan is invalid")
+        elif plan is not None:
+            raise ProtocolError("ready worker_ack execution_plan must be null")
 
 
 @dataclass(frozen=True, slots=True)
 class MessageEnvelope:
-    protocol_version: int
     message_type: str
     agent_id: str
     incarnation_id: str
@@ -122,10 +161,6 @@ class MessageEnvelope:
     payload: Mapping[str, object]
 
     def __post_init__(self) -> None:
-        if self.protocol_version != PROTOCOL_VERSION:
-            raise ProtocolError(
-                f"unsupported protocol version {self.protocol_version}; expected {PROTOCOL_VERSION}"
-            )
         if not self.message_type or not self.agent_id or not self.incarnation_id:
             raise ProtocolError("message_type, agent_id, and incarnation_id are required")
         if self.sequence_number < 0 or self.generation < 0:
@@ -143,7 +178,6 @@ class MessageEnvelope:
             extra = sorted(set(value) - _FIELDS)
             raise ProtocolError(f"invalid envelope fields; missing={missing}, extra={extra}")
         expected_types = {
-            "protocol_version": int,
             "message_type": str,
             "agent_id": str,
             "incarnation_id": str,

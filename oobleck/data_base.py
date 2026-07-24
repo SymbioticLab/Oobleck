@@ -92,6 +92,28 @@ class OobleckBatchSampler(BatchSampler):
     def committed_cursor(self) -> int:
         return self._committed_cursor
 
+    def state_dict(self) -> dict[str, int]:
+        return {
+            "schema_version": 1,
+            "epoch": self.epoch,
+            "committed_cursor": self._committed_cursor,
+        }
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        if set(state) != {"schema_version", "epoch", "committed_cursor"}:
+            raise ValueError("batch sampler state fields are invalid")
+        if state["schema_version"] != 1:
+            raise ValueError("unsupported batch sampler state schema")
+        epoch = state["epoch"]
+        cursor = state["committed_cursor"]
+        if type(epoch) is not int or epoch < 0:
+            raise ValueError("batch sampler epoch must be non-negative")
+        if type(cursor) is not int or not 0 <= cursor <= len(self):
+            raise ValueError("batch sampler committed_cursor is out of range")
+        self.epoch = epoch
+        self._committed_cursor = cursor
+        self._issued.clear()
+
     def set_epoch(self, epoch: int) -> None:
         if epoch < 0:
             raise ValueError("epoch must be non-negative")

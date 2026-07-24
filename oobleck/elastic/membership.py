@@ -8,6 +8,8 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Callable, Mapping
 
+from oobleck.types import OobleckExecutionPlan
+
 
 class StaleGeneration(RuntimeError):
     pass
@@ -46,14 +48,36 @@ class _LiveNode:
 class MembershipSnapshot:
     generation: int
     nodes: tuple[NodeIdentity, ...]
-    reasons: tuple[str, ...]
+    removed_nodes: tuple[NodeIdentity, ...]
+    added_nodes: tuple[NodeIdentity, ...]
     snapshot_hash: str = field(default="", compare=False)
+    previous_execution_plan: OobleckExecutionPlan | None = None
+    detection_seconds: float = 0.0
 
     def __post_init__(self) -> None:
+        if self.detection_seconds < 0:
+            raise ValueError("detection_seconds must be non-negative")
+        for field_name, members in (
+            ("nodes", self.nodes),
+            ("removed_nodes", self.removed_nodes),
+            ("added_nodes", self.added_nodes),
+        ):
+            keys = [(item.agent_id, item.incarnation_id) for item in members]
+            if len(keys) != len(set(keys)):
+                raise ValueError(f"{field_name} contains duplicate membership identities")
+        if len({item.agent_id for item in self.nodes}) != len(self.nodes):
+            raise ValueError("target membership node IDs must be unique")
         payload = {
             "generation": self.generation,
             "nodes": [asdict(item) for item in self.nodes],
-            "reasons": self.reasons,
+            "removed_nodes": [asdict(item) for item in self.removed_nodes],
+            "added_nodes": [asdict(item) for item in self.added_nodes],
+            "detection_seconds": self.detection_seconds,
+            "previous_execution_plan": (
+                self.previous_execution_plan.to_dict()
+                if self.previous_execution_plan is not None
+                else None
+            ),
         }
         expected = hashlib.sha256(
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
@@ -63,28 +87,18 @@ class MembershipSnapshot:
         object.__setattr__(self, "snapshot_hash", expected)
 
 
-def membership_snapshot_from_payload(
-    generation: int, payload: Mapping[str, object]
-) -> MembershipSnapshot:
-    """Strictly reconstruct a checksummed snapshot from a control payload."""
-
-    if set(payload) != {"nodes", "reasons", "snapshot_hash"}:
-        raise ValueError("membership payload fields are invalid")
-    nodes_value = payload["nodes"]
-    reasons_value = payload["reasons"]
-    if not isinstance(nodes_value, list) or not isinstance(reasons_value, list):
-        raise ValueError("membership nodes and reasons must be lists")
-    if type(payload["snapshot_hash"]) is not str:
-        raise ValueError("membership snapshot_hash must be a string")
+def _parse_nodes(field: str, value: object) -> tuple[NodeIdentity, ...]:
+    if not isinstance(value, list):
+        raise ValueError(f"membership {field} must be a list")
     nodes = []
-    for item in nodes_value:
+    for item in value:
         if not isinstance(item, dict) or set(item) != {
             "agent_id",
             "incarnation_id",
             "addresses",
             "gpu_ids",
         }:
-            raise ValueError("membership node fields are invalid")
+            raise ValueError(f"membership {field} node fields are invalid")
         addresses = item["addresses"]
         gpu_ids = item["gpu_ids"]
         if (
@@ -94,9 +108,9 @@ def membership_snapshot_from_payload(
             or not isinstance(gpu_ids, (list, tuple))
             or not addresses
             or not gpu_ids
-            or not all(type(value) is str for value in (*addresses, *gpu_ids))
+            or not all(type(member) is str for member in (*addresses, *gpu_ids))
         ):
-            raise ValueError("membership addresses and gpu_ids must be sequences")
+            raise ValueError(f"membership {field} identity is invalid")
         nodes.append(
             NodeIdentity(
                 item["agent_id"],
@@ -105,18 +119,60 @@ def membership_snapshot_from_payload(
                 tuple(gpu_ids),
             )
         )
-    if not all(isinstance(reason, str) for reason in reasons_value):
-        raise ValueError("membership reasons must be strings")
+    return tuple(nodes)
+
+
+def membership_snapshot_from_payload(
+    generation: int, payload: Mapping[str, object]
+) -> MembershipSnapshot:
+    """Strictly reconstruct a checksummed snapshot from a control payload."""
+
+    if set(payload) != {
+        "nodes",
+        "removed_nodes",
+        "added_nodes",
+        "detection_seconds",
+        "previous_execution_plan",
+        "snapshot_hash",
+    }:
+        raise ValueError("membership payload fields are invalid")
+    if type(payload["snapshot_hash"]) is not str:
+        raise ValueError("membership snapshot_hash must be a string")
+    detection_seconds = payload["detection_seconds"]
+    if (
+        not isinstance(detection_seconds, (int, float))
+        or isinstance(detection_seconds, bool)
+        or detection_seconds < 0
+    ):
+        raise ValueError("membership detection_seconds must be non-negative")
+    previous_value = payload["previous_execution_plan"]
+    if previous_value is not None and not isinstance(previous_value, Mapping):
+        raise ValueError("previous_execution_plan must be an object or null")
+    previous_plan = (
+        OobleckExecutionPlan.from_dict(previous_value) if previous_value is not None else None
+    )
     return MembershipSnapshot(
         generation,
-        tuple(nodes),
-        tuple(reasons_value),
+        _parse_nodes("nodes", payload["nodes"]),
+        _parse_nodes("removed_nodes", payload["removed_nodes"]),
+        _parse_nodes("added_nodes", payload["added_nodes"]),
         payload["snapshot_hash"],
+        previous_plan,
+        float(detection_seconds),
     )
 
 
+def is_pure_addition(
+    snapshot: MembershipSnapshot,
+    active_plan: OobleckExecutionPlan | None,
+) -> bool:
+    """Return whether a proposal contains additions and no removals."""
+
+    return active_plan is not None and not snapshot.removed_nodes and bool(snapshot.added_nodes)
+
+
 class MembershipStateMachine:
-    """Serializes disconnect, lease, join, replacement, and drain events."""
+    """Serializes incarnation-qualified membership removals and additions."""
 
     def __init__(
         self,
@@ -137,16 +193,18 @@ class MembershipStateMachine:
         self.gpu_ids_per_node = gpu_ids_per_node
         self.clock = clock
         self.generation = 0
-        self._nodes: dict[str, _LiveNode] = {}
-        self._pending_reasons: set[str] = set()
+        self._nodes: dict[tuple[str, str], _LiveNode] = {}
+        self._pending_removed: dict[tuple[str, str], NodeIdentity] = {}
+        self._pending_added: dict[tuple[str, str], NodeIdentity] = {}
+        self._pending_detection_seconds = 0.0
 
     @property
     def agent_ids(self) -> tuple[str, ...]:
-        return tuple(sorted(self._nodes))
+        return tuple(sorted(node.identity.agent_id for node in self._nodes.values()))
 
     @property
     def has_pending_generation(self) -> bool:
-        return bool(self._pending_reasons)
+        return bool(self._pending_removed or self._pending_added)
 
     def _check_generation(self, generation: int) -> None:
         if generation != self.generation:
@@ -157,7 +215,10 @@ class MembershipStateMachine:
     def register(self, identity: NodeIdentity, sequence_number: int) -> None:
         if sequence_number < 0:
             raise ValueError("sequence_number must be non-negative")
-        existing = self._nodes.get(identity.agent_id)
+        existing = next(
+            (node for node in self._nodes.values() if node.identity.agent_id == identity.agent_id),
+            None,
+        )
         if existing is None and self.max_nodes is not None and len(self._nodes) >= self.max_nodes:
             raise ValueError(f"membership exceeds configured max_nodes={self.max_nodes}")
         expected_gpu_ids = self.gpu_ids_per_node
@@ -174,10 +235,14 @@ class MembershipStateMachine:
             existing.last_sequence = sequence_number
             existing.lease_deadline = self.clock() + self.lease_timeout_s
             return
-        self._nodes[identity.agent_id] = _LiveNode(
+        if existing is not None:
+            old = existing.identity
+            self._pending_removed[(old.agent_id, old.incarnation_id)] = old
+            del self._nodes[(old.agent_id, old.incarnation_id)]
+        self._nodes[(identity.agent_id, identity.incarnation_id)] = _LiveNode(
             identity, sequence_number, self.clock() + self.lease_timeout_s
         )
-        self._pending_reasons.add(f"{'replacement' if existing else 'join'}:{identity.agent_id}")
+        self._pending_added[(identity.agent_id, identity.incarnation_id)] = identity
 
     def acknowledge(
         self,
@@ -210,17 +275,18 @@ class MembershipStateMachine:
         node.lease_deadline = self.clock() + self.lease_timeout_s
 
     def _require_incarnation(self, agent_id: str, incarnation_id: str) -> _LiveNode:
-        node = self._nodes.get(agent_id)
-        if node is None or node.identity.incarnation_id != incarnation_id:
+        node = self._nodes.get((agent_id, incarnation_id))
+        if node is None:
             raise IncarnationMismatch(f"connection does not own active incarnation for {agent_id}")
         return node
 
     def disconnect(self, agent_id: str, incarnation_id: str) -> bool:
-        node = self._nodes.get(agent_id)
-        if node is None or node.identity.incarnation_id != incarnation_id:
+        node = self._nodes.get((agent_id, incarnation_id))
+        if node is None:
             return False
-        del self._nodes[agent_id]
-        self._pending_reasons.add(f"disconnect:{agent_id}")
+        identity = node.identity
+        del self._nodes[(agent_id, incarnation_id)]
+        self._pending_removed[(identity.agent_id, identity.incarnation_id)] = identity
         return True
 
     def drain(
@@ -234,36 +300,72 @@ class MembershipStateMachine:
         node = self._require_incarnation(agent_id, incarnation_id)
         if sequence_number <= node.last_sequence:
             raise StaleSequence("duplicate or out-of-order drain")
-        del self._nodes[agent_id]
-        self._pending_reasons.add(f"drain:{agent_id}")
+        identity = node.identity
+        del self._nodes[(agent_id, incarnation_id)]
+        self._pending_removed[(identity.agent_id, identity.incarnation_id)] = identity
 
     def expire_leases(self, now: float | None = None) -> tuple[str, ...]:
         current = self.clock() if now is None else now
         expired = tuple(
             sorted(
-                agent_id for agent_id, node in self._nodes.items() if node.lease_deadline <= current
+                node.identity.agent_id
+                for node in self._nodes.values()
+                if node.lease_deadline <= current
             )
         )
         for agent_id in expired:
-            del self._nodes[agent_id]
-            self._pending_reasons.add(f"lease-expired:{agent_id}")
+            key, node = next(
+                item for item in self._nodes.items() if item[0][0] == agent_id
+            )
+            identity = node.identity
+            del self._nodes[key]
+            self._pending_removed[(identity.agent_id, identity.incarnation_id)] = identity
+        if expired:
+            self._pending_detection_seconds = max(
+                self._pending_detection_seconds, self.lease_timeout_s
+            )
         return expired
 
     def publish(self) -> MembershipSnapshot | None:
-        if not self._pending_reasons:
+        if not self.has_pending_generation:
             return None
         self.generation += 1
         snapshot = MembershipSnapshot(
             self.generation,
-            tuple(self._nodes[agent_id].identity for agent_id in sorted(self._nodes)),
-            tuple(sorted(self._pending_reasons)),
+            tuple(
+                sorted(
+                    (node.identity for node in self._nodes.values()),
+                    key=lambda item: (item.agent_id, item.incarnation_id),
+                )
+            ),
+            tuple(
+                sorted(
+                    self._pending_removed.values(),
+                    key=lambda item: (item.agent_id, item.incarnation_id),
+                )
+            ),
+            tuple(
+                sorted(
+                    self._pending_added.values(),
+                    key=lambda item: (item.agent_id, item.incarnation_id),
+                )
+            ),
+            detection_seconds=self._pending_detection_seconds,
         )
-        self._pending_reasons.clear()
+        self._pending_removed.clear()
+        self._pending_added.clear()
+        self._pending_detection_seconds = 0.0
         return snapshot
 
     def snapshot(self) -> MembershipSnapshot:
         return MembershipSnapshot(
             self.generation,
-            tuple(self._nodes[agent_id].identity for agent_id in sorted(self._nodes)),
+            tuple(
+                sorted(
+                    (node.identity for node in self._nodes.values()),
+                    key=lambda item: (item.agent_id, item.incarnation_id),
+                )
+            ),
+            (),
             (),
         )

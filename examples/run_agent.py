@@ -11,9 +11,11 @@ from oobleck.elastic import MessageEnvelope, run_agent_service
 async def run(config: AgentConfig) -> None:
     async def membership(message: MessageEnvelope) -> None:
         nodes = [item["agent_id"] for item in message.payload["nodes"]]
+        removed = [item["agent_id"] for item in message.payload["removed_nodes"]]
+        added = [item["agent_id"] for item in message.payload["added_nodes"]]
         print(
             f"node {config.node_id}: generation={message.generation} "
-            f"members={nodes} reasons={message.payload['reasons']}",
+            f"members={nodes} removed={removed} added={added}",
             flush=True,
         )
 

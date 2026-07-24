@@ -70,7 +70,7 @@ def reconfigure_pipelines(
         known_survivors = survivors.intersection(known)
         return ReconfigurationResult(
             instances,
-            ("join",),
+            ("addition",),
             retained,
             len(known_survivors) - retained,
             retained_state,

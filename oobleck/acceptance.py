@@ -102,6 +102,16 @@ def runtime_metric(
             "activation_seconds": transition.activation_seconds,
             "total_seconds": transition.total_seconds,
             "source_scheduling_error_bytes": transition.source_scheduling_error_bytes,
+            "removed_members": [
+                {"agent_id": agent_id, "incarnation_id": incarnation_id}
+                for agent_id, incarnation_id in transition.removed_members
+            ],
+            "added_members": [
+                {"agent_id": agent_id, "incarnation_id": incarnation_id}
+                for agent_id, incarnation_id in transition.added_members
+            ],
+            "graceful_cutover": transition.graceful_cutover,
+            "cutover_committed_step": transition.cutover_committed_step,
         }
     return metric
 
@@ -171,6 +181,7 @@ def verify_churn_metrics(
 
     observed_strategies: set[str] = set()
     replay_count = 0
+    graceful_transition_count = 0
     maximum_growth = 0
     maximum_group_growth = 0
     worker_summaries: dict[str, object] = {}
@@ -187,6 +198,46 @@ def verify_churn_metrics(
         if any(right != left + 1 for left, right in zip(committed, committed[1:])):
             raise AssertionError(f"worker {worker_id} committed steps skipped or duplicated")
         replay_count += sum(_metric_int(item, "attempts") > 1 for item in steps)
+        graceful: dict[int, int] = {}
+        for item in ordered:
+            recovery = item.get("recovery")
+            if not isinstance(recovery, Mapping) or not recovery.get("graceful_cutover"):
+                continue
+            removed_members = recovery.get("removed_members")
+            added_members = recovery.get("added_members")
+            if removed_members != [] or not isinstance(added_members, list) or not added_members:
+                raise AssertionError("graceful cutover must contain additions and no removals")
+            for field, members in (
+                ("removed_members", removed_members),
+                ("added_members", added_members),
+            ):
+                if not isinstance(members, list) or not all(
+                    isinstance(member, Mapping)
+                    and set(member) == {"agent_id", "incarnation_id"}
+                    and all(isinstance(value, str) and value for value in member.values())
+                    for member in members
+                ):
+                    raise ValueError(f"recovery {field} identities are invalid")
+            cutover = recovery.get("cutover_committed_step")
+            if not isinstance(cutover, int) or isinstance(cutover, bool) or cutover < 0:
+                raise ValueError("graceful cutover committed step must be non-negative")
+            graceful[_metric_int(item, "generation")] = cutover
+        for generation, cutover in graceful.items():
+            resumed = [
+                item
+                for item in steps
+                if _metric_int(item, "generation") == generation
+                and _metric_int(item, "committed_step") > cutover
+            ]
+            if not resumed:
+                raise AssertionError("graceful addition did not resume after the cutover step")
+            first_resumed = resumed[0]
+            if (
+                _metric_int(first_resumed, "committed_step") != cutover + 1
+                or _metric_int(first_resumed, "attempts") != 1
+            ):
+                raise AssertionError("graceful addition replayed or skipped the next logical batch")
+        graceful_transition_count += len(graceful)
         for item in ordered:
             strategies = item["strategies"]
             if not isinstance(strategies, list) or not all(
@@ -241,6 +292,7 @@ def verify_churn_metrics(
         "workers": worker_summaries,
         "observed_strategies": sorted(observed_strategies),
         "replayed_steps": replay_count,
+        "graceful_transitions": graceful_transition_count,
         "maximum_cuda_reserved_growth_bytes": maximum_growth,
         "maximum_process_group_growth": maximum_group_growth,
     }

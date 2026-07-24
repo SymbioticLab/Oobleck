@@ -21,8 +21,9 @@ def metric(
     reserved: int = 100,
     groups: int = 1,
     initialized: bool = True,
+    recovery=None,
 ):
-    return {
+    value = {
         "schema_version": 1,
         "event": event,
         "timestamp_ns": timestamp,
@@ -38,6 +39,9 @@ def metric(
         "process_group_count": groups,
         "distributed_initialized": initialized,
     }
+    if recovery is not None:
+        value["recovery"] = recovery
+    return value
 
 
 def test_churn_verifier_proves_replay_strategies_memory_and_clean_close(tmp_path):
@@ -94,6 +98,28 @@ def test_churn_verifier_rejects_commit_gaps_memory_growth_and_group_leaks():
         )
 
 
+def test_churn_verifier_validates_graceful_addition_resume_without_replay():
+    recovery = {
+        "removed_members": [],
+        "added_members": [{"agent_id": "node-b", "incarnation_id": "b1"}],
+        "graceful_cutover": True,
+        "cutover_committed_step": 1,
+    }
+    result = verify_churn_metrics(
+        [metric(1, step=1), metric(2, generation=2, step=2, recovery=recovery)],
+        require_replay=False,
+    )
+    assert result["graceful_transitions"] == 1
+    with pytest.raises(AssertionError, match="replayed or skipped"):
+        verify_churn_metrics(
+            [
+                metric(1, step=1),
+                metric(2, generation=2, step=2, attempts=2, recovery=recovery),
+            ],
+            require_replay=False,
+        )
+
+
 def test_churn_verifier_handles_twenty_five_generation_campaign():
     records = [
         metric(
@@ -121,6 +147,7 @@ def test_chaos_runner_injects_cascade_before_activation_and_verifies_metrics(tmp
             tuple(
                 NodeIdentity(node, f"{node}-{generation}", ("127.0.0.1",), ("0",)) for node in nodes
             ),
+            (),
             (),
         )
         agents = nodes if active else ()
