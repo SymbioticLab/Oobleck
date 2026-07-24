@@ -1,316 +1,364 @@
-use crate::execution_result::*;
+use crate::execution_result::{
+    LayerExecutionResult, PipelineExecutionResult, StageExecutionResult,
+};
 use crate::PlannerError;
-use dashmap::DashMap;
-use log;
-use rayon::prelude::*;
 use std::cmp::Ordering;
-use std::result::Result;
-use std::sync::Arc;
+
+#[derive(Clone, Debug)]
+struct PartitionState {
+    bottleneck_latency: f64,
+    stage_starts: Vec<usize>,
+}
+
+impl PartitionState {
+    fn compare(&self, other: &Self) -> Ordering {
+        self.bottleneck_latency
+            .total_cmp(&other.bottleneck_latency)
+            .then_with(|| self.stage_starts.cmp(&other.stage_starts))
+    }
+}
 
 pub struct PipelineTemplateGenerator {
-    pub layer_execution_results: Vec<LayerExecutionResult>,
-    // Key: (layer_start_index, layer_end_index)
-    stage_execution_results: DashMap<(usize, usize), Arc<StageExecutionResult>>,
-    // Key: (num_stages, layer_start_index, layer_end_index)
-    execution_result_cache: DashMap<(u32, usize, usize), Result<PipelineExecutionResult, String>>,
+    layer_execution_results: Vec<LayerExecutionResult>,
+    stage_execution_results: Vec<Vec<Option<StageExecutionResult>>>,
+    pipeline_execution_results: Vec<Option<PipelineExecutionResult>>,
 }
 
 impl PipelineTemplateGenerator {
-    pub fn new(profile_data: Vec<LayerExecutionResult>) -> Self {
-        PipelineTemplateGenerator {
-            layer_execution_results: profile_data,
-            stage_execution_results: DashMap::new(),
-            execution_result_cache: DashMap::new(),
+    pub fn new(profile_data: Vec<LayerExecutionResult>) -> Result<Self, PlannerError> {
+        if profile_data.is_empty() {
+            return Err(PlannerError::invalid_input(
+                "profile_data must contain at least one layer",
+            ));
         }
+        for (index, layer) in profile_data.iter().enumerate() {
+            layer.validate(index)?;
+        }
+
+        let stage_execution_results = Self::build_stage_results(&profile_data)?;
+        Ok(Self {
+            layer_execution_results: profile_data,
+            stage_execution_results,
+            pipeline_execution_results: Vec::new(),
+        })
     }
 
-    pub fn divide_and_conquer(&mut self, max_num_nodes: u32) -> Result<(), PlannerError> {
-        if !self.stage_execution_results.is_empty() {
-            return Ok(());
+    fn checked_prefix(
+        profile_data: &[LayerExecutionResult],
+        value: impl Fn(&LayerExecutionResult) -> u64,
+        name: &str,
+    ) -> Result<Vec<u64>, PlannerError> {
+        let mut prefix = Vec::with_capacity(profile_data.len() + 1);
+        prefix.push(0_u64);
+        for layer in profile_data {
+            let next = prefix
+                .last()
+                .expect("prefix contains its zero element")
+                .checked_add(value(layer))
+                .ok_or_else(|| {
+                    PlannerError::invalid_input(format!(
+                        "{name} overflows u64 while aggregating profile_data"
+                    ))
+                })?;
+            prefix.push(next);
+        }
+        Ok(prefix)
+    }
+
+    fn build_stage_results(
+        profile_data: &[LayerExecutionResult],
+    ) -> Result<Vec<Vec<Option<StageExecutionResult>>>, PlannerError> {
+        let num_layers = profile_data.len();
+        let mut forward_prefix = Vec::with_capacity(num_layers + 1);
+        let mut backward_prefix = Vec::with_capacity(num_layers + 1);
+        forward_prefix.push(0.0);
+        backward_prefix.push(0.0);
+        for layer in profile_data {
+            forward_prefix.push(
+                forward_prefix
+                    .last()
+                    .expect("prefix contains its zero element")
+                    + layer.forward,
+            );
+            backward_prefix.push(
+                backward_prefix
+                    .last()
+                    .expect("prefix contains its zero element")
+                    + layer.backward,
+            );
+        }
+        let activation_prefix = Self::checked_prefix(
+            profile_data,
+            |layer| layer.activation_memory,
+            "activation_memory",
+        )?;
+        let persistent_prefix = Self::checked_prefix(
+            profile_data,
+            |layer| layer.persistent_memory,
+            "persistent_memory",
+        )?;
+
+        if !(forward_prefix[num_layers] + backward_prefix[num_layers]).is_finite() {
+            return Err(PlannerError::invalid_input(
+                "aggregate profile timing overflows f64",
+            ));
         }
 
+        let mut results = vec![vec![None; num_layers + 1]; num_layers];
+        for start in 0..num_layers {
+            for end in (start + 1)..=num_layers {
+                results[start][end] = Some(StageExecutionResult {
+                    layers: (start as u32, end as u32),
+                    forward: forward_prefix[end] - forward_prefix[start],
+                    backward: backward_prefix[end] - backward_prefix[start],
+                    activation_memory: activation_prefix[end] - activation_prefix[start],
+                    persistent_memory: persistent_prefix[end] - persistent_prefix[start],
+                });
+            }
+        }
+        Ok(results)
+    }
+
+    fn stage(&self, start: usize, end: usize) -> &StageExecutionResult {
+        self.stage_execution_results[start][end]
+            .as_ref()
+            .expect("only non-empty contiguous stages are requested")
+    }
+
+    pub fn plan(
+        &mut self,
+        max_resource_count: u32,
+        device_memory_bytes: Option<u64>,
+    ) -> Result<(), PlannerError> {
         let num_layers = self.layer_execution_results.len();
-
-        if max_num_nodes as usize > num_layers {
-            return Err(PlannerError::new("Invalid number of nodes"));
+        let max_stages = max_resource_count as usize;
+        if max_stages == 0 {
+            return Err(PlannerError::invalid_input(
+                "resource counts must be positive",
+            ));
+        }
+        if max_stages > num_layers {
+            return Err(PlannerError::invalid_input(format!(
+                "resource count {max_stages} exceeds the number of profiled layers {num_layers}"
+            )));
         }
 
-        // Put all base cases in the cache
-        (0..num_layers).into_par_iter().for_each(|i| {
-            ((i + 1)..=num_layers).into_par_iter().for_each(|j| {
-                let stage_execution_result = Arc::new(StageExecutionResult::new(
-                    &self.layer_execution_results[i..j],
-                ));
-                log::debug!(
-                    "StageExecutionResult({}, {})  -> {}",
-                    stage_execution_result.layers.0,
-                    stage_execution_result.layers.1,
-                    stage_execution_result.latency()
-                );
-                self.stage_execution_results
-                    .insert((i, j), stage_execution_result.clone());
-
-                let pipeline_execution_result =
-                    PipelineExecutionResult::make_base_result(stage_execution_result);
-                log::debug!(
-                    "PipelineExecutionResult({}, {}, {}) -> {}",
-                    1,
-                    i,
-                    j,
-                    pipeline_execution_result.latency()
-                );
-                self.execution_result_cache
-                    .insert((1, i, j), Ok(pipeline_execution_result));
-            });
+        let mut states = vec![vec![None::<PartitionState>; num_layers + 1]; max_stages + 1];
+        states[0][0] = Some(PartitionState {
+            bottleneck_latency: 0.0,
+            stage_starts: Vec::new(),
         });
 
-        log::debug!("Base cases inserted into the cache");
-
-        // Compute the rest of the results, gradually increasing the number of stages
-        // Number of stages can increase from 2 up to the number of nodes
-        // (currently more than two stages cannot be assigned to a node)
-        // Each number of stages all computations should be done before moving on to the next number of stages
-        for num_stages in 2..=max_num_nodes as u32 {
-            (0..num_layers).into_par_iter().for_each(|i| {
-                ((i + 1)..=num_layers).into_par_iter().for_each(|j| {
-                    let key = (num_stages, i, j);
-
-                    // If number of layers is less than number of stages, skip it
-                    // Cannot create specified number of stages with the given number of layers
-                    if j - i < num_stages as usize {
-                        self.execution_result_cache
-                            .insert(key, Err("Infeasible case".to_string()));
-                        return;
+        for num_stages in 1..=max_stages {
+            for end in num_stages..=num_layers {
+                let mut best: Option<PartitionState> = None;
+                for start in (num_stages - 1)..end {
+                    let Some(previous) = states[num_stages - 1][start].as_ref() else {
+                        continue;
+                    };
+                    let stage = self.stage(start, end);
+                    if !stage.fits_one_microbatch(device_memory_bytes) {
+                        continue;
                     }
+                    let mut stage_starts = previous.stage_starts.clone();
+                    stage_starts.push(start);
+                    let candidate = PartitionState {
+                        bottleneck_latency: previous.bottleneck_latency.max(stage.latency()),
+                        stage_starts,
+                    };
+                    if best
+                        .as_ref()
+                        .map_or(true, |current| candidate.compare(current) == Ordering::Less)
+                    {
+                        best = Some(candidate);
+                    }
+                }
+                states[num_stages][end] = best;
+            }
+        }
 
-                    // Spawn a task to compute the result for this subproblem.
-                    let best_result = (i..j)
-                        .into_par_iter()
-                        .map(|num_layers_left| {
-                            let mut result: Result<PipelineExecutionResult, String> =
-                                Err("Error in subproblem".to_string());
-
-                            for num_stages_left in 1..num_stages {
-                                let num_stages_right = num_stages - num_stages_left;
-
-                                if num_layers_left - i == 0 || j - num_layers_left == 0 {
-                                    continue;
-                                }
-
-                                // As we gradually increase the number of stages from 1,
-                                // we must have already computed the results for the subproblems
-                                let left = self
-                                    .execution_result_cache
-                                    .get(&(num_stages_left, i, num_layers_left))
-                                    .unwrap();
-                                let right = self
-                                    .execution_result_cache
-                                    .get(&(num_stages_right, num_layers_left, j))
-                                    .unwrap();
-
-                                if left.is_err() || right.is_err() {
-                                    continue;
-                                }
-
-                                // Merge two subproblems into a bigger PipelineExecutionResult
-                                let local_result = PipelineExecutionResult::new(
-                                    left.as_ref().unwrap(),
-                                    right.as_ref().unwrap(),
-                                );
-                                if result.is_err()
-                                    || local_result.cmp(result.as_ref().unwrap()) == Ordering::Less
-                                {
-                                    result = Ok(local_result);
-                                }
-                            }
-
-                            result
-                        })
-                        .reduce(
-                            || Err("Error in subproblem".to_string()),
-                            |acc, result| {
-                                if result.is_err() {
-                                    return acc;
-                                } else if acc.is_err() {
-                                    return result;
-                                } else if result.as_ref().unwrap() < acc.as_ref().unwrap() {
-                                    return result;
-                                } else {
-                                    return acc;
-                                }
-                            },
-                        );
-
-                    log::debug!(
-                        "PipelineExecutionResult({}, {}, {}) -> {}",
-                        num_stages,
-                        i,
-                        j,
-                        if best_result.is_ok() {
-                            best_result.as_ref().unwrap().latency()
-                        } else {
-                            0.0
-                        }
-                    );
-                    self.execution_result_cache.insert(key, best_result);
-                })
-            });
+        self.pipeline_execution_results = vec![None; max_stages + 1];
+        for num_stages in 1..=max_stages {
+            let Some(state) = states[num_stages][num_layers].as_ref() else {
+                continue;
+            };
+            let mut stages = Vec::with_capacity(num_stages);
+            for (index, start) in state.stage_starts.iter().copied().enumerate() {
+                let end = state
+                    .stage_starts
+                    .get(index + 1)
+                    .copied()
+                    .unwrap_or(num_layers);
+                stages.push(self.stage(start, end).clone());
+            }
+            self.pipeline_execution_results[num_stages] =
+                Some(PipelineExecutionResult { stages });
         }
         Ok(())
     }
 
     pub fn get_pipeline_template(
         &self,
-        num_nodes: u32,
+        resource_count: u32,
     ) -> Result<PipelineExecutionResult, PlannerError> {
-        log::debug!(
-            "get_pipeline_template({}, {}, {})",
-            num_nodes,
-            0,
-            self.layer_execution_results.len()
-        );
-
-        let result =
-            self.execution_result_cache
-                .get(&(num_nodes, 0, self.layer_execution_results.len()));
-
-        match result {
-            Some(result) => Ok(result.value().clone().unwrap()),
-            None => Err(PlannerError::new(
-                format!("No pipeline template for {} nodes", num_nodes).as_str(),
-            ))?,
-        }
+        self.pipeline_execution_results
+            .get(resource_count as usize)
+            .and_then(Option::as_ref)
+            .cloned()
+            .ok_or_else(|| {
+                PlannerError::infeasible(format!(
+                    "pipeline template for resource count {resource_count} cannot fit one microbatch in device memory"
+                ))
+            })
     }
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
 
-    fn prepare(
-        num_layers: u32,
-        same_latency: bool,
-        mut num_nodes: Vec<u32>,
-    ) -> Result<PipelineTemplateGenerator, PlannerError> {
-        let mut layer_results = vec![];
-        for i in 0..num_layers {
-            layer_results.push(LayerExecutionResult {
-                layer_index: i,
-                layer_name: format!("layer{}", i),
-                forward: if same_latency {
-                    1 as f64
-                } else {
-                    (i + 1) as f64
-                },
-                backward: if same_latency {
-                    1 as f64
-                } else {
-                    (i + 1) as f64
-                },
-                mem_required: if same_latency {
-                    1 as u64
-                } else {
-                    (i + 1) as u64
-                },
-                activation_memory: (i + 1) as u64,
-                persistent_memory: (i + 1) as u64 * 2,
-            });
+    fn layer(index: u32, latency: f64, activation_memory: u64) -> LayerExecutionResult {
+        LayerExecutionResult {
+            layer_index: index,
+            layer_name: format!("layer{index}"),
+            forward: latency,
+            backward: 0.0,
+            activation_memory,
+            persistent_memory: 0,
         }
+    }
 
-        num_nodes.sort();
-
-        let mut generator = PipelineTemplateGenerator::new(layer_results);
-        generator.divide_and_conquer(num_nodes[num_nodes.len() - 1])?;
+    fn prepare(
+        latencies: &[f64],
+        max_resource_count: u32,
+        device_memory_bytes: Option<u64>,
+    ) -> Result<PipelineTemplateGenerator, PlannerError> {
+        let profile = latencies
+            .iter()
+            .enumerate()
+            .map(|(index, latency)| layer(index as u32, *latency, 1))
+            .collect();
+        let mut generator = PipelineTemplateGenerator::new(profile)?;
+        generator.plan(max_resource_count, device_memory_bytes)?;
         Ok(generator)
     }
 
-    #[test]
-    fn test_return_no_template_for_too_large_num_nodes() {
-        let generator = prepare(6, true, vec![7]);
-        assert!(generator.is_err());
+    fn ranges(result: &PipelineExecutionResult) -> Vec<(u32, u32)> {
+        result.stages.iter().map(|stage| stage.layers).collect()
+    }
 
-        let generator = prepare(6, true, vec![6]);
-        assert!(generator.is_ok());
-        assert!(generator.unwrap().get_pipeline_template(7).is_err());
+    fn brute_force_bottleneck(
+        latencies: &[f64],
+        stages: usize,
+        start: usize,
+    ) -> Option<f64> {
+        if stages == 1 {
+            return Some(latencies[start..].iter().sum());
+        }
+        let mut best: Option<f64> = None;
+        for end in (start + 1)..=(latencies.len() - stages + 1) {
+            let first: f64 = latencies[start..end].iter().sum();
+            let suffix = brute_force_bottleneck(latencies, stages - 1, end)?;
+            let candidate = first.max(suffix);
+            best = Some(best.map_or(candidate, |current| current.min(candidate)));
+        }
+        best
     }
 
     #[test]
-    fn test_all_layers_covered() {
-        let generator = prepare(6, false, vec![1, 2, 3, 4, 5, 6]).unwrap();
-        let expected_layers: Vec<u32> = (0..6).map(|i| i).collect();
+    fn rejects_invalid_profiles_and_resource_counts() {
+        assert!(PipelineTemplateGenerator::new(Vec::new()).is_err());
+        let mut invalid = layer(1, 1.0, 1);
+        assert!(PipelineTemplateGenerator::new(vec![invalid.clone()]).is_err());
+        invalid.layer_index = 0;
+        invalid.forward = f64::NAN;
+        assert!(PipelineTemplateGenerator::new(vec![invalid]).is_err());
 
-        for i in 1..=6 {
-            let template = generator.get_pipeline_template(i).unwrap();
-            let mut covered_layers: Vec<u32> = Vec::new();
-            for stage in template.stages.iter() {
-                for layer in stage.layers.0..stage.layers.1 {
-                    covered_layers.push(layer);
-                }
+        let mut generator = prepare(&[1.0, 2.0], 2, None).unwrap();
+        assert!(generator.plan(0, None).is_err());
+        assert!(generator.plan(3, None).is_err());
+    }
+
+    #[test]
+    fn returns_contiguous_globally_optimal_partitions() {
+        let generator = prepare(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 4, None).unwrap();
+        for stage_count in 1..=4 {
+            let result = generator.get_pipeline_template(stage_count).unwrap();
+            assert_eq!(result.stages.len(), stage_count as usize);
+            assert_eq!(result.stages.first().unwrap().layers.0, 0);
+            assert_eq!(result.stages.last().unwrap().layers.1, 6);
+            for adjacent in result.stages.windows(2) {
+                assert_eq!(adjacent[0].layers.1, adjacent[1].layers.0);
             }
-            assert_eq!(covered_layers, expected_layers);
+            assert_eq!(
+                result.bottleneck_latency(),
+                brute_force_bottleneck(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], stage_count as usize, 0)
+                    .unwrap()
+            );
+        }
+        assert_eq!(
+            ranges(&generator.get_pipeline_template(2).unwrap()),
+            vec![(0, 4), (4, 6)]
+        );
+    }
+
+    #[test]
+    fn fixes_the_legacy_non_optimal_subproblem_counterexample() {
+        let latencies = [91.0, 45.0, 29.0, 75.0, 73.0, 66.0, 99.0, 81.0, 83.0, 83.0];
+        let generator = prepare(&latencies, 6, None).unwrap();
+        let result = generator.get_pipeline_template(6).unwrap();
+        assert_eq!(
+            ranges(&result),
+            vec![(0, 2), (2, 4), (4, 6), (6, 7), (7, 9), (9, 10)]
+        );
+        assert_eq!(
+            result.bottleneck_latency(),
+            brute_force_bottleneck(&latencies, 6, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn uses_lexicographically_smallest_cuts_for_equal_costs() {
+        let generator = prepare(&[1.0, 1.0, 1.0], 2, None).unwrap();
+        assert_eq!(
+            ranges(&generator.get_pipeline_template(2).unwrap()),
+            vec![(0, 1), (1, 3)]
+        );
+    }
+
+    #[test]
+    fn excludes_fast_partitions_that_do_not_fit_memory() {
+        let profile = vec![layer(0, 1.0, 8), layer(1, 5.0, 5), layer(2, 6.0, 1)];
+        let mut generator = PipelineTemplateGenerator::new(profile).unwrap();
+        generator.plan(2, Some(10)).unwrap();
+        let result = generator.get_pipeline_template(2).unwrap();
+        assert_eq!(ranges(&result), vec![(0, 1), (1, 3)]);
+        assert_eq!(result.bottleneck_latency(), 11.0);
+        assert_eq!(result.max_microbatches(Some(10)), Some(1));
+    }
+
+    #[test]
+    fn plans_realistic_layer_and_resource_counts() {
+        let latencies: Vec<f64> = (1..=96).map(f64::from).collect();
+        let generator = prepare(&latencies, 64, None).unwrap();
+        for resource_count in 1..=64 {
+            let result = generator.get_pipeline_template(resource_count).unwrap();
+            assert_eq!(result.stages.len(), resource_count as usize);
         }
     }
 
     #[test]
-    fn test_divide_and_conquer_base_only() {
-        let generator = prepare(6, false, vec![1]).unwrap();
-        let template = generator.get_pipeline_template(1).unwrap();
-
-        assert_eq!(template.stages.len(), 1);
-        assert_eq!(template.stages[0].layers, (0, 6));
+    fn rejects_aggregate_timing_overflow() {
+        let profile = vec![layer(0, 1.0e308, 1), layer(1, 1.0e308, 1)];
+        assert!(PipelineTemplateGenerator::new(profile).is_err());
     }
 
     #[test]
-    fn test_divide_and_conquer_divide() {
-        // Uneven distribution test
-        let generator = prepare(6, false, vec![1, 2]).unwrap();
-
-        // Template for 1 node
-        let template = generator.get_pipeline_template(1).unwrap();
-        assert_eq!(template.stages.len(), 1);
-        assert_eq!(template.stages[0].layers, (0, 6));
-
-        let template = generator.get_pipeline_template(2).unwrap();
-        assert_eq!(template.stages.len(), 2);
-        assert_eq!(template.stages[0].layers, (0, 4));
-        assert_eq!(template.stages[1].layers, (4, 6));
-
-        let generator = prepare(6, true, vec![1, 2]).unwrap();
-        let template = generator.get_pipeline_template(2).unwrap();
-        assert_eq!(template.stages.len(), 2);
-        assert_eq!(template.stages[0].layers, (0, 3));
-        assert_eq!(template.stages[1].layers, (3, 6));
-    }
-
-    #[test]
-    fn test_divide_and_conquer_divide2() {
-        let generator = prepare(6, false, vec![2, 3, 4]).unwrap();
-        let template = generator.get_pipeline_template(2).unwrap();
-        assert_eq!(template.stages.len(), 2);
-        assert_eq!(template.stages[0].layers, (0, 4));
-        assert_eq!(template.stages[1].layers, (4, 6));
-
-        let template = generator.get_pipeline_template(3).unwrap();
-        assert_eq!(template.stages.len(), 3);
-        assert_eq!(template.stages[0].layers, (0, 3));
-        assert_eq!(template.stages[1].layers, (3, 5));
-        assert_eq!(template.stages[2].layers, (5, 6));
-
-        let template = generator.get_pipeline_template(4).unwrap();
-        assert_eq!(template.stages.len(), 4);
-        assert_eq!(template.stages[0].layers, (0, 3));
-        assert_eq!(template.stages[1].layers, (3, 4));
-        assert_eq!(template.stages[2].layers, (4, 5));
-        assert_eq!(template.stages[3].layers, (5, 6));
-    }
-
-    #[test]
-    fn test_measure_time_of_large_model() {
-        let generator = prepare(96, false, vec![64]).unwrap();
-        for i in 1..=64 {
-            let template_result = generator.get_pipeline_template(i);
-            assert!(template_result.is_ok());
-            assert_eq!(template_result.unwrap().stages.len(), i as usize);
-        }
+    fn reports_infeasible_memory_with_context() {
+        let profile = vec![layer(0, 1.0, 11), layer(1, 1.0, 1)];
+        let mut generator = PipelineTemplateGenerator::new(profile).unwrap();
+        generator.plan(1, Some(10)).unwrap();
+        let error = generator.get_pipeline_template(1).unwrap_err();
+        assert!(error.to_string().contains("resource count 1"));
     }
 }

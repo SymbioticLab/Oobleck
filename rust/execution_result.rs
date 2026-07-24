@@ -1,26 +1,14 @@
+use crate::PlannerError;
 use pyo3::conversion::FromPyObject;
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
-use serde::{Deserialize, Serialize};
-use std::cmp::{Ordering, PartialEq};
-use std::sync::Arc;
 
-#[derive(Serialize, Deserialize)]
-pub struct ProfileResult {
-    model_name: String,
-    microbatch_size: u32,
-    tp_size: u32,
-    precision: String,
-    layers: Vec<LayerExecutionResult>,
-}
-
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct LayerExecutionResult {
     pub layer_index: u32,
     pub layer_name: String,
     pub forward: f64,
     pub backward: f64,
-    pub mem_required: u64,
     pub activation_memory: u64,
     pub persistent_memory: u64,
 }
@@ -46,127 +34,120 @@ impl<'py> FromPyObject<'py> for LayerExecutionResult {
             layer_name: ob.getattr("layer_name")?.extract()?,
             forward: ob.getattr("forward")?.extract()?,
             backward: ob.getattr("backward")?.extract()?,
-            mem_required,
             activation_memory,
             persistent_memory,
         })
     }
 }
 
+impl LayerExecutionResult {
+    pub fn validate(&self, expected_index: usize) -> Result<(), PlannerError> {
+        if self.layer_index as usize != expected_index {
+            return Err(PlannerError::invalid_input(format!(
+                "profile_data must have contiguous layer indices; expected {expected_index}, got {}",
+                self.layer_index
+            )));
+        }
+        if self.layer_name.is_empty() {
+            return Err(PlannerError::invalid_input(format!(
+                "layer {expected_index} must have a non-empty name"
+            )));
+        }
+        if !self.forward.is_finite()
+            || !self.backward.is_finite()
+            || !(self.forward + self.backward).is_finite()
+            || self.forward < 0.0
+            || self.backward < 0.0
+        {
+            return Err(PlannerError::invalid_input(format!(
+                "layer {expected_index} timings must be finite and non-negative"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct StageExecutionResult {
     pub layers: (u32, u32),
-    forward: f64,
-    backward: f64,
-    mem_required: u64,
-    activation_memory: u64,
-    persistent_memory: u64,
+    pub forward: f64,
+    pub backward: f64,
+    pub activation_memory: u64,
+    pub persistent_memory: u64,
 }
 
 impl StageExecutionResult {
-    pub fn new(layers: &[LayerExecutionResult]) -> Self {
-        Self {
-            layers: (layers[0].layer_index, layers[layers.len() - 1].layer_index + 1),
-            forward: layers.iter().map(|layer| layer.forward).sum(),
-            backward: layers.iter().map(|layer| layer.backward).sum(),
-            mem_required: layers.iter().map(|layer| layer.mem_required).sum(),
-            activation_memory: layers.iter().map(|layer| layer.activation_memory).sum(),
-            persistent_memory: layers.iter().map(|layer| layer.persistent_memory).sum(),
-        }
-    }
-
     pub fn latency(&self) -> f64 {
         self.forward + self.backward
     }
+
+    pub fn fits_one_microbatch(&self, device_memory_bytes: Option<u64>) -> bool {
+        device_memory_bytes.map_or(true, |device_memory| {
+            self.persistent_memory
+                .checked_add(self.activation_memory)
+                .is_some_and(|required| required <= device_memory)
+        })
+    }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PipelineExecutionResult {
-    pub stages: Vec<Arc<StageExecutionResult>>,
-    pub t1: f64,
-    pub t2: f64,
-    pub t3: f64,
-    pub kstar: usize,
+    pub stages: Vec<StageExecutionResult>,
 }
 
 impl PipelineExecutionResult {
-    pub fn new(left: &Self, right: &Self) -> Self {
-        let mut stages = left.stages.clone();
-        stages.extend(right.stages.clone());
-        let t1 = left.t1 + right.t1;
-        let kstar = if left.stages[left.kstar].latency() > right.stages[right.kstar].latency() {
-            left.kstar
-        } else {
-            left.stages.len() + right.kstar
-        };
-        let num_microbatches = 4 * stages.len();
-        let t2 = (num_microbatches - stages.len() + kstar - 1) as f64 * stages[kstar].latency();
-        let t3 = if kstar == left.kstar { left.t3 + right.t1 } else { right.t3 };
-        Self {
-            stages,
-            t1,
-            t2,
-            t3,
-            kstar,
-        }
-    }
-
-    pub fn make_base_result(stage: Arc<StageExecutionResult>) -> Self {
-        let latency = stage.latency();
-        Self {
-            stages: vec![stage],
-            t1: latency,
-            t2: 2.0 * latency,
-            t3: latency,
-            kstar: 0,
-        }
-    }
-
-    pub fn latency_with_mb(&self, mb: u32) -> f64 {
-        self.t1 + self.t2 + self.t3
-            + ((mb as i32 - 4 * self.stages.len() as i32) as f64)
-                * self.stages[self.kstar].latency()
-    }
-    pub fn latency(&self) -> f64 {
-        self.t1 + self.t2 + self.t3
-    }
-    pub fn forward_time(&self) -> f64 {
-        self.stages.iter().map(|stage| stage.forward).fold(0.0, f64::max)
-    }
-    pub fn backward_time(&self) -> f64 {
-        self.stages.iter().map(|stage| stage.backward).fold(0.0, f64::max)
-    }
-    pub fn mem_required(&self) -> u64 {
+    pub fn bottleneck_stage(&self) -> &StageExecutionResult {
         self.stages
             .iter()
-            .map(|stage| stage.mem_required)
+            .enumerate()
+            .max_by(|(left_index, left), (right_index, right)| {
+                left.latency()
+                    .total_cmp(&right.latency())
+                    .then_with(|| left_index.cmp(right_index))
+            })
+            .map(|(_, stage)| stage)
+            .expect("a planned pipeline always has at least one stage")
+    }
+
+    pub fn bottleneck_latency(&self) -> f64 {
+        self.bottleneck_stage().latency()
+    }
+
+    pub fn forward_time(&self) -> f64 {
+        self.bottleneck_stage().forward
+    }
+
+    pub fn backward_time(&self) -> f64 {
+        self.bottleneck_stage().backward
+    }
+
+    pub fn activation_memory(&self) -> u64 {
+        self.stages
+            .iter()
+            .map(|stage| stage.activation_memory)
             .max()
             .unwrap_or(0)
     }
-    pub fn activation_memory(&self) -> u64 {
-        self.stages.iter().map(|stage| stage.activation_memory).max().unwrap_or(0)
-    }
-    pub fn persistent_memory(&self) -> u64 {
-        self.stages.iter().map(|stage| stage.persistent_memory).max().unwrap_or(0)
-    }
-}
 
-impl PartialEq for PipelineExecutionResult {
-    fn eq(&self, other: &Self) -> bool {
-        self.latency_with_mb(128) == other.latency_with_mb(128)
-            && self.mem_required() == other.mem_required()
+    pub fn persistent_memory(&self) -> u64 {
+        self.stages
+            .iter()
+            .map(|stage| stage.persistent_memory)
+            .max()
+            .unwrap_or(0)
     }
-}
-impl Eq for PipelineExecutionResult {}
-impl Ord for PipelineExecutionResult {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.latency_with_mb(128)
-            .partial_cmp(&other.latency_with_mb(128))
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| self.mem_required().cmp(&other.mem_required()))
-    }
-}
-impl PartialOrd for PipelineExecutionResult {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+
+    pub fn max_microbatches(&self, device_memory_bytes: Option<u64>) -> Option<u64> {
+        let device_memory = device_memory_bytes?;
+        self.stages
+            .iter()
+            .filter(|stage| stage.activation_memory > 0)
+            .map(|stage| {
+                device_memory
+                    .checked_sub(stage.persistent_memory)
+                    .map(|available| available / stage.activation_memory)
+                    .unwrap_or(0)
+            })
+            .min()
     }
 }

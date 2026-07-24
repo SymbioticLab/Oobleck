@@ -133,7 +133,12 @@ class PipelineStageSpec:
 
 @dataclass(frozen=True, slots=True)
 class PipelineTemplate:
-    """A profiled pipeline layout independent of concrete nodes and ranks."""
+    """A profiled pipeline layout independent of concrete nodes and ranks.
+
+    Generated templates store the forward and backward components of the same
+    bottleneck stage, so their sum is the minimax steady-state stage work used
+    by :meth:`iteration_time` and heterogeneous composition.
+    """
 
     template_id: str
     layer_ranges: tuple[tuple[int, int], ...]

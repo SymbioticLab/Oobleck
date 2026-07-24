@@ -2,12 +2,6 @@
 
 These items are intentionally deferred until the DP/PP/TP elastic runtime and its recovery path are complete.
 
-## Refactor the Rust pipeline planner
-
-The initial Oobleck refactor will reuse the current Rust pipeline-template planner behind a narrow, versioned Python API. It will receive correctness fixes, tests, and the required PyO3 upgrade, but its internal design will not be substantially rewritten in the first implementation.
-
-Later work should simplify the planner's data model, separate enumeration from optimization, replace legacy assumptions and naming, improve error reporting, benchmark a pure-Python or alternative solver where useful, and document the Rust/Python boundary. Preserve behavioral fixtures for template generation and simple/borrow/merge decisions before changing the implementation.
-
 ## Add context and expert parallelism
 
 The first implementation supports LLM DP/PP/TP with fixed per-node TP width. Add Cornstarch context parallelism (CP) and expert parallelism (EP) after that path is stable.

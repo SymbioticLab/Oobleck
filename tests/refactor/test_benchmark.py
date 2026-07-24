@@ -1,3 +1,4 @@
+from benchmarks.pipeline_planner import run as run_pipeline_planner
 from benchmarks.recovery_schedule import run
 from benchmarks.transaction_overhead import run as run_transaction_overhead
 
@@ -24,3 +25,11 @@ def test_transaction_overhead_benchmark_replays_once_and_matches_reference():
     assert result["committed_step"] == 3
     assert result["numerically_equivalent"] is True
     assert len(result["replayed_sample_indices"]) == 4
+
+
+def test_pipeline_planner_benchmark_matches_backends():
+    result = run_pipeline_planner(layers=12, max_resources=6, repeats=1)
+    assert result["backends_match"] is True
+    assert result["scenario"]["template_count"] == 6
+    assert result["rust_seconds"] >= 0
+    assert result["python_seconds"] >= 0
