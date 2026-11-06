@@ -351,7 +351,7 @@ class OobleckPlugin(HeterogeneousParallelPlugin):
                         dist.recv(tensor, sender_rank)
                         buff = io.BytesIO(tensor.numpy(force=True))
                         tensor: dict[str, tuple[dict, torch.Tensor]] = torch.load(
-                            buff, map_location=device
+                            buff, map_location=device, weights_only=True
                         )
 
                         states: dict[str, torch.Tensor] = tensor["states"]
